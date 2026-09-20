@@ -9,7 +9,6 @@ use super::*;
 
 mod departure;
 mod leave;
-mod session_start;
 
 pub use departure::{
     FinalizeOutcome, activate_connection_epoch, claim_close_report, connection_epoch_matches,
@@ -22,12 +21,6 @@ pub use leave::{
     has_reconnectable_departure, has_undecided_departure, leave_reconcile, leave_schedulable,
     normalize_observed_leave, observe_leave, reachable_frame, reinstate_slot, session_closed,
     slot_departed, slot_homed, slot_leave_decided, slot_strictly_homed,
-};
-pub use session_start::{
-    adopt_session_start, mark_session_started, note_slot_present, record_peer_slot_started,
-    record_slot_connected, record_slot_started, reevaluate_session_start,
-    session_initial_buffer_turns, session_started, set_session_shape, slot_has_started,
-    started_home_slots, started_session_slot_count,
 };
 
 pub(crate) use departure::{

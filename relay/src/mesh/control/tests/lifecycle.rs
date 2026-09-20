@@ -100,11 +100,11 @@ fn a_descriptor_reconciles_dials_that_raced_it_and_starts_the_session() {
     // `note_slot_present` takes its no-maker path and reports no start, so the
     // presence is dropped.
     assert!(
-        !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
+        !makers.note_slot_present(&key(1), SlotId(0)),
         "an announce with no maker yet drops the presence and fires no start",
     );
     assert!(
-        !consensus::note_slot_present(&makers, &key(1), SlotId(1)),
+        !makers.note_slot_present(&key(1), SlotId(1)),
         "an announce with no maker yet drops the presence and fires no start",
     );
 
@@ -141,7 +141,7 @@ fn a_reconcile_over_a_partial_roster_waits_for_the_late_slot() {
     let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0), 1)
         .expect("slot 0 registers into an empty roster");
     assert!(
-        !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
+        !makers.note_slot_present(&key(1), SlotId(0)),
         "slot 0's announce with no maker yet drops the presence",
     );
 
@@ -164,7 +164,7 @@ fn a_reconcile_over_a_partial_roster_waits_for_the_late_slot() {
     let (_reg1, _inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1), 1)
         .expect("slot 1 registers after the descriptor applied");
     assert!(
-        consensus::note_slot_present(&makers, &key(1), SlotId(1)),
+        makers.note_slot_present(&key(1), SlotId(1)),
         "slot 1's announce completes the expected set and fires the start",
     );
     assert!(

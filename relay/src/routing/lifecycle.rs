@@ -23,7 +23,7 @@ pub(crate) fn deliver_session_start(
     mesh_links: &crate::mesh::MeshLinks,
     key: &SessionKey,
 ) {
-    let initial_buffer_turns = consensus::session_initial_buffer_turns(decision_makers, key);
+    let initial_buffer_turns = decision_makers.initial_buffer_turns(key);
     fan_out_session_start(sessions, key, initial_buffer_turns);
     crate::mesh::fan_out_session_start(mesh_links, key, initial_buffer_turns);
 }
@@ -39,7 +39,7 @@ pub fn maybe_start_session(
     mesh_links: &crate::mesh::MeshLinks,
     key: &SessionKey,
 ) {
-    if consensus::reevaluate_session_start(decision_makers, key) {
+    if decision_makers.reevaluate_start(key) {
         deliver_session_start(sessions, decision_makers, mesh_links, key);
     }
 }
@@ -67,10 +67,10 @@ pub fn announce_slot_present(
     // Record it locally. On the authority, completing the expected set fires the
     // directive session-wide; otherwise, if the session already started, this
     // late slot still needs the directive pushed to it directly.
-    if consensus::note_slot_present(decision_makers, key, slot) {
+    if decision_makers.note_slot_present(key, slot) {
         deliver_session_start(sessions, decision_makers, mesh_links, key);
-    } else if consensus::session_started(decision_makers, key) {
-        let initial_buffer_turns = consensus::session_initial_buffer_turns(decision_makers, key);
+    } else if decision_makers.is_started(key) {
+        let initial_buffer_turns = decision_makers.initial_buffer_turns(key);
         deliver_session_start_to_slot(sessions, key, slot, initial_buffer_turns);
     }
 }

@@ -38,23 +38,9 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
     // The session's decision-maker holds the load state the beat restates:
     // slot 2 arrived and dropped again (so it is off the live roster but
     // still ever-connected), slot 3 arrived and reported its game loop.
-    crate::consensus::record_slot_connected(
-        &decision_makers,
-        &key(7),
-        rally_point_proto::ids::SlotId(2),
-        false,
-    );
-    crate::consensus::record_slot_connected(
-        &decision_makers,
-        &key(7),
-        rally_point_proto::ids::SlotId(3),
-        false,
-    );
-    crate::consensus::record_slot_started(
-        &decision_makers,
-        &key(7),
-        rally_point_proto::ids::SlotId(3),
-    );
+    decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(2), false);
+    decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(3), false);
+    decision_makers.note_slot_started(&key(7), rally_point_proto::ids::SlotId(3));
 
     SubscriberFixture {
         heartbeat: HeartbeatConfig {
@@ -115,8 +101,8 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
     let (sessions, decision_makers) = fence_fixture();
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
-    crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
+    decision_makers.note_slot_started(&key(7), SlotId(0));
 
     // The slot's link ends: the routing group goes with it, the maker stays.
     drop(registration);
@@ -196,18 +182,9 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
             .expect("slot 3 registers");
     guard.disarm();
     for slot in [2u8, 3] {
-        crate::consensus::record_slot_connected(
-            &decision_makers,
-            &key(7),
-            rally_point_proto::ids::SlotId(slot),
-            false,
-        );
+        decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(slot), false);
     }
-    crate::consensus::record_slot_started(
-        &decision_makers,
-        &key(7),
-        rally_point_proto::ids::SlotId(3),
-    );
+    decision_makers.note_slot_started(&key(7), rally_point_proto::ids::SlotId(3));
 
     SubscriberFixture {
         heartbeat: HeartbeatConfig {
@@ -261,8 +238,8 @@ fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
     let (sessions, decision_makers) = fence_fixture();
     let (_registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
-    crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
+    decision_makers.note_slot_started(&key(7), SlotId(0));
 
     let sources = HeartbeatSources {
         sessions: Arc::clone(&sessions),

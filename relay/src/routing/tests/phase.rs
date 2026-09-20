@@ -45,7 +45,7 @@ fn phase_corrections_fan_to_the_corrected_slot_and_survive_for_repush() {
         assert!(feed(&makers, 0, seq, 0).is_empty());
         assert!(feed(&makers, 1, seq, 15_000).is_empty());
     }
-    consensus::mark_session_started(&makers, &k);
+    makers.mark_started(&k);
 
     // Steady post-start flow: slot 0 at the cycle's base phase, slot 1
     // fifteen milliseconds later. The controller evaluates on its own

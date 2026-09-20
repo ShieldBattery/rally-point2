@@ -169,7 +169,7 @@ pub(super) fn handle_control_frame(
                         slot: ctx.slot.0,
                     },
                 );
-                consensus::record_slot_started(&ctx.decision_makers, &ctx.key, ctx.slot);
+                ctx.decision_makers.note_slot_started(&ctx.key, ctx.slot);
                 // Only this relay hears the report, and every relay
                 // serving the session needs it: its silent-slot
                 // watch cannot weigh a slot it does not know has

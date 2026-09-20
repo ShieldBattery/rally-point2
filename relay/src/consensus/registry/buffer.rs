@@ -7,7 +7,7 @@ impl DecisionMakers {
     /// Feeds one home-client `conditions` sample into the session's decision-maker
     /// if the relay has one, logging any decision it fires. Returns the
     /// [`Decision`], if any — the broadcast the decision queues is emitted later by
-    /// [`active_directive`] at fan-out. A no-op returning `None` when no maker
+    /// [`active_directive`](Self::active_directive) at fan-out. A no-op returning `None` when no maker
     /// exists for the session (no policy pushed yet), so a slot link can call it
     /// unconditionally.
     pub fn ingest_local_conditions(
@@ -18,7 +18,7 @@ impl DecisionMakers {
         self.ingest_conditions(key, &conditions.slots, 0, true)
     }
 
-    /// The allocation-free single-slot counterpart to [`ingest_local_conditions`].
+    /// The allocation-free single-slot counterpart to [`ingest_local_conditions`](Self::ingest_local_conditions).
     /// Slot-link sampling produces exactly one [`SlotConditions`], so accepting it
     /// directly avoids wrapping every sample in a temporary `Vec` while retaining
     /// the identical state update, decision, logging, and flight-recording path.

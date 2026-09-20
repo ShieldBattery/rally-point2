@@ -11,7 +11,7 @@
 //! # Marking and clearing
 //!
 //! [`ProvisionalSessions::mark_if_undescribed`] runs under the same
-//! decision-maker registry lock [`crate::consensus::sync_maker`]'s own
+//! decision-maker registry lock [`DecisionMakers::sync_maker`](crate::consensus::DecisionMakers::sync_maker)'s own
 //! check-and-insert does, so the two can never race past each other:
 //! whichever observes the session's maker absent first completes -- a mark
 //! recorded, or a maker inserted -- before the other proceeds. A mark that
@@ -92,7 +92,7 @@ impl ProvisionalSessions {
     /// exists for it (a descriptor already named the session, or one is
     /// concurrently being applied). Returns whether the mark was recorded.
     /// See the module docs for why holding that lock across the mark is what
-    /// closes the race with [`crate::consensus::sync_maker`]'s own
+    /// closes the race with [`DecisionMakers::sync_maker`](crate::consensus::DecisionMakers::sync_maker)'s own
     /// check-and-insert.
     ///
     /// A duplicate call for an already-marked session -- a second slot's

@@ -49,9 +49,8 @@ pub(super) fn reconcile_leaves_on_join(
     // Carries this relay's stored initial buffer depth, which is `None` on a
     // resumed relay (it never sized one), so a re-push into a running game never
     // resizes a live buffer.
-    if crate::consensus::session_started(decision_makers, key) {
-        let initial_buffer_turns =
-            crate::consensus::session_initial_buffer_turns(decision_makers, key);
+    if decision_makers.is_started(key) {
+        let initial_buffer_turns = decision_makers.initial_buffer_turns(key);
         let _ = control_tx.send(session_start_frame(key.session, initial_buffer_turns));
     }
 }
@@ -104,7 +103,7 @@ pub(super) fn reconcile_started_slots_on_join(
     control_tx: &MeshControlTx,
     key: &SessionKey,
 ) {
-    for slot in crate::consensus::started_home_slots(decision_makers, key) {
+    for slot in decision_makers.started_home_slots(key) {
         let _ = control_tx.send(slot_started_frame(key.session, slot));
     }
 }

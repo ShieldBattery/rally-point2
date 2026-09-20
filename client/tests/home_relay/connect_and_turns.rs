@@ -260,7 +260,6 @@ async fn wildcard_relay_accepts_ipv4_and_ipv6_clients() {
 #[tokio::test]
 async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_channel() {
     use rally_point_client::LinkDriver;
-    use rally_point_relay::consensus;
 
     let tenant = make_tenant(KID, TENANT);
     let session = SessionId(71);
@@ -273,7 +272,9 @@ async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_chann
     // far below the hint).
     let mesh = rally_point_relay::mesh::MeshState::default();
     let key = seed_session_authority(&mesh, &tenant, session, &[SlotId(0), SlotId(1)]);
-    consensus::set_session_shape(&mesh.session.decision_makers, &key, Some(400), false);
+    mesh.session
+        .decision_makers
+        .set_session_shape(&key, Some(400), false);
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
     let endpoint = client_endpoint(&ca);

@@ -158,8 +158,7 @@ impl MeshControl {
         // mesh peers) — the latter decides both the fully-observed rule and the
         // multi-relay hop cushion. Set on create and every re-sync, like the
         // observer/expected/homed sets above.
-        consensus::set_session_shape(
-            &self.mesh.session.decision_makers,
+        self.mesh.session.decision_makers.set_session_shape(
             &key,
             descriptor.latency_estimate_ms,
             new_peers.is_empty(),
@@ -340,8 +339,11 @@ impl MeshControl {
         // returns true.
         let mut reconcile_started_session = false;
         for slot in registered_slots {
-            reconcile_started_session |=
-                consensus::note_slot_present(&self.mesh.session.decision_makers, &key, slot);
+            reconcile_started_session |= self
+                .mesh
+                .session
+                .decision_makers
+                .note_slot_present(&key, slot);
         }
         if reconcile_started_session {
             crate::routing::deliver_session_start(

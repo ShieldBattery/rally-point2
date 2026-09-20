@@ -37,7 +37,7 @@ pub(super) fn resample_pre_start(link: &Link, ctx: &mut SlotLinkCtx) {
     // reflects live conditions. It stops once the session starts; the
     // receive-driven sampler covers the running game, so nothing is
     // double-sampled.
-    if consensus::session_started(&ctx.decision_makers, &ctx.key) {
+    if ctx.decision_makers.is_started(&ctx.key) {
         ctx.pre_start_sampling = false;
     } else {
         let sample = sample_slot_conditions(link, ctx.slot, ctx.connection_epoch).conditions;

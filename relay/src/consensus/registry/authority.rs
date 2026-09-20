@@ -278,7 +278,7 @@ impl DecisionMakers {
         }
     }
 
-    /// The seq-aware sibling of [`observe_frame`]: records the same per-slot frame
+    /// The seq-aware sibling of [`observe_frame`](Self::observe_frame): records the same per-slot frame
     /// **and** the turn's transport seq into the slot's bounded frame history, so a
     /// later leave can clamp its apply frame to a survivor-reachable ceiling (see
     /// `DecisionMaker`'s `reachable_frame`). **Every production frame-observation on
@@ -369,7 +369,7 @@ impl DecisionMakers {
     /// Feeds one forwarded turn's commands into the session's desync comparator, if
     /// the relay has a maker, and fires a [`DesyncNotice`] up the coordinator
     /// connection when a divergence is confirmed. Called at the same turn choke
-    /// points as [`observe_frame`], for every turn (client edge, mesh hop, oversize
+    /// points as [`observe_frame`](Self::observe_frame), for every turn (client edge, mesh hop, oversize
     /// divert). Every relay retains ordered checksum metadata so a promotion keeps
     /// its native ring epochs; only the authority compares or emits a notice.
     ///
@@ -388,7 +388,7 @@ impl DecisionMakers {
         self.observe_sync_with_generation(key, slot, seq, game_frame, commands, None);
     }
 
-    /// The enhanced checksum-coverage variant of [`observe_sync`].
+    /// The enhanced checksum-coverage variant of [`observe_sync`](Self::observe_sync).
     pub fn observe_sync_with_generation(
         &self,
         key: &SessionKey,

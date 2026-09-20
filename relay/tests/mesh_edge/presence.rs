@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 #[tokio::test]
 async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() -> Result<(), AnyError>
 {
-    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::consensus::Authority;
     use rally_point_transport::control::ControlInbound;
 
     let tenant = make_default_tenant();
@@ -57,10 +57,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     let (_send_b, mut control_b) = open_lobby_streams(client_b.connection()).await;
     wait_for_slots(&relay_a.sessions, &key, 1).await;
     wait_for_slots(&relay_b.sessions, &key, 1).await;
-    assert!(!consensus::session_started(
-        &relay_b.mesh.session.decision_makers,
-        &key
-    ));
+    assert!(!relay_b.mesh.session.decision_makers.is_started(&key));
 
     let (mesh_a, mesh_b, _mesh_ep_a, _mesh_ep_b) = mesh_link_pair().await;
     let commands_a = spawn_mesh_link(mesh_a, Arc::clone(&relay_a.sessions), relay_a.mesh.clone());
@@ -74,10 +71,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     // if it were going to. A negative claim needs some window, but a short one:
     // B is one loopback hop away.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(!consensus::session_started(
-        &relay_b.mesh.session.decision_makers,
-        &key
-    ));
+    assert!(!relay_b.mesh.session.decision_makers.is_started(&key));
 
     // B now joins and sends its initial aggregate. A's one-shot rendezvous
     // response replays slot 0 after B is known joined, completing B's expected
@@ -91,10 +85,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
         recv_meaningful(&mut control_a).await,
         ControlInbound::SessionStart(_)
     ));
-    assert!(consensus::session_started(
-        &relay_b.mesh.session.decision_makers,
-        &key
-    ));
+    assert!(relay_b.mesh.session.decision_makers.is_started(&key));
 
     Ok(())
 }

@@ -18,23 +18,20 @@ fn session_start_fires_once_when_live_slots_cover_expected() {
     );
 
     // No directive until the last expected slot completes the set.
-    assert!(!note_slot_present(&registry, &k, SlotId(0)));
-    assert!(!note_slot_present(&registry, &k, SlotId(1)));
+    assert!(!registry.note_slot_present(&k, SlotId(0)));
+    assert!(!registry.note_slot_present(&k, SlotId(1)));
+    assert!(!registry.is_started(&k), "not yet — slot 2 is missing");
     assert!(
-        !session_started(&registry, &k),
-        "not yet — slot 2 is missing"
-    );
-    assert!(
-        note_slot_present(&registry, &k, SlotId(2)),
+        registry.note_slot_present(&k, SlotId(2)),
         "the last expected slot fires the directive exactly once",
     );
-    assert!(session_started(&registry, &k));
+    assert!(registry.is_started(&k));
 
     // Churn after start never re-fires: a re-announce, or a slot not in the
     // expected set, returns false and the latch stays set.
-    assert!(!note_slot_present(&registry, &k, SlotId(2)));
-    assert!(!note_slot_present(&registry, &k, SlotId(5)));
-    assert!(session_started(&registry, &k));
+    assert!(!registry.note_slot_present(&k, SlotId(2)));
+    assert!(!registry.note_slot_present(&k, SlotId(5)));
+    assert!(registry.is_started(&k));
 }
 
 #[test]
@@ -44,9 +41,9 @@ fn empty_expected_slots_never_fires_session_start() {
     let registry = new_decision_makers();
     let k = key();
     let _ = sync_default(&registry, &k, bounds(1, 6), Authority::SelfRelay);
-    assert!(!note_slot_present(&registry, &k, SlotId(0)));
-    assert!(!note_slot_present(&registry, &k, SlotId(1)));
-    assert!(!session_started(&registry, &k));
+    assert!(!registry.note_slot_present(&k, SlotId(0)));
+    assert!(!registry.note_slot_present(&k, SlotId(1)));
+    assert!(!registry.is_started(&k));
 }
 
 #[test]
@@ -66,16 +63,16 @@ fn a_non_authority_accumulates_presence_and_fires_on_promotion() {
     );
 
     // Both expected slots register, but a peer relay never fires.
-    assert!(!note_slot_present(&registry, &k, SlotId(0)));
-    assert!(!note_slot_present(&registry, &k, SlotId(1)));
-    assert!(!session_started(&registry, &k));
+    assert!(!registry.note_slot_present(&k, SlotId(0)));
+    assert!(!registry.note_slot_present(&k, SlotId(1)));
+    assert!(!registry.is_started(&k));
 
     // Promote it: the accumulated live slots already cover the expected set,
     // so the re-evaluation fires now — and only once.
     let _ = registry.set_authority(&k, Authority::SelfRelay, &HashSet::new());
-    assert!(reevaluate_session_start(&registry, &k));
-    assert!(session_started(&registry, &k));
-    assert!(!reevaluate_session_start(&registry, &k));
+    assert!(registry.reevaluate_start(&k));
+    assert!(registry.is_started(&k));
+    assert!(!registry.reevaluate_start(&k));
 }
 
 #[test]
@@ -92,7 +89,7 @@ fn a_departure_uncovers_a_not_yet_started_session() {
             ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
         },
     );
-    assert!(!note_slot_present(&registry, &k, SlotId(0)));
+    assert!(!registry.note_slot_present(&k, SlotId(0)));
     // Slot 0 departs, retiring it from the live-slot set.
     record_departure(
         &registry,
@@ -102,8 +99,8 @@ fn a_departure_uncovers_a_not_yet_started_session() {
         LEAVE_REASON_DROPPED,
     );
     // Slot 1 arrives: coverage is still incomplete (slot 0 left), so no fire.
-    assert!(!note_slot_present(&registry, &k, SlotId(1)));
-    assert!(!session_started(&registry, &k));
+    assert!(!registry.note_slot_present(&k, SlotId(1)));
+    assert!(!registry.is_started(&k));
 }
 
 #[test]
@@ -121,12 +118,12 @@ fn mark_session_started_latches_without_firing() {
             ..MakerSync::new(bounds(1, 6), Authority::Peer)
         },
     );
-    assert!(!session_started(&registry, &k));
-    mark_session_started(&registry, &k);
-    assert!(session_started(&registry, &k));
+    assert!(!registry.is_started(&k));
+    registry.mark_started(&k);
+    assert!(registry.is_started(&k));
     // Even a later promotion never re-fires: the latch is already set.
     let _ = registry.set_authority(&k, Authority::SelfRelay, &HashSet::new());
-    assert!(!reevaluate_session_start(&registry, &k));
+    assert!(!registry.reevaluate_start(&k));
 }
 
 /// A peer relay's shared game-started report is folded into the maker so the
@@ -146,7 +143,7 @@ fn a_peer_shared_start_report_is_recorded_without_a_coordinator_notice() {
         },
     );
 
-    record_peer_slot_started(&registry, &k, SlotId(1));
+    registry.note_peer_slot_started(&k, SlotId(1));
     assert!(
         rx.try_recv().is_err(),
         "only the slot's home reports the load it watched",
@@ -160,19 +157,19 @@ fn a_peer_shared_start_report_is_recorded_without_a_coordinator_notice() {
         "the heartbeat restates only this relay's own first-hand reports",
     );
     assert!(
-        started_home_slots(&registry, &k).is_empty(),
+        registry.started_home_slots(&k).is_empty(),
         "and re-shares only its own, so a report never loops the mesh",
     );
 
     // This relay's own home client reporting does notify, and does join both
     // the heartbeat's set and what the mesh reconcile re-shares.
-    record_slot_started(&registry, &k, SlotId(0));
+    registry.note_slot_started(&k, SlotId(0));
     assert!(matches!(rx.try_recv(), Ok(RelayNotice::SlotStarted(_))));
     assert_eq!(load_state_of(&registry, &k).started, vec![SlotId(0)]);
-    assert_eq!(started_home_slots(&registry, &k), vec![SlotId(0)]);
+    assert_eq!(registry.started_home_slots(&k), vec![SlotId(0)]);
 
     // A crossed report for a slot this relay homes changes no answer.
-    record_peer_slot_started(&registry, &k, SlotId(0));
+    registry.note_peer_slot_started(&k, SlotId(0));
     assert!(rx.try_recv().is_err());
-    assert_eq!(started_home_slots(&registry, &k), vec![SlotId(0)]);
+    assert_eq!(registry.started_home_slots(&k), vec![SlotId(0)]);
 }

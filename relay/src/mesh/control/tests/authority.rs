@@ -132,7 +132,7 @@ fn a_resumed_descriptor_latches_started_and_seeds_departures() {
     // Because the session is already started, a slot registering does not fire a
     // fresh session-wide start (the authority never re-covers the expected set).
     assert!(
-        !consensus::note_slot_present(&makers, &key(1), SlotId(0)),
+        !makers.note_slot_present(&key(1), SlotId(0)),
         "an already-started session fires no fresh session-wide start directive",
     );
 

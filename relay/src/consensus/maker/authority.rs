@@ -146,7 +146,7 @@ impl DecisionMaker {
     /// Also adopts the directive's buffer as this relay's tracked buffer, so a
     /// peer relay follows the session's committed depth rather than sitting at its
     /// creation-time minimum. This is what lets a promoted authority baseline its
-    /// control law -- and its promotion re-broadcast (see [`set_authority`]) --
+    /// control law -- and its promotion re-broadcast (see [`DecisionMakers::set_authority`]) --
     /// against the true current buffer instead of forcing an abrupt resize toward
     /// a stale minimum. Adopted immediately (before the directive's apply frame),
     /// exactly as the authority sets its own buffer the moment it decides; by the
@@ -193,7 +193,7 @@ impl DecisionMaker {
     /// broadcasting -- only the authority stamps.
     ///
     /// `held_slots` is this relay's set of undecided drop holds, exactly as
-    /// [`set_authority`](Self::set_authority) takes it -- a descriptor-driven
+    /// [`DecisionMakers::set_authority`](Self::set_authority) takes it -- a descriptor-driven
     /// promotion races a reconnection on this relay exactly the way a
     /// presence-driven one does (a client can be mid-reconnect when the
     /// coordinator's descriptor happens to re-push and promote this relay), so
@@ -201,10 +201,10 @@ impl DecisionMaker {
     /// owns the drop-hold registry) passes the current held set in.
     ///
     /// Returns the synced leaves a promotion (Peer -> SelfRelay) must (re)broadcast
-    /// -- see [`set_authority`](Self::set_authority); empty otherwise. The second
+    /// -- see [`DecisionMakers::set_authority`](Self::set_authority); empty otherwise. The second
     /// element names which of those are **freshly derived** by this call (a first
     /// insert into the directive cache, not a verbatim re-broadcast of one already
-    /// cached) -- see [`set_authority`](Self::set_authority) for why the caller
+    /// cached) -- see [`DecisionMakers::set_authority`](Self::set_authority) for why the caller
     /// needs the distinction.
     #[must_use]
     pub fn sync(
@@ -312,7 +312,7 @@ impl DecisionMaker {
     /// leave is lost when authority moves off a relay that had decided (or should
     /// have decided) one. Every cached directive is re-emitted verbatim, and
     /// every recorded departure without a cached directive is decided fresh and
-    /// cached. See [`set_authority`](Self::set_authority) for the `(all, fresh)`
+    /// cached. See [`DecisionMakers::set_authority`](Self::set_authority) for the `(all, fresh)`
     /// shape.
     ///
     /// Deliberately **unconditional** -- there is no "already applied everywhere,

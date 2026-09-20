@@ -55,7 +55,6 @@ impl rally_point_client::RehomeProvider for FixedTarget {
 #[tokio::test]
 async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     use rally_point_client::{LinkDriver, Reconnect};
-    use rally_point_relay::consensus;
 
     // The full coordinator-mediated failover path against two real relays: both
     // slots home on relay A; A dies; each driver escalates to its re-home provider,
@@ -78,7 +77,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     // rehome descriptor from the coordinator would.
     let mesh_b = rally_point_relay::mesh::MeshState::default();
     let key = seed_session_authority(&mesh_b, &tenant, session, &slots);
-    consensus::mark_session_started(&mesh_b.session.decision_makers, &key);
+    mesh_b.session.decision_makers.mark_started(&key);
     let (addr_b, ca_b, _endpoint_b) = start_relay_killable(registry_for(&[&tenant]), mesh_b);
 
     let id0 = identity_for(&tenant, session, SlotId(0));
@@ -179,8 +178,6 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
 
 #[tokio::test]
 async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
-    use rally_point_relay::consensus;
-
     // Regression for the re-home receive-window bug (the confirmed-disconnect-tier
     // failure). A client re-homing onto a fresh relay resumes its own slot's seq
     // stream mid-way — it kept counting across the move and re-injects only a recent
@@ -203,7 +200,7 @@ async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
     // for the replacement relay the coordinator pushed a `resumed` descriptor to.
     let mesh = rally_point_relay::mesh::MeshState::default();
     let key = seed_session_authority(&mesh, &tenant, session, &[SlotId(0), SlotId(1)]);
-    consensus::mark_session_started(&mesh.session.decision_makers, &key);
+    mesh.session.decision_makers.mark_started(&key);
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
     let endpoint = client_endpoint(&ca);

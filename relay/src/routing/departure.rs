@@ -345,7 +345,7 @@ pub(crate) fn reconcile_abandon(
         let roster = sessions.lock();
         roster.get(key).map_or(0, |slots| slots.len() as u32)
     };
-    let session_started = consensus::session_started(&mesh.session.decision_makers, key);
+    let session_started = mesh.session.decision_makers.is_started(key);
     let globally_empty = crate::session::presence::all_empty(&mesh.session.presence, key, own_live);
     let abandoned = session_started
         && globally_empty

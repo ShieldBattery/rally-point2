@@ -14,6 +14,7 @@ mod authority;
 mod buffer;
 mod homing;
 mod phase;
+mod session_start;
 mod silence;
 mod sync_coverage;
 
@@ -91,9 +92,9 @@ pub enum RelayNotice {
 /// It also owns an optional **notice notifier** — the sender half of an
 /// unbounded channel drained by the coordinator control connection. The leave
 /// sites ([`decide_leave`], [`observe_leave`], and the promotion re-derivation
-/// in [`set_authority`]/[`sync_maker`]) fire a [`DepartureNotice`] onto it the
+/// in [`DecisionMakers::set_authority`]/[`DecisionMakers::sync_maker`]) fire a [`DepartureNotice`] onto it the
 /// moment a synced leave for a slot first enters this relay's cache, and the
-/// desync comparator ([`observe_sync`]) fires a [`DesyncNotice`] when it confirms
+/// desync comparator ([`DecisionMakers::observe_sync`]) fires a [`DesyncNotice`] when it confirms
 /// a divergence — so the coordinator learns "player X left vs. was dropped" and
 /// "this game desynced at ordinal N". The notifier is set once at startup when a
 /// coordinator is configured and is simply absent when the relay runs standalone

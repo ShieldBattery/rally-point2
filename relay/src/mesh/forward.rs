@@ -281,7 +281,7 @@ pub(super) fn deliver_turn_to_locals(
     // and must not be double-buffered here. The session's slot count rides along
     // so the ring's bounds fit the session's actual shape rather than assuming
     // the largest possible game.
-    if let Some(slots) = crate::consensus::started_session_slot_count(decision_makers, key) {
+    if let Some(slots) = decision_makers.started_session_slot_count(key) {
         let origin = match home {
             crate::consensus::delivery::DeliveryHome::Local => {
                 crate::session::turn_ring::TurnOrigin::Local

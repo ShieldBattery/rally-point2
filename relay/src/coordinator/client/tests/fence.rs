@@ -23,7 +23,7 @@ async fn a_live_unstarted_slot_that_acks_fences_the_answer() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
 
     // Stand in for slot 0's link task: take the probe off its push queue and
     // resolve it exactly as `run_slot_link` does on the client's ack, with the
@@ -61,7 +61,7 @@ async fn a_slot_that_arrives_mid_fence_leaves_the_answer_unfenced() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
 
     let ack = async {
         loop {
@@ -107,7 +107,7 @@ async fn a_link_replaced_after_acking_leaves_the_answer_unfenced() {
             .expect("slot 0 registers");
     // Left armed: dropping it is how this test ends the link that acked.
     let mut original = Some(registration);
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
 
     let ack = async {
         loop {
@@ -153,7 +153,7 @@ async fn a_live_unstarted_slot_that_never_acks_leaves_the_answer_unfenced() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
 
     let (state, fenced) =
         fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
@@ -177,8 +177,8 @@ async fn a_started_slot_is_not_probed_at_all() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
-    crate::consensus::record_slot_started(&decision_makers, &key(7), SlotId(0));
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
+    decision_makers.note_slot_started(&key(7), SlotId(0));
 
     let (state, fenced) =
         fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
@@ -202,7 +202,7 @@ async fn a_slot_that_connected_and_then_dropped_can_never_be_fenced() {
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
     // The link ends: the guard deregisters the slot, leaving it ever-connected
     // and not live.
     drop(registration);
@@ -243,7 +243,7 @@ async fn an_ask_beyond_the_fence_cap_is_shed_without_probing() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
     let sources = HeartbeatSources {
         sessions: Arc::clone(&sessions),
         decision_makers: Arc::clone(&decision_makers),

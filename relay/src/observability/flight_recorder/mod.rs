@@ -431,7 +431,7 @@ impl FlightRecorder {
 
     /// Folds the current counters, published link conditions, and per-session
     /// end-to-end delivery view (`e2e_for`, typically
-    /// [`crate::consensus::session_e2e`]) into one sample row per live
+    /// [`DecisionMakers::delivery_view`](crate::consensus::DecisionMakers::delivery_view)) into one sample row per live
     /// recording — the sampling tick's body, exposed so tests drive it
     /// directly.
     pub fn sample_now(

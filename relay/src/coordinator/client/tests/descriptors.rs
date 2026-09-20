@@ -176,11 +176,11 @@ fn a_delta_upsert_reconciles_dials_that_raced_it_and_starts_the_session() {
     let (_reg1, mut inbox1) = crate::routing::register(&sessions, &key(1), SlotId(1), 1)
         .expect("slot 1 registers into an empty roster");
     assert!(
-        !crate::consensus::note_slot_present(&makers, &key(1), SlotId(0)),
+        !makers.note_slot_present(&key(1), SlotId(0)),
         "an announce with no maker yet drops the presence",
     );
     assert!(
-        !crate::consensus::note_slot_present(&makers, &key(1), SlotId(1)),
+        !makers.note_slot_present(&key(1), SlotId(1)),
         "an announce with no maker yet drops the presence",
     );
 

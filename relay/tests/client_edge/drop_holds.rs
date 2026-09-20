@@ -127,10 +127,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
-    wait_until("the session never started", || {
-        consensus::session_started(&makers, &key)
-    })
-    .await;
+    wait_until("the session never started", || makers.is_started(&key)).await;
 
     // A framed turn gives the session a frame basis (a clean leave's decide
     // schedules against it), and a lobby command goes into the replay log the

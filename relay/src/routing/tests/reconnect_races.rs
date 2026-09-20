@@ -124,8 +124,8 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
 
     let _i0 = registered(&sessions, &k, SlotId(0));
     let _i1 = registered(&sessions, &k, SlotId(1));
-    let _ = consensus::note_slot_present(&makers, &k, SlotId(0));
-    let _ = consensus::note_slot_present(&makers, &k, SlotId(1));
+    let _ = makers.note_slot_present(&k, SlotId(0));
+    let _ = makers.note_slot_present(&k, SlotId(1));
     report_own_presence(
         &sessions,
         &mesh_with(&holds, &makers, &mesh_links, &presence),

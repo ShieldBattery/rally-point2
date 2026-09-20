@@ -19,12 +19,12 @@ fn retained_load_state_outlives_the_links_it_was_recorded_from() {
         },
     );
 
-    record_slot_connected(&registry, &k, SlotId(2), false);
-    record_slot_connected(&registry, &k, SlotId(1), false);
-    record_slot_started(&registry, &k, SlotId(2));
-    assert!(!note_slot_present(&registry, &k, SlotId(1)));
+    registry.note_slot_connected(&k, SlotId(2), false);
+    registry.note_slot_connected(&k, SlotId(1), false);
+    registry.note_slot_started(&k, SlotId(2));
+    assert!(!registry.note_slot_present(&k, SlotId(1)));
     assert!(
-        note_slot_present(&registry, &k, SlotId(2)),
+        registry.note_slot_present(&k, SlotId(2)),
         "the last expected slot fires the coverage latch",
     );
     let latched_at = load_state_of(&registry, &k).started_at_ms;
@@ -50,7 +50,7 @@ fn retained_load_state_outlives_the_links_it_was_recorded_from() {
     );
 
     // A reconnect re-reports an arrival; the union absorbs it unchanged.
-    record_slot_connected(&registry, &k, SlotId(1), true);
+    registry.note_slot_connected(&k, SlotId(1), true);
     assert_eq!(
         load_state_of(&registry, &k).ever_connected,
         load.ever_connected
@@ -64,8 +64,8 @@ fn a_session_without_a_maker_retains_no_load_state() {
     // sets for it, which omits the fields from the wire entirely.
     let registry = new_decision_makers();
     let k = key();
-    record_slot_connected(&registry, &k, SlotId(0), false);
-    record_slot_started(&registry, &k, SlotId(0));
+    registry.note_slot_connected(&k, SlotId(0), false);
+    registry.note_slot_started(&k, SlotId(0));
     assert_eq!(load_state_of(&registry, &k), RetainedLoadState::default());
 }
 
@@ -87,8 +87,8 @@ fn a_peer_adopting_the_start_directive_stands_in_its_own_start_instant() {
         },
     );
     let before = unix_millis();
-    adopt_session_start(&registry, &k, Some(4));
-    assert!(session_started(&registry, &k));
+    registry.adopt_session_start(&k, Some(4));
+    assert!(registry.is_started(&k));
     let adopted_at = load_state_of(&registry, &k)
         .started_at_ms
         .expect("the adopting peer stamps an instant of its own");
@@ -96,7 +96,7 @@ fn a_peer_adopting_the_start_directive_stands_in_its_own_start_instant() {
 
     // The directive is re-delivered (an authority handoff re-firing it, a
     // late slot's re-push) — the first instant stands.
-    adopt_session_start(&registry, &k, Some(4));
+    registry.adopt_session_start(&k, Some(4));
     assert_eq!(load_state_of(&registry, &k).started_at_ms, Some(adopted_at));
 }
 

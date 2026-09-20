@@ -63,10 +63,10 @@ fn join_reconcile_re_shares_this_relay_s_own_started_slots() {
     let makers = Arc::new(crate::consensus::new_decision_makers());
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::SelfRelay);
-    crate::consensus::record_slot_started(&makers, &key, SlotId(2));
-    crate::consensus::record_slot_started(&makers, &key, SlotId(0));
+    makers.note_slot_started(&key, SlotId(2));
+    makers.note_slot_started(&key, SlotId(0));
     // A peer's slot, learned over the mesh: recorded here, never re-shared.
-    crate::consensus::record_peer_slot_started(&makers, &key, SlotId(1));
+    makers.note_peer_slot_started(&key, SlotId(1));
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     reconcile_started_slots_on_join(&makers, &control_tx, &key);

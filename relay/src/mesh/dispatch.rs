@@ -353,14 +353,11 @@ fn dispatch_mesh_control_frame(
             // every peer (including the origin, harmlessly: it latches started and
             // fans to its own locals, but the frame is idempotent). A non-authority
             // relay just records it, for a later promotion.
-            if crate::consensus::note_slot_present(&mesh.session.decision_makers, &key, slot) {
+            if mesh.session.decision_makers.note_slot_present(&key, slot) {
                 // Coverage fired here (this relay is the authority): the maker
                 // sized and stored the initial buffer depth as the latch fired, so
                 // both fan-out legs carry it.
-                let initial_buffer_turns = crate::consensus::session_initial_buffer_turns(
-                    &mesh.session.decision_makers,
-                    &key,
-                );
+                let initial_buffer_turns = mesh.session.decision_makers.initial_buffer_turns(&key);
                 routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
                 fan_out_session_start(&mesh.links, &key, initial_buffer_turns);
             }
@@ -381,7 +378,9 @@ fn dispatch_mesh_control_frame(
             // fires no coordinator notice: the home already reported the slot,
             // and a second relay reporting it would attribute one load twice.
             // Not re-broadcast either — the origin sent a copy to every peer.
-            crate::consensus::record_peer_slot_started(&mesh.session.decision_makers, &key, slot);
+            mesh.session
+                .decision_makers
+                .note_peer_slot_started(&key, slot);
         }
         Some(mesh_control_frame::Kind::SessionStart(start)) => {
             // The authority's session-start directive. Adopt the carried initial
@@ -394,13 +393,10 @@ fn dispatch_mesh_control_frame(
             // slot. Deliberately NOT re-broadcast across the mesh: the authority
             // already sent a copy to every link serving the session, so re-flooding
             // would only echo.
-            crate::consensus::adopt_session_start(
-                &mesh.session.decision_makers,
-                &key,
-                start.initial_buffer_turns,
-            );
-            let initial_buffer_turns =
-                crate::consensus::session_initial_buffer_turns(&mesh.session.decision_makers, &key);
+            mesh.session
+                .decision_makers
+                .adopt_session_start(&key, start.initial_buffer_turns);
+            let initial_buffer_turns = mesh.session.decision_makers.initial_buffer_turns(&key);
             routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
         }
         Some(mesh_control_frame::Kind::SlotConnectivity(change)) => {

@@ -205,7 +205,7 @@ pub(super) fn abandoned_harness() -> (
     let makers = Arc::new(consensus::new_decision_makers());
     let presence = Arc::new(crate::session::presence::new_presence_registry());
     seed_maker(&makers, &k, Authority::SelfRelay, &[0, 1], &[]);
-    consensus::mark_session_started(&makers, &k);
+    makers.mark_started(&k);
     makers.observe_frame(&k, SlotId(0), GameFrameCount(50));
     makers.observe_frame(&k, SlotId(1), GameFrameCount(50));
     crate::session::presence::set_order(&presence, &k, vec![Candidate::SelfRelay]);

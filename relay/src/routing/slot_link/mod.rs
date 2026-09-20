@@ -325,7 +325,7 @@ pub async fn run_slot_link(
     // Armed only while the session has not started (a late slot joining an already
     // started session leaves it to the receive-driven sampler); disarmed the tick
     // it observes the session started, so post-start sampling is never doubled.
-    let pre_start_sampling = !consensus::session_started(&decision_makers, &key);
+    let pre_start_sampling = !decision_makers.is_started(&key);
     let pre_start_deadline = Instant::now() + PRE_START_SAMPLE_INTERVAL;
 
     let mut ctx = SlotLinkCtx {

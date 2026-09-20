@@ -65,7 +65,6 @@ async fn a_late_slot_receives_session_start_on_register() {
 /// so it never lifts the max above the hint.
 #[tokio::test]
 async fn fires_session_start_with_the_computed_depth_once_every_expected_slot_connects() {
-    use rally_point_relay::consensus;
     use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{ControlInbound, spawn_control_reader};
 
@@ -79,7 +78,7 @@ async fn fires_session_start_with_the_computed_depth_once_every_expected_slot_co
         session,
     };
     seed_authority(&makers, &key).expecting([0, 1]).apply();
-    consensus::set_session_shape(&makers, &key, Some(400), false);
+    makers.set_session_shape(&key, Some(400), false);
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);

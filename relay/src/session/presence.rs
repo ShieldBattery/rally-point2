@@ -233,7 +233,7 @@ pub fn all_empty(registry: &PresenceRegistry, key: &SessionKey, own_live: u32) -
 /// undecided (read from the drop-hold registry by the caller, which holds it). A
 /// promotion skips those slots so a presence flap does not decide a drop a
 /// reconnecting client could still return from — and a held drop is decided only
-/// by an honored manual request; see [`crate::consensus::set_authority`].
+/// by an honored manual request; see [`DecisionMakers::set_authority`](crate::consensus::DecisionMakers::set_authority).
 #[must_use]
 pub fn recompute(
     registry: &PresenceRegistry,

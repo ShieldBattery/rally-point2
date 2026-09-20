@@ -40,7 +40,7 @@ fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
             ..consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay)
         },
     );
-    consensus::mark_session_started(&decision_makers, &key);
+    decision_makers.mark_started(&key);
 
     // Overfill past the 2-slot count bound (empty commands, so the byte
     // bound never binds): the ring holds exactly the 2-slot cap, proving
@@ -126,8 +126,6 @@ fn delivery_relay(
 /// meant to be open gets none at all.
 #[test]
 fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
-    use crate::consensus;
-
     let turn = |seq: u64, frame: u32| Payload {
         seq,
         slot: 0,
@@ -161,7 +159,7 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
         // The session starts, but the delay has not elapsed — and a turn
         // forging an enormous frame does not change that. The gate reads no
         // part of a payload, so a claim a client controls cannot advance it.
-        consensus::mark_session_started(&decision_makers, &key);
+        decision_makers.mark_started(&key);
         deliver(turn(1, u32::MAX));
         assert_eq!(
             inbox0.try_recv_region_labels(),
@@ -188,7 +186,7 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
         );
     };
 
-    consensus::mark_session_started(&decision_makers, &key);
+    decision_makers.mark_started(&key);
     deliver(turn(2, 5));
     assert_eq!(inbox0.try_recv_region_labels().as_ref(), Some(&labels));
     assert_eq!(inbox1.try_recv_region_labels().as_ref(), Some(&labels));
@@ -215,13 +213,11 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
 /// a session whose turns carried no frames would seal its labels forever.
 #[test]
 fn a_frameless_turn_drives_the_region_label_gate_like_any_other() {
-    use crate::consensus;
-
     let (sessions, mesh, key, labels) = delivery_relay(std::time::Duration::ZERO);
     let decision_makers = mesh.session.decision_makers.clone();
     let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
 
-    consensus::mark_session_started(&decision_makers, &key);
+    decision_makers.mark_started(&key);
 
     deliver_turn_to_locals(
         &sessions,

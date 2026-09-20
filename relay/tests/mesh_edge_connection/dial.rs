@@ -247,8 +247,6 @@ async fn dial_redials_after_the_peer_control_stream_dies() -> Result<(), AnyErro
 #[tokio::test]
 async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchange()
 -> Result<(), AnyError> {
-    use rally_point_relay::consensus;
-
     let tenant = make_default_tenant();
     let session = SessionId(9);
     let key = SessionKey {
@@ -275,7 +273,7 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
     seed_authority(&relay_a.mesh.session.decision_makers, &key)
         .bounds(1, 6)
         .apply();
-    consensus::mark_session_started(&relay_a.mesh.session.decision_makers, &key);
+    relay_a.mesh.session.decision_makers.mark_started(&key);
 
     cmds_a1.send(mesh::MeshCommand::Join(key.clone()))?;
     cmds_b1.send(mesh::MeshCommand::Join(key.clone()))?;

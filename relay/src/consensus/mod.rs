@@ -275,17 +275,13 @@ use sync::*;
 pub use law::ControlLaw;
 pub use maker::{DecisionMaker, DepartureStamps, RecordedDeparture, SilentSlot};
 pub use ops::{
-    FinalizeOutcome, activate_connection_epoch, adopt_session_start, claim_close_report,
-    connection_epoch_matches, decide_abandoned_departures, decide_leave, decided_slots,
-    departure_epoch, deregister_maker, finalize_drop, finalized_drops_enabled,
-    has_reconnectable_departure, has_undecided_departure, leave_reconcile, leave_schedulable,
-    maker_exists, mark_session_started, normalize_observed_leave, note_slot_present, observe_leave,
-    reachable_frame, record_departure, record_departure_for_epoch, record_peer_slot_started,
-    record_result, record_slot_connected, record_slot_started, reevaluate_session_start,
-    reinstate_slot, remove_slot_for_epoch, reopen_close_report, result_for, session_closed,
-    session_initial_buffer_turns, session_started, set_session_shape, slot_departed,
-    slot_has_started, slot_homed, slot_leave_decided, slot_strictly_homed, started_home_slots,
-    started_session_slot_count,
+    FinalizeOutcome, activate_connection_epoch, claim_close_report, connection_epoch_matches,
+    decide_abandoned_departures, decide_leave, decided_slots, departure_epoch, deregister_maker,
+    finalize_drop, finalized_drops_enabled, has_reconnectable_departure, has_undecided_departure,
+    leave_reconcile, leave_schedulable, maker_exists, normalize_observed_leave, observe_leave,
+    reachable_frame, record_departure, record_departure_for_epoch, record_result, reinstate_slot,
+    remove_slot_for_epoch, reopen_close_report, result_for, session_closed, slot_departed,
+    slot_homed, slot_leave_decided, slot_strictly_homed,
 };
 pub use registry::{
     DecisionMakers, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,

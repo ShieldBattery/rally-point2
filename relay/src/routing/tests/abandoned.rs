@@ -23,7 +23,7 @@ async fn elapse_the_abandon_window() {
 /// much as one that reported a live slot, since silence is never absence.
 #[test]
 fn peer_zero_closes_a_never_started_session_on_a_relay_with_no_local_slots() {
-    use crate::consensus::{self, Authority, RelayNotice};
+    use crate::consensus::{Authority, RelayNotice};
     use crate::session::presence::Candidate;
     use rally_point_proto::ids::RelayId;
 
@@ -42,7 +42,7 @@ fn peer_zero_closes_a_never_started_session_on_a_relay_with_no_local_slots() {
         &[0],
     );
     assert!(
-        !consensus::session_started(&mesh.session.decision_makers, &k),
+        !mesh.session.decision_makers.is_started(&k),
         "only one peer ever connected, so the session never started",
     );
     crate::session::presence::set_order(

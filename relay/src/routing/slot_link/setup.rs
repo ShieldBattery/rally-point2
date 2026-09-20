@@ -57,7 +57,7 @@ pub(super) fn activate_slot(
         // on every activation (a reconnect included); the coordinator keeps the
         // ever-connected set and dedups the tenant notification itself. Inside the
         // ingress section so a session retired mid-activation reports nothing.
-        consensus::record_slot_connected(decision_makers, key, slot, resumed_dial);
+        decision_makers.note_slot_connected(key, slot, resumed_dial);
 
         // Announce this slot's presence to the mesh and record it into the session's
         // live-slot set. On the authority relay, this slot completing the descriptor's

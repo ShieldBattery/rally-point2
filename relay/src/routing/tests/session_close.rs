@@ -180,7 +180,7 @@ fn session_emptying_teardown_drops_the_seen_registry_entry() {
 /// the resume whole. Deciding the departure is what runs the close.
 #[tokio::test]
 async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
-    use crate::consensus::{self, Authority, RelayNotice};
+    use crate::consensus::{Authority, RelayNotice};
     use crate::session::presence::Candidate;
     use rally_point_proto::ids::GameFrameCount;
 
@@ -200,7 +200,7 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
         &[0],
         &[],
     );
-    consensus::mark_session_started(&mesh.session.decision_makers, &k);
+    mesh.session.decision_makers.mark_started(&k);
     mesh.session
         .decision_makers
         .observe_frame(&k, SlotId(0), GameFrameCount(50));
@@ -258,7 +258,7 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
 /// immediately, exactly as an emptying with nothing held always has.
 #[tokio::test]
 async fn a_clean_leave_does_not_defer_the_emptied_session_close() {
-    use crate::consensus::{self, Authority, RelayNotice};
+    use crate::consensus::{Authority, RelayNotice};
 
     let k = key();
     let sessions: Sessions = Arc::default();
@@ -276,7 +276,7 @@ async fn a_clean_leave_does_not_defer_the_emptied_session_close() {
         &[0],
         &[],
     );
-    consensus::mark_session_started(&mesh.session.decision_makers, &k);
+    mesh.session.decision_makers.mark_started(&k);
 
     let _i0 = registered(&sessions, &k, SlotId(0));
     crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 0);

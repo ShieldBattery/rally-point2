@@ -96,7 +96,7 @@ fn maybe_close_emptied_session_gated(
         return;
     }
     let held = mesh.session.drop_holds.pending_slots(key);
-    if consensus::session_started(&mesh.session.decision_makers, key)
+    if mesh.session.decision_makers.is_started(key)
         && consensus::has_reconnectable_departure(&mesh.session.decision_makers, key, &held)
     {
         tracing::info!(

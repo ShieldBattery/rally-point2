@@ -98,11 +98,11 @@ fn a_mesh_slot_started_marks_the_slot_without_notifying_or_echoing() {
     dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
     assert!(
-        crate::consensus::slot_has_started(&makers, &key, SlotId(3)),
+        makers.has_started(&key, SlotId(3)),
         "the peer's report is recorded here",
     );
     assert!(
-        crate::consensus::started_home_slots(&makers, &key).is_empty(),
+        makers.started_home_slots(&key).is_empty(),
         "a peer's slot is never re-shared as one of this relay's own",
     );
     assert!(
