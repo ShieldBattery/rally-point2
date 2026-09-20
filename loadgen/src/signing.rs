@@ -7,8 +7,6 @@
 //! window, so every send (including a provisioning re-send) signs fresh with
 //! the current time over the identical body.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rally_point_proto::request_auth::request_message;
 use ring::signature::Ed25519KeyPair;
 
@@ -20,11 +18,10 @@ pub fn sign_request(
     path: &str,
     body: &[u8],
 ) -> (String, String) {
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .to_string();
+    // Fails open on an unreadable clock: the resulting zero timestamp lands
+    // outside the coordinator's replay window, so the request is refused there
+    // rather than signed with a plausible-looking wrong time.
+    let timestamp = rally_point_proto::time::unix_secs_fail_open().to_string();
     let message = request_message(&timestamp, method, path, body);
     let signature = key.sign(&message);
     (timestamp, hex::encode(signature.as_ref()))

@@ -178,11 +178,10 @@ pub(super) fn is_link_failure(error: &DriverError) -> bool {
 /// the relay would reject any re-dial, so reconnection stops. Matches the relay's
 /// boundary: the expiry instant itself counts as expired.
 pub(super) fn token_expired(identity: &Identity) -> bool {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    now >= identity.token().claims.expires_at.0
+    // Fails open on an unreadable clock: an unusable reading reads as "not
+    // expired yet", leaving the re-dial to the relay's own verdict rather than
+    // ending a live game on a local clock fault.
+    rally_point_proto::time::unix_secs_fail_open() >= identity.token().claims.expires_at.0
 }
 
 /// The outcome of the reconnect loop for one dropped link.

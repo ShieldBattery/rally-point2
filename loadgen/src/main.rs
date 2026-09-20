@@ -18,7 +18,7 @@ mod turn;
 
 use std::io::{self, Write};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use color_eyre::eyre::{Result, WrapErr, bail, eyre};
@@ -251,11 +251,7 @@ fn load_signing_key(client_key: &str) -> Result<Ed25519KeyPair> {
 /// A time-derived default run id (unix milliseconds), namespacing this run's
 /// session `external_id`s away from any other run's.
 fn default_run_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("{millis}")
+    format!("{}", rally_point_proto::time::unix_millis())
 }
 
 /// FNV-1a over the run id, seeding per-session hash streams deterministically.
