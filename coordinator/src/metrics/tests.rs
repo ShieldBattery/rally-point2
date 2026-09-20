@@ -10,10 +10,8 @@ use rally_point_proto::version::ProtocolVersion;
 use tower::ServiceExt;
 
 use super::*;
-use crate::api::{ControlAuth, HELLO_TIMEOUT, LIVENESS_TIMEOUT};
-use crate::lifecycle::Lifecycle;
-use crate::regions::RegionsConfig;
-use crate::{notify, pair_rtts, registry, session, tenant};
+use crate::api::ControlAuth;
+use crate::{registry, session, tenant};
 
 /// A coordinator state with one enrolled (untagged) relay and one active
 /// tenant, with no ledger or flight store — enough for the gauges to render.
@@ -37,19 +35,9 @@ fn test_state() -> CoordinatorState {
     )
     .unwrap();
     let setup = session::SessionSetup::new(reg, tenants);
-    let lifecycle = Lifecycle::new(setup.clone());
     CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth: ControlAuth::Open,
-        hello_timeout: HELLO_TIMEOUT,
-        liveness_timeout: LIVENESS_TIMEOUT,
-        regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup, ControlAuth::Open)
     }
 }
 

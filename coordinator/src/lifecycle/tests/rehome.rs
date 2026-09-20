@@ -76,7 +76,7 @@ async fn rehome_then_the_replacements_close_satisfies_all_relays_closed_and_reap
 
     let (url, mut rx) = spawn_receiver(None).await;
     let (setup, s) = setup_with_two_relays_and_session(url);
-    let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup.clone());
     lc.register_session(
         tid(),
         s,
@@ -124,7 +124,7 @@ async fn a_late_close_from_the_swapped_out_dead_relay_is_ignored() {
 
     let (url, mut rx) = spawn_receiver(None).await;
     let (setup, s) = setup_with_two_relays_and_session(url);
-    let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup.clone());
     lc.register_session(
         tid(),
         s,
@@ -251,7 +251,7 @@ async fn rehome_swap_composes_with_a_surviving_relay_that_was_already_serving() 
         HashSet::from([RelayId(1), RelayId(2)]),
     );
 
-    let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup.clone());
     lc.register_session(
         tid(),
         s,
@@ -303,7 +303,7 @@ async fn an_unassigned_close_cannot_seed_a_future_assignment() {
     // cached assignment must not be retained and reused later.
     let (url, mut rx) = spawn_receiver(None).await;
     let setup = setup_with_notify(url);
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -348,7 +348,7 @@ async fn an_unassigned_close_cannot_seed_a_future_assignment() {
 #[tokio::test]
 async fn session_closed_requires_matching_authoritative_membership() {
     let setup = bare_setup();
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let s = SessionId(101);
     lc.register_session(
         tid(),
@@ -388,7 +388,7 @@ async fn rehome_reopens_a_target_that_already_served_and_previously_closed() {
     // must not retire the resumed one immediately.
     let (url, mut rx) = spawn_receiver(None).await;
     let setup = setup_with_notify(url);
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -423,7 +423,7 @@ async fn a_rehome_preflight_without_a_commit_preserves_terminal_evidence() {
     // Stay and Unavailable outcomes run the preflight reset but have no new
     // assignment. A close recorded on the unchanged set must remain valid.
     let setup = bare_setup();
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let s = SessionId(2);
     lc.register_session(
         tid(),
@@ -450,7 +450,7 @@ async fn on_rehome_is_a_no_op_for_a_same_id_swap() {
     // first place, so composing `on_rehome` with it must leave the set
     // untouched rather than dropping the relay entirely.
     let setup = bare_setup();
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -491,7 +491,13 @@ async fn webhook_only_reap_retires_membership_harmlessly() {
 
     let (url, mut rx) = spawn_receiver(None).await;
     let setup = setup_with_notify(url.clone());
-    let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, SHORT);
+    let lc = Lifecycle::with_tunables(
+        setup.clone(),
+        LifecycleTunables {
+            webhook_grace: SHORT,
+            ..Default::default()
+        },
+    );
     let s = SessionId(1);
 
     lc.enqueue_webhook(

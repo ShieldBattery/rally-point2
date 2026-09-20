@@ -263,7 +263,7 @@ impl Lifecycle {
                 tenant = tenant.as_ref(),
                 session = session.0,
                 kind = job.kind,
-                capacity = self.inner.queue_capacity,
+                capacity = self.inner.tunables.queue_capacity,
                 "notice queue full; dropping the newest notice",
             );
             return;
@@ -329,7 +329,7 @@ impl Lifecycle {
     /// Builds a fresh `SessionState` with an ordered dispatch queue whose detached
     /// drain task delivers jobs one at a time (each retry blocking the next).
     pub(super) fn new_state(&self, serving_relays: Vec<RelayId>) -> SessionState {
-        let (tx, rx) = mpsc::channel::<WebhookJob>(self.inner.queue_capacity);
+        let (tx, rx) = mpsc::channel::<WebhookJob>(self.inner.tunables.queue_capacity);
         let tenants = self.inner.setup.tenants().clone();
         tokio::spawn(drain_queue(rx, tenants));
         SessionState {

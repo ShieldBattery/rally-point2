@@ -155,19 +155,10 @@ fn provisioning_state(region_ids: &[&str], provisioning: bool) -> CoordinatorSta
             Duration::from_secs(75),
         ));
     }
-    let lifecycle = Lifecycle::new(setup.clone());
     CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth: ControlAuth::Open,
-        hello_timeout: HELLO_TIMEOUT,
-        liveness_timeout: LIVENESS_TIMEOUT,
         regions: regions_config(region_ids),
         player_token_lifetime: TEST_TOKEN_LIFETIME,
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup, ControlAuth::Open)
     }
 }
 

@@ -9,7 +9,7 @@ use super::*;
 /// duplicate notice never rewrites what the first one recorded.
 #[tokio::test]
 async fn departed_slots_carry_the_final_turn_count_first_record_wins() {
-    let lc = Lifecycle::with_graces(bare_setup(), HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(bare_setup());
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -65,7 +65,7 @@ async fn departed_slots_carry_the_final_turn_count_first_record_wins() {
 #[tokio::test]
 async fn is_alive_reports_live_gone_and_unknown() {
     let setup = bare_setup();
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let live = SessionId(1);
     lc.register_session(
         tid(),

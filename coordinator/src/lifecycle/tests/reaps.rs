@@ -7,7 +7,13 @@ use super::*;
 async fn holdout_reap_closes_the_silent_slot_after_grace_not_before() {
     let setup = bare_setup();
     let mut reaps = setup.reaps().subscribe(RelayId(1));
-    let lc = Lifecycle::with_graces(setup, SHORT, HOUR, HOUR);
+    let lc = Lifecycle::with_tunables(
+        setup,
+        LifecycleTunables {
+            holdout_grace: SHORT,
+            ..Default::default()
+        },
+    );
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -35,7 +41,13 @@ async fn holdout_reap_closes_the_silent_slot_after_grace_not_before() {
 async fn holdout_reap_disarms_when_the_holdout_reports() {
     let setup = bare_setup();
     let mut reaps = setup.reaps().subscribe(RelayId(1));
-    let lc = Lifecycle::with_graces(setup, SHORT, HOUR, HOUR);
+    let lc = Lifecycle::with_tunables(
+        setup,
+        LifecycleTunables {
+            holdout_grace: SHORT,
+            ..Default::default()
+        },
+    );
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -61,7 +73,13 @@ async fn linger_reap_closes_non_departed_slots_including_observers() {
     let setup = bare_setup();
     let mut r1 = setup.reaps().subscribe(RelayId(1));
     let mut r2 = setup.reaps().subscribe(RelayId(2));
-    let lc = Lifecycle::with_graces(setup, HOUR, SHORT, HOUR);
+    let lc = Lifecycle::with_tunables(
+        setup,
+        LifecycleTunables {
+            linger_grace: SHORT,
+            ..Default::default()
+        },
+    );
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -99,16 +117,11 @@ async fn a_never_started_session_reaps_while_a_started_one_does_not() {
     let setup = setup_with_notify(url);
     // Only the never-started grace is shrunk; every other grace stays at
     // production scale so nothing else in this test fires early.
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        SHORT,
-        EmptyReapTunables {
-            grace: HOUR,
-            freshness: HOUR,
+        LifecycleTunables {
+            never_started_grace: SHORT,
+            ..Default::default()
         },
     );
 
@@ -164,16 +177,11 @@ async fn a_never_started_session_reaps_while_a_started_one_does_not() {
 async fn the_never_started_reaper_cancels_on_late_presence() {
     let (url, mut rx) = spawn_receiver(None).await;
     let setup = setup_with_notify(url);
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        SHORT,
-        EmptyReapTunables {
-            grace: HOUR,
-            freshness: HOUR,
+        LifecycleTunables {
+            never_started_grace: SHORT,
+            ..Default::default()
         },
     );
     let s = SessionId(1);
@@ -212,7 +220,13 @@ async fn a_webhook_only_state_is_reaped_and_prunes_its_dedup_after_the_idle_grac
     let (url, mut rx) = spawn_receiver(None).await;
     let setup = setup_with_notify(url.clone());
     // Only the webhook-only idle grace is short; the others don't apply here.
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, SHORT);
+    let lc = Lifecycle::with_tunables(
+        setup,
+        LifecycleTunables {
+            webhook_grace: SHORT,
+            ..Default::default()
+        },
+    );
     let dedup = notify::new_dedup();
     lc.attach_dedup(dedup.clone());
     let s = SessionId(1);
@@ -264,7 +278,13 @@ async fn a_fresh_webhook_re_arms_the_idle_reap() {
     // they stop arriving, rather than a fixed window from the first one.
     let (url, mut rx) = spawn_receiver(None).await;
     let setup = setup_with_notify(url.clone());
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, SHORT * 4);
+    let lc = Lifecycle::with_tunables(
+        setup,
+        LifecycleTunables {
+            webhook_grace: SHORT * 4,
+            ..Default::default()
+        },
+    );
     let s = SessionId(1);
 
     let enqueue = |lc: &Lifecycle| {

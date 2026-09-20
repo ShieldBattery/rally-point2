@@ -15,19 +15,9 @@ async fn tenant_pubkey_endpoint_returns_the_enrolled_key() {
     )
     .unwrap();
     let setup = crate::session::SessionSetup::new(reg, tenants);
-    let lifecycle = Lifecycle::new(setup.clone());
     let state = CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth: ControlAuth::Open,
-        hello_timeout: HELLO_TIMEOUT,
-        liveness_timeout: LIVENESS_TIMEOUT,
-        regions: RegionsConfig::default(),
         player_token_lifetime: TEST_TOKEN_LIFETIME,
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup, ControlAuth::Open)
     };
     let app = router(state);
 

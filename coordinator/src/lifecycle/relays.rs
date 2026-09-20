@@ -161,7 +161,7 @@ impl Lifecycle {
             .filter(|session| !session.slots.is_empty())
             .map(|session| (session.tenant.clone(), session.session))
             .collect();
-        let freshness = self.inner.empty_roster_freshness;
+        let freshness = self.inner.tunables.empty_roster_freshness;
         let mut sessions = self.inner.sessions.lock();
         for descriptor in assigned {
             let key = (descriptor.tenant, descriptor.session);
@@ -253,7 +253,8 @@ impl Lifecycle {
             if !state.serving_relays.is_empty() {
                 let census = out.sessions.entry(tenant.clone()).or_default();
                 if state.empty_timer.is_some()
-                    && state.all_relays_confirmed_empty(now, self.inner.empty_roster_freshness)
+                    && state
+                        .all_relays_confirmed_empty(now, self.inner.tunables.empty_roster_freshness)
                     && state.empty_evidence_matches_epochs(&epochs)
                 {
                     census.empty_grace += 1;

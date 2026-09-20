@@ -51,8 +51,11 @@ impl Lifecycle {
             timer.abort();
         }
         if !state.started {
-            state.never_started_timer =
-                Some(self.arm_never_started(tenant, session, self.inner.never_started_grace));
+            state.never_started_timer = Some(self.arm_never_started(
+                tenant,
+                session,
+                self.inner.tunables.never_started_grace,
+            ));
         }
         self.reset_empty_evidence(state);
     }

@@ -10,7 +10,13 @@ async fn closing_a_session_retires_its_pending_reap_directives() {
     // re-synced with a stale close for a session it no longer serves.
     let setup = bare_setup();
     let reaps = setup.reaps().clone();
-    let lc = Lifecycle::with_graces(setup, SHORT, HOUR, HOUR);
+    let lc = Lifecycle::with_tunables(
+        setup,
+        LifecycleTunables {
+            holdout_grace: SHORT,
+            ..Default::default()
+        },
+    );
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -44,7 +50,7 @@ async fn closing_a_session_prunes_its_dedup_entries_only() {
     // The normal all-relays-closed removal must also prune the session's dedup
     // entries (across all three sets), without touching another session's.
     let setup = bare_setup();
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let dedup = notify::new_dedup();
     lc.attach_dedup(dedup.clone());
     let s = SessionId(1);
@@ -83,7 +89,7 @@ async fn closing_a_session_retires_membership_and_limiter_bucket() {
     use crate::session::{self, RehomeOutcome};
 
     let (setup, s) = setup_with_relay_and_session();
-    let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup.clone());
     lc.register_session(
         tid(),
         s,
@@ -133,7 +139,7 @@ async fn closing_a_session_removes_its_descriptor_from_each_serving_relay() {
     // re-synced the stale descriptor and re-applies the dead session (its
     // reconciler only leaves sessions absent from the pushed set).
     let (setup, s) = setup_with_relay_and_session();
-    let lc = Lifecycle::with_graces(setup.clone(), HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup.clone());
     lc.register_session(
         tid(),
         s,

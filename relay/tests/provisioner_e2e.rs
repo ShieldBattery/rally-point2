@@ -23,14 +23,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::ledger::RelayLedger;
-use rally_point_coordinator::lifecycle::Lifecycle;
 use rally_point_coordinator::provision::{
     ProcessConfig, ProcessProvisioner, ProvisionConfig, ProvisionLoop, Provisioner, WarmTargets,
 };
 use rally_point_coordinator::regions::RegionsConfig;
 use rally_point_coordinator::registry::{self, EnrolledRelay, RelayRegistry};
 use rally_point_coordinator::session::SessionSetup;
-use rally_point_coordinator::{notify, pair_rtts, tenant};
+use rally_point_coordinator::{pair_rtts, tenant};
 use rally_point_proto::control::RegionId;
 
 /// The single region the coordinator is configured for; the relay enrolls tagged
@@ -69,19 +68,12 @@ async fn serve_coordinator() -> (String, RelayRegistry, Arc<RelayLedger>, Sessio
         Arc::new(RelayLedger::open(std::path::Path::new(":memory:")).expect("ledger opens"));
     let reg = registry::new_registry();
     let setup = SessionSetup::new(reg.clone(), tenant::new_store());
-    let lifecycle = Lifecycle::new(setup.clone());
     let state = CoordinatorState {
-        setup: setup.clone(),
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth: ControlAuth::Open,
-        hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: Duration::from_secs(30),
         regions: one_region_config(),
         player_token_lifetime: Duration::from_secs(3_600),
         ledger: Some(ledger.clone()),
-        pair_rtts: rally_point_coordinator::pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup.clone(), ControlAuth::Open)
     };
     let app = api::router(state);
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))

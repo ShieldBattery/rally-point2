@@ -80,11 +80,12 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::attest::LOAD_STATE_ATTEST_TIMEOUT;
 use crate::flight_store::S3FlightStore;
 use crate::ledger::RelayLedger;
 use crate::lifecycle::Lifecycle;
-use crate::notify::NoticeDedup;
-use crate::pair_rtts::PairRttStore;
+use crate::notify::{self, NoticeDedup};
+use crate::pair_rtts::{self, PairRttStore};
 use crate::regions::RegionsConfig;
 use crate::session::SessionSetup;
 
@@ -217,6 +218,13 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// runs.
 const MAX_CONTROL_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 
+/// The player-token lifetime a coordinator started with no
+/// `--player-token-lifetime-secs` mints at: six hours, long enough for a game
+/// plus the reconnects around it and well under the fleet ceiling the relay's
+/// retired-session tombstones are sized against. The CLI flag defaults to it
+/// and [`CoordinatorState::new`] starts from it.
+pub const DEFAULT_PLAYER_TOKEN_LIFETIME: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// The shared state the HTTP handlers operate over: the coordinator's
 /// session-setup context plus the relay control-connection auth posture.
 /// Cloned cheaply (the setup's fields are `Arc`-backed), so axum's per-request
@@ -243,6 +251,12 @@ pub struct CoordinatorState {
     /// before its connection is dropped and it is deregistered (see
     /// [`LIVENESS_TIMEOUT`]). A field so tests can shorten it.
     pub liveness_timeout: Duration,
+    /// How long a load-state read waits for the serving relays' attestation
+    /// snapshots before answering with whoever replied (see
+    /// [`LOAD_STATE_ATTEST_TIMEOUT`]). One absolute deadline covers the whole
+    /// fan-out, so this bounds the read however many relays serve the session. A
+    /// field so tests can shorten it.
+    pub attest_timeout: Duration,
     /// The configured placement regions (immutable after startup). Read by
     /// `GET /regions` to serve the client-facing list, and at relay enroll to
     /// refuse a relay tagged with a region not listed here. Empty (the default,
@@ -276,6 +290,38 @@ pub struct CoordinatorState {
     /// report nothing — the dev / no-store posture. Shared (an `Arc`) across all relay
     /// control connections and the HTTP state.
     pub flight_store: Option<Arc<S3FlightStore>>,
+}
+
+impl CoordinatorState {
+    /// Builds the dev / loopback posture over `setup` and `control_auth`: a
+    /// fresh notice-dedup set and lifecycle wired to each other, every timeout
+    /// and the token lifetime at their production defaults, and no region
+    /// config, no ledger, and no flight store.
+    ///
+    /// The binary and the tests both start here and override only the fields
+    /// they configure, so a new field lands in one place rather than in every
+    /// state literal in the crate.
+    pub fn new(setup: SessionSetup, control_auth: ControlAuth) -> Self {
+        let notices = notify::new_dedup();
+        let lifecycle = Lifecycle::new(setup.clone());
+        // Let the lifecycle prune these dedup sets when it removes a session's
+        // state, so they don't grow for the process lifetime.
+        lifecycle.attach_dedup(notices.clone());
+        Self {
+            setup,
+            notices,
+            lifecycle,
+            control_auth,
+            hello_timeout: HELLO_TIMEOUT,
+            liveness_timeout: LIVENESS_TIMEOUT,
+            attest_timeout: LOAD_STATE_ATTEST_TIMEOUT,
+            regions: RegionsConfig::default(),
+            player_token_lifetime: DEFAULT_PLAYER_TOKEN_LIFETIME,
+            ledger: None,
+            pair_rtts: pair_rtts::new_store(),
+            flight_store: None,
+        }
+    }
 }
 
 /// Builds the coordinator's HTTP router over `state`.

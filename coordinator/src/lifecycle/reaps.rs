@@ -25,7 +25,7 @@ impl Lifecycle {
         }
         let this = self.clone();
         let tenant = tenant.clone();
-        let grace = self.inner.webhook_grace;
+        let grace = self.inner.tunables.webhook_grace;
         state.webhook_timer = Some(
             tokio::spawn(async move {
                 tokio::time::sleep(grace).await;
@@ -119,7 +119,7 @@ impl Lifecycle {
                     tenant.clone(),
                     session,
                     holdout,
-                    self.inner.holdout_grace,
+                    self.inner.tunables.holdout_grace,
                 ));
             }
         } else if let Some(timer) = state.holdout_timer.take() {
@@ -130,8 +130,11 @@ impl Lifecycle {
         // fired). Protects the defeated spectator — not all accounted, no reap.
         if !state.player_slots.is_empty() && unaccounted.is_empty() && !state.all_relays_closed() {
             if state.linger_timer.is_none() {
-                state.linger_timer =
-                    Some(self.arm_linger(tenant.clone(), session, self.inner.linger_grace));
+                state.linger_timer = Some(self.arm_linger(
+                    tenant.clone(),
+                    session,
+                    self.inner.tunables.linger_grace,
+                ));
             }
         } else if let Some(timer) = state.linger_timer.take() {
             timer.abort();
@@ -151,7 +154,7 @@ impl Lifecycle {
     ) {
         let confirmed_empty = state.started
             && !state.all_relays_closed()
-            && state.all_relays_confirmed_empty(now, self.inner.empty_roster_freshness);
+            && state.all_relays_confirmed_empty(now, self.inner.tunables.empty_roster_freshness);
         if confirmed_empty {
             if state.empty_timer.is_none() {
                 let token = self
@@ -164,7 +167,7 @@ impl Lifecycle {
                         tenant.clone(),
                         session,
                         token,
-                        self.inner.empty_session_grace,
+                        self.inner.tunables.empty_session_grace,
                     ),
                 });
             }
@@ -346,7 +349,10 @@ impl Lifecycle {
         state.empty_timer = None;
         if !state.started
             || state.all_relays_closed()
-            || !state.all_relays_confirmed_empty(Instant::now(), self.inner.empty_roster_freshness)
+            || !state.all_relays_confirmed_empty(
+                Instant::now(),
+                self.inner.tunables.empty_roster_freshness,
+            )
             || !state.empty_evidence_matches_epochs(&epochs)
         {
             return;

@@ -13,7 +13,6 @@ use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::ledger::RelayLedger;
-use rally_point_coordinator::lifecycle::Lifecycle;
 use rally_point_coordinator::provision::{
     EcsConfig, EcsProvisioner, ProcessConfig, ProcessProvisioner, ProvisionConfig, ProvisionLoop,
     Provisioner, WarmTargets,
@@ -21,8 +20,7 @@ use rally_point_coordinator::provision::{
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::tenant::NotifyConfig;
 use rally_point_coordinator::{
-    acme, flight_store, metrics, notify, pair_rtts, regions, registry, session, tenant,
-    tenant_config,
+    acme, flight_store, metrics, pair_rtts, regions, registry, session, tenant, tenant_config,
 };
 use rally_point_proto::control::{RegionId, TenantId};
 use rally_point_proto::token::KeyId;
@@ -205,12 +203,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    let lifecycle = Lifecycle::new(setup.clone());
-    let notices = notify::new_dedup();
-    // Let the lifecycle prune these dedup sets when it removes a session's state,
-    // so they don't grow for the process lifetime.
-    lifecycle.attach_dedup(notices.clone());
-
     // Capture the handles the provisioning loop reconciles over before they move
     // into the served state: it shares the same setup, ledger, and region list the
     // API does.
@@ -237,18 +229,17 @@ async fn main() -> Result<()> {
     } else {
         cli.player_token_lifetime_secs
     };
+    // The dev / loopback posture, overridden with everything this binary
+    // configured: the region list, the resolved token lifetime, and the ledger,
+    // pair table, and flight store opened above (the pair table already seeded
+    // from the ledger).
     let state = CoordinatorState {
-        setup,
-        notices,
-        lifecycle,
-        control_auth,
-        hello_timeout: api::HELLO_TIMEOUT,
-        liveness_timeout: api::LIVENESS_TIMEOUT,
         regions,
         player_token_lifetime: Duration::from_secs(player_token_lifetime_secs),
         ledger,
         pair_rtts,
         flight_store,
+        ..CoordinatorState::new(setup, control_auth)
     };
 
     // Bring up the plaintext metrics listener before the primary serve, when one

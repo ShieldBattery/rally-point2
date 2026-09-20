@@ -110,7 +110,7 @@ pub(super) struct Cli {
     #[arg(
         long,
         env = "COORDINATOR_PLAYER_TOKEN_LIFETIME_SECS",
-        default_value_t = 21600
+        default_value_t = crate::api::DEFAULT_PLAYER_TOKEN_LIFETIME.as_secs()
     )]
     pub(super) player_token_lifetime_secs: u64,
 
@@ -314,7 +314,7 @@ mod tests {
     fn player_token_lifetime_defaults_to_six_hours() {
         // With no flag and no env var, the mint lifetime falls back to 6 hours.
         let cli = Cli::parse_from(["rally-point-coordinator"]);
-        assert_eq!(cli.player_token_lifetime_secs, 21600);
+        assert_eq!(cli.player_token_lifetime_secs, 6 * 60 * 60);
     }
 
     #[test]

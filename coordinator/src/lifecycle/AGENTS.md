@@ -37,6 +37,6 @@ spread across these files, so grep by method name, not by file.
 ## Tests
 
 `cargo test -p rally-point-coordinator --lib lifecycle::`. Graces are injected —
-`with_graces` for holdout/linger/webhook, `with_test_tunables` for queue capacity,
-never-started grace, and `EmptyReapTunables { grace, freshness }` — so no test
-sleeps a production window.
+`Lifecycle::with_tunables(setup, LifecycleTunables { .. })`, overriding only the
+fields a test cares about and letting `..Default::default()` fill the rest — so
+no test sleeps a production window.

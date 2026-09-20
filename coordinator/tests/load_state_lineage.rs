@@ -15,10 +15,9 @@ use std::time::Duration;
 
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::lifecycle::Lifecycle;
-use rally_point_coordinator::regions::RegionsConfig;
 use rally_point_coordinator::registry;
 use rally_point_coordinator::session::SessionSetup;
-use rally_point_coordinator::{notify, pair_rtts, tenant};
+use rally_point_coordinator::tenant;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rustls_pki_types::PrivateKeyDer;
@@ -42,17 +41,10 @@ async fn serve_coordinator() -> (String, Lifecycle) {
     let setup = SessionSetup::new(registry::new_registry(), tenant::new_store());
     let lifecycle = Lifecycle::new(setup.clone());
     let app = api::router(CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle: lifecycle.clone(),
-        control_auth: ControlAuth::Open,
-        hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: LIVENESS,
-        regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        lifecycle: lifecycle.clone(),
+        ..CoordinatorState::new(setup, ControlAuth::Open)
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

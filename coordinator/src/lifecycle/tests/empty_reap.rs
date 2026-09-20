@@ -7,16 +7,11 @@ use super::*;
 #[tokio::test]
 async fn complete_empty_heartbeats_reap_a_started_session_and_release_membership() {
     let (setup, s) = setup_with_relay_and_session();
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup.clone(),
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: SHORT,
-            freshness: HOUR,
+        LifecycleTunables {
+            empty_session_grace: SHORT,
+            ..Default::default()
         },
     );
     lc.register_session(
@@ -76,16 +71,11 @@ async fn an_entry_with_no_connected_slots_reaps_exactly_as_an_omission_does() {
     // of the roster does — otherwise a relay holding a finished session's
     // record would keep the session alive for as long as it ran.
     let (setup, s) = setup_with_relay_and_session();
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup.clone(),
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: SHORT,
-            freshness: HOUR,
+        LifecycleTunables {
+            empty_session_grace: SHORT,
+            ..Default::default()
         },
     );
     lc.register_session(
@@ -137,18 +127,7 @@ async fn a_stale_empty_timer_cannot_consume_a_rearmed_timers_evidence() {
     let setup = bare_setup();
     let s = SessionId(89);
     stage_assignments(&setup, s, &[RelayId(1)]);
-    let lc = Lifecycle::with_test_tunables(
-        setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: HOUR,
-            freshness: HOUR,
-        },
-    );
+    let lc = Lifecycle::new(setup);
     lc.register_session(
         tid(),
         s,
@@ -208,7 +187,7 @@ async fn a_stale_empty_timer_cannot_consume_a_rearmed_timers_evidence() {
 #[tokio::test]
 async fn a_superseded_connection_cannot_restore_cleared_close_evidence() {
     let setup = bare_setup();
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let s = SessionId(88);
     lc.inner
         .setup
@@ -240,16 +219,12 @@ async fn an_empty_roster_that_stops_refreshing_cannot_reap_a_session() {
     let setup = bare_setup();
     let s = SessionId(90);
     stage_assignments(&setup, s, &[RelayId(1)]);
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: SHORT * 2,
-            freshness: SHORT / 2,
+        LifecycleTunables {
+            empty_session_grace: SHORT * 2,
+            empty_roster_freshness: SHORT / 2,
+            ..Default::default()
         },
     );
     lc.register_session(
@@ -282,16 +257,11 @@ async fn every_assigned_relay_must_report_empty_before_the_grace_begins() {
     let setup = bare_setup();
     let s = SessionId(91);
     stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: SHORT,
-            freshness: HOUR,
+        LifecycleTunables {
+            empty_session_grace: SHORT,
+            ..Default::default()
         },
     );
     lc.register_session(
@@ -335,16 +305,11 @@ async fn positive_presence_reopens_a_relays_prior_close_evidence() {
     let setup = bare_setup();
     let s = SessionId(93);
     stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: SHORT,
-            freshness: HOUR,
+        LifecycleTunables {
+            empty_session_grace: SHORT,
+            ..Default::default()
         },
     );
     lc.register_session(
@@ -396,16 +361,11 @@ async fn a_new_relay_enrollment_reopens_its_prior_close_evidence() {
     let setup = bare_setup();
     let s = SessionId(94);
     stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: SHORT,
-            freshness: HOUR,
+        LifecycleTunables {
+            empty_session_grace: SHORT,
+            ..Default::default()
         },
     );
     lc.register_session(
@@ -441,16 +401,11 @@ async fn partial_rosters_and_connection_changes_reset_empty_continuity() {
     let setup = bare_setup();
     let s = SessionId(92);
     stage_assignments(&setup, s, &[RelayId(1)]);
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        NOTICE_QUEUE_CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: SHORT,
-            freshness: HOUR,
+        LifecycleTunables {
+            empty_session_grace: SHORT,
+            ..Default::default()
         },
     );
     lc.register_session(

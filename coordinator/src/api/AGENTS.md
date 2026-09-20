@@ -39,5 +39,8 @@ Public paths (`api::CoordinatorState`, `router`, `ControlAuth`,
 ## Tests
 
 `cargo test -p rally-point-coordinator --lib api::`; fixtures in `tests/mod.rs`
-(`state_with_relay_and_tenant`, `signed_post`, `note_inbound_frame`). Shorten
-`hello_timeout`/`liveness_timeout` on the state rather than sleeping.
+(`state_with_relay_and_tenant`, `signed_post`, `note_inbound_frame`). Build a
+state from `CoordinatorState::new(setup, auth)` and override only what the test
+configures — never a full literal, so a new field lands in one place. Shorten
+`hello_timeout`/`liveness_timeout`/`attest_timeout` on the state rather than
+sleeping.

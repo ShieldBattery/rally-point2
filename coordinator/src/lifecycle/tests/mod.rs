@@ -19,7 +19,6 @@ use crate::registry;
 use crate::tenant;
 
 const TENANT: &str = "sb-test";
-const HOUR: Duration = Duration::from_secs(3600);
 const SHORT: Duration = Duration::from_millis(80);
 
 fn tid() -> TenantId {

@@ -9,11 +9,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
-use rally_point_coordinator::lifecycle::Lifecycle;
 use rally_point_coordinator::regions::RegionsConfig;
 use rally_point_coordinator::registry::RelayRegistry;
 use rally_point_coordinator::session::SessionSetup;
-use rally_point_coordinator::{notify, pair_rtts, registry, session, tenant};
+use rally_point_coordinator::{registry, session, tenant};
 use rally_point_proto::control::{
     BufferBounds, CoordinatorToRelay, MeshPeerIdentity, PlayerHandoff, RegionId, RelayHello,
     RelayPeer, RelayToCoordinator, SessionDescriptor, SessionRequest, TenantId,
@@ -182,19 +181,11 @@ pub(crate) async fn serve_bare_coordinator(
 ) -> (String, RelayRegistry) {
     let reg = registry::new_registry();
     let setup = session::SessionSetup::new(reg.clone(), tenant::new_store());
-    let lifecycle = Lifecycle::new(setup.clone());
     let app = api::router(CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth: ControlAuth::Open,
         hello_timeout,
         liveness_timeout,
-        regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup, ControlAuth::Open)
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -261,23 +252,13 @@ pub(crate) async fn coordinator_with_session(
 
     // Keep a handle to the outbox before the setup moves into the router state.
     let outbox = setup.clone();
-    let lifecycle = Lifecycle::new(setup.clone());
     let control_auth = match bootstrap_secret {
         Some(secret) => ControlAuth::Secret(secret.to_owned()),
         None => ControlAuth::Open,
     };
     let app = api::router(CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth,
-        hello_timeout: api::HELLO_TIMEOUT,
-        liveness_timeout: api::LIVENESS_TIMEOUT,
-        regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup, control_auth)
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -312,20 +293,11 @@ pub(crate) async fn serve_coordinator_returning_setup(
 ) -> (String, SessionSetup) {
     let reg = registry::new_registry();
     let setup = session::SessionSetup::new(reg, tenant::new_store());
-    let lifecycle = Lifecycle::new(setup.clone());
     let outbox = setup.clone();
     let app = api::router(CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth,
-        hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: LIVENESS,
-        regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup, control_auth)
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -477,19 +449,10 @@ pub(crate) async fn serve_coordinator_with_liveness(
     .unwrap();
     let setup = session::SessionSetup::new(reg, tenants);
     let handle = setup.clone();
-    let lifecycle = Lifecycle::new(setup.clone());
     let app = api::router(CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth: ControlAuth::Open,
-        hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout,
-        regions: RegionsConfig::default(),
         player_token_lifetime: Duration::from_secs(3600),
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup, ControlAuth::Open)
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -607,19 +570,11 @@ pub(crate) async fn serve_coordinator_with_regions(
     .unwrap();
     let setup = session::SessionSetup::new(reg, tenants);
     let handle = setup.clone();
-    let lifecycle = Lifecycle::new(setup.clone());
     let app = api::router(CoordinatorState {
-        setup,
-        notices: notify::new_dedup(),
-        lifecycle,
-        control_auth: ControlAuth::Open,
-        hello_timeout: api::HELLO_TIMEOUT,
         liveness_timeout: LIVENESS,
         regions,
         player_token_lifetime: Duration::from_secs(3600),
-        ledger: None,
-        pair_rtts: pair_rtts::new_store(),
-        flight_store: None,
+        ..CoordinatorState::new(setup, ControlAuth::Open)
     });
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await

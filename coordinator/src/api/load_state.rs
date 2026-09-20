@@ -15,8 +15,6 @@ use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{RelayId, SessionId};
 use serde::{Deserialize, Serialize};
 
-use crate::attest::LOAD_STATE_ATTEST_TIMEOUT;
-
 use super::CoordinatorState;
 use super::request_auth::{TenantAccess, verify_tenant_request};
 
@@ -91,7 +89,7 @@ struct SessionLoadStateResponse {
 /// answers evidence about *absence*, with no clock comparison anywhere. Every
 /// snapshot that arrives is merged whether or not the set completes, so a silent
 /// relay costs the completeness claim and never the facts its peers reported. A
-/// relay silent past [`LOAD_STATE_ATTEST_TIMEOUT`], or holding no control
+/// relay silent past the state's attestation deadline, or holding no control
 /// connection at all, simply did not answer.
 ///
 /// The read is **rate-limited per tenant** ([`LoadStateLimiter`]), because the cost
@@ -199,8 +197,8 @@ async fn attest_round(
 /// received, so this only has to record who produced one.
 ///
 /// Every request goes out before any answer is waited on, and all of them share one
-/// absolute deadline, so the whole exchange costs at most
-/// [`LOAD_STATE_ATTEST_TIMEOUT`] however many relays serve the session and however
+/// absolute deadline, so the whole exchange costs at most the state's
+/// `attest_timeout` however many relays serve the session and however
 /// many of them are slow. A relay that cannot be reached at all — no live control
 /// connection, or a control connection whose question queue is full — is never asked
 /// and counts exactly like one that stayed silent: it did not attest.
@@ -226,7 +224,7 @@ async fn attest_serving_relays(
                 .map(|waiter| (relay, waiter))
         })
         .collect();
-    let deadline = tokio::time::Instant::now() + LOAD_STATE_ATTEST_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + state.attest_timeout;
     let mut attested = std::collections::HashSet::new();
     let mut fenced = std::collections::HashSet::new();
     for (relay, waiter) in &mut pending {

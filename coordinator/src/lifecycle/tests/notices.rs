@@ -8,7 +8,7 @@ use super::*;
 async fn session_closed_fires_only_after_all_serving_relays_closed() {
     let (url, mut rx) = spawn_receiver(None).await;
     let setup = setup_with_notify(url);
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -50,7 +50,7 @@ async fn a_retrying_notice_blocks_session_closed_behind_it() {
     let gate = StdArc::new(TokioNotify::new());
     let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
     let setup = setup_with_notify(url.clone());
-    let lc = Lifecycle::with_graces(setup, HOUR, HOUR, HOUR);
+    let lc = Lifecycle::new(setup);
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -105,16 +105,11 @@ async fn a_full_queue_drops_the_newest_notice_but_never_the_terminal_one() {
     let gate = StdArc::new(TokioNotify::new());
     let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
     let setup = setup_with_notify(url.clone());
-    let lc = Lifecycle::with_test_tunables(
+    let lc = Lifecycle::with_tunables(
         setup,
-        HOUR,
-        HOUR,
-        HOUR,
-        CAPACITY,
-        HOUR,
-        EmptyReapTunables {
-            grace: HOUR,
-            freshness: HOUR,
+        LifecycleTunables {
+            queue_capacity: CAPACITY,
+            ..Default::default()
         },
     );
     let s = SessionId(1);

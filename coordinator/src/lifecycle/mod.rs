@@ -400,22 +400,8 @@ struct Inner {
     /// Process-wide timer identities prevent a callback from an already-retired
     /// session key matching a timer on a later state with the same key.
     next_empty_timer_token: AtomicU64,
-    holdout_grace: Duration,
-    linger_grace: Duration,
-    webhook_grace: Duration,
-    /// Each new session's dispatch queue capacity — [`NOTICE_QUEUE_CAPACITY`]
-    /// in production; injectable ([`Lifecycle::with_test_tunables`]) so a
-    /// queue-overflow test doesn't need to push the full production headroom
-    /// through a fake endpoint to observe the drop policy.
-    queue_capacity: usize,
-    /// The never-started reap's grace window — [`NEVER_STARTED_REAP_GRACE`]
-    /// in production; injectable ([`Lifecycle::with_test_tunables`]) for the
-    /// same reason as `queue_capacity`.
-    never_started_grace: Duration,
-    /// A started session's globally-empty grace and the maximum accepted gap
-    /// between the complete rosters proving that emptiness.
-    empty_session_grace: Duration,
-    empty_roster_freshness: Duration,
+    /// Every window and capacity this tracker's reaps and queues run on.
+    tunables: LifecycleTunables,
     /// The notice dedup sets to prune when a session's state is removed, wired in
     /// once at startup ([`Lifecycle::attach_dedup`]). Optional so a lifecycle
     /// built without one (a test that never exercises dedup) simply skips pruning.
@@ -447,79 +433,67 @@ pub(crate) struct SessionCensus {
     pub(crate) empty_grace: u64,
 }
 
-#[cfg(test)]
+/// Every window and capacity the lifecycle's reaps and queues run on.
+/// Production uses [`Default`]; a test builds one from `Default` and overrides
+/// only the fields whose real windows it cannot afford to wait out.
 #[derive(Debug, Clone, Copy)]
-struct EmptyReapTunables {
-    grace: Duration,
-    freshness: Duration,
+pub struct LifecycleTunables {
+    /// How long a holdout slot may stay silent — all-but-one player accounted —
+    /// before the coordinator closes its link ([`HOLDOUT_REAP_GRACE`]).
+    pub holdout_grace: Duration,
+    /// How long a session's stragglers may linger with every player accounted
+    /// but links still open ([`LINGER_REAP_GRACE`]).
+    pub linger_grace: Duration,
+    /// How long a webhook-only state may sit idle, measured from the last
+    /// webhook enqueued onto it, before it is reaped
+    /// ([`WEBHOOK_ONLY_REAP_GRACE`]).
+    pub webhook_grace: Duration,
+    /// How long a created session may sit with no client ever having connected
+    /// before it is retired ([`NEVER_STARTED_REAP_GRACE`]).
+    pub never_started_grace: Duration,
+    /// How long a started session may stay continuously empty on every assigned
+    /// relay before it is retired ([`EMPTY_SESSION_REAP_GRACE`]).
+    pub empty_session_grace: Duration,
+    /// The longest gap between the complete heartbeat rosters proving that
+    /// emptiness that may still count as continuous ([`EMPTY_ROSTER_FRESHNESS`]).
+    pub empty_roster_freshness: Duration,
+    /// Each new session's ordered dispatch queue capacity —
+    /// `NOTICE_QUEUE_CAPACITY` in production. Shrinking it lets a
+    /// queue-overflow test observe the drop policy without pushing the full
+    /// production headroom through a fake endpoint.
+    pub queue_capacity: usize,
+}
+
+impl Default for LifecycleTunables {
+    fn default() -> Self {
+        Self {
+            holdout_grace: HOLDOUT_REAP_GRACE,
+            linger_grace: LINGER_REAP_GRACE,
+            webhook_grace: WEBHOOK_ONLY_REAP_GRACE,
+            never_started_grace: NEVER_STARTED_REAP_GRACE,
+            empty_session_grace: EMPTY_SESSION_REAP_GRACE,
+            empty_roster_freshness: EMPTY_ROSTER_FRESHNESS,
+            queue_capacity: NOTICE_QUEUE_CAPACITY,
+        }
+    }
 }
 
 impl Lifecycle {
-    /// Creates a lifecycle tracker over `setup` with the production reap graces.
+    /// Creates a lifecycle tracker over `setup` with the production windows.
     pub fn new(setup: SessionSetup) -> Self {
-        Self::with_graces(
-            setup,
-            HOLDOUT_REAP_GRACE,
-            LINGER_REAP_GRACE,
-            WEBHOOK_ONLY_REAP_GRACE,
-        )
+        Self::with_tunables(setup, LifecycleTunables::default())
     }
 
-    /// Creates a lifecycle tracker with the reap graces injected, so a test need
-    /// not wait the production minute.
-    pub fn with_graces(
-        setup: SessionSetup,
-        holdout_grace: Duration,
-        linger_grace: Duration,
-        webhook_grace: Duration,
-    ) -> Self {
+    /// Creates a lifecycle tracker with its windows and capacities injected, so
+    /// a test never waits out a production grace.
+    pub fn with_tunables(setup: SessionSetup, tunables: LifecycleTunables) -> Self {
         Self {
             inner: Arc::new(Inner {
                 setup,
                 sessions: Mutex::new(HashMap::new()),
                 relay_epochs: Mutex::new(HashMap::new()),
                 next_empty_timer_token: AtomicU64::new(1),
-                holdout_grace,
-                linger_grace,
-                webhook_grace,
-                queue_capacity: NOTICE_QUEUE_CAPACITY,
-                never_started_grace: NEVER_STARTED_REAP_GRACE,
-                empty_session_grace: EMPTY_SESSION_REAP_GRACE,
-                empty_roster_freshness: EMPTY_ROSTER_FRESHNESS,
-                dedup: OnceLock::new(),
-            }),
-        }
-    }
-
-    /// [`with_graces`](Self::with_graces) plus every other production
-    /// constant a test might need to shrink: the per-session queue capacity,
-    /// the never-started grace, and the empty-roster policy. Each defaults to
-    /// its production value in [`with_graces`](Self::with_graces); this exists
-    /// only so a test can override the ones it actually cares about without
-    /// waiting out the real windows.
-    #[cfg(test)]
-    fn with_test_tunables(
-        setup: SessionSetup,
-        holdout_grace: Duration,
-        linger_grace: Duration,
-        webhook_grace: Duration,
-        queue_capacity: usize,
-        never_started_grace: Duration,
-        empty_reap: EmptyReapTunables,
-    ) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                setup,
-                sessions: Mutex::new(HashMap::new()),
-                relay_epochs: Mutex::new(HashMap::new()),
-                next_empty_timer_token: AtomicU64::new(1),
-                holdout_grace,
-                linger_grace,
-                webhook_grace,
-                queue_capacity,
-                never_started_grace,
-                empty_session_grace: empty_reap.grace,
-                empty_roster_freshness: empty_reap.freshness,
+                tunables,
                 dedup: OnceLock::new(),
             }),
         }
