@@ -1,14 +1,13 @@
-//! Desync- and result-webhook tests, combined: both are per-slot or
-//! per-session facts a relay reports once, deduped by their own key shape
-//! (`(tenant, session, sync_ordinal)` for desyncs, `(tenant, session, slot)`
-//! for results), with the same notice-first correlation-id resolution as
-//! departures. Desyncs additionally exercise the desync mark that pins a
+//! Desync- and result-webhook tests, combined: the bodies a consumer parses and
+//! the notice-first correlation-id resolution both share with departures. That
+//! each webhooks once per event — a desync keyed `(tenant, session,
+//! sync_ordinal)`, a result `(tenant, session, slot)` — is tabled for every kind
+//! in `ingest`. Desyncs additionally exercise the desync mark that pins a
 //! session's flight-recorder retention class independent of webhook delivery.
 
 use rally_point_proto::control::{DesyncNotice, ResultNotice};
 
 use super::*;
-use crate::lifecycle::Lifecycle;
 
 // -- Desync webhooks --
 
@@ -35,35 +34,19 @@ fn desync(session: SessionId, sync_ordinal: u64, no_majority: bool) -> DesyncNot
 }
 
 #[tokio::test]
-async fn a_desync_posts_one_signed_webhook_and_dedups_by_sync_ordinal() {
+async fn a_desync_webhook_carries_the_shape_the_tenant_parses() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     // A tenant enrolled (for the signing key) but no session created this
     // lifetime: the notice's self-stamped refs carry the webhook.
     let setup = setup_without_session(url);
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
-    // Two at-least-once redeliveries of the same event webhook once.
-    handle_desync(
-        &setup,
-        &dedup.desyncs,
-        &dedup.desync_marks,
+    report(
         &lifecycle,
-        desync(SessionId(7), 91, false),
-    );
-    handle_desync(
-        &setup,
-        &dedup.desyncs,
-        &dedup.desync_marks,
-        &lifecycle,
-        desync(SessionId(7), 91, false),
+        SessionNotice::Desync(desync(SessionId(7), 91, false)),
     );
 
-    let got = timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("a desync webhook is delivered")
-        .expect("the receiver got it");
-    assert_signed(&setup, TEST_TENANT, &got);
+    let got = signed_webhook(&setup, &mut rx).await;
     assert_eq!(got.body["event"], "desync");
     assert_eq!(got.body["tenant"], TEST_TENANT);
     assert_eq!(got.body["session"], 7);
@@ -74,33 +57,19 @@ async fn a_desync_posts_one_signed_webhook_and_dedups_by_sync_ordinal() {
     assert_eq!(got.body["noMajority"], false);
     assert_eq!(got.body["diverged"][0]["slot"], 2);
     assert_eq!(got.body["diverged"][0]["externalRef"], "sb-user-diverged");
-
-    assert!(
-        timeout(Duration::from_millis(400), rx.recv())
-            .await
-            .is_err(),
-        "a redelivery of the same (tenant, session, sync_ordinal) webhooks once",
-    );
 }
 
 #[tokio::test]
 async fn a_no_majority_desync_omits_absent_optionals_and_carries_an_empty_diverged() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let setup = setup_without_session(url);
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     // A no-majority desync with no game frame — gameFrame must be omitted, not
     // null, and diverged is an empty array.
     let mut notice = desync(SessionId(8), 5, true);
     notice.game_frame = None;
-    handle_desync(
-        &setup,
-        &dedup.desyncs,
-        &dedup.desync_marks,
-        &lifecycle,
-        notice,
-    );
+    report(&lifecycle, SessionNotice::Desync(notice));
 
     let got = timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -124,33 +93,29 @@ async fn a_desync_with_no_gameid_from_any_source_is_a_silent_no_op() {
         &TenantId(TEST_TENANT.to_owned()),
         Some(NotifyConfig { url }),
     );
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     // Neither the notice nor the stored session has a gameId.
     let mut notice = desync(session, 1, false);
     notice.external_id = None;
     let tenant = notice.tenant.clone();
-    handle_desync(
-        &setup,
-        &dedup.desyncs,
-        &dedup.desync_marks,
-        &lifecycle,
-        notice,
-    );
+    report(&lifecycle, SessionNotice::Desync(notice));
 
-    assert!(
-        timeout(Duration::from_millis(400), rx.recv())
-            .await
-            .is_err(),
+    no_further_webhook(
+        &mut rx,
         "no gameId from the notice or the stored session -> dropped",
-    );
+    )
+    .await;
 
     // Dropped, but not orphaned: the dedup entry this call inserted has a
     // lifecycle state to eventually retire it, even though no webhook was
     // ever enqueued for this session.
     assert!(
-        dedup.desyncs.lock().contains(&(tenant.clone(), session, 1)),
+        lifecycle
+            .notice_dedup()
+            .desyncs
+            .lock()
+            .contains(&(tenant.clone(), session, 1)),
         "the dedup entry was recorded",
     );
     assert!(
@@ -163,7 +128,7 @@ async fn a_desync_with_no_gameid_from_any_source_is_a_silent_no_op() {
     // sink still pins this session's recordings.
     assert!(
         is_session_desynced(
-            &dedup.desync_marks,
+            lifecycle.desync_marks(),
             &tenant,
             session,
             std::time::Instant::now(),
@@ -216,33 +181,19 @@ fn result(session: SessionId, slot: u8, refs_from_notice: bool) -> ResultNotice 
 }
 
 #[tokio::test]
-async fn a_result_posts_one_signed_webhook_with_base64_payload_and_dedups_by_slot() {
+async fn a_result_webhook_carries_the_shape_the_tenant_parses() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     // A tenant enrolled (for the signing key) but no session created this
     // lifetime: the notice's self-stamped refs carry the webhook.
     let setup = setup_without_session(url);
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
-    // Two at-least-once redeliveries of the same slot's report webhook once.
-    handle_result(
-        &setup,
-        &dedup.results,
+    report(
         &lifecycle,
-        result(SessionId(7), 1, true),
-    );
-    handle_result(
-        &setup,
-        &dedup.results,
-        &lifecycle,
-        result(SessionId(7), 1, true),
+        SessionNotice::Result(result(SessionId(7), 1, true)),
     );
 
-    let got = timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("a result webhook is delivered")
-        .expect("the receiver got it");
-    assert_signed(&setup, TEST_TENANT, &got);
+    let got = signed_webhook(&setup, &mut rx).await;
     assert_eq!(got.body["event"], "result");
     assert_eq!(got.body["tenant"], TEST_TENANT);
     assert_eq!(got.body["session"], 7);
@@ -257,13 +208,6 @@ async fn a_result_posts_one_signed_webhook_with_base64_payload_and_dedups_by_slo
     assert_eq!(got.body["arrivalMs"], 1_700_000_000_123u64);
     assert_eq!(got.body["sessionFrame"], 4200);
     assert_eq!(got.body["slotFrame"], 4242);
-
-    assert!(
-        timeout(Duration::from_millis(400), rx.recv())
-            .await
-            .is_err(),
-        "a redelivery of the same (tenant, session, slot) webhooks once",
-    );
 }
 
 #[tokio::test]
@@ -278,15 +222,9 @@ async fn a_result_with_no_notice_refs_falls_back_to_the_stored_session() {
         &TenantId(TEST_TENANT.to_owned()),
         Some(NotifyConfig { url }),
     );
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
-    handle_result(
-        &setup,
-        &dedup.results,
-        &lifecycle,
-        result(session, 0, false),
-    );
+    report(&lifecycle, SessionNotice::Result(result(session, 0, false)));
 
     let got = timeout(Duration::from_secs(2), rx.recv())
         .await

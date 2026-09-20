@@ -12,12 +12,13 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use base64::Engine as _;
 use rally_point_proto::control::{BufferBounds, DepartureKind, DivergedSlot, TenantId};
-use rally_point_proto::ids::SlotId;
+use rally_point_proto::ids::{RelayId, SlotId};
 use rally_point_proto::token::KeyId;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use tokio::time::{Duration, Instant, timeout};
 
 use super::*;
+use crate::lifecycle::{Lifecycle, SessionNotice};
 use crate::test_support::*;
 
 /// The three load-progress bodies serialize to exactly the shapes the tenant
@@ -177,6 +178,44 @@ pub(super) fn setup_without_session(url: String) -> SessionSetup {
     .setup_only()
 }
 
+/// Reports `notice` the way production does — through the one ingest entry
+/// point, as relay 1, the serving relay of every session these fixtures create.
+/// A test that wants the authorization refused names a different relay itself.
+pub(super) fn report(lifecycle: &Lifecycle, notice: SessionNotice) {
+    lifecycle.ingest_notice(RelayId(1), notice);
+}
+
+/// The next webhook delivered, asserted to be signed by the test tenant's own
+/// enrolled key. Panics if none arrives inside a generous couple of seconds.
+pub(super) async fn signed_webhook(
+    setup: &SessionSetup,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Received>,
+) -> Received {
+    let got = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("a webhook is delivered")
+        .expect("the receiver got it");
+    assert_signed(setup, TEST_TENANT, &got);
+    got
+}
+
+/// Asserts nothing further is delivered, `why` explaining what that proves. The
+/// wait is short because a second delivery would already have been enqueued
+/// synchronously by the call under test — this only gives the dispatch task time
+/// to run it, it never waits for one to be decided.
+pub(super) async fn no_further_webhook(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Received>,
+    why: &str,
+) {
+    assert!(
+        timeout(Duration::from_millis(400), rx.recv())
+            .await
+            .is_err(),
+        "{why}",
+    );
+}
+
 mod departures;
 mod desync_and_results;
 mod dispatch_delivery;
+mod ingest;

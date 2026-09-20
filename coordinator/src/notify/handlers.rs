@@ -114,7 +114,7 @@ fn resolve_or_drop(
 ///
 /// The dedup entry is claimed before the later lookups, so those terminal
 /// drops are not re-processed by a later duplicate either.
-pub fn handle_departure(
+pub(crate) fn handle_departure(
     setup: &SessionSetup,
     dedup: &DepartureDedup,
     lifecycle: &Lifecycle,
@@ -182,7 +182,7 @@ pub fn handle_departure(
 /// notify-config/gameId gates that can drop the webhook: the flight-recorder sink
 /// pins a session's recordings on the desync FACT, which holds regardless of whether
 /// a webhook is ever delivered for it.
-pub fn handle_desync(
+pub(crate) fn handle_desync(
     setup: &SessionSetup,
     dedup: &DesyncDedup,
     marks: &DesyncMarks,
@@ -267,7 +267,7 @@ pub fn handle_desync(
 /// as departures, so a coordinator restart that wiped the session store still
 /// delivers a correct webhook from the notice's self-stamped refs. The payload
 /// bytes are never parsed here; they are relayed straight through as base64.
-pub fn handle_result(
+pub(crate) fn handle_result(
     setup: &SessionSetup,
     dedup: &ResultDedup,
     lifecycle: &Lifecycle,
@@ -328,7 +328,7 @@ pub fn handle_result(
 ///
 /// Correlation ids come notice-first, stored-session as fallback — the same rule
 /// as departures.
-pub fn handle_slot_connected(
+pub(crate) fn handle_slot_connected(
     setup: &SessionSetup,
     dedup: &SlotConnectedDedup,
     lifecycle: &Lifecycle,
@@ -385,7 +385,7 @@ pub fn handle_slot_connected(
 ///
 /// The `external_id` comes notice-first, stored-session as fallback — the same
 /// rule as departures.
-pub fn handle_session_started(
+pub(crate) fn handle_session_started(
     setup: &SessionSetup,
     dedup: &SessionStartedDedup,
     lifecycle: &Lifecycle,
@@ -430,7 +430,7 @@ pub fn handle_session_started(
 /// A sibling of [`handle_result`] with the same `(tenant, session, slot)` dedup
 /// key (a slot reports one game-loop start), the same notice-first correlation-id
 /// resolution, and the same best-effort drops.
-pub fn handle_slot_started(
+pub(crate) fn handle_slot_started(
     setup: &SessionSetup,
     dedup: &SlotStartedDedup,
     lifecycle: &Lifecycle,

@@ -1,14 +1,13 @@
-//! Departure-webhook tests: one webhook per `(tenant, session, slot)` leave,
-//! deduped across redundant relay reports, with correlation ids resolved
-//! notice-first then falling back to the stored session. The drop branches
-//! every notice kind shares are tabled here too, since they are decided in one
-//! place.
+//! Departure-webhook tests: the body a consumer parses, and correlation ids
+//! resolved notice-first then falling back to the stored session. That one
+//! event webhooks exactly once however often it is reported is tabled for every
+//! kind in `ingest`. The drop branches every notice kind shares are tabled
+//! here, since they are decided in one place.
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rally_point_proto::control::{DepartureNotice, ResultNotice};
 
 use super::*;
-use crate::lifecycle::Lifecycle;
 
 /// A departure notice with no correlation ids of its own — the relay-predates-
 /// the-field case, which relies entirely on the coordinator's stored session.
@@ -38,33 +37,18 @@ fn notify_at(setup: &SessionSetup, url: String) {
 }
 
 #[tokio::test]
-async fn a_departure_posts_one_webhook_with_body_and_signature_and_dedups_relays() {
+async fn a_departure_webhook_carries_the_shape_the_tenant_parses() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, session) = setup_with_session(Some("game-99"), Some("sb-user-7"));
     notify_at(&setup, url);
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
-    // Two relays report the same departure; the coordinator must webhook once.
-    handle_departure(
-        &setup,
-        &dedup.departures,
+    report(
         &lifecycle,
-        notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
-    );
-    handle_departure(
-        &setup,
-        &dedup.departures,
-        &lifecycle,
-        notice(session, 0, DepartureKind::Dropped, 0x4000_0006),
+        SessionNotice::Departure(notice(session, 0, DepartureKind::Dropped, 0x4000_0006)),
     );
 
-    let got = timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("a webhook is delivered")
-        .expect("the receiver got it");
-
-    assert_signed(&setup, TEST_TENANT, &got);
+    let got = signed_webhook(&setup, &mut rx).await;
     assert_eq!(got.body["event"], "departure");
     assert_eq!(got.body["tenant"], TEST_TENANT);
     assert_eq!(got.body["session"], session.0);
@@ -79,14 +63,6 @@ async fn a_departure_posts_one_webhook_with_body_and_signature_and_dedups_relays
         got.body.get("result").is_none(),
         "a departure with no embedded result omits the field, not null",
     );
-
-    // No second webhook: the duplicate relay report was deduped.
-    assert!(
-        timeout(Duration::from_millis(400), rx.recv())
-            .await
-            .is_err(),
-        "duplicate departures from multiple relays webhook exactly once",
-    );
 }
 
 #[tokio::test]
@@ -97,21 +73,14 @@ async fn a_clean_leave_is_classified_left_and_omits_an_unstored_slot_ref() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, session) = setup_with_session(Some("game-42"), None);
     notify_at(&setup, url);
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
-    handle_departure(
-        &setup,
-        &dedup.departures,
+    report(
         &lifecycle,
-        notice(session, 0, DepartureKind::Left, 3),
+        SessionNotice::Departure(notice(session, 0, DepartureKind::Left, 3)),
     );
 
-    let got = timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("a webhook is delivered")
-        .unwrap();
-    assert_signed(&setup, TEST_TENANT, &got);
+    let got = signed_webhook(&setup, &mut rx).await;
     assert_eq!(got.body["kind"], "left");
     assert_eq!(got.body["externalId"], "game-42");
     // Absent correlation ids are omitted entirely, not sent as `null` — the
@@ -133,7 +102,6 @@ async fn a_departure_embeds_a_base64_result_when_the_slot_reported_one() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, session) = setup_with_session(Some("game-99"), Some("sb-user-7"));
     notify_at(&setup, url);
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     let mut with_result = notice(session, 0, DepartureKind::Left, 3);
@@ -143,13 +111,9 @@ async fn a_departure_embeds_a_base64_result_when_the_slot_reported_one() {
         session_frame: Some(4200),
         slot_frame: Some(4242),
     });
-    handle_departure(&setup, &dedup.departures, &lifecycle, with_result);
+    report(&lifecycle, SessionNotice::Departure(with_result));
 
-    let got = timeout(Duration::from_secs(2), rx.recv())
-        .await
-        .expect("a webhook is delivered")
-        .unwrap();
-    assert_signed(&setup, TEST_TENANT, &got);
+    let got = signed_webhook(&setup, &mut rx).await;
     assert_eq!(
         got.body["result"]["payload"],
         BASE64_STANDARD.encode([0x01, 0x02, 0x03, 0x04]),
@@ -170,14 +134,13 @@ async fn a_notice_carrying_its_own_refs_delivers_even_with_no_stored_session() {
     // process lifetime) must still deliver a correct webhook.
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let setup = setup_without_session(url);
-    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     let mut restart_notice = notice(SessionId(777), 0, DepartureKind::Dropped, 0x4000_0006);
     restart_notice.external_id = Some("game-restart".to_owned());
     restart_notice.external_ref = Some("sb-user-restart".to_owned());
 
-    handle_departure(&setup, &dedup.departures, &lifecycle, restart_notice);
+    report(&lifecycle, SessionNotice::Departure(restart_notice));
 
     let got = timeout(Duration::from_secs(2), rx.recv())
         .await
@@ -207,6 +170,11 @@ fn refless_result(session: SessionId) -> ResultNotice {
 /// The reasons a notice resolves to nothing to send. All four are decided in
 /// the prefix every handler resolves first, so they are proven once here rather
 /// than per notice kind.
+///
+/// These drive the webhook path directly rather than through `report`: the
+/// verdict below is read off the absence of lifecycle state, and ingest's
+/// accounting step (which is not the webhook path) creates that state for a
+/// departure or a result before the webhook path ever runs.
 #[derive(Debug)]
 enum Dropped {
     /// Neither the notice nor the stored session (itself created with no

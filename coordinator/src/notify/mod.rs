@@ -74,7 +74,7 @@ mod handlers;
 mod payloads;
 
 pub(crate) use dispatch::dispatch;
-pub use handlers::{
+pub(crate) use handlers::{
     handle_departure, handle_desync, handle_result, handle_session_started, handle_slot_connected,
     handle_slot_started,
 };
