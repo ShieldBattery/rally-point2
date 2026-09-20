@@ -49,7 +49,11 @@ pub struct RecarryPolicy {
 
 impl RecarryPolicy {
     /// No bounds: every packet re-carries the whole unacked window up to the
-    /// datagram budget. For tests that isolate the refill mechanics.
+    /// datagram budget. This is the pre-policy behaviour the two bounds
+    /// replaced, never shipped — it exists so tests can isolate the refill
+    /// mechanics from the spacing schedule, and so the simulator can measure
+    /// the bounded policies against it, so it is compiled only for tests.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn unbounded() -> Self {
         Self {
             redundancy_byte_budget: None,

@@ -56,72 +56,54 @@ fn a_payload_wider_than_the_policy_budget_is_still_re_carried() {
 /// wide payload fits; packing around it would keep resetting that flush
 /// from packets the wide payload can never ride, stranding it behind
 /// continuous smaller traffic indefinitely.
+///
+/// The same holds when the path shrinks under the payload mid-flight: floor
+/// admission means a fresh-free flush fits it alone at any legal MTU, so a
+/// turn admitted on a discovered 1350-byte budget is still recoverable once
+/// the path falls back to the 1200-byte floor.
 #[test]
 fn a_blocked_wide_payload_suppresses_all_redundancy_so_the_flush_stays_armed() {
-    let budget = 1350usize;
-    let mut manager = AckManager::new();
+    // (budget the wide turn was sent at, budget every later packet gets,
+    //  fresh command bytes per later turn, how many of them follow)
+    let cases = [
+        ("a steady path", 1350usize, 1350usize, 450usize, 10u64),
+        ("a path-MTU shrink to the floor", 1350, 1200, 300, 4),
+    ];
 
-    // A wide turn under the admission floor — it fits a datagram alone,
-    // but never beside one of the mid-size fresh payloads that follow; its
-    // datagram is lost.
-    let wide_commands = GUARANTEED_DATAGRAM_BUDGET - 64;
-    build_sent(
-        &mut manager,
-        Some(test_payload_sized(0, 0, wide_commands)),
-        budget,
-    );
+    for (case, send_budget, flush_budget, fresh_commands, fresh_turns) in cases {
+        let mut manager = AckManager::new();
 
-    // Continuous mid-size fresh turns follow, never acked, so smaller
-    // redundancy candidates are always available (any two of them share a
-    // packet comfortably). Every packet must decline them all: the wide
-    // payload heads the line and cannot ride.
-    for i in 1..=10u64 {
-        let packet = build_sent(&mut manager, Some(test_payload_sized(0, i, 450)), budget);
-        assert_eq!(
-            packet.payloads.len(),
-            1,
-            "packet {} packed redundancy around the blocked wide payload",
-            packet.seq,
+        // A wide turn under the admission floor — it fits a datagram alone,
+        // but never beside one of the mid-size fresh payloads that follow;
+        // its datagram is lost.
+        let wide_commands = GUARANTEED_DATAGRAM_BUDGET - 64;
+        build_sent(
+            &mut manager,
+            Some(test_payload_sized(0, 0, wide_commands)),
+            send_budget,
         );
+
+        // Continuous mid-size fresh turns follow, never acked, so smaller
+        // redundancy candidates are always available (any two of them share a
+        // packet comfortably). Every packet must decline them all: the wide
+        // payload heads the line and cannot ride.
+        for i in 1..=fresh_turns {
+            let packet = build_sent(
+                &mut manager,
+                Some(test_payload_sized(0, i, fresh_commands)),
+                flush_budget,
+            );
+            assert_eq!(
+                packet.payloads.len(),
+                1,
+                "{case}: packet {} packed redundancy around the blocked wide payload",
+                packet.seq,
+            );
+        }
+
+        // The flush the drivers fire on those redundancy-free sends has no
+        // fresh payload, so the wide turn heads it — recovery rides there.
+        let flush = build_sent(&mut manager, None, flush_budget);
+        assert_eq!(flush.payloads.first().map(|p| p.seq), Some(0), "{case}");
     }
-
-    // The flush the drivers fire on those redundancy-free sends has no
-    // fresh payload, so the wide turn heads it — recovery rides there.
-    let flush = build_sent(&mut manager, None, budget);
-    assert_eq!(flush.payloads.first().map(|p| p.seq), Some(0));
-}
-
-/// A payload admitted under the guaranteed floor stays re-carryable after
-/// a path-MTU shrink: fresh packets at the reduced budget may block on it
-/// (carrying nothing, which arms the drivers' flush), and the fresh-free
-/// flush at the same reduced budget still fits it alone.
-#[test]
-fn a_floor_admitted_payload_survives_a_path_mtu_shrink() {
-    let wide_commands = GUARANTEED_DATAGRAM_BUDGET - 64;
-    let mut manager = AckManager::new();
-
-    // Admitted and sent at a discovered 1350-byte budget; the datagram is
-    // lost.
-    build_sent(
-        &mut manager,
-        Some(test_payload_sized(0, 0, wide_commands)),
-        1350,
-    );
-
-    // The path shrinks to the 1200-byte MTU floor. Fresh packets cannot
-    // fit the wide payload beside their own turn and must carry nothing.
-    for i in 1..=4u64 {
-        let packet = build_sent(&mut manager, Some(test_payload_sized(0, i, 300)), 1200);
-        assert_eq!(
-            packet.payloads.len(),
-            1,
-            "packet {} packed around the blocked wide payload",
-            packet.seq,
-        );
-    }
-
-    // The flush at the shrunken budget still carries it: floor admission
-    // guarantees a fresh-free packet fits it at any legal MTU.
-    let flush = build_sent(&mut manager, None, 1200);
-    assert_eq!(flush.payloads.first().map(|p| p.seq), Some(0));
 }

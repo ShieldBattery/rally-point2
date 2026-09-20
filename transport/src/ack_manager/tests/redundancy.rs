@@ -9,31 +9,6 @@ use crate::ack_manager::sent::payload_element_len;
 use super::*;
 
 #[test]
-fn redundancy_repacks_all_unacked_payloads_within_a_slot() {
-    // With a generous budget, each new packet should re-carry every earlier
-    // unacked payload alongside the fresh one. Their serialization order is
-    // immaterial when every candidate fits; the fresh payload remains first.
-    let mut manager = AckManager::new();
-    manager
-        .build_outgoing(Some(test_payload(0, 0)), MTU)
-        .unwrap();
-    manager
-        .build_outgoing(Some(test_payload(0, 1)), MTU)
-        .unwrap();
-    let third = manager
-        .build_outgoing(Some(test_payload(0, 2)), MTU)
-        .unwrap();
-
-    assert_eq!(third.payloads.first().map(|payload| payload.seq), Some(2));
-    let mut redundant_seqs: Vec<u64> = third.payloads[1..]
-        .iter()
-        .map(|payload| payload.seq)
-        .collect();
-    redundant_seqs.sort_unstable();
-    assert_eq!(redundant_seqs, vec![0, 1]);
-}
-
-#[test]
 fn redundancy_refills_across_slots_oldest_per_slot_first() {
     // Two slots each with one unacked payload, tied on send_count (both
     // sent exactly once, as their own fresh payload). A tie falls back to
@@ -58,8 +33,36 @@ fn redundancy_refills_across_slots_oldest_per_slot_first() {
     assert_eq!(keys, vec![(0, 100), (1, 5)]);
 }
 
+/// The dense phase, where every candidate fits: each new packet re-carries
+/// the whole unacked window alongside the fresh payload, which stays first.
+/// Serialization order among the redundant elements is immaterial there, so
+/// this pins what is not — every candidate carried, each send count
+/// incremented exactly once, the exact budget respected, and one ack retiring
+/// the lot.
 #[test]
 fn all_fit_refill_carries_every_candidate_and_increments_each_once() {
+    // Payloads that entered the window as ordinary fresh sends: the next
+    // packet must re-carry the previous turns beside its own.
+    let mut manager = AckManager::new();
+    manager
+        .build_outgoing(Some(test_payload(0, 0)), MTU)
+        .unwrap();
+    manager
+        .build_outgoing(Some(test_payload(0, 1)), MTU)
+        .unwrap();
+    let third = manager
+        .build_outgoing(Some(test_payload(0, 2)), MTU)
+        .unwrap();
+    assert_eq!(third.payloads.first().map(|payload| payload.seq), Some(2));
+    let mut redundant_seqs: Vec<u64> = third.payloads[1..]
+        .iter()
+        .map(|payload| payload.seq)
+        .collect();
+    redundant_seqs.sort_unstable();
+    assert_eq!(redundant_seqs, vec![0, 1]);
+
+    // The same fast path with re-injected candidates, an exact budget, and
+    // deliberately uneven coverage histories.
     let mut manager = AckManager::new();
     let candidates = [test_payload(0, 7), test_payload(1, 3), test_payload(2, 11)];
     for payload in &candidates {
@@ -247,17 +250,17 @@ fn a_permanently_tight_budget_spreads_redundancy_coverage_across_slots() {
         }
     }
 
-    // Fair spreading: every slot's payload gets picked repeatedly across
-    // the 40 rounds -- none is starved. With the old `(slot, seq)`
-    // iteration order, slot 0 would win literally every round and slots
-    // 1-3 would sit at 0 picks for as long as the budget stayed tight.
-    for (slot, &picks) in picks_per_slot.iter().enumerate() {
-        assert!(
-            picks > 0,
-            "slot {slot} was never picked across 40 rounds of a tight budget -- \
-             starved instead of getting a fair share of redundancy coverage",
-        );
-    }
+    // Fair spreading: the slots take roughly equal turns, so the busiest
+    // gets at most twice the picks of the quietest. "Everyone picked at
+    // least once" would not be enough -- one slot taking 37 of 40 rounds
+    // and the others one each is the monopoly this test exists to forbid,
+    // and it is what the old `(slot, seq)` iteration order produced.
+    let most = picks_per_slot.iter().copied().max().expect("four slots");
+    let least = picks_per_slot.iter().copied().min().expect("four slots");
+    assert!(
+        least > 0 && most <= 2 * least,
+        "redundancy coverage was not spread fairly across the slots: {picks_per_slot:?}",
+    );
 }
 
 #[test]

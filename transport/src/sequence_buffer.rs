@@ -146,58 +146,32 @@ mod tests {
     #[derive(Clone, Default)]
     struct Data(u64);
 
+    /// Inserting a run of seqs leaves the ring holding the newest `capacity`
+    /// of them and nothing else: an exact fill, a run that starts above zero
+    /// (so the ring rotates onto it), and a run that overruns the ring and
+    /// overwrites its own oldest entries.
     #[test]
-    fn buffer_empty_at_start() {
-        let buffer: SequenceBuffer<Data> = SequenceBuffer::with_capacity(2);
-        for i in 0..8 {
-            assert!(!buffer.exists(i));
+    fn inserting_a_run_keeps_the_newest_capacity_entries() {
+        // (case, first seq, how many, a seq that must be present afterwards,
+        //  seqs that must not be)
+        let cases: [(&str, u64, u64, u64, &[u64]); 3] = [
+            ("an exact fill", 0, 4, 0, &[4, 8]),
+            ("a run starting above zero", 2, 4, 2, &[0, 8]),
+            ("a run that overruns the ring", 0, 6, 2, &[0, 8]),
+        ];
+
+        for (case, start, count, present, absent) in cases {
+            let mut buffer: SequenceBuffer<Data> = SequenceBuffer::with_capacity(4);
+            for i in start..start + count {
+                buffer.insert(i, Data(i));
+            }
+
+            assert_eq!(count_entries(&buffer), 4, "{case}");
+            assert!(buffer.exists(present), "{case}: {present} was overwritten");
+            for &gone in absent {
+                assert!(!buffer.exists(gone), "{case}: {gone} should not be present");
+            }
         }
-    }
-
-    #[test]
-    fn entries_and_sequences_same_size() {
-        let buffer: SequenceBuffer<Data> = SequenceBuffer::with_capacity(2);
-        assert_eq!(buffer.entry_sequences.len(), buffer.entries.len());
-    }
-
-    #[test]
-    fn fill_buffer() {
-        let mut buffer: SequenceBuffer<Data> = SequenceBuffer::with_capacity(4);
-        for i in 0..4 {
-            buffer.insert(i, Data(i));
-        }
-
-        assert_eq!(count_entries(&buffer), 4);
-        assert!(buffer.exists(0));
-        assert!(!buffer.exists(4));
-    }
-
-    #[test]
-    fn fill_buffer_with_rotation() {
-        let mut buffer: SequenceBuffer<Data> = SequenceBuffer::with_capacity(4);
-        for i in 2..6 {
-            buffer.insert(i, Data(i));
-        }
-
-        assert_eq!(count_entries(&buffer), 4);
-        assert!(buffer.exists(2));
-        assert!(!buffer.exists(0));
-        assert!(!buffer.exists(8));
-    }
-
-    #[test]
-    fn fill_buffer_with_overlap() {
-        let mut buffer: SequenceBuffer<Data> = SequenceBuffer::with_capacity(4);
-        for i in 0..6 {
-            buffer.insert(i, Data(i));
-        }
-
-        assert_eq!(count_entries(&buffer), 4);
-        assert!(buffer.exists(2));
-        // was overwritten
-        assert!(!buffer.exists(0));
-        // wasn't written
-        assert!(!buffer.exists(8));
     }
 
     #[test]

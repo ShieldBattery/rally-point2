@@ -12,6 +12,19 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use crate::noq;
 use crate::quic::{client_config, mesh_client_config, server_config};
 
+/// A one-command turn for `slot` at `seq`, tagged with `byte` so a test can
+/// tell which turn came back. The seq is assigned upstream and carried end to
+/// end, so tests set it directly rather than expecting it to be assigned.
+#[cfg(test)]
+pub(crate) fn turn(slot: u8, seq: u64, byte: u8) -> rally_point_proto::messages::Payload {
+    rally_point_proto::messages::Payload {
+        seq,
+        slot: u32::from(slot),
+        commands: vec![byte].into(),
+        ..Default::default()
+    }
+}
+
 /// A fresh self-signed `localhost` certificate: the chain a server presents, its
 /// private key, and the certificate alone to seed a dialer's trust roots.
 pub fn self_signed() -> (

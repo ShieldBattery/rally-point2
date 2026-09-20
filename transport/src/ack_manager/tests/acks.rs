@@ -100,72 +100,58 @@ fn ack_with_early_receives() {
     assert_eq!(packet.ack_bits, 0b1111_1110);
 }
 
+/// An incoming packet whose ack state cannot describe anything we sent is
+/// refused rather than folded in: an ack past our own highest sent seq, bits
+/// set with no ack to anchor them, and bits reaching below the first packet
+/// that ever existed. Each is a peer that is confused or hostile, and each
+/// would otherwise retire payloads we have no evidence arrived.
 #[test]
-fn rejects_ack_for_unsent_packet() {
-    let mut manager = AckManager::new();
-    manager
-        .build_outgoing(Some(test_payload(0, 0)), MTU)
-        .unwrap(); // only packet 0 sent
+fn rejects_inconsistent_ack_state() {
+    // Every case builds one packet first, so ack 0 is itself in range and only
+    // the deliberate inconsistency is left to reject.
+    let cases = [
+        (
+            "an ack past our highest sent packet seq",
+            Packet {
+                seq: 0,
+                ack: Some(1),
+                ack_bits: 0,
+                payloads: Vec::new(),
+            },
+            AckError::AckAheadOfSent { ack: 1, sent: 1 },
+        ),
+        (
+            "ack bits with no ack to anchor them",
+            Packet {
+                seq: 0,
+                ack: None,
+                ack_bits: 0b1,
+                payloads: Vec::new(),
+            },
+            AckError::AckBitsWithoutAck,
+        ),
+        (
+            "ack 0 with bit 0 set, claiming to ack packet -1",
+            Packet {
+                seq: 0,
+                ack: Some(0),
+                ack_bits: 0b1,
+                payloads: Vec::new(),
+            },
+            AckError::AckBitsOutOfRange {
+                ack: 0,
+                ack_bits: 0b1,
+            },
+        ),
+    ];
 
-    assert_eq!(
-        manager.handle_incoming(&incoming(0, Some(1), &[])),
-        Err(AckError::AckAheadOfSent { ack: 1, sent: 1 })
-    );
-}
-
-#[test]
-fn rejects_ack_bits_without_ack() {
-    let mut manager = AckManager::new();
-    let mut packet = incoming(0, None, &[]);
-    packet.ack_bits = 0b1;
-
-    assert_eq!(
-        manager.handle_incoming(&packet),
-        Err(AckError::AckBitsWithoutAck)
-    );
-}
-
-#[test]
-fn rejects_ack_bits_referencing_prehistory() {
-    // Send one packet so ack 0 is itself valid (0 < 1 sent).
-    let mut manager = AckManager::new();
-    manager
-        .build_outgoing(Some(test_payload(0, 0)), MTU)
-        .unwrap();
-
-    // ack 0 with bit 0 set claims to ack packet -1, which cannot exist.
-    let packet = Packet {
-        seq: 0,
-        ack: Some(0),
-        ack_bits: 0b1,
-        payloads: Vec::new(),
-    };
-
-    assert_eq!(
-        manager.handle_incoming(&packet),
-        Err(AckError::AckBitsOutOfRange {
-            ack: 0,
-            ack_bits: 0b1
-        })
-    );
-}
-
-#[test]
-fn symmetric_500_sends_without_loss() {
-    let mut local = AckManager::new();
-    let mut remote = AckManager::new();
-
-    for i in 0..500u64 {
-        let outgoing = build_sent(&mut local, Some(test_payload(0, i)), MTU);
-        let incoming = build_sent(&mut remote, Some(test_payload(0, i)), MTU);
-        remote.handle_incoming(&outgoing).unwrap();
-        local.handle_incoming(&incoming).unwrap();
+    for (case, packet, expected) in cases {
+        let mut manager = AckManager::new();
+        manager
+            .build_outgoing(Some(test_payload(0, 0)), MTU)
+            .unwrap();
+        assert_eq!(manager.handle_incoming(&packet), Err(expected), "{case}");
     }
-
-    // Only the final payload from each side is still in flight: nothing was
-    // built after it was seen, so it was never acked.
-    assert_eq!(local.payloads_in_flight(), 1);
-    assert_eq!(remote.payloads_in_flight(), 1);
 }
 
 #[test]

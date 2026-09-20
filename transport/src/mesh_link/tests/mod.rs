@@ -1,16 +1,13 @@
 //! Shared fixtures for the mesh-link tests: a loopback QUIC connection wrapped
-//! at both ends, plus the payload and conditions builders every topic uses.
+//! at both ends, plus the conditions builder several topics use.
 //!
 //! The tests themselves are split by subject into the submodules below; each
 //! pulls these helpers in with `use super::*`.
 
-use std::net::{Ipv4Addr, SocketAddr};
-
 use rally_point_proto::messages::Packet;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use super::*;
-use crate::quic::{mesh_client_config, server_config};
+use crate::test_util::{self, Edge, turn};
 
 mod conditions;
 mod demux;
@@ -18,46 +15,11 @@ mod dial;
 mod receive;
 mod send_budget;
 
-fn self_signed() -> (
-    Vec<CertificateDer<'static>>,
-    PrivateKeyDer<'static>,
-    CertificateDer<'static>,
-) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    let cert_der = cert.cert.der().clone();
-    let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-    (vec![cert_der.clone()], key, cert_der)
-}
-
-/// Brings up a loopback QUIC connection negotiated on `MESH_ALPN` and wraps
+/// Brings up a loopback QUIC connection negotiated on the mesh ALPN and wraps
 /// each end in a `MeshLink`. Both endpoints are returned so the caller keeps
 /// them alive for the test.
 async fn connected_mesh_links() -> (MeshLink, MeshLink, noq::Endpoint, noq::Endpoint) {
-    let (chain, key, ca) = self_signed();
-    let server_cfg = server_config(chain, key).unwrap();
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
-
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let client = noq::Endpoint::client(bind).unwrap();
-    client.set_default_client_config(client_cfg);
-
-    let accept = {
-        let server = server.clone();
-        tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
-    };
-    let client_conn = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-    let server_conn = accept.await.unwrap();
-
+    let (client_conn, server_conn, client, server) = test_util::loopback(Edge::Mesh).await;
     (
         MeshLink::new(client_conn),
         MeshLink::new(server_conn),
@@ -66,49 +28,16 @@ async fn connected_mesh_links() -> (MeshLink, MeshLink, noq::Endpoint, noq::Endp
     )
 }
 
-fn turn(slot: u8, seq: u64, byte: u8) -> Payload {
-    Payload {
-        seq,
-        slot: u32::from(slot),
-        commands: vec![byte].into(),
-        ..Default::default()
-    }
-}
-
-/// size, capping the sender's `max_datagram_size` toward it — a stand-in
-/// for any connection whose datagram budget sits near the payloads riding
-/// it (a small peer limit, or a path fallen back to the MTU floor).
+/// [`connected_mesh_links`] on a connection whose acceptor advertises `limit`
+/// as its datagram receive size, capping the sender's `max_datagram_size`
+/// toward it — a stand-in for any connection whose datagram budget sits near
+/// the payloads riding it (a small peer limit, or a path fallen back to the
+/// MTU floor).
 async fn connected_mesh_links_with_datagram_limit(
     limit: usize,
 ) -> (MeshLink, MeshLink, noq::Endpoint, noq::Endpoint) {
-    let (chain, key, ca) = self_signed();
-    let mut server_cfg = server_config(chain, key).unwrap();
-    let mut transport = noq::TransportConfig::default();
-    transport.datagram_receive_buffer_size(Some(limit));
-    server_cfg.transport_config(std::sync::Arc::new(transport));
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
-
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let client = noq::Endpoint::client(bind).unwrap();
-    client.set_default_client_config(client_cfg);
-
-    let accept = {
-        let server = server.clone();
-        tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
-    };
-    let client_conn = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-    let server_conn = accept.await.unwrap();
-
+    let (client_conn, server_conn, client, server) =
+        test_util::loopback_with_datagram_limit(Edge::Mesh, limit).await;
     (
         MeshLink::new(client_conn),
         MeshLink::new(server_conn),

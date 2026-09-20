@@ -1,56 +1,9 @@
-//! Tests for resuming a slot's seq stream mid-flight: anchoring a fresh
-//! receive window at the oldest replayable seq so the replay is not rejected
-//! as out-of-window, and seeding that window with receipts predating the
-//! connection so acked holes don't wedge the contiguous delivered prefix.
+//! Tests for everything that folds deliveries into a receive window from
+//! outside the datagram stream: seeding it with receipts that predate the
+//! connection so acked holes don't wedge the contiguous delivered prefix, and
+//! folding in a turn that rode the reliable control stream instead.
 
 use super::*;
-
-#[tokio::test]
-async fn same_relay_resume_anchor_from_oldest_unacked_accepts_a_past_window_stream() {
-    // The same-relay reconnect fix, end to end at the transport layer: a client
-    // deep into a game (unacked turns at a high absolute seq) sources its own-slot
-    // resume anchor from `oldest_replayable_seq` — exactly what the driver presents on
-    // a same-relay dial — and a fresh relay-side dedup anchored there accepts the
-    // resumed stream that a from-zero window would reject as out-of-window (the
-    // production blocker for any game past ~4096 turns).
-    let (mut sender, _peer, _ea, _eb) = connected_links().await;
-
-    let high = |seq: u64| Payload {
-        seq,
-        slot: 0,
-        commands: vec![0u8; 4].into(),
-        ..Default::default()
-    };
-    // The peer never acks, so these stay in flight — the window the redundancy
-    // pass re-carries over a rebound connection, oldest-first.
-    for seq in [8000u64, 8001, 8002] {
-        sender.send(Some(high(seq))).unwrap();
-    }
-    let anchor = sender
-        .oldest_replayable_seq(SlotId(0))
-        .expect("turns are in flight");
-    assert_eq!(
-        anchor, 8000,
-        "the same-relay anchor is the oldest unacked seq"
-    );
-
-    // The relay builds a fresh dedup on the re-dial. From zero the resumed seq is
-    // far beyond the window (the bug); anchored at the resume point it is accepted
-    // and the delivered prefix advances from there.
-    let mut unanchored = Dedup::with_window(RECEIVE_WINDOW);
-    assert_eq!(
-        unanchored.accept(SlotId(0), anchor),
-        Delivery::OutOfWindow,
-        "without the anchor a fresh relay rejects the resumed stream",
-    );
-
-    let mut anchored = Dedup::with_window(RECEIVE_WINDOW);
-    anchored.anchor(SlotId(0), anchor);
-    for seq in [8000u64, 8001, 8002] {
-        assert_eq!(anchored.accept(SlotId(0), seq), Delivery::New);
-    }
-    assert_eq!(anchored.delivered_through(SlotId(0)), Some(8002));
-}
 
 /// A resuming relay seeds the fresh receive window with the seqs its turn
 /// ring already holds, so an acked hole above the client's sparse-window
@@ -119,4 +72,53 @@ async fn a_bulk_seed_folds_the_prefix_and_never_rewinds() {
     let got = receiver.recv().await.unwrap();
     assert_eq!(got.fresh.len(), 1);
     assert_eq!(receiver.delivered_through(SlotId(0)), Some(8));
+}
+
+/// A turn too wide for a datagram is diverted to the reliable control stream,
+/// and `deliver_external` folds it into the same per-slot dedup the datagram
+/// path uses. Without the fold the stream-delivered seq is a permanent gap in
+/// the delivered prefix, stalling the beacon cursor behind it forever; with
+/// it, the prefix advances across the gap and a turn that somehow arrived both
+/// ways collapses to one delivery. The mesh twin is
+/// `MeshLink::deliver_external`; this is the client edge's.
+#[tokio::test]
+async fn deliver_external_folds_a_stream_delivered_seq_into_the_links_dedup() {
+    let (mut sender, mut receiver, _ea, _eb) = connected_links().await;
+
+    // Datagram seqs 0 and 1 arrive normally.
+    sender.send(Some(turn(0, 0, 0xA0))).unwrap();
+    sender.send(Some(turn(0, 1, 0xA1))).unwrap();
+    let mut delivered = 0;
+    while delivered < 2 {
+        delivered += receiver.recv().await.unwrap().fresh.len();
+    }
+    assert_eq!(receiver.delivered_through(SlotId(0)), Some(1));
+
+    // Seq 2 rode the control stream: folding it advances the prefix exactly
+    // as a datagram delivery would.
+    assert!(receiver.deliver_external(SlotId(0), 2).unwrap());
+    assert_eq!(
+        receiver.delivered_through(SlotId(0)),
+        Some(2),
+        "the stream-delivered seq closes the gap instead of stalling the prefix",
+    );
+
+    // A redundant copy of the same stream-delivered seq is a duplicate.
+    assert!(!receiver.deliver_external(SlotId(0), 2).unwrap());
+
+    // The datagram path continues past the folded seq without a gap.
+    sender.send(Some(turn(0, 3, 0xA3))).unwrap();
+    let got = receiver.recv().await.unwrap();
+    assert_eq!(got.fresh.len(), 1);
+    assert_eq!(receiver.delivered_through(SlotId(0)), Some(3));
+
+    // A seq beyond the receive window is an error here just as on the
+    // datagram path, not a silently accepted jump.
+    match receiver.deliver_external(SlotId(0), u64::MAX) {
+        Err(LinkError::PayloadOutOfWindow { slot, seq }) => {
+            assert_eq!(slot, SlotId(0));
+            assert_eq!(seq, u64::MAX);
+        }
+        other => panic!("expected PayloadOutOfWindow, got {other:?}"),
+    }
 }

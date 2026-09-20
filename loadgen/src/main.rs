@@ -310,42 +310,58 @@ mod tests {
         assert!(validate(&cli).is_ok());
     }
 
+    /// Workload shapes the harness cannot serve are refused up front rather
+    /// than discovered mid-run: more players than a session has slots, a
+    /// cadence too fine to express as a whole-microsecond tick, and an
+    /// aggregate whose exact-delivery ledger would exhaust memory.
     #[test]
-    fn rejects_players_outside_the_supported_session_slot_range() {
-        let mut cli = valid_cli();
-        cli.players = MAX_PLAYERS + 1;
-        assert!(
-            validate(&cli)
-                .unwrap_err()
-                .to_string()
-                .contains("--players must be at most 12")
-        );
-    }
+    fn rejects_the_workload_shapes_the_harness_cannot_serve() {
+        /// One case: what it is, how it bends a valid CLI out of shape, and
+        /// the fragment the resulting error must name.
+        struct Case {
+            what: &'static str,
+            mutate: fn(&mut Cli),
+            expected: &'static str,
+        }
+        let case = |what, mutate, expected| Case {
+            what,
+            mutate,
+            expected,
+        };
 
-    #[test]
-    fn rejects_a_cadence_finer_than_one_microsecond() {
-        let mut cli = valid_cli();
-        cli.turn_rate = MAX_TURN_RATE + 1;
-        assert!(
-            validate(&cli)
-                .unwrap_err()
-                .to_string()
-                .contains("--turn-rate must be at most")
-        );
-    }
+        let cases = [
+            case(
+                "more players than a session has slots",
+                |cli| cli.players = MAX_PLAYERS + 1,
+                "--players must be at most 12",
+            ),
+            case(
+                "a cadence finer than one microsecond",
+                |cli| cli.turn_rate = MAX_TURN_RATE + 1,
+                "--turn-rate must be at most",
+            ),
+            case(
+                "an aggregate whose delivery ledger would oom the harness",
+                |cli| {
+                    cli.sessions = 1;
+                    cli.players = MAX_PLAYERS;
+                    cli.game_secs = 15;
+                    cli.turn_rate = MAX_TURN_RATE;
+                },
+                "exact delivery accounting would retain",
+            ),
+        ];
 
-    #[test]
-    fn rejects_aggregate_exact_accounting_that_could_oom_the_harness() {
-        let mut cli = valid_cli();
-        cli.sessions = 1;
-        cli.players = MAX_PLAYERS;
-        cli.game_secs = 15;
-        cli.turn_rate = MAX_TURN_RATE;
-        assert!(
-            validate(&cli)
-                .unwrap_err()
-                .to_string()
-                .contains("exact delivery accounting would retain")
-        );
+        for Case {
+            what,
+            mutate,
+            expected,
+        } in cases
+        {
+            let mut cli = valid_cli();
+            mutate(&mut cli);
+            let error = validate(&cli).expect_err(what).to_string();
+            assert!(error.contains(expected), "{what}: got {error}");
+        }
     }
 }

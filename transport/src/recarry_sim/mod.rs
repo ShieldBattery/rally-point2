@@ -48,7 +48,9 @@ use rally_point_proto::ids::SlotId;
 use crate::ack_manager::{AckManager, RecarryPolicy};
 
 use model::{Bottleneck, EventKind, LossModel, Net, PathModel, PrefixTracker, Rng, turn_payload};
-use scenarios::{RunStats, Scenario, clean_path, percentile, policies, scenarios};
+use scenarios::{
+    RunStats, Scenario, clean_path, percentile, policies, representative_policies, scenarios,
+};
 
 /// One game turn at the SC:R rate, in milliseconds.
 const TURN_MS: f64 = 1000.0 / 24.0;
@@ -276,8 +278,10 @@ fn dump_policy_comparison() {
 // Pinned properties
 // ---------------------------------------------------------------------------
 
-/// Every policy, including the bounded ones, must deliver every payload under
-/// sustained random loss — bounding bytes must never become starvation.
+/// Every bounding regime — unbounded, byte budget alone, and the shipped
+/// budget plus spacing — must deliver every payload under sustained random
+/// loss: bounding bytes must never become starvation. The tuning variations
+/// within each regime are swept in the comparison dump.
 #[test]
 fn every_policy_delivers_everything_under_sustained_loss() {
     let scenario = Scenario {
@@ -293,7 +297,7 @@ fn every_policy_delivers_everything_under_sustained_loss() {
         },
         reverse: clean_path,
     };
-    for (name, policy) in policies() {
+    for (name, policy) in representative_policies() {
         let stats = run(&scenario, policy, 7);
         assert_eq!(
             stats.undelivered, 0,

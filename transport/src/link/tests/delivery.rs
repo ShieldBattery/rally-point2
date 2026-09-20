@@ -1,7 +1,6 @@
 //! End-to-end tests over a loopback QUIC pair: what a live link delivers —
-//! each payload exactly once, each slot independently, every payload field
-//! carried verbatim — and what it refuses on the wire, an out-of-window seq
-//! or a wire slot too wide for a `SlotId`.
+//! each payload exactly once, every payload field carried verbatim — and what
+//! the send side refuses before anything reaches the wire.
 
 use super::*;
 
@@ -33,20 +32,29 @@ async fn delivers_each_payload_once_and_retires_on_ack() {
 
 #[tokio::test]
 async fn preserves_payload_annotations_across_send_and_recv() {
-    // The frame is a consensus annotation, not a transport key: the link
-    // dedups and retires by (slot, seq) and must carry the frame through
-    // verbatim so the relay and decision-maker can key on it. A None (lobby
-    // turn) survives too — absent is a valid state, not zero.
+    // The payload envelope is opaque to the link: it dedups and retires by
+    // (slot, seq) alone and must carry every other field through verbatim —
+    // the consensus frame and sync generation the relay and decision-maker key
+    // on, and a relay-authored buffer directive the game applies out of band.
+    // An absent field survives as absent too: None is a valid state (a lobby
+    // turn, an ordinary turn with no directive), not zero.
+    use rally_point_proto::messages::BufferDirective;
     let (mut client, mut server, _client_ep, _server_ep) = connected_links().await;
 
+    let directive = BufferDirective {
+        buffer_turns: 6,
+        apply_at_frame: 512,
+        decision_seq: 3,
+        authority_relay_id: None,
+    };
     client
         .send(Some(Payload {
             seq: 0,
             slot: 0,
             game_frame_count: Some(1337),
             sync_generation: Some(73),
+            buffer_directive: Some(directive),
             commands: vec![0x05].into(),
-            ..Default::default()
         }))
         .unwrap();
     client
@@ -65,97 +73,20 @@ async fn preserves_payload_annotations_across_send_and_recv() {
     delivered.sort_by_key(|p| p.seq);
     assert_eq!(delivered[0].game_frame_count, Some(1337));
     assert_eq!(delivered[0].sync_generation, Some(73));
+    assert_eq!(delivered[0].buffer_directive, Some(directive));
     assert_eq!(delivered[1].game_frame_count, None);
-}
-
-#[tokio::test]
-async fn preserves_buffer_directive_across_send_and_recv() {
-    // A relay-authored buffer change rides the Payload envelope, so the link
-    // must carry it through verbatim like any other payload field — it is not
-    // a transport key (dedup and retirement stay on (slot, seq)), just metadata
-    // the game applies out of band. Absent is the common case and survives too.
-    use rally_point_proto::messages::BufferDirective;
-    let (mut client, mut server, _client_ep, _server_ep) = connected_links().await;
-
-    client
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(500),
-            sync_generation: None,
-            buffer_directive: Some(BufferDirective {
-                buffer_turns: 6,
-                apply_at_frame: 512,
-                decision_seq: 3,
-                authority_relay_id: None,
-            }),
-            commands: vec![0x0C].into(),
-        }))
-        .unwrap();
-    client
-        .send(Some(Payload {
-            seq: 1,
-            slot: 0,
-            game_frame_count: Some(501),
-            commands: vec![0x0C].into(),
-            ..Default::default()
-        }))
-        .unwrap();
-
-    let mut delivered = Vec::new();
-    while delivered.len() < 2 {
-        delivered.extend(server.recv().await.unwrap().fresh);
-    }
-    delivered.sort_by_key(|p| p.seq);
-    assert_eq!(
-        delivered[0].buffer_directive,
-        Some(BufferDirective {
-            buffer_turns: 6,
-            apply_at_frame: 512,
-            decision_seq: 3,
-            authority_relay_id: None,
-        }),
-    );
+    assert_eq!(delivered[1].sync_generation, None);
     assert_eq!(delivered[1].buffer_directive, None);
 }
 
 #[tokio::test]
-async fn delivers_each_slot_independently() {
-    // Two slots' turns interleave on the wire; each is dedup'd by (slot, seq).
-    let (mut client, mut server, _client_ep, _server_ep) = connected_links().await;
-
-    client.send(Some(turn(0, 0, 0xA0))).unwrap();
-    client.send(Some(turn(1, 0, 0xB0))).unwrap();
-    client.send(Some(turn(0, 1, 0xA1))).unwrap();
-    client.send(Some(turn(1, 1, 0xB1))).unwrap();
-
-    let mut delivered = Vec::new();
-    while delivered.len() < 4 {
-        delivered.extend(server.recv().await.unwrap().fresh);
-    }
-
-    // Slot 0's turns and slot 1's turns each arrive in their own seq order;
-    // the two streams are independent.
-    let slot0: Vec<u8> = delivered
-        .iter()
-        .filter(|p| p.slot == 0)
-        .map(|p| p.commands[0])
-        .collect();
-    let slot1: Vec<u8> = delivered
-        .iter()
-        .filter(|p| p.slot == 1)
-        .map(|p| p.commands[0])
-        .collect();
-    assert_eq!(slot0, vec![0xA0, 0xA1]);
-    assert_eq!(slot1, vec![0xB0, 0xB1]);
-}
-
-#[tokio::test]
 async fn delivers_a_redundant_low_seq_carried_after_a_high_fresh_one() {
-    let (client, mut server, _client_ep, _server_ep) = connected_links().await;
+    let (_client, mut server, _client_ep, _server_ep) = connected_links().await;
 
-    // A deep-loss packet leads with a high fresh seq and re-carries an older
-    // unacked one. Both must be delivered — the low seq is not dropped.
+    // A deep-loss packet leads with a fresh seq at the very top of the receive
+    // window and re-carries an older unacked one beside it. Leading with the
+    // window edge must not shut the window on the seq-0 re-carry travelling in
+    // the same packet: both are delivered, low seq first.
     let packet = Packet {
         seq: 0,
         ack: None,
@@ -175,74 +106,10 @@ async fn delivers_a_redundant_low_seq_carried_after_a_high_fresh_one() {
             },
         ],
     };
-    client
-        .connection()
-        .send_datagram(packet.encode_to_vec().into())
-        .unwrap();
 
-    let delivered = server.recv().await.unwrap().fresh;
+    let delivered = server.process_incoming(packet).unwrap().fresh;
     let seqs: Vec<u64> = delivered.iter().map(|p| p.seq).collect();
     assert_eq!(seqs, vec![0, RECEIVE_WINDOW]);
-}
-
-#[tokio::test]
-async fn rejects_payload_seq_beyond_the_window() {
-    let (client, mut server, _client_ep, _server_ep) = connected_links().await;
-
-    // A seq racing far past our contiguous progress must be rejected, not
-    // panic the receiver.
-    let malformed = Packet {
-        seq: 0,
-        ack: None,
-        ack_bits: 0,
-        payloads: vec![Payload {
-            seq: u64::MAX,
-            slot: 0,
-            commands: vec![1].into(),
-            ..Default::default()
-        }],
-    };
-    client
-        .connection()
-        .send_datagram(malformed.encode_to_vec().into())
-        .unwrap();
-
-    match server.recv().await {
-        Err(LinkError::PayloadOutOfWindow { slot, seq }) => {
-            assert_eq!(slot, SlotId(0));
-            assert_eq!(seq, u64::MAX);
-        }
-        other => panic!("expected PayloadOutOfWindow, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn rejects_a_payload_whose_wire_slot_does_not_fit_a_slot_id() {
-    let (client, mut server, _client_ep, _server_ep) = connected_links().await;
-
-    // A wire slot past `u8` range must be refused, not silently truncated
-    // onto a different, valid slot's dedup state (`300 as u8` would alias
-    // onto slot 44).
-    let malformed = Packet {
-        seq: 0,
-        ack: None,
-        ack_bits: 0,
-        payloads: vec![Payload {
-            seq: 0,
-            slot: 300,
-            commands: vec![1].into(),
-            ..Default::default()
-        }],
-    };
-    client
-        .connection()
-        .send_datagram(malformed.encode_to_vec().into())
-        .unwrap();
-
-    match server.recv().await {
-        Err(LinkError::MalformedSlot(slot)) => assert_eq!(slot, 300),
-        other => panic!("expected MalformedSlot, got {other:?}"),
-    }
 }
 
 #[tokio::test]

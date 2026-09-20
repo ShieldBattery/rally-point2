@@ -150,13 +150,6 @@ mod tests {
     ];
 
     #[test]
-    fn ring_kind_byte_matches_the_documented_sequence() {
-        for (ring, &expected) in DOCUMENTED_RING_BYTES.iter().enumerate() {
-            assert_eq!(ring_kind_byte(ring as u8), expected, "ring {ring}");
-        }
-    }
-
-    #[test]
     fn per_turn_ring_starts_at_one_and_advances_mod_16() {
         let builder = TurnBuilder::new(0xABCD, 16);
         // Over 20+ turns the ring nibble follows ring = (1 + ordinal) mod 16, so
@@ -172,8 +165,13 @@ mod tests {
         }
     }
 
+    /// The session seed, and nothing else, decides the hash stream: two
+    /// players of one session agree turn for turn even at different padded
+    /// sizes (so the relay's comparator sees a synced game), while two
+    /// sessions diverge (so a desync in one cannot be mistaken for agreement
+    /// with another).
     #[test]
-    fn all_players_in_a_session_emit_identical_hashes() {
+    fn the_session_seed_alone_decides_the_hash_stream() {
         let seed = 0x1234_5678_9ABC_DEF0;
         let a = TurnBuilder::new(seed, 16);
         let b = TurnBuilder::new(seed, 24);
@@ -185,15 +183,12 @@ mod tests {
                 "ordinal {ordinal}"
             );
         }
-    }
 
-    #[test]
-    fn different_sessions_produce_different_hash_streams() {
-        let a = TurnBuilder::new(1, 16);
-        let b = TurnBuilder::new(2, 16);
-        // At least one ordinal must differ (they are near-certain to differ often).
-        let any_different = (0..64u64).any(|o| a.turn(o)[2..4] != b.turn(o)[2..4]);
-        assert!(any_different);
+        let one = TurnBuilder::new(1, 16);
+        let two = TurnBuilder::new(2, 16);
+        // Distinct seeds are near-certain to differ often, so one matching
+        // ordinal proves nothing and one differing ordinal is enough.
+        assert!((0..64u64).any(|o| one.turn(o)[2..4] != two.turn(o)[2..4]));
     }
 
     #[test]

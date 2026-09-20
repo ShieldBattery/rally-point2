@@ -189,59 +189,13 @@ pub enum MeshControlSendError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
     use rally_point_proto::ids::SlotId;
     use rally_point_proto::messages::{MeshAckCursor, MeshAckCursors, Payload, mesh_control_frame};
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     use super::*;
-    use crate::quic::{mesh_client_config, server_config};
-
-    fn self_signed() -> (
-        Vec<CertificateDer<'static>>,
-        PrivateKeyDer<'static>,
-        CertificateDer<'static>,
-    ) {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let cert_der = cert.cert.der().clone();
-        let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-        (vec![cert_der.clone()], key, cert_der)
-    }
-
-    async fn connected_mesh_connections() -> (
-        noq::Connection,
-        noq::Connection,
-        noq::Endpoint,
-        noq::Endpoint,
-    ) {
-        let (chain, key, ca) = self_signed();
-        let server_cfg = server_config(chain, key).unwrap();
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca).unwrap();
-        let (dial_chain, dial_key, _) = self_signed();
-        let client_cfg = mesh_client_config(roots, dial_chain, dial_key).unwrap();
-
-        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
-        let server_addr = server.local_addr().unwrap();
-        let client = noq::Endpoint::client(bind).unwrap();
-        client.set_default_client_config(client_cfg);
-
-        let accept = {
-            let server = server.clone();
-            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
-        };
-        let client_conn = client
-            .connect(server_addr, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
-        let server_conn = accept.await.unwrap();
-        (client_conn, server_conn, client, server)
-    }
+    use crate::test_util::{Edge, loopback};
 
     fn ack_cursors_frame(session: u64, slot: SlotId, through: u64) -> MeshControlFrame {
         MeshControlFrame {
@@ -292,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_batch_write_is_read_as_multiple_control_frames() {
-        let (client_conn, server_conn, _client_ep, _server_ep) = connected_mesh_connections().await;
+        let (client_conn, server_conn, _client_ep, _server_ep) = loopback(Edge::Mesh).await;
         let (mut send, _recv) = client_conn.open_bi().await.unwrap();
         let accept = tokio::spawn(async move {
             let (_send, recv) = server_conn.accept_bi().await.unwrap();
@@ -323,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn batch_write_surfaces_a_peer_stopped_stream() {
-        let (client_conn, server_conn, _client_ep, _server_ep) = connected_mesh_connections().await;
+        let (client_conn, server_conn, _client_ep, _server_ep) = loopback(Edge::Mesh).await;
         let (mut send, _recv) = client_conn.open_bi().await.unwrap();
         let accept = tokio::spawn(async move { server_conn.accept_bi().await.unwrap() });
 

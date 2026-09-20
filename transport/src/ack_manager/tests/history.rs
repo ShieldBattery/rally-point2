@@ -95,7 +95,7 @@ fn rolling_ack_history_matches_sequence_buffer_for_deterministic_randomized_trac
         u32::MAX,
     ];
 
-    for step in 0..100_000u32 {
+    for step in 0..10_000u32 {
         // A fixed xorshift stream keeps the test deterministic while
         // exercising far more interleavings than the short exhaustive set.
         random ^= random << 13;

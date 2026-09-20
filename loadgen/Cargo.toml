@@ -55,3 +55,6 @@ bytes = { workspace = true }
 # turn validates clean with zero stripped commands — exactly what the relay's
 # ingress does to each turn on the wire.
 rally-point-relay = { workspace = true }
+# `test-util` for the paused clock the session-rendezvous tests run on: a real
+# millisecond timer racing a single `yield_now` is a flake on a loaded box.
+tokio = { workspace = true, features = ["test-util"] }

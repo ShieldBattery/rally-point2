@@ -1,40 +1,10 @@
 //! Tests for turning one decoded packet into deliveries: the single-slot
 //! ingress edge's rewrite of the untrusted wire slot, the per-wire-slot demux
 //! a multi-slot link keeps instead, the all-or-nothing dedup commit when a
-//! packet fails partway, and the in-place compaction of the decoded vector.
+//! packet fails partway, and the ack-only/carried-payload distinction the
+//! drivers schedule their reply from.
 
 use super::*;
-
-#[tokio::test]
-async fn ingress_slot_rebinds_a_wire_slot_zero_payload_to_the_authorized_slot() {
-    // A relay's client edge authorizes one slot. The real game client leaves the
-    // wire slot at 0 on every turn, but dedup and the receive-window anchor key
-    // on the authorized slot. An ingress link rewrites the wire slot before
-    // dedup, so a resumed high-seq stream anchored on the authorized slot is
-    // accepted — not rejected as out-of-window under a phantom slot-0 key.
-    let (raw, _peer, _ea, _eb) = connected_connections().await;
-    let mut link = Link::with_ingress_slot(raw, SlotId(1));
-    link.anchor_receive_window(SlotId(1), 8000);
-
-    let packet = Packet {
-        seq: 0,
-        ack: None,
-        ack_bits: 0,
-        payloads: vec![Payload {
-            seq: 8000,
-            slot: 0, // the untrusted wire claim the real client always sends
-            commands: vec![0x05].into(),
-            ..Default::default()
-        }],
-    };
-    let received = link.process_incoming(packet).unwrap();
-    assert_eq!(received.fresh.len(), 1);
-    // Rebound to the authorized slot, both in the dedup key and on the payload.
-    assert_eq!(received.fresh[0].slot, 1);
-    assert_eq!(link.delivered_through(SlotId(1)), Some(8000));
-    // Nothing was ever keyed under the wire slot 0.
-    assert_eq!(link.delivered_through(SlotId(0)), None);
-}
 
 /// A packet whose earlier payloads are genuinely in-window but whose LAST
 /// payload is out of window must not leave dedup believing the earlier
@@ -46,7 +16,7 @@ async fn ingress_slot_rebinds_a_wire_slot_zero_payload_to_the_authorized_slot() 
 /// return value while dedup kept them marked delivered.
 #[tokio::test]
 async fn a_mid_packet_out_of_window_payload_rolls_back_the_whole_packets_dedup_commit() {
-    let (raw, _peer, _ea, _eb) = connected_connections().await;
+    let (raw, _peer, _ea, _eb) = test_util::loopback(Edge::Client).await;
     let mut link = Link::new(raw);
 
     let packet = Packet {
@@ -114,7 +84,7 @@ async fn a_mid_packet_out_of_window_payload_rolls_back_the_whole_packets_dedup_c
 /// rolled back, not left half-committed.
 #[tokio::test]
 async fn a_trailing_malformed_slot_rolls_back_an_earlier_valid_slots_commit_too() {
-    let (raw, _peer, _ea, _eb) = connected_connections().await;
+    let (raw, _peer, _ea, _eb) = test_util::loopback(Edge::Client).await;
     let mut link = Link::new(raw);
 
     let packet = Packet {
@@ -153,7 +123,7 @@ async fn a_non_ingress_link_keeps_per_wire_slot_demux() {
     // slot: two payloads with different wire slots dedup independently, each
     // under its own key. This is the behavior the ingress rebind must not
     // disturb on multi-slot links.
-    let (raw, _peer, _ea, _eb) = connected_connections().await;
+    let (raw, _peer, _ea, _eb) = test_util::loopback(Edge::Client).await;
     let mut link = Link::new(raw);
 
     let packet = Packet {
@@ -182,58 +152,48 @@ async fn a_non_ingress_link_keeps_per_wire_slot_demux() {
     assert_eq!(link.delivered_through(SlotId(1)), Some(0));
 }
 
+/// `carried_payloads` reports whether the peer is waiting on an ack, and both
+/// drivers schedule their reply from it alone. It must be false for an
+/// ack-only packet — acking one would only provoke another ack-only packet
+/// back, forever — and true for a packet whose payloads were *all* redundant
+/// copies of already-delivered seqs: that delivers nothing fresh, but the peer
+/// is still holding those payloads unacked.
 #[tokio::test]
-async fn receive_compacts_fresh_payloads_in_the_decoded_vector() {
-    let (raw, _peer, _ea, _eb) = connected_connections().await;
+async fn carried_payloads_distinguishes_an_ack_only_packet_from_an_all_redundant_one() {
+    let (raw, _peer, _ea, _eb) = test_util::loopback(Edge::Client).await;
     let mut link = Link::new(raw);
 
-    // Deliberately unsorted, with two copies of (slot 0, seq 0). Stable
-    // low-seq sorting keeps the first copy, then in-place dedup removes the
-    // redundant one without replacing the protobuf decoder's Vec.
-    let packet = Packet {
+    let ack_only = Packet {
         seq: 0,
         ack: None,
         ack_bits: 0,
-        payloads: vec![
-            Payload {
-                seq: 1,
-                slot: 0,
-                commands: vec![0xB1].into(),
-                ..Default::default()
-            },
-            Payload {
-                seq: 0,
-                slot: 0,
-                commands: vec![0xA0].into(),
-                ..Default::default()
-            },
-            Payload {
-                seq: 0,
-                slot: 0,
-                commands: vec![0xD0].into(),
-                ..Default::default()
-            },
-            Payload {
-                seq: 0,
-                slot: 1,
-                commands: vec![0xC0].into(),
-                ..Default::default()
-            },
-        ],
+        payloads: Vec::new(),
     };
-    let allocation = packet.payloads.as_ptr();
-    let capacity = packet.payloads.capacity();
+    let received = link.process_incoming(ack_only).unwrap();
+    assert!(received.fresh.is_empty());
+    assert!(!received.carried_payloads);
 
-    let received = link.process_incoming(packet).unwrap();
+    let fresh = Packet {
+        seq: 1,
+        ack: None,
+        ack_bits: 0,
+        payloads: vec![turn(0, 0, 0xA0)],
+    };
+    let received = link.process_incoming(fresh).unwrap();
+    assert_eq!(received.fresh.len(), 1);
+    assert!(received.carried_payloads);
 
-    assert_eq!(received.fresh.as_ptr(), allocation);
-    assert_eq!(received.fresh.capacity(), capacity);
-    assert_eq!(received.fresh.len(), 3);
-    assert_eq!(received.fresh[0].commands.as_ref(), &[0xA0]);
-    assert_eq!(received.fresh[1].commands.as_ref(), &[0xB1]);
-    assert_eq!(received.fresh[2].commands.as_ref(), &[0xC0]);
-    assert_eq!(link.delivered_through(SlotId(0)), Some(1));
-    assert_eq!(link.delivered_through(SlotId(1)), Some(0));
+    // The same seq again: nothing fresh to deliver, but the payload element
+    // rode the wire, so the peer is still waiting to have it retired.
+    let all_redundant = Packet {
+        seq: 2,
+        ack: None,
+        ack_bits: 0,
+        payloads: vec![turn(0, 0, 0xA0)],
+    };
+    let received = link.process_incoming(all_redundant).unwrap();
+    assert!(received.fresh.is_empty());
+    assert!(received.carried_payloads);
 }
 
 #[tokio::test]
@@ -244,18 +204,18 @@ async fn same_relay_resume_on_a_nonzero_slot_accepts_a_wire_slot_zero_stream() {
     // slot, so a relay edge that keyed dedup on the wire slot would anchor slot N
     // yet dedup slot 0, making the anchor a silent no-op and rejecting the first
     // resumed turn past the window. The ingress-slot rebind keeps both on slot N.
-    let (raw_sender, raw_relay, _ea, _eb) = connected_connections().await;
+    let (raw_sender, raw_relay, _ea, _eb) = test_util::loopback(Edge::Client).await;
     let mut sender = Link::new(raw_sender);
 
     // The client counts its own seqs across the move but always sends wire slot 0.
-    let turn = |seq: u64| Payload {
+    let wire_turn = |seq: u64| Payload {
         seq,
         slot: 0,
         commands: vec![0u8; 4].into(),
         ..Default::default()
     };
     for seq in [8000u64, 8001, 8002] {
-        sender.send(Some(turn(seq))).unwrap();
+        sender.send(Some(wire_turn(seq))).unwrap();
     }
     let anchor = sender
         .oldest_replayable_seq(SlotId(0))
@@ -267,7 +227,8 @@ async fn same_relay_resume_on_a_nonzero_slot_accepts_a_wire_slot_zero_stream() {
 
     // The fresh relay edge authorizes this client as slot 1 and anchors slot 1 at
     // the resume point. Even though every incoming payload claims wire slot 0, the
-    // rebind keys them under slot 1, where the anchor lives.
+    // rebind keys them under slot 1, where the anchor lives — and nothing is ever
+    // keyed under the untrusted wire slot.
     let mut relay = Link::with_ingress_slot(raw_relay, SlotId(1));
     relay.anchor_receive_window(SlotId(1), anchor);
     for seq in [8000u64, 8001, 8002] {
@@ -275,25 +236,26 @@ async fn same_relay_resume_on_a_nonzero_slot_accepts_a_wire_slot_zero_stream() {
             seq: 0,
             ack: None,
             ack_bits: 0,
-            payloads: vec![turn(seq)],
+            payloads: vec![wire_turn(seq)],
         };
         let received = relay.process_incoming(packet).unwrap();
         assert_eq!(received.fresh.len(), 1);
         assert_eq!(received.fresh[0].slot, 1, "rebound to the authorized slot");
     }
     assert_eq!(relay.delivered_through(SlotId(1)), Some(8002));
+    assert_eq!(relay.delivered_through(SlotId(0)), None);
 
     // The bug shape for contrast: a wire-slot-keyed edge (no ingress rebind)
     // anchors slot 1 but dedups the wire-slot-0 payload under slot 0's from-zero
     // window, so it rejects the very first resumed turn and would close the link.
-    let (raw_bad, _peer, _ec, _ed) = connected_connections().await;
-    let mut buggy = Link::new(raw_bad);
+    // Only receive state decides this, so it rides the connection already up.
+    let mut buggy = Link::new(sender.connection().clone());
     buggy.anchor_receive_window(SlotId(1), anchor);
     let packet = Packet {
         seq: 0,
         ack: None,
         ack_bits: 0,
-        payloads: vec![turn(8000)],
+        payloads: vec![wire_turn(8000)],
     };
     match buggy.process_incoming(packet) {
         Err(LinkError::PayloadOutOfWindow { slot, seq }) => {

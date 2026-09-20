@@ -282,6 +282,25 @@ pub(super) fn scenarios() -> Vec<Scenario> {
     ]
 }
 
+/// One policy per bounding regime: no bounds at all, the byte budget alone,
+/// and the shipped budget-plus-spacing. The rest of [`policies`] are tuning
+/// variations within those regimes, so a property that must hold for every
+/// policy is settled by these three and swept over the whole table only in
+/// the comparison dump.
+pub(super) fn representative_policies() -> Vec<(&'static str, RecarryPolicy)> {
+    vec![
+        ("carry-all (pre-policy)", RecarryPolicy::unbounded()),
+        (
+            "budget-384",
+            RecarryPolicy {
+                redundancy_byte_budget: Some(384),
+                spacing: None,
+            },
+        ),
+        ("b384 d2/m8 (shipped)", RecarryPolicy::default()),
+    ]
+}
+
 pub(super) fn policies() -> Vec<(&'static str, RecarryPolicy)> {
     let budgeted = |budget| RecarryPolicy {
         redundancy_byte_budget: Some(budget),

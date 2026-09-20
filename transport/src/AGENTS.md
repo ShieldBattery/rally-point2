@@ -34,6 +34,7 @@ reliable-ordered protocol). Read it before touching `ack_manager/` or `link/`.
 
 ## Tests
 
-`cargo test -p rally-point-transport` (113 + 1 ignored). Module tests sit in
-`<module>/tests/` with shared fixtures in `tests/mod.rs`; `quic/tests.rs` spins up real
-loopback endpoints.
+`cargo test -p rally-point-transport` (84 + 1 ignored). Module tests sit in
+`<module>/tests/` with shared fixtures in `tests/mod.rs`. The self-signed
+certificate, the loopback QUIC pair on either ALPN, and the turn builder come
+from `test_util` — never re-rolled per module; extend it instead.

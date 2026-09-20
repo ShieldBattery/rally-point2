@@ -240,65 +240,16 @@ pub fn spawn_beacon_reader(connection: noq::Connection) -> BeaconCursors {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
     use std::time::Duration;
 
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    use tokio::time::{sleep, timeout};
+    use tokio::time::timeout;
 
     use super::*;
-    use crate::quic::{client_config, server_config};
-
-    fn self_signed() -> (
-        Vec<CertificateDer<'static>>,
-        PrivateKeyDer<'static>,
-        CertificateDer<'static>,
-    ) {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let cert_der = cert.cert.der().clone();
-        let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-        (vec![cert_der.clone()], key, cert_der)
-    }
-
-    /// Brings up a loopback QUIC connection, returning both raw ends plus the
-    /// endpoints (kept alive by the caller). The first connection is the beacon
-    /// writer (opens the uni-stream), the second is handed to the reader.
-    async fn connected_connections() -> (
-        noq::Connection,
-        noq::Connection,
-        noq::Endpoint,
-        noq::Endpoint,
-    ) {
-        let (chain, key, ca) = self_signed();
-        let server_cfg = server_config(chain, key).unwrap();
-
-        let mut roots = rustls::RootCertStore::empty();
-        roots.add(ca).unwrap();
-        let client_cfg = client_config(roots).unwrap();
-
-        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
-        let server_addr = server.local_addr().unwrap();
-        let client = noq::Endpoint::client(bind).unwrap();
-        client.set_default_client_config(client_cfg);
-
-        let accept = {
-            let server = server.clone();
-            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
-        };
-        let client_conn = client
-            .connect(server_addr, "localhost")
-            .unwrap()
-            .await
-            .unwrap();
-        let server_conn = accept.await.unwrap();
-
-        (client_conn, server_conn, client, server)
-    }
+    use crate::test_util::{Edge, loopback};
 
     #[tokio::test]
     async fn writer_batches_advances_and_suppresses_static_cursors() {
-        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
+        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = loopback(Edge::Client).await;
         let mut rx = spawn_beacon_reader(reader_conn);
         let mut send = writer_conn.open_uni().await.unwrap();
         let mut writer = BeaconWriter::new();
@@ -330,6 +281,9 @@ mod tests {
             writer.write_buf.is_empty(),
             "equal and regressing cursors produce no write batch",
         );
+        // Nothing was written, so nothing can arrive. Proving an absence needs
+        // a window, but only a short one: a regression here writes the frame
+        // straight away rather than late.
         assert!(
             timeout(Duration::from_millis(25), rx.recv()).await.is_err(),
             "a static prefix stays quiet",
@@ -350,35 +304,44 @@ mod tests {
     /// The final cursor before traffic stops must survive an arbitrarily slow
     /// driver: it has no successor to supersede it, and the sender pushes only
     /// on advance, so losing it would leave the peer re-carrying its
-    /// already-delivered unacked tail for the rest of the connection. A flood
-    /// far past any queue's depth, drained only afterwards, must still hand
-    /// the driver the newest cursor.
+    /// already-delivered unacked tail for the rest of the connection. Each
+    /// slot's cursor is its own durable fact too — a slot-0 advance never
+    /// subsumes a slot-1 advance — so a flood far past any queue's depth on
+    /// two slots must still yield the newest value for *both*, not one global
+    /// latest.
     #[tokio::test]
-    async fn the_final_cursor_survives_a_driver_that_drains_late() {
-        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
+    async fn the_newest_cursor_of_every_slot_survives_a_driver_that_drains_late() {
+        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = loopback(Edge::Client).await;
         let mut rx = spawn_beacon_reader(reader_conn);
 
-        // Flood one slot without draining `rx` at all — every intermediate value
-        // is superseded, but the last one is the durable fact.
+        // Flood two slots without draining `rx` at all — every intermediate
+        // value is superseded, but the last of each is the durable fact.
         let mut send = writer_conn.open_uni().await.unwrap();
         const FLOOD: u64 = 400;
         for cursor in 0..FLOOD {
             send.write_all(&beacon::encode_frame(SlotId(0), cursor))
                 .await
                 .unwrap();
+            send.write_all(&beacon::encode_frame(SlotId(1), cursor * 2))
+                .await
+                .unwrap();
         }
-        // Let the reader consume the whole stream before the late drain.
-        sleep(Duration::from_millis(200)).await;
 
-        let delivered = timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("a pending cursor must be receivable")
-            .expect("the reader is still alive");
-        assert_eq!(
-            delivered,
-            (SlotId(0), FLOOD - 1),
-            "the newest cursor survives however far the driver fell behind",
-        );
+        // Drain until both slots report their newest cursor. The reader folds
+        // as it consumes, so an intermediate value may be handed out before
+        // the whole flood has been read; polling to the expected cursor is
+        // what proves the newest is never lost, with no wall-clock wait for
+        // the reader to catch up.
+        let mut newest: HashMap<SlotId, u64> = HashMap::new();
+        while newest.get(&SlotId(0)) != Some(&(FLOOD - 1))
+            || newest.get(&SlotId(1)) != Some(&((FLOOD - 1) * 2))
+        {
+            let (slot, cursor) = timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the flood's newest cursors must arrive")
+                .expect("the reader is still alive");
+            newest.insert(slot, cursor);
+        }
 
         // And the reader keeps serving later advances after the flood.
         send.write_all(&beacon::encode_frame(SlotId(0), 9999))
@@ -391,42 +354,11 @@ mod tests {
         assert_eq!(later, (SlotId(0), 9999));
     }
 
-    /// Each slot's cursor is independent — a slot-0 advance never subsumes a
-    /// slot-1 advance — so a late drain yields the newest value for *every*
-    /// slot, not one global latest.
-    #[tokio::test]
-    async fn coalescing_is_per_slot_not_global() {
-        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
-        let mut rx = spawn_beacon_reader(reader_conn);
-
-        let mut send = writer_conn.open_uni().await.unwrap();
-        for cursor in 0..100u64 {
-            send.write_all(&beacon::encode_frame(SlotId(0), cursor))
-                .await
-                .unwrap();
-            send.write_all(&beacon::encode_frame(SlotId(1), cursor * 2))
-                .await
-                .unwrap();
-        }
-        sleep(Duration::from_millis(200)).await;
-
-        let mut newest: HashMap<SlotId, u64> = HashMap::new();
-        for _ in 0..2 {
-            let (slot, cursor) = timeout(Duration::from_secs(5), rx.recv())
-                .await
-                .expect("both slots' cursors must be pending")
-                .expect("the reader is still alive");
-            newest.insert(slot, cursor);
-        }
-        assert_eq!(newest.get(&SlotId(0)), Some(&99));
-        assert_eq!(newest.get(&SlotId(1)), Some(&198));
-    }
-
     /// A closed beacon stream goes terminal — but never before the last folded
     /// cursor has been handed out.
     #[tokio::test]
     async fn recv_goes_terminal_only_after_the_last_cursor_is_taken() {
-        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = connected_connections().await;
+        let (writer_conn, reader_conn, _writer_ep, _reader_ep) = loopback(Edge::Client).await;
         let mut rx = spawn_beacon_reader(reader_conn);
 
         let mut send = writer_conn.open_uni().await.unwrap();

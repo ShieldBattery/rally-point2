@@ -127,19 +127,49 @@ fn reinject_re_carries_an_already_retired_payload() {
         .map(|p| (p.slot as u8, p.seq))
         .collect();
     assert_eq!(seqs, vec![(0, 0)]);
-}
 
-#[test]
-fn reinject_does_not_double_track_a_still_unacked_payload() {
-    // A payload still in flight (kept across a reset) must not be re-tracked by
-    // a re-inject — the window stays at one, not two.
-    let mut manager = AckManager::new();
-    manager
-        .build_outgoing(Some(test_payload(0, 0)), MTU)
-        .unwrap();
-    assert_eq!(manager.payloads_in_flight(), 1);
+    // A payload still in flight (one kept across a reset) must not be
+    // re-tracked by a second re-inject — the window stays at one, not two.
     manager.reinject_unacked(test_payload(0, 0));
     assert_eq!(manager.payloads_in_flight(), 1);
+}
+
+/// A re-dial that resumed the same session keeps the unacked payloads — the
+/// redundancy pass re-carries them over the new connection, and every hop
+/// dedups by origin `(slot, seq)`, so losing them would drop whatever was in
+/// flight when the link failed and desync lockstep. Their coverage history
+/// belongs to the connection that died, though, so it must not survive: every
+/// carry stamp names a packet seq in a space that no longer exists, and a
+/// survivor that kept one would sit out a spacing gap against the fresh
+/// packet-seq space. Each survivor comes back uncovered and rides the very
+/// first packet built on the new connection.
+#[test]
+fn reset_connection_keeps_unacked_payloads_but_clears_their_carry_history() {
+    let mut manager = AckManager::new();
+    // Budget 0 suppresses redundancy so each turn rides exactly one packet,
+    // then enough further packets that the spacing schedule would hold a
+    // well-covered payload back if its carry stamps survived the reset.
+    for seq in 0..3u64 {
+        build_sent(&mut manager, Some(test_payload(0, seq)), 0);
+    }
+    for _ in 0..16 {
+        build_sent(&mut manager, None, MTU);
+    }
+    assert_eq!(manager.payloads_in_flight(), 3);
+
+    manager.reset_connection();
+
+    // The window survived whole, and the new connection assigns packet seqs
+    // from zero.
+    assert_eq!(manager.payloads_in_flight(), 3);
+    assert_eq!(manager.next_packet_seq(), 0);
+
+    // Every survivor is immediately due: the first packet on the new
+    // connection re-carries all three, none held back by a stale carry stamp.
+    let first = manager.build_outgoing(None, MTU).unwrap();
+    let mut carried: Vec<u64> = first.payloads.iter().map(|p| p.seq).collect();
+    carried.sort_unstable();
+    assert_eq!(carried, vec![0, 1, 2]);
 }
 
 #[test]

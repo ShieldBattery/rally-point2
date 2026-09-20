@@ -284,7 +284,12 @@ impl SessionLifecycle {
 mod tests {
     use super::*;
 
-    #[tokio::test]
+    // Paused time: the start lead is a real timer, and on a loaded box its
+    // millisecond could elapse inside the yield below, inverting the
+    // not-yet-started assertion. With the clock paused it cannot advance while
+    // the test task is runnable, so the only thing that can release the first
+    // player is the second one arriving.
+    #[tokio::test(start_paused = true)]
     async fn staggered_readiness_releases_one_common_start_instant() {
         let lifecycle =
             SessionLifecycle::with_timing(2, Duration::from_millis(1), Duration::from_secs(1));
