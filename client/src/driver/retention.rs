@@ -108,22 +108,6 @@ fn retained_size(payload: &Payload) -> usize {
     payload.commands.len() + 32
 }
 
-/// Re-carries the retained turns onto a freshly re-homed link so the replacement
-/// relay's empty turn ring re-delivers them to peers (each deduping by origin
-/// `(slot, seq)`). Only ever called on a re-home — a same-relay resume keeps the
-/// old relay's ring, so there is nothing to re-carry.
-///
-/// A turn that still fits a datagram goes back into the unacked window, where the
-/// next packet's redundancy pass re-carries it. A turn too large for any datagram
-/// cannot go there: [`AckManager::build_outgoing`] skips a payload that can't fit a
-/// lone packet on every pass, so a re-injected oversize turn would sit in the
-/// window forever — never re-delivered (inflating `payloads_in_flight`) and, worse,
-/// leaving a peer that never received it from the dead relay stalled on its seq.
-/// Those are staged in [`LoopState::pending_control_redivert`] instead, which
-/// [`session`](Driver::session) drains onto the new connection's reliable control
-/// stream — the same divert path an oversize turn takes when first sent. A path
-/// that can't currently size a datagram is treated as oversize, so the turn is
-/// re-carried reliably rather than risk being lost.
 /// Drains the retained oversize turns a re-home staged for the fresh connection's
 /// control stream onto `control_send`, oldest-first — the same divert path an
 /// oversize turn takes when first sent.
@@ -235,6 +219,22 @@ pub(super) fn stage_control_redivert(pending: &mut Vec<Payload>, turn: Payload) 
     }
 }
 
+/// Re-carries the retained turns onto a freshly re-homed link so the replacement
+/// relay's empty turn ring re-delivers them to peers (each deduping by origin
+/// `(slot, seq)`). Only ever called on a re-home — a same-relay resume keeps the
+/// old relay's ring, so there is nothing to re-carry.
+///
+/// A turn that still fits a datagram goes back into the unacked window, where the
+/// next packet's redundancy pass re-carries it. A turn too large for any datagram
+/// cannot go there: [`AckManager::build_outgoing`] skips a payload that can't fit a
+/// lone packet on every pass, so a re-injected oversize turn would sit in the
+/// window forever — never re-delivered (inflating `payloads_in_flight`) and, worse,
+/// leaving a peer that never received it from the dead relay stalled on its seq.
+/// Those are staged in [`LoopState::pending_control_redivert`] instead, which
+/// [`session`](Driver::session) drains onto the new connection's reliable control
+/// stream — the same divert path an oversize turn takes when first sent. A path
+/// that can't currently size a datagram is treated as oversize, so the turn is
+/// re-carried reliably rather than risk being lost.
 pub(super) fn reinject_retention(link: &mut Link, state: &mut LoopState) {
     let LoopState {
         retention,
