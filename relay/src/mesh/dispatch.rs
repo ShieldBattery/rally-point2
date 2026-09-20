@@ -426,19 +426,27 @@ fn dispatch_mesh_control_frame(
             // (the client edge's `Admission`). A failed admission is terminal for this frame: the
             // hold may already have been decided, or a final leave may have
             // arrived first, and fanning out true would resurrect that slot.
-            if change.connected {
-                if mesh
-                    .session
+            let rejected = if change.connected {
+                mesh.session
                     .admit_reconnect(&key, slot, change.connection_epoch)
                     == crate::consensus::ReconnectAdmission::Rejected
-                {
-                    return;
-                }
-            } else if !mesh.session.decision_makers.mark_connection_down(
-                &key,
-                slot,
-                change.connection_epoch,
-            ) {
+            } else {
+                !mesh.session.decision_makers.mark_connection_down(
+                    &key,
+                    slot,
+                    change.connection_epoch,
+                )
+            };
+            if rejected {
+                mesh.session.decision_makers.flight_recorder().record(
+                    &key,
+                    crate::observability::events::FlightEvent::ConnectivityMeshRejected {
+                        source_relay: peer_id.0,
+                        slot: slot.0,
+                        connected: change.connected,
+                        connection_epoch: change.connection_epoch,
+                    },
+                );
                 return;
             }
             routing::fan_out_connectivity(
@@ -447,6 +455,7 @@ fn dispatch_mesh_control_frame(
                 slot,
                 change.connected,
                 change.connection_epoch,
+                mesh.session.decision_makers.flight_recorder(),
             );
         }
         Some(mesh_control_frame::Kind::RequestDrop(request)) => {

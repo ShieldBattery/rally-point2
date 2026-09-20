@@ -227,6 +227,70 @@ async fn lobby_spam_past_the_rate_cap_never_reaches_the_mesh_and_a_departure_sti
     Ok(())
 }
 
+/// A disconnect received over the mesh records the write to its local survivor
+/// with the recipient's link epoch and the remote subject's lifecycle epoch.
+#[tokio::test]
+async fn a_mesh_disconnect_records_the_connectivity_write_with_both_link_epochs()
+-> Result<(), AnyError> {
+    let tenant = make_default_tenant();
+    let session = SessionId(4);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
+    let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    wait_for_mesh_link(&relay_b.mesh, &key).await;
+
+    // Establish the survivor first. Its own connectivity notification proves
+    // activation completed, including publishing its epoch to conditions.
+    let peer_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(peer_b.connection()).await;
+    wait_for_connectivity(&mut peer_b_rx, SlotId(1), true).await;
+    let host = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let (_host_send, _host_rx) = open_lobby_streams(host.connection()).await;
+    wait_for_connectivity(&mut peer_b_rx, SlotId(0), true).await;
+
+    let epoch = |relay: &Relay, slot| {
+        rally_point_relay::mesh::snapshot_conditions(&relay.mesh.conditions, &key)
+            .unwrap()
+            .slots
+            .iter()
+            .find(|row| row.slot == slot)
+            .unwrap()
+            .connection_epoch
+            .unwrap()
+    };
+    let subject_epoch = epoch(&relay_a, 0);
+    let recipient_epoch = epoch(&relay_b, 1);
+    host.connection().close(0u32.into(), b"done");
+    wait_for_connectivity(&mut peer_b_rx, SlotId(0), false).await;
+    let expected =
+        rally_point_relay::observability::flight_recorder::FlightEvent::ConnectivityControlWrite {
+            recipient: 1,
+            connection_epoch: recipient_epoch,
+            slot: 0,
+            connected: false,
+            subject_connection_epoch: Some(subject_epoch),
+            succeeded: true,
+        };
+    wait_until("the mesh-origin disconnect write was not recorded", || {
+        relay_b
+            .mesh
+            .session
+            .decision_makers
+            .flight_recorder()
+            .events(&key)
+            .iter()
+            .any(|record| record.event == expected)
+    })
+    .await;
+
+    Ok(())
+}
+
 /// The two mid-game broadcasts that ride the same cross-relay control path: a
 /// game-chat message and a cosmetic-skin blob a member authors on relay A both
 /// reach a cross-relay peer on relay B, stamped with the author's authoritative

@@ -85,6 +85,7 @@ pub(in crate::routing) fn end_slot_link(
                 slot,
                 false,
                 Some(connection_epoch),
+                mesh.session.decision_makers.flight_recorder(),
             );
         }
     }

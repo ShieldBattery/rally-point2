@@ -151,6 +151,15 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
     };
     dispatch_mesh_control(stale_down, RelayId(9), &joined, &sessions, &mesh_state);
     assert_eq!(inbox.try_recv_connectivity(), None);
+    assert!(makers.flight_recorder().events(&key).iter().any(|record| {
+        record.event
+            == crate::observability::events::FlightEvent::ConnectivityMeshRejected {
+                source_relay: 9,
+                slot: 0,
+                connected: false,
+                connection_epoch: Some(11),
+            }
+    }));
 
     let stale_departure = MeshControlFrame {
         session: key.session.0,
@@ -184,4 +193,114 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
     };
     dispatch_mesh_control(current_down, RelayId(9), &joined, &sessions, &mesh_state);
     assert_eq!(inbox.try_recv_connectivity(), Some((SlotId(0), false)));
+}
+
+/// A real cross-relay drop announces its departure before connectivity. The
+/// duplicate Down(E) transition must still reach the local survivor's display.
+#[test]
+fn departure_then_same_epoch_connectivity_reaches_the_survivor() {
+    let sessions: routing::Sessions = Arc::default();
+    let mesh = test_mesh_state();
+    let makers = &mesh.session.decision_makers;
+    let key = control_key();
+    test_maker(makers, &key, crate::consensus::Authority::Peer);
+    assert!(makers.activate_connection_epoch(&key, SlotId(0), 22));
+    let (mut guard, mut inbox) =
+        routing::register(&sessions, &key, SlotId(5), 7).expect("survivor registers");
+    guard.disarm();
+    let (_, mut echo_rx) = register_link_channels(&mesh.links, &key);
+    let joined = joined_state(&mesh.links, &key);
+    let dispatch = |kind| {
+        dispatch_mesh_control(
+            MeshControlFrame {
+                session: key.session.0,
+                kind: Some(kind),
+            },
+            RelayId(9),
+            &joined,
+            &sessions,
+            &mesh,
+        );
+    };
+
+    dispatch(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+        slot: 0,
+        last_frame: Some(10),
+        reachable_frame: Some(9),
+        reason: crate::consensus::LEAVE_REASON_DROPPED,
+        connection_epoch: Some(22),
+        ..Default::default()
+    }));
+    assert!(makers.has_departure(&key, SlotId(0)));
+    assert!(mesh.session.drop_holds.is_pending(&key, SlotId(0)));
+    assert_eq!(inbox.try_recv_connectivity(), None);
+
+    dispatch(mesh_control_frame::Kind::SlotConnectivity(
+        SlotConnectivity {
+            slot: 0,
+            connected: false,
+            connection_epoch: Some(22),
+        },
+    ));
+    assert_eq!(inbox.try_recv_connectivity(), Some((SlotId(0), false)));
+    assert_eq!(inbox.try_recv_connectivity(), None);
+    assert!(
+        inbox.try_recv_leave().is_none(),
+        "notification does not decide the hold"
+    );
+    assert!(mesh.session.drop_holds.is_pending(&key, SlotId(0)));
+    assert!(echo_rx.try_recv().is_err(), "no mesh echo");
+    assert!(!makers.flight_recorder().events(&key).iter().any(|record| {
+        matches!(
+            record.event,
+            crate::observability::events::FlightEvent::ConnectivityMeshRejected { .. }
+        )
+    }));
+}
+
+#[test]
+fn a_stale_mesh_reconnect_records_rejection_without_releasing_the_hold() {
+    let sessions: routing::Sessions = Arc::default();
+    let mesh = test_mesh_state();
+    let makers = &mesh.session.decision_makers;
+    let key = control_key();
+    test_maker(makers, &key, crate::consensus::Authority::Peer);
+    // Epochs are equality-only tokens: make 11 a known retired incarnation
+    // before installing 22, rather than treating a smaller number as older.
+    assert!(makers.activate_connection_epoch(&key, SlotId(0), 11));
+    assert!(makers.mark_connection_down(&key, SlotId(0), Some(11)));
+    assert!(makers.activate_connection_epoch(&key, SlotId(0), 22));
+    assert!(makers.mark_connection_down(&key, SlotId(0), Some(22)));
+    mesh.session.drop_holds.hold(key.clone(), SlotId(0));
+    let (mut guard, mut inbox) =
+        routing::register(&sessions, &key, SlotId(5), 7).expect("survivor registers");
+    guard.disarm();
+    let joined = joined_state(&mesh.links, &key);
+    dispatch_mesh_control(
+        MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+                SlotConnectivity {
+                    slot: 0,
+                    connected: true,
+                    connection_epoch: Some(11),
+                },
+            )),
+        },
+        RelayId(9),
+        &joined,
+        &sessions,
+        &mesh,
+    );
+    assert!(mesh.session.drop_holds.is_pending(&key, SlotId(0)));
+    assert_eq!(inbox.try_recv_connectivity(), None);
+    assert!(makers.flight_recorder().events(&key).iter().any(|record| {
+        record.event
+            == crate::observability::events::FlightEvent::ConnectivityMeshRejected {
+                source_relay: 9,
+                slot: 0,
+                connected: true,
+                connection_epoch: Some(11),
+            }
+    }));
 }

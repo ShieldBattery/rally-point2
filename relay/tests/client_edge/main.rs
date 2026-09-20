@@ -12,6 +12,7 @@ mod common;
 mod helpers;
 
 mod auth;
+mod connectivity;
 mod drop_holds;
 mod leaves;
 mod provisional;

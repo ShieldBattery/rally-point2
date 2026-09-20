@@ -8,6 +8,7 @@
 use super::*;
 
 use super::forward::ForwardOutcome;
+use crate::observability::events::{FlightEvent, FlightEvents};
 
 /// Clones one push sender per registered slot out from under the roster lock,
 /// so nothing is ever sent with the lock held. `select` names which of a slot's
@@ -325,16 +326,44 @@ pub(crate) fn fan_out_connectivity(
     slot: SlotId,
     connected: bool,
     connection_epoch: Option<u64>,
+    events: &impl FlightEvents,
 ) {
-    let targets = collect_slot_senders(sessions, key, None, |entry| entry.conn_push.clone());
-    push_to_slots(
-        key,
-        "connectivity",
-        Some(slot),
-        targets
-            .into_iter()
-            .map(|(target, tx)| (target, tx, (slot, connected, connection_epoch))),
-    );
+    // Snapshot each recipient's epoch with its sender so a concurrent reconnect
+    // cannot attribute a full old queue to the replacement link.
+    let targets: Vec<_> = {
+        let roster = sessions.lock();
+        roster.get(key).map_or_else(Vec::new, |slots| {
+            slots
+                .iter()
+                .map(|(&recipient, entry)| {
+                    (recipient, entry.connection_epoch, entry.conn_push.clone())
+                })
+                .collect()
+        })
+    };
+    for (recipient, recipient_epoch, tx) in targets {
+        if let Err(mpsc::error::TrySendError::Full(_)) =
+            tx.try_send((slot, connected, connection_epoch))
+        {
+            tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = recipient.0,
+                subject = slot.0,
+                "connectivity queue full; the push was dropped for this slot",
+            );
+            events.record(
+                key,
+                FlightEvent::ConnectivityQueueFull {
+                    recipient: recipient.0,
+                    connection_epoch: recipient_epoch,
+                    slot: slot.0,
+                    connected,
+                    subject_connection_epoch: connection_epoch,
+                },
+            );
+        }
+    }
 }
 
 /// Pushes a load-state fence probe carrying `probe_id` down the control stream of
@@ -385,7 +414,8 @@ pub(crate) fn broadcast_connectivity(
     slot: SlotId,
     connected: bool,
     connection_epoch: Option<u64>,
+    events: &impl FlightEvents,
 ) {
-    fan_out_connectivity(sessions, key, slot, connected, connection_epoch);
+    fan_out_connectivity(sessions, key, slot, connected, connection_epoch, events);
     crate::mesh::fan_out_slot_connectivity(mesh_links, key, slot, connected, connection_epoch);
 }

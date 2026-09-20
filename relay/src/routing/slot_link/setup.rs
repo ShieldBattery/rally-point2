@@ -81,6 +81,7 @@ pub(super) fn activate_slot(
             slot,
             true,
             Some(connection_epoch),
+            mesh.session.decision_makers.flight_recorder(),
         );
     });
     activated.is_some()

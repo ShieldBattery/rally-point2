@@ -343,14 +343,18 @@ pub(super) async fn on_skin_out(bytes: Option<Vec<u8>>, wire: &mut Wire) {
 pub(super) async fn on_request_drop(target: Option<SlotId>, wire: &mut Wire) {
     match target {
         Some(target) => {
-            if let Err(error) =
-                send_control_request_drop(&mut wire.control_send, u32::from(target.0)).await
-            {
-                tracing::debug!(
-                    %error,
+            match send_control_request_drop(&mut wire.control_send, u32::from(target.0)).await {
+                Ok(()) => tracing::info!(
                     target = target.0,
-                    "drop-request send failed; dropping the request"
-                );
+                    "drop-request control-stream write completed"
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        target = target.0,
+                        "drop-request send failed; dropping the request"
+                    );
+                }
             }
         }
         None => wire.request_drop_alive = false,

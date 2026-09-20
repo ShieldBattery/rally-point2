@@ -231,7 +231,14 @@ async fn connectivity_fans_to_every_local_slot() {
     let mut inbox0 = registered(&sessions, &k, SlotId(0));
     let mut inbox1 = registered(&sessions, &k, SlotId(3));
 
-    fan_out_connectivity(&sessions, &k, SlotId(3), false, None);
+    fan_out_connectivity(
+        &sessions,
+        &k,
+        SlotId(3),
+        false,
+        None,
+        &crate::observability::flight_recorder::FlightRecorder::default(),
+    );
 
     assert_eq!(
         inbox0.try_recv_connectivity_change(),
@@ -243,4 +250,55 @@ async fn connectivity_fans_to_every_local_slot() {
         Some((SlotId(3), false, None)),
         "and so does the subject slot itself",
     );
+}
+
+#[test]
+fn a_full_connectivity_queue_records_the_recipient_without_blocking_other_slots() {
+    use crate::observability::flight_recorder::{FlightEvent, FlightRecorder};
+
+    let k = key();
+    let sessions: Sessions = Arc::default();
+    let (mut guard, mut stalled) = register(&sessions, &k, SlotId(0), 42).unwrap();
+    guard.disarm();
+    let mut draining = registered(&sessions, &k, SlotId(1));
+    let recorder = FlightRecorder::default();
+    for _ in 0..LEAVE_PUSH_CAPACITY {
+        fan_out_connectivity(&sessions, &k, SlotId(3), true, Some(11), &recorder);
+        assert_eq!(
+            draining.try_recv_connectivity_change(),
+            Some((SlotId(3), true, Some(11)))
+        );
+    }
+    assert!(recorder.events(&k).is_empty());
+    fan_out_connectivity(&sessions, &k, SlotId(3), false, Some(11), &recorder);
+    assert_eq!(
+        draining.try_recv_connectivity_change(),
+        Some((SlotId(3), false, Some(11)))
+    );
+    let events: Vec<_> = recorder.events(&k).into_iter().map(|r| r.event).collect();
+    assert_eq!(
+        events,
+        vec![FlightEvent::ConnectivityQueueFull {
+            recipient: 0,
+            connection_epoch: 42,
+            slot: 3,
+            connected: false,
+            subject_connection_epoch: Some(11),
+        }]
+    );
+    for _ in 0..LEAVE_PUSH_CAPACITY {
+        assert_eq!(
+            stalled.try_recv_connectivity_change(),
+            Some((SlotId(3), true, Some(11)))
+        );
+    }
+    assert!(stalled.try_recv_connectivity_change().is_none());
+    // The queue recovers as soon as its consumer drains; recording changes no
+    // delivery policy and does not close the recipient.
+    fan_out_connectivity(&sessions, &k, SlotId(3), false, Some(11), &recorder);
+    assert_eq!(
+        stalled.try_recv_connectivity_change(),
+        Some((SlotId(3), false, Some(11)))
+    );
+    assert_eq!(recorder.events(&k).len(), 1);
 }

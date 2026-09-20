@@ -300,14 +300,40 @@ pub(super) async fn on_control_frame(
                 .connectivity
                 .admit(subject, change.connected, change.connection_epoch)
             {
+                tracing::warn!(
+                    slot = subject.0,
+                    connected = change.connected,
+                    connection_epoch = ?change.connection_epoch,
+                    "rejecting slot-connectivity change at the connectivity fence",
+                );
                 return ArmFlow::Serve;
             }
             match push_to_game(&seam.connectivity, (subject, change.connected)) {
-                GamePush::Sent => {}
-                GamePush::Full => {
-                    tracing::debug!("dropping connectivity change; the game is not draining them");
+                GamePush::Sent => {
+                    tracing::info!(
+                        slot = subject.0,
+                        connected = change.connected,
+                        connection_epoch = ?change.connection_epoch,
+                        "slot-connectivity change pushed to game",
+                    );
                 }
-                GamePush::Closed => return ArmFlow::Teardown,
+                GamePush::Full => {
+                    tracing::warn!(
+                        slot = subject.0,
+                        connected = change.connected,
+                        connection_epoch = ?change.connection_epoch,
+                        "dropping slot-connectivity change; the game channel is full",
+                    );
+                }
+                GamePush::Closed => {
+                    tracing::warn!(
+                        slot = subject.0,
+                        connected = change.connected,
+                        connection_epoch = ?change.connection_epoch,
+                        "slot-connectivity change could not reach the game; channel is closed",
+                    );
+                    return ArmFlow::Teardown;
+                }
             }
         }
         // The session's relay → region labels, released by the

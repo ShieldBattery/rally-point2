@@ -260,6 +260,49 @@ fn the_blob_envelope_roundtrips_and_is_self_describing() {
             succeeded: true,
         },
     );
+    use crate::observability::events::{DropRequestRefusalReason, DropRequestRejectionReason};
+    for event in [
+        FlightEvent::ConnectivityControlWrite {
+            recipient: 2,
+            connection_epoch: 17,
+            slot: 1,
+            connected: false,
+            subject_connection_epoch: Some(23),
+            succeeded: false,
+        },
+        FlightEvent::ConnectivityMeshRejected {
+            source_relay: 9,
+            slot: 1,
+            connected: true,
+            connection_epoch: None,
+        },
+        FlightEvent::ConnectivityQueueFull {
+            recipient: 2,
+            connection_epoch: 17,
+            slot: 1,
+            connected: false,
+            subject_connection_epoch: Some(23),
+        },
+        FlightEvent::DropRequestRejected {
+            requester: 2,
+            target: u32::MAX,
+            reason: DropRequestRejectionReason::OutOfRange,
+        },
+        FlightEvent::DropRequestRefused {
+            requester: 2,
+            target: 1,
+            held_ms: None,
+            reason: DropRequestRefusalReason::NoHold,
+        },
+        FlightEvent::DropRequestRefused {
+            requester: 2,
+            target: 1,
+            held_ms: Some(123),
+            reason: DropRequestRefusalReason::BelowFloor,
+        },
+    ] {
+        recorder.record(&k, event);
+    }
     // A directive carrying its derivation and one without: the per-slot detail
     // must reach the wire, and the absent derivation must serialize no key at
     // all rather than a hole.
@@ -317,6 +360,26 @@ fn the_blob_envelope_roundtrips_and_is_self_describing() {
     assert!(json.contains("\"event\": \"leave_decided\""));
     assert!(json.contains("leave_mesh_accepted"));
     assert!(json.contains("leave_control_write"));
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let rows = value["events"].as_array().unwrap();
+    let find = |name| rows.iter().find(|row| row["event"] == name).unwrap();
+    assert_eq!(
+        find("connectivity_control_write")["subject_connection_epoch"],
+        23
+    );
+    assert_eq!(find("connectivity_control_write")["succeeded"], false);
+    assert_eq!(
+        find("connectivity_mesh_rejected")["connection_epoch"],
+        serde_json::Value::Null
+    );
+    assert_eq!(find("connectivity_queue_full")["recipient"], 2);
+    assert_eq!(find("drop_request_rejected")["target"], u32::MAX);
+    assert_eq!(find("drop_request_rejected")["reason"], "out_of_range");
+    assert_eq!(
+        find("drop_request_refused")["held_ms"],
+        serde_json::Value::Null
+    );
+    assert_eq!(find("drop_request_refused")["reason"], "no_hold");
     assert!(
         json.contains("\"eff_rtts\""),
         "a decision's per-slot detail reaches the wire",

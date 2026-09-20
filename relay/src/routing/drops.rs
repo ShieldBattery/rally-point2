@@ -7,17 +7,24 @@ use super::*;
 use super::departure::decide_and_broadcast_leave;
 use crate::consensus;
 use crate::consensus::LEAVE_REASON_DROPPED;
+use crate::observability::events::{
+    DropRequestRefusalReason, DropRequestRejectionReason, FlightEvent,
+};
+
+fn elapsed_ms(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
 
 /// Validates and acts on a client's manual `RequestDrop` at the relay's client
 /// edge. `requester` is the authenticated connection's slot (never a wire value);
 /// `wire_target` is the slot the requester asked to drop.
 ///
-/// Rejects silently — an info log, never a link close, because a mis-click must
-/// not disconnect the survivor who made it — when the request names the requester
-/// itself, names a slot this relay has no reason to believe is disconnected
-/// (neither a pending hold nor a departure record), or exceeds the requester's
-/// rate cap. A valid, admitted request is honored locally (this relay may be the
-/// authority — see [`honor_drop_request`]) and broadcast to every peer so a
+/// Rejects without a client response or link close, because a mis-click must not
+/// disconnect the survivor who made it. Each rejection records an info log and
+/// a flight event. Requests are rejected when the target is out of range, names
+/// the requester, or is neither held nor departed, or when the requester exceeds
+/// its rate cap. A valid request is honored locally (this relay may be the
+/// authority; see [`honor_drop_request`]) and broadcast to every peer so a
 /// peer-homed authority honors it too.
 pub(super) fn handle_drop_request(
     sessions: &Sessions,
@@ -30,6 +37,14 @@ pub(super) fn handle_drop_request(
     let decision_makers = &mesh.session.decision_makers;
     let mesh_links = &mesh.links;
     let Ok(target) = u8::try_from(wire_target).map(SlotId) else {
+        decision_makers.flight_recorder().record(
+            key,
+            FlightEvent::DropRequestRejected {
+                requester: requester.0,
+                target: wire_target,
+                reason: DropRequestRejectionReason::OutOfRange,
+            },
+        );
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
@@ -40,6 +55,14 @@ pub(super) fn handle_drop_request(
         return;
     };
     if target == requester {
+        decision_makers.flight_recorder().record(
+            key,
+            FlightEvent::DropRequestRejected {
+                requester: requester.0,
+                target: wire_target,
+                reason: DropRequestRejectionReason::SelfTarget,
+            },
+        );
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
@@ -53,6 +76,14 @@ pub(super) fn handle_drop_request(
     // relay sees as neither held nor departed is nonsense (a stale or hostile
     // client), so drop it before spending a mesh broadcast on it.
     if !drop_holds.is_pending(key, target) && !decision_makers.has_departure(key, target) {
+        decision_makers.flight_recorder().record(
+            key,
+            FlightEvent::DropRequestRejected {
+                requester: requester.0,
+                target: wire_target,
+                reason: DropRequestRejectionReason::NotDisconnected,
+            },
+        );
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
@@ -66,6 +97,14 @@ pub(super) fn handle_drop_request(
     // the mesh with request broadcasts. Over-limit requests are dropped silently —
     // never a link close.
     if !drop_holds.admit_request(key, requester) {
+        decision_makers.flight_recorder().record(
+            key,
+            FlightEvent::DropRequestRejected {
+                requester: requester.0,
+                target: wire_target,
+                reason: DropRequestRejectionReason::RateCapped,
+            },
+        );
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
@@ -77,10 +116,17 @@ pub(super) fn handle_drop_request(
     }
     decision_makers.flight_recorder().record(
         key,
-        crate::observability::flight_recorder::FlightEvent::DropRequested {
+        FlightEvent::DropRequested {
             requester: requester.0,
             target: target.0,
         },
+    );
+    tracing::info!(
+        tenant = key.tenant.as_ref(),
+        session = key.session.0,
+        requester = requester.0,
+        target = target.0,
+        "admitting manual drop request",
     );
     // Honor it here (this relay may be the authority) and broadcast to every peer
     // so a peer-homed authority honors it too. The broadcast carries the
@@ -100,8 +146,8 @@ pub(super) fn handle_drop_request(
 /// claimed and, if the claim succeeds, the synced leave decided with the DROPPED
 /// reason; the decide path also dedups, so a duplicate request after the decide
 /// is a harmless no-op. A hold short of the floor, or no hold at all (the slot
-/// reconnected or left cleanly), is ignored — logged with the elapsed-vs-floor so
-/// a refused click is diagnosable.
+/// reconnected or left cleanly), is ignored without a client response; an info log
+/// and flight event retain the refusal reason and any observed hold duration.
 ///
 /// `held_for`'s read and `release`'s claim below are two separate lock
 /// acquisitions, not one atomic check-and-take — a concurrent reconnect's
@@ -160,7 +206,7 @@ pub(crate) fn honor_drop_request(
                     } else if outcome == consensus::FinalizeOutcome::RejectedNoCursor {
                         decision_makers.flight_recorder().record(
                             key,
-                            crate::observability::flight_recorder::FlightEvent::DropFinalizeRejected {
+                            FlightEvent::DropFinalizeRejected {
                                 slot: target.0,
                                 no_cursor: true,
                             },
@@ -211,6 +257,15 @@ pub(crate) fn honor_drop_request(
                 // first. The slot may already be live again, so standing down
                 // -- not deciding anyway -- is what keeps this from
                 // resurrecting a departure record for a connected player.
+                decision_makers.flight_recorder().record(
+                    key,
+                    FlightEvent::DropRequestRefused {
+                        requester,
+                        target: target.0,
+                        held_ms: Some(elapsed_ms(elapsed)),
+                        reason: DropRequestRefusalReason::LostClaim,
+                    },
+                );
                 tracing::info!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
@@ -220,22 +275,44 @@ pub(crate) fn honor_drop_request(
                 );
             }
         }
-        Some(elapsed) => tracing::info!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            target = target.0,
-            requester,
-            held_ms = elapsed.as_millis(),
-            floor_ms = drop_holds.unlock().as_millis(),
-            "ignoring drop request; the target's drop has not stood past the unlock floor",
-        ),
-        None => tracing::info!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            target = target.0,
-            requester,
-            "ignoring drop request; the target has no pending drop hold",
-        ),
+        Some(elapsed) => {
+            decision_makers.flight_recorder().record(
+                key,
+                FlightEvent::DropRequestRefused {
+                    requester,
+                    target: target.0,
+                    held_ms: Some(elapsed_ms(elapsed)),
+                    reason: DropRequestRefusalReason::BelowFloor,
+                },
+            );
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                target = target.0,
+                requester,
+                held_ms = elapsed.as_millis(),
+                floor_ms = drop_holds.unlock().as_millis(),
+                "ignoring drop request; the target's drop has not stood past the unlock floor",
+            );
+        }
+        None => {
+            decision_makers.flight_recorder().record(
+                key,
+                FlightEvent::DropRequestRefused {
+                    requester,
+                    target: target.0,
+                    held_ms: None,
+                    reason: DropRequestRefusalReason::NoHold,
+                },
+            );
+            tracing::info!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                target = target.0,
+                requester,
+                "ignoring drop request; the target has no pending drop hold",
+            );
+        }
     }
 }
 
@@ -280,7 +357,7 @@ pub(crate) fn complete_finalized_drop(
         );
         decision_makers.flight_recorder().record(
             key,
-            crate::observability::flight_recorder::FlightEvent::DropFinalizeStaleCount {
+            FlightEvent::DropFinalizeStaleCount {
                 slot: target.0,
                 sealed_count: final_turn_count,
                 forwarded,
@@ -306,7 +383,7 @@ pub(crate) fn complete_finalized_drop(
         );
         decision_makers.flight_recorder().record(
             key,
-            crate::observability::flight_recorder::FlightEvent::DropFinalizeRejected {
+            FlightEvent::DropFinalizeRejected {
                 slot: target.0,
                 no_cursor: false,
             },

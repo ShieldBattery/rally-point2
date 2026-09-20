@@ -108,6 +108,34 @@ pub enum FlightEvent {
         replayed: bool,
         succeeded: bool,
     },
+    /// One connectivity-frame write to a local client. Success means the QUIC
+    /// stream accepted the frame, not that the client or game consumed it.
+    ConnectivityControlWrite {
+        recipient: u8,
+        /// The recipient's link epoch, matching `LeaveControlWrite`.
+        connection_epoch: u64,
+        slot: u8,
+        connected: bool,
+        /// The subject's lifecycle epoch carried in the connectivity frame.
+        subject_connection_epoch: Option<u64>,
+        succeeded: bool,
+    },
+    /// A mesh connectivity change failed the subject's lifecycle admission.
+    ConnectivityMeshRejected {
+        source_relay: u64,
+        slot: u8,
+        connected: bool,
+        connection_epoch: Option<u64>,
+    },
+    /// A connectivity change could not enter a local recipient's full queue.
+    /// No control-stream write was attempted for this change.
+    ConnectivityQueueFull {
+        recipient: u8,
+        connection_epoch: u64,
+        slot: u8,
+        connected: bool,
+        subject_connection_epoch: Option<u64>,
+    },
     /// This relay (as session authority) queued a latency-buffer change.
     BufferDirective {
         buffer_turns: u32,
@@ -145,6 +173,21 @@ pub enum FlightEvent {
     /// A surviving member's manual drop request was admitted (validated and
     /// rate-cap-passed) against a held slot.
     DropRequested { requester: u8, target: u8 },
+    /// A client request was rejected before local honoring or mesh broadcast.
+    DropRequestRejected {
+        requester: u8,
+        /// Preserve the wire value even when it cannot fit in a slot id.
+        target: u32,
+        reason: DropRequestRejectionReason,
+    },
+    /// The authority could not honor a request. No hold has no elapsed time;
+    /// a lost claim carries the elapsed time observed before the claim attempt.
+    DropRequestRefused {
+        requester: u32,
+        target: u8,
+        held_ms: Option<u64>,
+        reason: DropRequestRefusalReason,
+    },
     /// The session-start directive fired on this relay (it was the authority
     /// observing full expected-slot coverage). `initial_buffer_turns` is the
     /// latency-buffer depth the authority sized and stamped onto the directive,
@@ -213,6 +256,25 @@ pub enum FlightEvent {
         buffer_turns: u32,
         decision_seq: u32,
     },
+}
+
+/// Why a manual drop request was rejected at the authenticated client edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropRequestRejectionReason {
+    SelfTarget,
+    NotDisconnected,
+    RateCapped,
+    OutOfRange,
+}
+
+/// Why the authority left a manual drop request unhonored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropRequestRefusalReason {
+    BelowFloor,
+    NoHold,
+    LostClaim,
 }
 
 /// The control law's derivation of one latency-buffer decision: every term

@@ -109,7 +109,7 @@ pub(super) async fn push_connectivity(
     ctx: &mut SlotLinkCtx,
     (subject, connected, subject_epoch): ConnectivityChange,
 ) -> ControlFlow<()> {
-    write_or_break(
+    let flow = write_or_break(
         ctx,
         "connectivity",
         OnWriteFailure::CloseLink,
@@ -123,7 +123,19 @@ pub(super) async fn push_connectivity(
             .await
         },
     )
-    .await
+    .await;
+    ctx.decision_makers.flight_recorder().record(
+        &ctx.key,
+        crate::observability::events::FlightEvent::ConnectivityControlWrite {
+            recipient: ctx.slot.0,
+            connection_epoch: ctx.connection_epoch,
+            slot: subject.0,
+            connected,
+            subject_connection_epoch: subject_epoch,
+            succeeded: flow.is_continue(),
+        },
+    );
+    flow
 }
 
 /// Writes the session's region-label map down this client's control stream.

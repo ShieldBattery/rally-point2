@@ -2,6 +2,8 @@
 //! that resolve them.
 
 use super::*;
+use crate::observability::events::{DropRequestRefusalReason, DropRequestRejectionReason};
+use crate::observability::flight_recorder::FlightEvent;
 
 /// A dropped departure is never decided on its own: it marks an undecided hold
 /// and no leave ever reaches survivors without an explicit request, no matter
@@ -243,5 +245,160 @@ async fn a_request_for_a_decided_self_or_connected_slot_is_a_no_op() {
     assert!(
         h.inbox.try_recv_leave().is_none(),
         "a request for an already-decided slot decides nothing further",
+    );
+}
+
+/// Every client-edge rejection reaches the bounded flight recorder, while an
+/// admitted request still follows the existing authority check and rate cap.
+#[tokio::test]
+async fn edge_drop_request_rejections_are_recorded_without_deciding_or_fanning_out() {
+    use std::sync::Arc;
+
+    use rally_point_proto::messages::mesh_control_frame;
+    use tokio::sync::{Notify, mpsc};
+
+    let k = key();
+    let mut h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
+    let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK)
+        .with_request_rate(1, UNREACHABLE_UNLOCK);
+    let (forward_tx, _forward_rx) = mpsc::channel(1);
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    let _mesh_registration = crate::mesh::register_mesh_link(
+        &h.mesh_links,
+        k.clone(),
+        forward_tx,
+        control_tx,
+        Arc::new(Notify::new()),
+    );
+
+    handle_drop_request(
+        &h.sessions,
+        &h.mesh(&holds),
+        &k,
+        SlotId(0),
+        u32::from(u8::MAX) + 1,
+    );
+    handle_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(0), 0);
+    handle_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(0), 1);
+    assert!(
+        control_rx.try_recv().is_err(),
+        "edge rejections do not enter the mesh control fan-out",
+    );
+
+    hold_or_decide_leave(
+        &holds,
+        &h.makers,
+        &h.sessions,
+        &h.mesh_links,
+        &k,
+        SlotId(1),
+        LEAVE_REASON_DROPPED,
+    );
+    handle_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(0), 1);
+    let admitted = control_rx
+        .try_recv()
+        .expect("the admitted request is broadcast exactly once");
+    assert!(matches!(
+        admitted.kind,
+        Some(mesh_control_frame::Kind::RequestDrop(request))
+            if request.slot == 1 && request.requester == 0
+    ));
+    handle_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(0), 1);
+    assert!(
+        control_rx.try_recv().is_err(),
+        "the rate-capped duplicate does not fan out",
+    );
+
+    let events: Vec<_> = h
+        .makers
+        .flight_recorder()
+        .events(&k)
+        .into_iter()
+        .map(|record| record.event)
+        .collect();
+    assert!(events.contains(&FlightEvent::DropRequestRejected {
+        requester: 0,
+        target: 256,
+        reason: DropRequestRejectionReason::OutOfRange,
+    }));
+    assert!(events.contains(&FlightEvent::DropRequestRejected {
+        requester: 0,
+        target: 0,
+        reason: DropRequestRejectionReason::SelfTarget,
+    }));
+    assert!(events.contains(&FlightEvent::DropRequestRejected {
+        requester: 0,
+        target: 1,
+        reason: DropRequestRejectionReason::NotDisconnected,
+    }));
+    assert!(events.contains(&FlightEvent::DropRequestRejected {
+        requester: 0,
+        target: 1,
+        reason: DropRequestRejectionReason::RateCapped,
+    }));
+    assert!(events.contains(&FlightEvent::DropRequested {
+        requester: 0,
+        target: 1,
+    }));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        FlightEvent::DropRequestRefused {
+            requester: 0,
+            target: 1,
+            held_ms: Some(_),
+            reason: DropRequestRefusalReason::BelowFloor,
+        }
+    )));
+    assert!(
+        h.inbox.try_recv_leave().is_none(),
+        "each rejected request, and the below-floor admission, leaves the survivor untouched",
+    );
+    assert!(
+        holds.is_pending(&k, SlotId(1)),
+        "the below-floor hold remains pending"
+    );
+}
+
+/// Refusals record only where this relay is allowed to decide; a peer relay's
+/// broadcast receiver remains the intentionally silent no-op.
+#[tokio::test]
+async fn authority_drop_refusals_are_recorded_but_peer_no_ops_are_not() {
+    use std::collections::HashSet;
+
+    use crate::consensus::Authority;
+
+    let k = key();
+    let mut h = drop_hold_harness(&k, SlotId(0), SlotId(1), None);
+    let holds = DropHolds::new(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+
+    honor_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(1), 99);
+    assert!(
+        h.makers
+            .flight_recorder()
+            .events(&k)
+            .iter()
+            .any(|record| matches!(
+                record.event,
+                FlightEvent::DropRequestRefused {
+                    requester: 99,
+                    target: 1,
+                    held_ms: None,
+                    reason: DropRequestRefusalReason::NoHold,
+                }
+            ))
+    );
+
+    let event_count = h.makers.flight_recorder().events(&k).len();
+    let _ = h.makers.set_authority(&k, Authority::Peer, &HashSet::new());
+    honor_drop_request(&h.sessions, &h.mesh(&holds), &k, SlotId(1), 99);
+
+    assert_eq!(
+        h.makers.flight_recorder().events(&k).len(),
+        event_count,
+        "non-authority request reception remains an ordinary unrecorded no-op",
+    );
+    assert!(
+        h.inbox.try_recv_leave().is_none(),
+        "neither refusal decides a leave"
     );
 }
