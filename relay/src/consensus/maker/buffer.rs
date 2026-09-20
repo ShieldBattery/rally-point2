@@ -419,12 +419,10 @@ impl DecisionMaker {
                 let mut rtts: Vec<_> = self
                     .slots
                     .iter()
-                    .map(
-                        |(slot, state)| crate::observability::flight_recorder::SlotEffRtt {
-                            slot: slot.0,
-                            eff_rtt_us: state.eff_rtt(),
-                        },
-                    )
+                    .map(|(slot, state)| SlotEffRtt {
+                        slot: slot.0,
+                        eff_rtt_us: state.eff_rtt(),
+                    })
                     .collect();
                 rtts.sort_unstable_by_key(|row| row.slot);
                 rtts

@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 
-use super::events::{EventRecord, SampleRecord, SlotSample, SyncCoverage};
 use super::{MAX_EVENTS_PER_SESSION, MAX_SAMPLES_PER_SESSION};
+use crate::observability::events::{EventRecord, SampleRecord, SlotSample, SyncCoverage};
 
 /// One slot's turn-stream counters: plain atomics the hot path bumps through a
 /// pre-fetched `Arc` handle — no lock, no allocation per turn. Cumulative for

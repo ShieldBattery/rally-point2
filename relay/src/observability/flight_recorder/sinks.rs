@@ -12,7 +12,7 @@ use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::SessionId;
 use tokio::sync::{mpsc, oneshot};
 
-use super::events::{FlightBlob, FlightEvent};
+use crate::observability::events::{FlightBlob, FlightEvent};
 
 /// Where flushed blobs go. Implementations persist one blob per call; the blob
 /// header carries the tenant/session/relay identity the store keys on (so the

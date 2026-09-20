@@ -303,7 +303,7 @@ fn promotion_re_affirms_the_committed_buffer() {
 /// mass-drops the session's players.
 #[test]
 fn an_over_ceiling_peer_directive_is_forwarded_verbatim_and_recorded_once() {
-    use crate::observability::flight_recorder::FlightEvent;
+    use crate::observability::events::FlightEvent;
 
     let registry = new_decision_makers();
     let k = key();

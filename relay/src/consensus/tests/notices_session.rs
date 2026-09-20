@@ -43,9 +43,9 @@ fn session_closed_does_not_begin_a_flight_recording() {
 fn session_closed_without_a_maker_plants_no_seal() {
     let registry = new_decision_makers();
     let k = key();
-    registry.flight_recorder().record(
+    registry.record_event(
         &k,
-        crate::observability::flight_recorder::FlightEvent::SlotConnected {
+        FlightEvent::SlotConnected {
             slot: 0,
             resumed: false,
         },
@@ -60,9 +60,9 @@ fn session_closed_without_a_maker_plants_no_seal() {
     );
 
     // A fresh admission for the same id records again — nothing sealed it.
-    registry.flight_recorder().record(
+    registry.record_event(
         &k,
-        crate::observability::flight_recorder::FlightEvent::SlotConnected {
+        FlightEvent::SlotConnected {
             slot: 1,
             resumed: false,
         },
@@ -81,18 +81,18 @@ fn session_closed_with_a_maker_still_seals() {
     let registry = new_decision_makers();
     let k = key();
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
-    registry.flight_recorder().record(
+    registry.record_event(
         &k,
-        crate::observability::flight_recorder::FlightEvent::SlotConnected {
+        FlightEvent::SlotConnected {
             slot: 0,
             resumed: false,
         },
     );
 
     session_closed(&registry, &k);
-    registry.flight_recorder().record(
+    registry.record_event(
         &k,
-        crate::observability::flight_recorder::FlightEvent::SlotConnected {
+        FlightEvent::SlotConnected {
             slot: 1,
             resumed: false,
         },

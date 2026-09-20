@@ -112,7 +112,7 @@ fn a_law_decision_records_the_terms_it_derived_the_target_from() {
     );
     assert_eq!(
         recorded.eff_rtts,
-        vec![crate::observability::flight_recorder::SlotEffRtt {
+        vec![SlotEffRtt {
             slot: 0,
             eff_rtt_us: 150_000,
         }],

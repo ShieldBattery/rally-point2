@@ -61,14 +61,18 @@
 //! identity the blob header carries; the tenant-first prefix is the structural hook
 //! for tenant-scoped read authorization.
 
-mod events;
 mod flush;
 mod recording;
 mod sinks;
 
-pub use events::{
-    BufferDecisionInputs, EventRecord, FlightBlob, FlightEvent, SampleRecord, SlotEffRtt,
-    SlotSample, SyncCoverage,
+// The record shapes themselves live one level up, in `observability::events`,
+// which depends on nothing else in the relay. A module that only needs the
+// vocabulary — to name an event it emits — can depend on that leaf without
+// reaching the recorder's own mesh/session wiring; these re-exports keep the
+// `flight_recorder::FlightEvent` paths every wiring site already uses.
+pub use crate::observability::events::{
+    BufferDecisionInputs, EventRecord, FlightBlob, FlightEvent, FlightEvents, SampleRecord,
+    SlotEffRtt, SlotSample, SyncCoverage,
 };
 pub use recording::{FlushOutcome, RelayWorkSnapshot, SlotCounters};
 pub use sinks::{
@@ -538,3 +542,13 @@ pub async fn run_sampler(
 
 #[cfg(test)]
 mod tests;
+
+impl FlightEvents for FlightRecorder {
+    fn record(&self, key: &SessionKey, event: FlightEvent) {
+        FlightRecorder::record(self, key, event);
+    }
+
+    fn record_existing(&self, key: &SessionKey, event: FlightEvent) {
+        FlightRecorder::record_existing(self, key, event);
+    }
+}

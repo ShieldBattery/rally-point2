@@ -81,12 +81,12 @@ impl DecisionMaker {
     /// Coverage counts describe this relay's current observation, not whether
     /// any player's simulation is honest. Missing expected players count even
     /// before their first turn arrives. Observers and departed players do not.
-    pub fn sync_coverage(&self) -> crate::observability::flight_recorder::SyncCoverage {
+    pub fn sync_coverage(&self) -> SyncCoverage {
         let mut players = self.expected_slots.clone();
         players.extend(self.sync_turns.slots());
         players
             .retain(|slot| !self.observers.contains(slot) && !self.departures.contains_key(slot));
-        let mut coverage = crate::observability::flight_recorder::SyncCoverage {
+        let mut coverage = SyncCoverage {
             expected_players: players.len() as u32,
             authority: self.authority == Authority::SelfRelay,
             dormant: self.sync.dormant,

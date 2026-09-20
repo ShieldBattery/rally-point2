@@ -198,10 +198,7 @@ pub fn session_closed(registry: &DecisionMakers, key: &SessionKey) {
     // for a session this relay recorded nothing of — or one whose recording an
     // earlier close already flushed — must store nothing, rather than begin a
     // recording whose whole content is that the session ended.
-    registry.flight.record_existing(
-        key,
-        crate::observability::flight_recorder::FlightEvent::SessionClosed,
-    );
+    registry.record_existing_event(key, FlightEvent::SessionClosed);
     // Whether the flush plants a close seal follows the session's lifecycle.
     // A maker means a descriptor named the session, so the descriptor
     // retirement that clears seals will come; a maker-less session (a
@@ -269,9 +266,9 @@ pub(in crate::consensus) fn record_leave_event(
     key: &SessionKey,
     directive: &LeaveDirective,
 ) {
-    registry.flight.record(
+    registry.record_event(
         key,
-        crate::observability::flight_recorder::FlightEvent::LeaveDecided {
+        FlightEvent::LeaveDecided {
             slot: directive.slot as u8,
             kind: if directive.reason == LEAVE_REASON_DROPPED {
                 DepartureKind::Dropped

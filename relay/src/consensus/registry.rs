@@ -114,9 +114,11 @@ pub struct DecisionMakers {
     /// a session simply carries no `external_id`/`external_ref`, and the
     /// coordinator falls back to its own store.
     pub(in crate::consensus) refs: parking_lot::Mutex<HashMap<SessionKey, SessionExternalRefs>>,
-    /// The relay-wide flight recorder. Carried here — not as its own parameter
-    /// through every task — because this `Arc` already reaches every wiring
-    /// site: the slot-link tasks (via `MeshState`), the consensus decision
+    /// The relay-wide flight recorder — the one place this module names the
+    /// recorder rather than the event vocabulary it emits, because the whole
+    /// relay reaches its recorder through this handle. Carried here — not as
+    /// its own parameter through every task — because this `Arc` already
+    /// reaches every wiring site: the slot-link tasks (via `MeshState`), the consensus decision
     /// paths in this module, `MeshControl`, and the binary. Always present
     /// (recording is cheap and bounded); the *sink* is what's optional.
     pub(in crate::consensus) flight: crate::observability::flight_recorder::FlightRecorder,
@@ -137,9 +139,27 @@ impl DecisionMakers {
     }
 
     /// The relay-wide flight recorder (see the field's doc for why it rides
-    /// this registry).
+    /// this registry). The rest of the relay reaches its recorder through here;
+    /// the decision paths in this module record through
+    /// [`record_event`](Self::record_event) instead, so they name only the
+    /// event vocabulary.
     pub fn flight_recorder(&self) -> &crate::observability::flight_recorder::FlightRecorder {
         &self.flight
+    }
+
+    /// Writes one flight event for `key`, beginning the session's recording if
+    /// this is the first thing observed about it. Statically dispatched through
+    /// the sink trait — an event can be emitted from a rare branch of the turn
+    /// path, so this must cost no more than the call it wraps.
+    pub(in crate::consensus) fn record_event(&self, key: &SessionKey, event: FlightEvent) {
+        FlightEvents::record(&self.flight, key, event);
+    }
+
+    /// Writes one flight event for `key` **only if a recording already
+    /// exists** — for an event that merely ends an observation, which must
+    /// never begin one.
+    pub(in crate::consensus) fn record_existing_event(&self, key: &SessionKey, event: FlightEvent) {
+        FlightEvents::record_existing(&self.flight, key, event);
     }
 
     /// Installs the notice notifier — the sender half of the channel the

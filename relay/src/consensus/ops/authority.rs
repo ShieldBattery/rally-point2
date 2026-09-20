@@ -375,9 +375,9 @@ pub fn observe_turn_frame(
              game loop began, or a hostile stamp); the slot's recorded frame stays at the \
              high-water mark, so a frame-scheduled leave for it may be unreachable",
         );
-        registry.flight_recorder().record(
+        registry.record_event(
             key,
-            crate::observability::flight_recorder::FlightEvent::FrameStampRegressed {
+            FlightEvent::FrameStampRegressed {
                 slot: slot.0,
                 seq,
                 frame: frame.0,
@@ -483,9 +483,9 @@ pub fn observe_sync_with_generation(
     // The recorder has its own locks. Capture the transition under the maker
     // lock, then publish outside it; a latched origin produces only one event.
     if let Some(failure) = ordering_failure {
-        registry.flight.record(
+        registry.record_event(
             key,
-            crate::observability::flight_recorder::FlightEvent::SyncOrderingUnavailable {
+            FlightEvent::SyncOrderingUnavailable {
                 slot: slot.0,
                 reason: failure.reason.to_owned(),
                 seq: failure.seq,
@@ -497,9 +497,9 @@ pub fn observe_sync_with_generation(
     }
     if let Some(divergence) = divergence {
         log_desync(key, &divergence);
-        registry.flight.record(
+        registry.record_event(
             key,
-            crate::observability::flight_recorder::FlightEvent::DesyncDetected {
+            FlightEvent::DesyncDetected {
                 sync_ordinal: divergence.sync_ordinal,
                 diverged: divergence.diverged.iter().map(|slot| slot.0).collect(),
                 no_majority: divergence.no_majority,

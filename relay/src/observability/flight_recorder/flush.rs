@@ -11,9 +11,9 @@ use crate::key::SessionKey;
 
 use super::BLOB_VERSION;
 use super::FlightRecorder;
-use super::events::FlightBlob;
 use super::recording::FlushOutcome;
 use super::sinks::DRAIN_FLUSH_CONCURRENCY;
+use crate::observability::events::FlightBlob;
 
 impl FlightRecorder {
     /// Removes `key`'s recording and builds its flushed blob, or `None` if no

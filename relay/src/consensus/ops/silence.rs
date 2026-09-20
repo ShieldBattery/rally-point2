@@ -115,9 +115,9 @@ pub async fn run_silence_watch(
                 lead_ms = found.lead.as_millis() as u64,
                 "slot's turns stopped reaching its peers before any other slot's did; closing its link so the survivors can drop it",
             );
-            makers.flight_recorder().record(
+            makers.record_event(
                 &key,
-                crate::observability::flight_recorder::FlightEvent::SlotEvictedSilent {
+                FlightEvent::SlotEvictedSilent {
                     slot: found.slot.0,
                     silent_ms: found.silent_for.as_millis() as u64,
                     lead_ms: found.lead.as_millis() as u64,

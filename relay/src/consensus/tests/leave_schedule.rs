@@ -135,14 +135,12 @@ fn a_frame_regression_is_recorded_as_a_flight_event() {
         .collect();
     assert_eq!(
         events,
-        vec![
-            crate::observability::flight_recorder::FlightEvent::FrameStampRegressed {
-                slot: 2,
-                seq: 1,
-                frame: 0,
-                prior_frame: 126,
-            }
-        ],
+        vec![FlightEvent::FrameStampRegressed {
+            slot: 2,
+            seq: 1,
+            frame: 0,
+            prior_frame: 126,
+        }],
         "exactly one event, for the first backwards stamp",
     );
 }

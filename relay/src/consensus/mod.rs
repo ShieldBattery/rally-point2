@@ -256,7 +256,12 @@ use rally_point_proto::time::unix_millis;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::key::SessionKey;
-use crate::observability::flight_recorder::BufferDecisionInputs;
+// Only the event vocabulary — plain record shapes and the sink trait, a leaf
+// module depending on nothing else here. The concrete recorder is named once,
+// where the registry is built.
+use crate::observability::events::{
+    BufferDecisionInputs, FlightEvent, FlightEvents, SlotEffRtt, SyncCoverage,
+};
 
 // Every submodule of this one reaches the rest of the module's internals
 // through these globs: each file's own `use super::*` picks them up, so an item

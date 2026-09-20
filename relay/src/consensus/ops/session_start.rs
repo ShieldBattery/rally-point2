@@ -156,9 +156,9 @@ pub(in crate::consensus) fn note_start_latched(
     let Some(initial_buffer_turns) = fired else {
         return;
     };
-    registry.flight.record(
+    registry.record_event(
         key,
-        crate::observability::flight_recorder::FlightEvent::SessionStart {
+        FlightEvent::SessionStart {
             initial_buffer_turns,
         },
     );

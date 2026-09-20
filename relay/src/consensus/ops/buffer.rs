@@ -68,9 +68,9 @@ pub(in crate::consensus) fn record_buffer_event(
     inputs: Option<BufferDecisionInputs>,
 ) {
     if let Some(directive) = directive {
-        registry.flight.record(
+        registry.record_event(
             key,
-            crate::observability::flight_recorder::FlightEvent::BufferDirective {
+            FlightEvent::BufferDirective {
                 buffer_turns: directive.buffer_turns,
                 apply_frame: directive.apply_at_frame,
                 decision_seq: directive.decision_seq,
@@ -148,9 +148,9 @@ pub fn observe_directive(registry: &DecisionMakers, key: &SessionKey, directive:
              ceiling; a depth past it deterministically mass-drops the session once \
              applied",
         );
-        registry.flight.record(
+        registry.record_event(
             key,
-            crate::observability::flight_recorder::FlightEvent::OverCeilingDirectiveForwarded {
+            FlightEvent::OverCeilingDirectiveForwarded {
                 buffer_turns: directive.buffer_turns,
                 decision_seq: directive.decision_seq,
             },

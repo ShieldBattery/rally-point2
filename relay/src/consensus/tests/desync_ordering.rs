@@ -473,7 +473,7 @@ fn coverage_reports_missing_history_before_the_window_is_exhausted() {
 
 #[test]
 fn ordering_failures_record_once_per_origin_without_a_desync_notice() {
-    use crate::observability::flight_recorder::FlightEvent;
+    use crate::observability::events::FlightEvent;
 
     for authority in [Authority::SelfRelay, Authority::Peer] {
         let (registry, mut rx) = notifying_registry();

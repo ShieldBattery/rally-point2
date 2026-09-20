@@ -1,9 +1,38 @@
 //! Flight-recorder record shapes: the events, per-slot samples, and the
-//! flushed blob envelope that wraps them. Pure data — no locking, no I/O —
-//! kept separate from the recorder that accumulates and flushes them.
+//! flushed blob envelope that wraps them, plus the one trait a module needs to
+//! emit them. Pure data — no locking, no I/O, and no dependency on anything
+//! else in this relay — kept separate from the recorder that accumulates and
+//! flushes them, which needs the mesh conditions registry and the session
+//! gates to do its own job.
+//!
+//! This separation is what lets a decision or routing path name the event it
+//! emits without depending on the recorder's wiring.
+
+use serde::{Deserialize, Serialize};
 
 use rally_point_proto::control::DepartureKind;
-use serde::{Deserialize, Serialize};
+
+use crate::key::SessionKey;
+
+/// Somewhere a flight event can be written. The recorder implements it; a test
+/// can stand in with a collecting fake.
+///
+/// Narrow on purpose: a module that emits events wants exactly these two calls
+/// and nothing else the recorder can do (sampling, flushing, sink wiring).
+/// Emitters take it as an `impl`/generic bound rather than a trait object —
+/// every implementation is known at the call site, and an event can be emitted
+/// from the turn path's rare branches, where an indirect call would buy
+/// nothing.
+pub trait FlightEvents {
+    /// Records one event for `key`'s session, beginning the session's
+    /// recording if this is the first thing observed about it.
+    fn record(&self, key: &SessionKey, event: FlightEvent);
+
+    /// Records one event **only when a recording for `key` already exists**;
+    /// with none, the event is dropped and no recording begins. For an event
+    /// that only marks the end of an observation, such as a session close.
+    fn record_existing(&self, key: &SessionKey, event: FlightEvent);
+}
 
 /// One discrete thing that happened to a session, as the recorder saw it.
 /// Frame/turn coordinates ride inside the variants that have them (apply
