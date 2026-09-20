@@ -6,31 +6,19 @@ use super::*;
 
 #[test]
 fn descriptor_for_lists_other_session_relays_as_peers() {
-    let setup = setup_with_two_relays_region_b_and_tenant();
+    let setup = region_b_fleet();
     let resp = create_session(
         &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            // Slot 1 names region-b so it homes on relay 2,
-            // giving both relays a slot to serve and mesh — the only way a
-            // session spans two relays.
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        // Slot 1 names region-b so it homes on relay 2, giving both relays a
+        // slot to serve and mesh — the only way a session spans two relays.
+        request(two_players_slot_1_in_region_b()),
         ExpiresAt(u64::MAX),
     )
     .unwrap()
     .response;
 
     // Relay 1's peers are the other relays serving this session → relay 2.
-    let desc = descriptor_for(
-        &setup,
-        &TenantId("sb-test".to_owned()),
-        resp.session,
-        RelayId(1),
-    )
-    .unwrap();
+    let desc = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
     assert_eq!(desc.peers.len(), 1);
     assert_eq!(desc.peers[0].relay_id, RelayId(2));
     assert_eq!(
@@ -41,13 +29,7 @@ fn descriptor_for_lists_other_session_relays_as_peers() {
     assert_eq!(desc.bounds, BufferBounds::new(1, 6).unwrap());
 
     // Relay 2's peers → relay 1.
-    let desc2 = descriptor_for(
-        &setup,
-        &TenantId("sb-test".to_owned()),
-        resp.session,
-        RelayId(2),
-    )
-    .unwrap();
+    let desc2 = descriptor_for(&setup, &tid(), resp.session, RelayId(2)).unwrap();
     assert_eq!(desc2.peers.len(), 1);
     assert_eq!(desc2.peers[0].relay_id, RelayId(1));
     assert_eq!(desc2.peers[0].cert_der, fake_cert(1));
@@ -79,44 +61,34 @@ fn descriptor_for_includes_the_stored_session_refs() {
     // in every descriptor built for the session, so a relay can stamp them
     // into a departure notice itself rather than depending on the
     // coordinator's in-memory session-refs store surviving to notice time.
-    let setup = setup_with_two_relays_and_tenant();
+    // The tenant's one-way latency estimate rides alongside them, so the
+    // authority relay can fold it into the initial buffer depth it sizes at
+    // session start.
+    let setup = two_relay_fleet();
     let resp = create_session(
         &setup,
         SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![
+            external_id: Some("game-99".to_owned()),
+            latency_estimate_ms: Some(72),
+            ..request(vec![
                 PlayerHandoff {
-                    slot: SlotId(0),
-                    client_pubkey: ClientPublicKey([0xAA; 32]),
                     external_ref: Some("sb-user-7".to_owned()),
-                    observer: false,
-                    region: None,
+                    ..player(0)
                 },
                 PlayerHandoff {
-                    slot: SlotId(1),
-                    client_pubkey: ClientPublicKey([0xBB; 32]),
-                    external_ref: None,
                     // An observer: it must show up in the descriptor's
                     // observer_slots so relays exclude it from desync checks.
                     observer: true,
-                    region: None,
+                    ..player(1)
                 },
-            ],
-            external_id: Some("game-99".to_owned()),
-            latency_estimate_ms: None,
+            ])
         },
         ExpiresAt(u64::MAX),
     )
     .unwrap()
     .response;
 
-    let desc = descriptor_for(
-        &setup,
-        &TenantId("sb-test".to_owned()),
-        resp.session,
-        RelayId(1),
-    )
-    .unwrap();
+    let desc = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
     assert_eq!(desc.external_id, Some("game-99".to_owned()));
     assert_eq!(desc.slot_refs.len(), 1, "only the slot with a ref appears");
     assert_eq!(desc.slot_refs[0].slot, SlotId(0));
@@ -125,6 +97,11 @@ fn descriptor_for_includes_the_stored_session_refs() {
         desc.observer_slots,
         vec![SlotId(1)],
         "the observer-flagged slot is carried into the descriptor",
+    );
+    assert_eq!(
+        desc.latency_estimate_ms,
+        Some(72),
+        "the tenant's latency hint is carried into the descriptor",
     );
     // Every slot the request listed — the competitor and the observer alike —
     // is carried as an expected slot so the authority relay knows the full set
@@ -135,78 +112,13 @@ fn descriptor_for_includes_the_stored_session_refs() {
 }
 
 #[test]
-fn descriptor_for_carries_the_latency_estimate_hint() {
-    // The tenant's one-way latency estimate rides in the descriptor built for
-    // the session, so the authority relay can fold it into the initial buffer
-    // depth it sizes at session start.
-    let setup = setup_with_two_relays_and_tenant();
-    let resp = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![
-                PlayerHandoff {
-                    slot: SlotId(0),
-                    client_pubkey: ClientPublicKey([0xAA; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: None,
-                },
-                PlayerHandoff {
-                    slot: SlotId(1),
-                    client_pubkey: ClientPublicKey([0xBB; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: None,
-                },
-            ],
-            external_id: None,
-            latency_estimate_ms: Some(72),
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-
-    let desc = descriptor_for(
-        &setup,
-        &TenantId("sb-test".to_owned()),
-        resp.session,
-        RelayId(1),
-    )
-    .unwrap();
-    assert_eq!(
-        desc.latency_estimate_ms,
-        Some(72),
-        "the tenant's latency hint is carried into the descriptor",
-    );
-}
-
-#[test]
 fn descriptor_for_without_stored_refs_has_none_and_empty() {
     // A session created with no correlation ids at all still builds a
     // descriptor — just with the fields empty, not an error.
-    let setup = setup_with_two_relays_and_tenant();
-    let resp = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
+    let setup = two_relay_fleet();
+    let resp = create_default_session(&setup);
 
-    let desc = descriptor_for(
-        &setup,
-        &TenantId("sb-test".to_owned()),
-        resp.session,
-        RelayId(1),
-    )
-    .unwrap();
+    let desc = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
     assert!(desc.external_id.is_none());
     assert!(desc.slot_refs.is_empty());
     assert!(
@@ -225,55 +137,10 @@ fn descriptor_for_without_stored_refs_has_none_and_empty() {
 }
 
 #[test]
-fn descriptor_for_single_relay_session_has_no_peers() {
-    let reg = registry::new_registry();
-    enroll_relay(&reg, 1, 14900);
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
-
-    let resp = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-
-    let desc = descriptor_for(
-        &setup,
-        &TenantId("sb-test".to_owned()),
-        resp.session,
-        RelayId(1),
-    )
-    .unwrap();
-    assert!(desc.peers.is_empty());
-}
-
-#[test]
 fn descriptor_for_unknown_session_returns_none() {
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     // No session was created → no membership recorded.
-    assert!(
-        descriptor_for(
-            &setup,
-            &TenantId("sb-test".to_owned()),
-            SessionId(999),
-            RelayId(1),
-        )
-        .is_none()
-    );
+    assert!(descriptor_for(&setup, &tid(), SessionId(999), RelayId(1)).is_none());
 }
 
 #[test]
@@ -281,42 +148,21 @@ fn descriptor_for_excludes_relays_not_in_session() {
     // Three relays registered, but a session only uses two (region-b resolves
     // slot 1 onto relay 2). The third relay must NOT appear in the
     // descriptor's peer list.
-    let reg = registry::new_registry();
-    enroll_relay(&reg, 1, 14900);
-    enroll_relay_in_region(&reg, 2, 14901, Some("region-b"));
-    enroll_relay(&reg, 3, 14902); // not in the session
-
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
-
+    let setup = region_fleet(&[
+        (1, 14900, None),
+        (2, 14901, Some("region-b")),
+        (3, 14902, None),
+    ]);
     let resp = create_session(
         &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        request(two_players_slot_1_in_region_b()),
         ExpiresAt(u64::MAX),
     )
     .unwrap()
     .response;
 
     // Relays 1 and 2 serve the session. Relay 3 is registered but unused.
-    let desc = descriptor_for(
-        &setup,
-        &TenantId("sb-test".to_owned()),
-        resp.session,
-        RelayId(1),
-    )
-    .unwrap();
+    let desc = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
     // Only relay 2 is a peer — relay 3 is excluded.
     assert_eq!(desc.peers.len(), 1);
     assert_eq!(desc.peers[0].relay_id, RelayId(2));
@@ -324,16 +170,11 @@ fn descriptor_for_excludes_relays_not_in_session() {
 
 #[test]
 fn create_session_stages_descriptors_for_each_relay() {
-    let setup = setup_with_two_relays_region_b_and_tenant();
+    let setup = region_b_fleet();
     let resp = create_session(
         &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            // Slot 1 names region-b, giving both relays a slot.
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        // Slot 1 names region-b, giving both relays a slot.
+        request(two_players_slot_1_in_region_b()),
         ExpiresAt(u64::MAX),
     )
     .unwrap()
@@ -359,29 +200,9 @@ fn create_session_stages_descriptors_for_each_relay() {
 fn create_session_single_relay_stages_a_peerless_descriptor() {
     // A single-relay session still stages a descriptor (with no peers) so the
     // relay learns the session and its bounds, even with no mesh.
-    let reg = registry::new_registry();
-    enroll_relay(&reg, 5, 14900);
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
+    let setup = fleet(&[(5, 14900, None, false)]).0;
 
-    create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap();
+    create_session(&setup, request(two_players()), ExpiresAt(u64::MAX)).unwrap();
 
     let staged = setup.descriptors().current_for(RelayId(5));
     assert_eq!(staged.len(), 1);
@@ -410,28 +231,15 @@ fn a_dual_stack_enrollment_flows_through_response_descriptor_and_rehome() {
         &reg,
         RelayHello::new(RelayId(2), v4_2, ProtocolVersion::CURRENT, fake_cert(2))
             .with_relay_addrs(vec![v4_2, v6_2])
-            .with_region(RegionId("region-b".to_owned())),
+            .with_region(region("region-b")),
     );
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        tid(),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
+    let setup = SessionSetup::new(reg, tenant_store());
 
     // A cross-relay session so both relays serve (and each descriptor names
     // the other as a peer): slot 1 names region-b, homing it on relay 2.
     let resp = create_session(
         &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        request(two_players_slot_1_in_region_b()),
         ExpiresAt(u64::MAX),
     )
     .unwrap()

@@ -175,65 +175,80 @@ fn launch_spec(region: Option<&str>) -> LaunchSpec {
 
 #[tokio::test]
 async fn launch_builds_overrides_with_exact_env_and_network_config() {
-    let core = core(FakeEcsApi::new());
-    let task = core.launch(&launch_spec(Some("us-east"))).await.unwrap();
+    // Two configs: one naming every optional field, one omitting `container`
+    // and `assign_public_ip` so their serde defaults apply instead.
+    struct Case {
+        config: EcsConfig,
+        expected_container: &'static str,
+        expected_security_groups: Vec<&'static str>,
+        expected_assign_public_ip: bool,
+    }
+    let cases = [
+        Case {
+            config: one_region_config(),
+            expected_container: "relay",
+            expected_security_groups: vec!["sg-1"],
+            expected_assign_public_ip: true,
+        },
+        Case {
+            config: EcsConfig::from_json(
+                r#"{
+                    "started_by": "rp2-coordinator-test",
+                    "regions": {
+                        "us-east": {
+                            "aws_region": "us-east-1",
+                            "cluster": "rp2-relays",
+                            "task_definition": "rp2-relay",
+                            "subnets": ["subnet-a", "subnet-b"]
+                        }
+                    }
+                }"#,
+            )
+            .unwrap(),
+            expected_container: "relay",
+            expected_security_groups: vec![],
+            expected_assign_public_ip: false,
+        },
+    ];
 
-    // The ARN comes back verbatim as the task handle.
-    assert_eq!(
-        task.0,
-        "arn:aws:ecs:us-east-1:123456789012:task/rp2-relays/task-0"
-    );
+    for case in cases {
+        let core = EcsCore {
+            config: case.config,
+            api: FakeEcsApi::new(),
+        };
+        let task = core.launch(&launch_spec(Some("us-east"))).await.unwrap();
 
-    let requests = core.api.run_requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    assert_eq!(request.aws_region, "us-east-1");
-    assert_eq!(request.cluster, "rp2-relays");
-    assert_eq!(request.task_definition, "rp2-relay");
-    assert_eq!(request.started_by, "rp2-coordinator-test");
-    assert_eq!(request.container, "relay");
-    assert_eq!(request.subnets, vec!["subnet-a", "subnet-b"]);
-    assert_eq!(request.security_groups, vec!["sg-1"]);
-    assert!(request.assign_public_ip);
+        // The ARN comes back verbatim as the task handle.
+        assert_eq!(
+            task.0,
+            "arn:aws:ecs:us-east-1:123456789012:task/rp2-relays/task-0"
+        );
 
-    // The three environment overrides, by exact name and value.
-    assert_eq!(
-        request.env,
-        vec![
-            ("RELAY_ID".to_owned(), "42".to_owned()),
-            (
-                "RELAY_ENROLL_TOKEN".to_owned(),
-                "the-one-time-token".to_owned()
-            ),
-            ("RELAY_REGION".to_owned(), "us-east".to_owned()),
-        ],
-    );
-}
+        let requests = core.api.run_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert_eq!(request.aws_region, "us-east-1");
+        assert_eq!(request.cluster, "rp2-relays");
+        assert_eq!(request.task_definition, "rp2-relay");
+        assert_eq!(request.started_by, "rp2-coordinator-test");
+        assert_eq!(request.container, case.expected_container);
+        assert_eq!(request.subnets, vec!["subnet-a", "subnet-b"]);
+        assert_eq!(request.security_groups, case.expected_security_groups);
+        assert_eq!(request.assign_public_ip, case.expected_assign_public_ip);
 
-#[tokio::test]
-async fn launch_defaults_container_when_config_omits_it() {
-    // A config without a `container` field defaults the override target.
-    let config = EcsConfig::from_json(
-        r#"{
-            "started_by": "rp2-coordinator-test",
-            "regions": {
-                "us-east": {
-                    "aws_region": "us-east-1",
-                    "cluster": "c",
-                    "task_definition": "td",
-                    "subnets": ["subnet-a"]
-                }
-            }
-        }"#,
-    )
-    .unwrap();
-    let core = EcsCore {
-        config,
-        api: FakeEcsApi::new(),
-    };
-    core.launch(&launch_spec(Some("us-east"))).await.unwrap();
-    assert_eq!(core.api.run_requests()[0].container, "relay");
-    assert!(!core.api.run_requests()[0].assign_public_ip);
+        // The three environment overrides, by exact name and value.
+        assert_eq!(
+            request.env,
+            vec![
+                ("RELAY_ID".to_owned(), "42".to_owned()),
+                (
+                    "RELAY_ENROLL_TOKEN".to_owned(),
+                    "the-one-time-token".to_owned()
+                ),
+                ("RELAY_REGION".to_owned(), "us-east".to_owned()),
+            ],
+        );
+    }
 }
 
 #[tokio::test]
@@ -507,48 +522,74 @@ fn expects_public_ipv4_reflects_the_region_configs_flag() {
 }
 
 #[test]
-fn parse_task_arn_extracts_region_and_cluster() {
-    let parsed =
-        parse_task_arn("arn:aws:ecs:us-east-1:123456789012:task/rp2-relays/abc123").unwrap();
-    assert_eq!(parsed.region, "us-east-1");
-    assert_eq!(parsed.cluster, "rp2-relays");
-}
-
-#[test]
-fn parse_task_arn_rejects_non_task_and_clusterless_arns() {
-    // Not an ECS task ARN.
-    assert!(parse_task_arn("arn:aws:ec2:us-east-1:123456789012:instance/i-abc").is_err());
-    // The old clusterless task ARN form cannot address a stop/describe.
-    assert!(parse_task_arn("arn:aws:ecs:us-east-1:123456789012:task/abc123").is_err());
-    // Not an ARN at all.
-    assert!(parse_task_arn("proc-1").is_err());
-}
-
-#[test]
-fn config_rejects_missing_regions_and_subnets() {
-    // No regions.
-    assert!(matches!(
-        EcsConfig::from_json(r#"{"started_by": "x", "regions": {}}"#),
-        Err(EcsConfigError::Invalid(_)),
-    ));
-    // A region with no subnet.
-    assert!(matches!(
-        EcsConfig::from_json(
-            r#"{"started_by":"x","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":[]}}}"#
+fn parse_task_arn_extracts_region_and_cluster_or_refuses_a_malformed_arn() {
+    // (input arn, expected (region, cluster) — `None` for a refusal.)
+    let cases: &[(&str, Option<(&str, &str)>)] = &[
+        (
+            "arn:aws:ecs:us-east-1:123456789012:task/rp2-relays/abc123",
+            Some(("us-east-1", "rp2-relays")),
         ),
-        Err(EcsConfigError::Invalid(_)),
-    ));
-    // An empty launcher tag.
-    assert!(matches!(
-        EcsConfig::from_json(
-            r#"{"started_by":"","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":["s"]}}}"#
-        ),
-        Err(EcsConfigError::Invalid(_)),
-    ));
+        // Not an ECS task ARN.
+        ("arn:aws:ec2:us-east-1:123456789012:instance/i-abc", None),
+        // The old clusterless task ARN form cannot address a stop/describe.
+        ("arn:aws:ecs:us-east-1:123456789012:task/abc123", None),
+        // Not an ARN at all.
+        ("proc-1", None),
+    ];
+    for (arn, expected) in cases {
+        let result = parse_task_arn(arn);
+        match expected {
+            Some((region, cluster)) => {
+                let parsed = result.unwrap_or_else(|e| panic!("{arn}: expected Ok, got {e}"));
+                assert_eq!(parsed.region, *region, "region for {arn}");
+                assert_eq!(parsed.cluster, *cluster, "cluster for {arn}");
+            }
+            None => assert!(result.is_err(), "{arn} should be refused"),
+        }
+    }
 }
 
 #[test]
-fn config_rejects_an_unknown_top_level_field() {
+fn config_rejects_an_empty_required_field_or_no_regions() {
+    // Every field `validate` requires non-empty, plus the no-regions case —
+    // each row is an otherwise-valid config with exactly one field emptied.
+    let cases: &[(&str, &str)] = &[
+        (
+            "started_by",
+            r#"{"started_by":"","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":["s"]}}}"#,
+        ),
+        (
+            "container",
+            r#"{"started_by":"x","container":"","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":["s"]}}}"#,
+        ),
+        ("regions", r#"{"started_by":"x","regions":{}}"#),
+        (
+            "aws_region",
+            r#"{"started_by":"x","regions":{"r":{"aws_region":"","cluster":"c","task_definition":"td","subnets":["s"]}}}"#,
+        ),
+        (
+            "cluster",
+            r#"{"started_by":"x","regions":{"r":{"aws_region":"us-east-1","cluster":"","task_definition":"td","subnets":["s"]}}}"#,
+        ),
+        (
+            "task_definition",
+            r#"{"started_by":"x","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"","subnets":["s"]}}}"#,
+        ),
+        (
+            "subnets",
+            r#"{"started_by":"x","regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":[]}}}"#,
+        ),
+    ];
+    for (field, json) in cases {
+        assert!(
+            matches!(EcsConfig::from_json(json), Err(EcsConfigError::Invalid(_))),
+            "an empty {field} must be rejected",
+        );
+    }
+}
+
+#[test]
+fn config_rejects_an_unknown_field_at_either_level() {
     // A misspelled top-level field (`started_bye` for `started_by`) must
     // surface as a parse error rather than silently defaulting `started_by`
     // to nothing and leaving the typo unread.
@@ -558,12 +599,8 @@ fn config_rejects_an_unknown_top_level_field() {
         ),
         Err(EcsConfigError::Json(_)),
     ));
-}
-
-#[test]
-fn config_rejects_an_unknown_per_region_field() {
-    // A misspelled region field (e.g. `security_group` for
-    // `security_groups`) must fail loudly rather than silently launching
+    // Same for a misspelled per-region field (`security_group` for
+    // `security_groups`): it must fail loudly rather than silently launching
     // with no security groups applied.
     assert!(matches!(
         EcsConfig::from_json(

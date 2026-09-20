@@ -1,10 +1,7 @@
 use rally_point_proto::ids::SlotId;
 
 use super::*;
-
-fn tid() -> TenantId {
-    TenantId("sb-test".to_owned())
-}
+use crate::test_support::tid;
 
 fn snapshot(session: SessionId, ever_connected: &[u8]) -> AttestedSnapshot {
     AttestedSnapshot {
@@ -104,25 +101,6 @@ async fn ids_do_not_cross_match_between_relays_sessions_or_reads() {
 }
 
 #[tokio::test]
-async fn a_waiter_that_gives_up_retires_its_request() {
-    let attest = LoadStateAttest::new();
-    let mut asks = attest.subscribe(RelayId(1));
-    let pending = attest
-        .request(RelayId(1), &tid(), SessionId(5))
-        .expect("connected");
-    let ask = asks.recv().await.expect("queued");
-    assert_eq!(attest.pending_count(), 1);
-
-    drop(pending);
-    assert_eq!(attest.pending_count(), 0, "the map tracks live reads only");
-    assert_eq!(
-        attest.resolve(ask.request_id, RelayId(1), snapshot(SessionId(5), &[0])),
-        Err(StaleSnapshot),
-        "an answer for an abandoned read is discarded",
-    );
-}
-
-#[tokio::test]
 async fn a_full_question_channel_is_a_non_answer_rather_than_a_block() {
     // A relay whose writer has stopped draining must cost the read its
     // completeness claim, never the coordinator's thread. The sender stays —
@@ -213,13 +191,17 @@ fn round_started_at(started: Instant, relay: RelayId) -> AttestRound {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_read_that_arrived_mid_round_leads_its_own() {
     // The interleaving the boundary exists for: the leader takes its instant and
     // asks relay 1, which snapshots and answers; a read arrives; only then is
     // relay 2 asked. Relay 1's snapshot predates the second read entirely, so
     // the round cannot answer it however late the fan-out finished — the read
     // waits the round out and runs one of its own.
+    //
+    // The runtime's clock is paused, so the sleeps below only order the two
+    // tasks relative to each other (and to the round boundary) — they cost no
+    // wall-clock time and need no margin between them.
     let attest = LoadStateAttest::new();
     let rounds_run = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -259,12 +241,15 @@ async fn a_read_that_arrived_mid_round_leads_its_own() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_read_that_arrived_before_the_boundary_shares_the_round() {
     // The other side of the same rule, and the reason sharing is worth having:
     // a read already waiting when the round took its instant is covered by every
     // snapshot that round collects, so it answers from the shared outcome and
     // costs the fleet no questions of its own.
+    //
+    // The runtime's clock is paused, so the sleep below only orders the joiner's
+    // arrival before the round's boundary — it costs no wall-clock time.
     let attest = LoadStateAttest::new();
     let rounds_run = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -324,7 +309,8 @@ async fn a_round_whose_leader_leaves_without_publishing_frees_the_next_caller() 
 #[tokio::test]
 async fn a_request_nobody_waits_on_is_no_longer_pending() {
     // What the control connection's writer checks before spending a frame: a
-    // read that timed out retires its request on the way out.
+    // read that timed out (or whose waiter otherwise gave up) retires its
+    // request on the way out — the pending map tracks live reads only.
     let attest = LoadStateAttest::new();
     let mut asks = attest.subscribe(RelayId(1));
     let pending = attest
@@ -335,6 +321,13 @@ async fn a_request_nobody_waits_on_is_no_longer_pending() {
 
     drop(pending);
     assert!(!attest.is_pending(ask.request_id));
+    // An answer that arrives for the now-abandoned read is discarded, exactly
+    // like any other stale one.
+    assert_eq!(
+        attest.resolve(ask.request_id, RelayId(1), snapshot(SessionId(5), &[0])),
+        Err(StaleSnapshot),
+        "an answer for an abandoned read is discarded",
+    );
 }
 
 #[tokio::test]

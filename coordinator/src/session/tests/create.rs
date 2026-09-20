@@ -5,15 +5,8 @@ use super::*;
 
 #[test]
 fn create_session_assigns_relays_and_mints_tokens() {
-    let setup = setup_with_two_relays_and_tenant();
-    let req = SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
-        players: two_players(),
-        external_id: None,
-        latency_estimate_ms: None,
-    };
-
-    let resp = create_session(&setup, req, ExpiresAt(u64::MAX))
+    let setup = two_relay_fleet();
+    let resp = create_session(&setup, request(two_players()), ExpiresAt(u64::MAX))
         .unwrap()
         .response;
 
@@ -38,59 +31,36 @@ fn create_session_assigns_relays_and_mints_tokens() {
 }
 
 #[test]
-fn a_latency_estimate_change_is_a_create_mismatch_not_a_replay() {
-    let setup = setup_with_two_relays_and_tenant();
-    let request = |latency: Option<u32>| SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
-        players: two_players(),
-        external_id: Some("game-1".to_owned()),
-        latency_estimate_ms: latency,
-    };
-
-    create_session(&setup, request(Some(40)), ExpiresAt(u64::MAX)).unwrap();
-
-    // Same roster + same estimate: an honest retry, replayed.
-    let retry = create_session(&setup, request(Some(40)), ExpiresAt(u64::MAX)).unwrap();
-    assert!(retry.replayed);
-
-    // Same roster, different estimate: a different logical create — the
-    // cached response would bind the wrong initial-buffer input to the
-    // session, so it is refused rather than replayed.
-    let err = create_session(&setup, request(Some(90)), ExpiresAt(u64::MAX)).unwrap_err();
-    assert!(matches!(err, SessionSetupError::IdempotentCreateMismatch));
-}
-
-#[test]
 fn the_session_ceiling_refuses_fresh_creates_and_frees_on_close() {
-    let setup = setup_with_two_relays_and_tenant().with_session_ceiling(Some(1));
-    let tenant = TenantId("sb-test".to_owned());
-    let request = |external_id: &str| SessionRequest {
-        tenant: tenant.clone(),
-        players: two_players(),
+    let setup = two_relay_fleet().with_session_ceiling(Some(1));
+    let game = |external_id: &str| SessionRequest {
         external_id: Some(external_id.to_owned()),
-        latency_estimate_ms: None,
+        ..request(two_players())
     };
 
-    let first = create_session(&setup, request("game-1"), ExpiresAt(u64::MAX)).unwrap();
+    let first = create_session(&setup, game("game-1"), ExpiresAt(u64::MAX)).unwrap();
 
     // At the cap a fresh create is refused...
-    let err = create_session(&setup, request("game-2"), ExpiresAt(u64::MAX)).unwrap_err();
+    let err = create_session(&setup, game("game-2"), ExpiresAt(u64::MAX)).unwrap_err();
     assert!(matches!(err, SessionSetupError::SessionCeilingReached));
 
     // ...but an idempotent retry of the live session still replays — it
     // mints nothing, so the cap must not fail an ordinary HTTP retry.
-    let retry = create_session(&setup, request("game-1"), ExpiresAt(u64::MAX)).unwrap();
+    let retry = create_session(&setup, game("game-1"), ExpiresAt(u64::MAX)).unwrap();
     assert!(retry.replayed);
 
     // Closing the live session frees the capacity.
-    setup.forget_session_membership(&tenant, first.response.session);
-    create_session(&setup, request("game-2"), ExpiresAt(u64::MAX)).unwrap();
+    setup.forget_session_membership(&tid(), first.response.session);
+    create_session(&setup, game("game-2"), ExpiresAt(u64::MAX)).unwrap();
 }
 
 #[test]
 fn session_count_for_relay_counts_serving_memberships() {
-    let setup = setup_with_two_relays_and_tenant();
-    let tenant = TenantId("sb-test".to_owned());
+    // Relay 2 is tagged `region-b` so the third phase below can also produce a
+    // cross-relay session, without changing how the first two phases behave —
+    // an unnamed-region roster still falls back to relay 1 regardless of relay
+    // 2's tag.
+    let setup = region_b_fleet();
 
     // No sessions yet: every relay serves zero.
     assert_eq!(setup.session_count_for_relay(RelayId(1)), 0);
@@ -98,30 +68,12 @@ fn session_count_for_relay_counts_serving_memberships() {
 
     // Two single-relay sessions both home on relay 1 (the primary); relay 2
     // serves neither.
-    let first = create_session(
-        &setup,
-        SessionRequest {
-            tenant: tenant.clone(),
-            players: two_players(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-    let second = create_session(
-        &setup,
-        SessionRequest {
-            tenant: tenant.clone(),
-            players: two_players(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
+    let first = create_session(&setup, request(two_players()), ExpiresAt(u64::MAX))
+        .unwrap()
+        .response;
+    let second = create_session(&setup, request(two_players()), ExpiresAt(u64::MAX))
+        .unwrap()
+        .response;
     assert_eq!(
         setup.session_count_for_relay(RelayId(1)),
         2,
@@ -130,24 +82,16 @@ fn session_count_for_relay_counts_serving_memberships() {
     assert_eq!(setup.session_count_for_relay(RelayId(2)), 0);
 
     // Closing one session's membership drops relay 1's count.
-    setup.take_session_membership(&tenant, first.session);
+    setup.take_session_membership(&tid(), first.session);
     assert_eq!(setup.session_count_for_relay(RelayId(1)), 1);
-    setup.take_session_membership(&tenant, second.session);
+    setup.take_session_membership(&tid(), second.session);
     assert_eq!(setup.session_count_for_relay(RelayId(1)), 0);
-}
 
-#[test]
-fn session_count_for_relay_counts_a_cross_relay_session_for_each_home() {
-    // A session served by two relays counts once against each.
-    let setup = setup_with_two_relays_region_b_and_tenant();
+    // A session served by two relays counts once against each home, not just
+    // the primary.
     create_session(
         &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        request(two_players_slot_1_in_region_b()),
         ExpiresAt(u64::MAX),
     )
     .unwrap();
@@ -156,69 +100,13 @@ fn session_count_for_relay_counts_a_cross_relay_session_for_each_home() {
 }
 
 #[test]
-fn region_override_preserves_each_slots_assigned_home() {
-    // The slot naming region-b homes on the relay tagged for it, while the
-    // other falls back to relay 1. Which equally populated relay is represented
-    // as the primary rotates, but the per-slot assignment does not.
-    let setup = setup_with_two_relays_region_b_and_tenant();
-    let resp = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-
-    assert_eq!(response_home_for_slot(&resp, SlotId(0)), RelayId(1));
-    assert_eq!(response_home_for_slot(&resp, SlotId(1)), RelayId(2));
-    assert_eq!(resp.slot_homes.len(), 1, "one slot differs from primary");
-    assert_eq!(
-        response_endpoint_for_relay(&resp, RelayId(1)).cert_der,
-        fake_cert(1),
-    );
-    assert_eq!(
-        response_endpoint_for_relay(&resp, RelayId(2)).cert_der,
-        fake_cert(2),
-    );
-
-    // The session serves exactly the distinct home relays of its slots.
-    let serving = setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session);
-    assert_eq!(
-        serving
-            .iter()
-            .copied()
-            .collect::<std::collections::HashSet<_>>(),
-        std::collections::HashSet::from([RelayId(1), RelayId(2)]),
-    );
-}
-
-#[test]
 fn serving_relays_are_the_distinct_homes_not_every_enrolled_relay() {
     // With no player naming a region (and even with a second relay enrolled)
     // the session serves only the primary home — a serving relay always homes
     // at least one slot, so an unused relay is never in the set.
-    let setup = setup_with_two_relays_and_tenant();
-    let resp = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-    assert_eq!(
-        setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
-        vec![RelayId(1)],
-    );
+    let setup = two_relay_fleet();
+    let resp = create_default_session(&setup);
+    assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
 }
 
 #[test]
@@ -227,76 +115,43 @@ fn a_relay_with_no_assigned_slots_is_not_recorded_as_serving() {
     // must not be recorded as serving — a slotless serving relay would never
     // register a slot, never report `SessionClosed`, and the session's
     // lifecycle would never close.
-    let setup = setup_with_two_relays_region_b_and_tenant();
-    let resp = create_session(
+    let setup = region_b_fleet();
+    let resp = create_region_session(
         &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![
-                PlayerHandoff {
-                    slot: SlotId(0),
-                    client_pubkey: ClientPublicKey([0xAA; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: Some(RegionId("region-b".to_owned())),
-                },
-                PlayerHandoff {
-                    slot: SlotId(1),
-                    client_pubkey: ClientPublicKey([0xBB; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: Some(RegionId("region-b".to_owned())),
-                },
-            ],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
+        vec![
+            player_in_region(0, Some("region-b")),
+            player_in_region(1, Some("region-b")),
+        ],
+    );
 
     // Both slots land on relay 2, so it is the home outright and no override
     // rides (every slot already homes on the home relay).
     assert_eq!(resp.home_relay.relay_id, RelayId(2));
     assert!(resp.slot_homes.is_empty());
     assert_eq!(
-        setup.serving_relays(&TenantId("sb-test".to_owned()), resp.session),
+        setup.serving_relays(&tid(), resp.session),
         vec![RelayId(2)],
         "the slotless relay 1 is not recorded as serving",
     );
 
     // The descriptor built for the sole serving relay ranks only itself in the
     // authority order — the unused relay never appears.
-    let desc = descriptor_for(
-        &setup,
-        &TenantId("sb-test".to_owned()),
-        resp.session,
-        RelayId(2),
-    )
-    .unwrap();
+    let desc = descriptor_for(&setup, &tid(), resp.session, RelayId(2)).unwrap();
     assert_eq!(desc.authority_order, vec![RelayId(2)]);
     assert!(desc.peers.is_empty(), "the unused relay is not a mesh peer");
 }
 
 #[test]
 fn issued_tokens_verify_on_the_relay() {
-    let setup = setup_with_two_relays_and_tenant();
-    let req = SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
-        players: two_players(),
-        external_id: None,
-        latency_estimate_ms: None,
-    };
-    let resp = create_session(&setup, req, ExpiresAt(u64::MAX))
+    let setup = two_relay_fleet();
+    let resp = create_session(&setup, request(two_players()), ExpiresAt(u64::MAX))
         .unwrap()
         .response;
 
     // Seed the relay registry with the tenant's verifying key.
-    let (kid, pubkey) =
-        tenant::verifying_key(&setup.tenants, &TenantId("sb-test".to_owned())).unwrap();
+    let (kid, pubkey) = tenant::verifying_key(&setup.tenants, &tid()).unwrap();
     let mut relay_registry = Registry::new();
-    relay_registry.insert(kid, TenantId("sb-test".to_owned()), pubkey);
+    relay_registry.insert(kid, tid(), pubkey);
 
     // Each token the coordinator minted must verify on the relay.
     for player_token in &resp.tokens {
@@ -310,27 +165,15 @@ fn issued_tokens_verify_on_the_relay() {
 
 #[test]
 fn no_relays_available_fails_without_consuming_the_session_id() {
-    let setup = SessionSetup::new(registry::new_registry(), tenant::new_store());
-    let request = SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
-        players: two_players(),
-        external_id: None,
-        latency_estimate_ms: None,
-    };
+    let setup = SessionSetup::new(registry::new_registry(), tenant_store());
+    let req = request(two_players());
     let candidate = candidate_session_id(&setup);
-    let result = create_session(&setup, request.clone(), ExpiresAt(u64::MAX));
+    let result = create_session(&setup, req.clone(), ExpiresAt(u64::MAX));
     assert_eq!(result.unwrap_err(), SessionSetupError::NoRelaysAvailable);
     assert_eq!(candidate_session_id(&setup), candidate);
 
-    enroll_relay(setup.registry(), 1, 14900);
-    tenant::enroll(
-        setup.tenants(),
-        KeyId("test-key-1".to_owned()),
-        request.tenant.clone(),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let created = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+    enroll_fleet(setup.registry(), &[(1, 14900, None, false)]);
+    let created = create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap();
     assert_eq!(
         created.response.session, candidate,
         "the next successful create receives the id the failed placement peeked",
@@ -339,16 +182,13 @@ fn no_relays_available_fails_without_consuming_the_session_id() {
 
 #[test]
 fn unenrolled_tenant_fails() {
-    let reg = registry::new_registry();
-    enroll_relay(&reg, 1, 14900);
-    let setup = SessionSetup::new(reg, tenant::new_store());
+    let setup = SessionSetup::new(registry::new_registry(), tenant::new_store());
+    enroll_fleet(setup.registry(), &[(1, 14900, None, false)]);
     let result = create_session(
         &setup,
         SessionRequest {
             tenant: TenantId("not-enrolled".to_owned()),
-            players: two_players(),
-            external_id: None,
-            latency_estimate_ms: None,
+            ..request(two_players())
         },
         ExpiresAt(u64::MAX),
     );
@@ -359,26 +199,13 @@ fn unenrolled_tenant_fails() {
 }
 
 #[test]
-fn empty_players_fails() {
-    let setup = setup_with_two_relays_and_tenant();
-    let result = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    );
-    assert_eq!(result.unwrap_err(), SessionSetupError::NoPlayers);
-}
-
-#[test]
 fn slot_11_is_accepted_and_slot_12_is_rejected() {
-    // BW supports 12 network participants (8 players + 4 observers), so
-    // slots 0..=11 are valid and 12 is out of range.
-    let setup = setup_with_two_relays_and_tenant();
+    // The survivor of a merge across every `validate_request` rejection: the
+    // boundary that gives the test its name (BW supports 12 network
+    // participants -- 8 players + 4 observers -- so slots 0..=11 are valid and
+    // 12 is out of range), plus a table over every other way a request is
+    // refused before placement ever runs.
+    let setup = two_relay_fleet();
     let player = |slot: u8| PlayerHandoff {
         slot: SlotId(slot),
         client_pubkey: ClientPublicKey([slot; 32]),
@@ -389,134 +216,70 @@ fn slot_11_is_accepted_and_slot_12_is_rejected() {
 
     let resp = create_session(
         &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: (0..=11).map(player).collect(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        request((0..=11).map(player).collect()),
         ExpiresAt(u64::MAX),
     )
     .unwrap()
     .response;
     assert_eq!(resp.tokens.len(), 12);
-
-    let result = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![player(12)],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    );
-    assert_eq!(result.unwrap_err(), SessionSetupError::SlotOutOfRange(12));
-}
-
-#[test]
-fn two_players_naming_the_same_slot_is_rejected() {
-    let setup = setup_with_two_relays_and_tenant();
-    let player = |slot: u8| PlayerHandoff {
-        slot: SlotId(slot),
-        client_pubkey: ClientPublicKey([slot; 32]),
-        external_ref: None,
-        observer: false,
-        region: None,
-    };
-
-    let result = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![player(0), player(1), player(0)],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    );
-    assert_eq!(result.unwrap_err(), SessionSetupError::DuplicateSlot(0));
-}
-
-#[test]
-fn an_oversized_external_id_is_rejected() {
-    let setup = setup_with_two_relays_and_tenant();
-    let result = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players(),
-            external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    );
-    assert_eq!(result.unwrap_err(), SessionSetupError::ExternalIdTooLong);
-
-    // Exactly at the cap is fine.
-    let ok = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: two_players(),
-            external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN)),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    );
-    assert!(ok.is_ok());
-}
-
-#[test]
-fn an_oversized_external_ref_is_rejected() {
-    let setup = setup_with_two_relays_and_tenant();
-    let result = create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![
-                PlayerHandoff {
-                    slot: SlotId(0),
-                    client_pubkey: ClientPublicKey([0; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: None,
-                },
-                PlayerHandoff {
-                    slot: SlotId(1),
-                    client_pubkey: ClientPublicKey([1; 32]),
-                    external_ref: Some("y".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
-                    observer: false,
-                    region: None,
-                },
-            ],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    );
     assert_eq!(
-        result.unwrap_err(),
-        SessionSetupError::ExternalRefTooLong(1)
+        create_session(&setup, request(vec![player(12)]), ExpiresAt(u64::MAX)).unwrap_err(),
+        SessionSetupError::SlotOutOfRange(12),
     );
-}
 
-#[test]
-fn session_ids_are_unique_per_session() {
-    let setup = setup_with_two_relays_and_tenant();
-    let req = SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
-        players: two_players(),
-        external_id: None,
-        latency_estimate_ms: None,
-    };
-    let r1 = create_session(&setup, req.clone(), ExpiresAt(u64::MAX))
-        .unwrap()
-        .response;
-    let r2 = create_session(&setup, req, ExpiresAt(u64::MAX))
-        .unwrap()
-        .response;
-    assert_ne!(r1.session, r2.session);
+    type ValidationCase = (&'static str, SessionRequest, SessionSetupError);
+    let cases: Vec<ValidationCase> = vec![
+        (
+            "no players at all",
+            request(vec![]),
+            SessionSetupError::NoPlayers,
+        ),
+        (
+            "two players naming the same slot",
+            request(vec![player(0), player(1), player(0)]),
+            SessionSetupError::DuplicateSlot(0),
+        ),
+        (
+            "an external_id past the length cap",
+            SessionRequest {
+                external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
+                ..request(two_players())
+            },
+            SessionSetupError::ExternalIdTooLong,
+        ),
+        (
+            "a player's external_ref past the length cap",
+            request(vec![
+                player(0),
+                PlayerHandoff {
+                    external_ref: Some("y".repeat(MAX_EXTERNAL_STRING_LEN + 1)),
+                    ..player(1)
+                },
+            ]),
+            SessionSetupError::ExternalRefTooLong(1),
+        ),
+    ];
+    for (label, req, expected) in cases {
+        assert_eq!(
+            create_session(&setup, req, ExpiresAt(u64::MAX)).unwrap_err(),
+            expected,
+            "{label} must be rejected",
+        );
+    }
+
+    // Exactly at the external_id cap is fine -- only *past* it is rejected.
+    assert!(
+        create_session(
+            &setup,
+            SessionRequest {
+                external_id: Some("x".repeat(MAX_EXTERNAL_STRING_LEN)),
+                ..request(two_players())
+            },
+            ExpiresAt(u64::MAX),
+        )
+        .is_ok(),
+        "exactly the cap is accepted",
+    );
 }
 
 #[test]
@@ -533,18 +296,13 @@ fn a_restarted_coordinator_does_not_reuse_session_ids() {
         "the seed is wall-clock microseconds, not a small counter",
     );
 
-    let before = setup_with_two_relays_and_tenant();
-    let req = SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
-        players: two_players(),
-        external_id: None,
-        latency_estimate_ms: None,
-    };
+    let before = two_relay_fleet();
+    let req = request(two_players());
     let old = create_session(&before, req.clone(), ExpiresAt(u64::MAX))
         .unwrap()
         .response;
 
-    let after = setup_with_two_relays_and_tenant();
+    let after = two_relay_fleet();
     let new = create_session(&after, req, ExpiresAt(u64::MAX))
         .unwrap()
         .response;

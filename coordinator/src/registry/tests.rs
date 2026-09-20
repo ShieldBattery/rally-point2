@@ -1,18 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 use super::*;
-use rally_point_proto::control::RelayHello;
-use rally_point_proto::ids::RelayId;
-use rally_point_proto::version::ProtocolVersion;
-
-fn hello(id: u64, port: u16) -> RelayHello {
-    RelayHello::new(
-        RelayId(id),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        ProtocolVersion::CURRENT,
-        vec![id as u8; 4],
-    )
-}
+use crate::test_support::{hello, hello_with_cert};
 
 #[test]
 fn enroll_then_peer_roundtrips() {
@@ -36,17 +25,6 @@ fn enroll_then_peer_roundtrips() {
 }
 
 #[test]
-fn re_enroll_replaces_address() {
-    let reg = new_registry();
-    enroll(&reg, hello(1, 14900));
-    enroll(&reg, hello(1, 14999)); // same id, new address
-
-    let p = peer(&reg, RelayId(1)).unwrap();
-    assert_eq!(p.relay_addr, SocketAddr::from((Ipv4Addr::LOCALHOST, 14999)));
-    assert_eq!(len(&reg), 1);
-}
-
-#[test]
 fn enroll_hands_out_strictly_increasing_generations() {
     let reg = new_registry();
     let g0 = enroll(&reg, hello(1, 14900));
@@ -54,16 +32,6 @@ fn enroll_hands_out_strictly_increasing_generations() {
     let g2 = enroll(&reg, hello(2, 14901)); // a different relay
     assert!(g1 > g0, "a re-enroll gets a later generation");
     assert!(g2 > g1, "every enroll gets a distinct, later generation");
-}
-
-#[test]
-fn remove_if_current_removes_on_a_matching_generation() {
-    let reg = new_registry();
-    let generation = enroll(&reg, hello(1, 14900));
-    assert!(remove_if_current(&reg, RelayId(1), generation));
-    assert!(is_empty(&reg));
-    // A second drop of the same connection is a no-op (already gone).
-    assert!(!remove_if_current(&reg, RelayId(1), generation));
 }
 
 #[test]
@@ -81,39 +49,20 @@ fn remove_if_current_keeps_a_relay_that_already_reconnected() {
         "a stale connection must not deregister a reconnected relay",
     );
     assert!(!is_empty(&reg), "the relay stays registered");
-    // The current connection's own later drop still deregisters it.
+    // The current connection's own later drop still deregisters it (the
+    // matching-generation case).
     assert!(remove_if_current(&reg, RelayId(1), current));
     assert!(is_empty(&reg));
-}
-
-#[test]
-fn peer_for_unknown_returns_none() {
-    let reg = new_registry();
-    enroll(&reg, hello(1, 14900));
-    assert!(peer(&reg, RelayId(99)).is_none());
-}
-
-#[test]
-fn all_entries_lists_everyone() {
-    let reg = new_registry();
-    enroll(&reg, hello(1, 14900));
-    enroll(&reg, hello(2, 14901));
-    let entries = all_entries(&reg);
-    assert_eq!(entries.len(), 2);
-}
-
-#[test]
-fn remove_clears_an_entry() {
-    let reg = new_registry();
-    enroll(&reg, hello(1, 14900));
-    remove(&reg, RelayId(1));
-    assert!(is_empty(&reg));
-    assert!(peer(&reg, RelayId(1)).is_none());
+    // A second drop of the same connection is a no-op (already gone).
+    assert!(!remove_if_current(&reg, RelayId(1), current));
 }
 
 #[test]
 fn mark_draining_applies_under_the_current_generation() {
     let reg = new_registry();
+    // Marking an id that was never enrolled is a no-op.
+    assert!(!mark_draining(&reg, RelayId(7), 0));
+
     let generation = enroll(&reg, hello(1, 14900));
     assert!(is_available(&reg, RelayId(1)));
 
@@ -166,12 +115,6 @@ fn generation_is_current_tracks_re_enrollment() {
 }
 
 #[test]
-fn mark_draining_on_an_unknown_relay_is_a_no_op() {
-    let reg = new_registry();
-    assert!(!mark_draining(&reg, RelayId(7), 0));
-}
-
-#[test]
 fn re_enroll_clears_the_draining_flag() {
     // A relay that reconnects mid-drain is fresh: its enroll clears the flag, so
     // it must re-send Draining to re-mark itself.
@@ -190,6 +133,9 @@ fn re_enroll_clears_the_draining_flag() {
 #[test]
 fn clear_draining_re_admits_under_the_current_generation() {
     let reg = new_registry();
+    // Clearing an id that was never enrolled is a no-op.
+    assert!(!clear_draining(&reg, RelayId(7), 0));
+
     let generation = enroll(&reg, hello(1, 14900));
     assert!(mark_draining(&reg, RelayId(1), generation));
     assert!(!is_available(&reg, RelayId(1)));
@@ -229,12 +175,6 @@ fn clear_draining_ignores_a_stale_generation() {
 }
 
 #[test]
-fn clear_draining_on_an_unknown_relay_is_a_no_op() {
-    let reg = new_registry();
-    assert!(!clear_draining(&reg, RelayId(7), 0));
-}
-
-#[test]
 fn is_enrolled_tracks_presence_including_draining() {
     let reg = new_registry();
     assert!(!is_enrolled(&reg, RelayId(1)));
@@ -248,6 +188,8 @@ fn is_enrolled_tracks_presence_including_draining() {
 
     remove(&reg, RelayId(1));
     assert!(!is_enrolled(&reg, RelayId(1)));
+    // A removed (or never-enrolled) id has no peer to hand out either.
+    assert!(peer(&reg, RelayId(1)).is_none());
 }
 
 #[test]
@@ -278,7 +220,7 @@ fn available_entries_excludes_a_draining_relay() {
     let g1 = enroll(&reg, hello(1, 14900));
     enroll(&reg, hello(2, 14901));
 
-    // Both enrolled: both available.
+    // Both enrolled: both available. `all_entries` lists everyone regardless.
     assert_eq!(available_entries(&reg).len(), 2);
     assert_eq!(all_entries(&reg).len(), 2);
 
@@ -359,17 +301,6 @@ fn live_cert_fingerprint_tracks_the_current_entry() {
     // Deregistering clears it.
     remove(&reg, RelayId(1));
     assert_eq!(live_cert_fingerprint(&reg, RelayId(1)), None);
-}
-
-/// Builds a hello like [`hello`] but with an explicit certificate, for
-/// exercising same-id/different-cert enrollment conflicts.
-fn hello_with_cert(id: u64, port: u16, cert_der: Vec<u8>) -> RelayHello {
-    RelayHello::new(
-        RelayId(id),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-        ProtocolVersion::CURRENT,
-        cert_der,
-    )
 }
 
 #[test]

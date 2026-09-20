@@ -236,12 +236,7 @@ async fn a_pair_value_resets_the_bootstrap_backoff() {
 
 #[tokio::test]
 async fn a_single_region_config_never_bootstraps() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, _east) = Harness::default_region();
 
     // A lone region has no pairs, so coverage never demands anything.
     h.provision.tick(1_000).await;

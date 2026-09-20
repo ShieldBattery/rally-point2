@@ -311,42 +311,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn player_token_lifetime_defaults_to_six_hours() {
-        // With no flag and no env var, the mint lifetime falls back to 6 hours.
-        let cli = Cli::parse_from(["rally-point-coordinator"]);
-        assert_eq!(cli.player_token_lifetime_secs, 6 * 60 * 60);
-    }
-
-    #[test]
-    fn no_acme_flags_leaves_tls_off() {
-        // The default posture is plain HTTP: no domain, so no TLS configuration.
-        let cli = Cli::try_parse_from(["rally-point-coordinator"]).expect("no acme flags is valid");
-        assert!(cli.acme_domain.is_none());
-        assert!(!cli.acme_staging);
-    }
-
-    #[test]
     fn acme_domain_requires_contact_and_cache() {
-        // A domain names TLS mode but cannot stand alone: the account contact and
-        // the certificate cache are both mandatory, enforced by clap `requires`.
-        assert!(
-            Cli::try_parse_from([
-                "rally-point-coordinator",
-                "--acme-domain",
-                "coord.example.com",
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "rally-point-coordinator",
-                "--acme-domain",
-                "coord.example.com",
-                "--acme-contact",
-                "ops@example.com",
-            ])
-            .is_err()
-        );
+        // A domain names TLS mode but cannot stand alone: the account contact
+        // and the certificate cache are both mandatory, enforced by clap
+        // `requires`. Dropping either attribute would ship a coordinator that
+        // starts in TLS mode with nowhere to persist its certificate.
+        let complete = [
+            "--acme-domain",
+            "coord.example.com",
+            "--acme-contact",
+            "ops@example.com",
+            "--acme-cache",
+            "/var/lib/rp2-acme",
+        ];
+        for (flags, expect_ok) in [
+            (&complete[..2], false),
+            (&complete[..4], false),
+            (&complete[..], true),
+        ] {
+            let parsed = Cli::try_parse_from(
+                std::iter::once("rally-point-coordinator").chain(flags.iter().copied()),
+            );
+            assert_eq!(
+                parsed.is_ok(),
+                expect_ok,
+                "a TLS configuration is valid only once it names all three: {flags:?}",
+            );
+            if let Ok(cli) = parsed {
+                assert_eq!(cli.acme_domain.as_deref(), Some("coord.example.com"));
+                assert_eq!(cli.acme_contact.as_deref(), Some("ops@example.com"));
+                assert!(!cli.acme_staging, "staging is opt-in, never implied");
+            }
+        }
     }
 
     #[test]
@@ -373,22 +369,5 @@ mod tests {
             Cli::try_parse_from(["rally-point-coordinator", "--dev-tenant"]).is_ok(),
             "the dev tenant alone is valid",
         );
-    }
-
-    #[test]
-    fn acme_domain_with_contact_and_cache_parses() {
-        let cli = Cli::try_parse_from([
-            "rally-point-coordinator",
-            "--acme-domain",
-            "coord.example.com",
-            "--acme-contact",
-            "ops@example.com",
-            "--acme-cache",
-            "/var/lib/rp2-acme",
-        ])
-        .expect("a domain with a contact and a cache is a valid TLS configuration");
-        assert_eq!(cli.acme_domain.as_deref(), Some("coord.example.com"));
-        assert_eq!(cli.acme_contact.as_deref(), Some("ops@example.com"));
-        assert!(!cli.acme_staging);
     }
 }

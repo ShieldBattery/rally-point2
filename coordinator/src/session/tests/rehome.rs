@@ -9,7 +9,7 @@ fn rehome_stays_when_the_named_relay_is_still_live() {
     // The coordinator authoritatively knows the relay's liveness from its
     // registry: a client that believes a still-enrolled relay is dead is told to
     // stay rather than move.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
     assert_eq!(
         rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
@@ -27,7 +27,7 @@ fn a_departure_recorded_mid_rehome_still_seeds_the_resumed_descriptors() {
     // otherwise a fresh relay would wait forever on a slot that
     // permanently left, with no surviving mesh peer to re-announce it
     // after a single-relay death.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
     registry::remove(setup.registry(), RelayId(1));
 
@@ -72,7 +72,7 @@ fn a_departure_after_the_rehome_refreshes_the_staged_resumed_descriptors() {
     // reporting relay may die before ever mesh-reconciling with the new
     // relay) must still reach the rehomed relay: the refresh folds it into
     // the staged resumed descriptors, whose idempotent replay seeds it.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
     registry::remove(setup.registry(), RelayId(1));
     let RehomeOutcome::NewTarget(_) = rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
@@ -108,7 +108,7 @@ fn a_departure_on_a_never_rehomed_session_restages_nothing() {
     // Without a rehome, every serving relay learns departures over the
     // mesh as they happen; the original descriptors carry no departure
     // seeds by design, and the refresh must leave them untouched.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
 
     refresh_resumed_descriptors(&setup, &tid(), resp.session, || {
@@ -138,7 +138,7 @@ fn rehome_moves_the_group_to_a_live_relay_when_the_home_died() {
     // moves to the lowest-id live relay (2), and the rebuilt descriptor is a
     // resumed one carrying the seeded departure and ranking the new relay in the
     // dead one's place.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
     registry::remove(setup.registry(), RelayId(1));
 
@@ -181,7 +181,7 @@ fn rehome_moves_the_group_to_a_live_relay_when_the_home_died() {
 
 #[test]
 fn rehome_commit_hook_precedes_resumed_descriptor_publication() {
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
     registry::remove(setup.registry(), RelayId(1));
     let committed = std::cell::Cell::new(false);
@@ -231,27 +231,14 @@ fn rehome_prefers_a_relay_already_serving_the_session() {
     // The home dies; the replacement must be relay 2 — already serving the
     // session — not the idle relay 3, even though 3 is a lower id than any
     // non-serving pick would otherwise use.
-    let reg = registry::new_registry();
-    enroll_relay(&reg, 1, 14900);
-    enroll_relay_in_region(&reg, 2, 14901, Some("region-b"));
-    enroll_relay(&reg, 3, 14902);
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        tid(),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
+    let setup = region_fleet(&[
+        (1, 14900, None),
+        (2, 14901, Some("region-b")),
+        (3, 14902, None),
+    ]);
     let resp = create_session(
         &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        request(two_players_slot_1_in_region_b()),
         ExpiresAt(u64::MAX),
     )
     .unwrap()
@@ -288,7 +275,7 @@ fn rehome_prefers_a_relay_already_serving_the_session() {
 fn rehome_is_idempotent_for_the_same_dead_relay() {
     // A concurrent/repeated re-home naming the same dead relay returns the same
     // target and does not re-mutate the serving set.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
     registry::remove(setup.registry(), RelayId(1));
 
@@ -310,7 +297,7 @@ fn rehome_returns_the_recorded_target_after_the_dead_relay_re_enrolls() {
     // cert then asks to re-home the same dead relay id. It must get the recorded
     // replacement (relay 2), not `Stay` — a `Stay` would pin it to relay 1's new
     // cert, which its old pin can never accept, wedging it forever.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
 
     // The home relay 1 dies; the first client re-homes the group onto relay 2.
@@ -323,7 +310,7 @@ fn rehome_returns_the_recorded_target_after_the_dead_relay_re_enrolls() {
     assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(2)]);
 
     // Relay 1 restarts and re-enrolls under a fresh cert.
-    enroll_relay(setup.registry(), 1, 14900);
+    enroll_fleet(setup.registry(), &[(1, 14900, None, false)]);
 
     // The straggler names the same dead relay 1. Even though relay 1 is enrolled
     // again, the recorded re-home wins: it gets relay 2, not Stay.
@@ -343,8 +330,8 @@ fn a_chained_rehome_repoints_earlier_recorded_aliases() {
     // must be sent to R3: the recorded-rehome lookup validates only
     // registry liveness, so a stale R1 → R2 alias would misroute it
     // permanently onto a relay the session no longer uses.
-    let setup = setup_with_two_relays_and_tenant();
-    enroll_relay(setup.registry(), 3, 14902);
+    let setup = two_relay_fleet();
+    enroll_fleet(setup.registry(), &[(3, 14902, None, false)]);
     let resp = create_default_session(&setup);
 
     registry::remove(setup.registry(), RelayId(1));
@@ -356,7 +343,7 @@ fn a_chained_rehome_repoints_earlier_recorded_aliases() {
     assert!(matches!(second, RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(3)));
 
     // Relay 2 restarts: live again, but no longer serving this session.
-    enroll_relay(setup.registry(), 2, 14901);
+    enroll_fleet(setup.registry(), &[(2, 14901, None, false)]);
 
     assert_eq!(
         recorded_rehome(&setup, &tid(), resp.session, RelayId(1))
@@ -385,25 +372,14 @@ fn rehome_replaces_a_same_id_relay_that_restarted_with_a_new_cert() {
     // enroll later without becoming the session's original home -- proving the
     // replacement pick reaches for the restarted relay's own id rather than
     // drifting to whichever live relay happens to sort lowest.
-    let reg = registry::new_registry();
-    enroll_relay(&reg, 5, 14900);
-    enroll_relay(&reg, 6, 14901);
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        tid(),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
+    let setup = fleet(&[(5, 14900, None, false), (6, 14901, None, false)]).0;
     let resp = create_default_session(&setup);
     assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(5)]);
 
     // A new, lower-id relay enrolls after the session was created. It must not
     // steal the replacement pick away from the restarted relay's own id.
-    enroll_relay(setup.registry(), 1, 14899);
-    enroll_relay_with_cert(setup.registry(), 5, 14900, vec![0xEE; 4]);
+    enroll_fleet(setup.registry(), &[(1, 14899, None, false)]);
+    registry::enroll(setup.registry(), hello_with_cert(5, 14900, vec![0xEE; 4]));
 
     let departed = vec![DepartedSlot {
         finalized: false,
@@ -459,43 +435,14 @@ fn rehome_stays_when_a_relay_reconnects_under_an_unchanged_cert() {
     // generation but the SAME cert -- a connection blip, not a restart. The
     // enroll generation is deliberately not the signal for a cert change, so
     // this must still answer Stay.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
 
-    enroll_relay(setup.registry(), 1, 14900); // same id, same fake_cert(1)
+    enroll_fleet(setup.registry(), &[(1, 14900, None, false)]); // same id, same fake_cert(1)
 
     assert_eq!(
         rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
         RehomeOutcome::Stay,
     );
     assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
-}
-
-#[test]
-fn create_session_records_each_serving_relays_cert_for_a_cross_relay_session() {
-    let setup = setup_with_two_relays_region_b_and_tenant();
-    let resp = create_session(
-        &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-
-    let refs = session_refs(&setup, &tid(), resp.session).unwrap();
-    assert_eq!(
-        refs.relay_certs.get(&RelayId(1)),
-        Some(&cert_fingerprint(&fake_cert(1))),
-        "relay 1's client-pinned cert is recorded",
-    );
-    assert_eq!(
-        refs.relay_certs.get(&RelayId(2)),
-        Some(&cert_fingerprint(&fake_cert(2))),
-        "the region-b relay's cert is recorded too",
-    );
 }

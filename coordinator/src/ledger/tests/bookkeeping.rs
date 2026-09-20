@@ -6,11 +6,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
-
-/// A region id for the launching-count tests.
-fn region(name: &str) -> RegionId {
-    RegionId(name.to_owned())
-}
+use crate::test_support::region;
 
 #[test]
 fn count_launching_counts_only_unretired_unbound_unexpired_in_region() {
@@ -18,15 +14,28 @@ fn count_launching_counts_only_unretired_unbound_unexpired_in_region() {
     let east = region("us-east");
     let west = region("us-west");
 
-    // Two launching ids in us-east, one in us-west, one untagged.
+    // Two long-lived launching ids in us-east, one in us-west, one untagged,
+    // plus a short-lived one in us-east (a 10-second token minted at t=1000
+    // expires at 1010, so it has dropped out by the later checks below).
     let a = ledger.mint_at(1_000, Some(&east), DAY).unwrap();
     let _b = ledger.mint_at(1_000, Some(&east), DAY).unwrap();
     let _c = ledger.mint_at(1_000, Some(&west), DAY).unwrap();
     let _d = ledger.mint_at(1_000, None, DAY).unwrap();
+    ledger
+        .mint_at(1_000, Some(&east), Duration::from_secs(10))
+        .unwrap();
 
-    assert_eq!(ledger.count_launching(Some(&east), 1_100).unwrap(), 2);
-    assert_eq!(ledger.count_launching(Some(&west), 1_100).unwrap(), 1);
-    assert_eq!(ledger.count_launching(None, 1_100).unwrap(), 1);
+    // Before the short-lived token expires, all three us-east ids count.
+    assert_eq!(ledger.count_launching(Some(&east), 1_005).unwrap(), 3);
+    assert_eq!(ledger.count_launching(Some(&west), 1_005).unwrap(), 1);
+    assert_eq!(ledger.count_launching(None, 1_005).unwrap(), 1);
+    // Once it expires, it drops out -- excluded alongside region, binding, and
+    // retirement, not only by the separate launch-deadline sweep.
+    assert_eq!(
+        ledger.count_launching(Some(&east), 1_100).unwrap(),
+        2,
+        "an expired token no longer counts as launching",
+    );
 
     // Binding `a` (a first enroll) drops it from the launching count.
     ledger
@@ -38,28 +47,13 @@ fn count_launching_counts_only_unretired_unbound_unexpired_in_region() {
         "a bound id no longer counts as launching",
     );
 
-    // Retiring one of the remaining launching ids drops it too.
+    // Retiring the remaining launching id drops it too.
     ledger.retire(_b.relay_id).unwrap();
     assert_eq!(
         ledger.count_launching(Some(&east), 1_100).unwrap(),
         0,
         "a retired id no longer counts as launching",
     );
-}
-
-#[test]
-fn count_launching_excludes_an_expired_token() {
-    let ledger = ledger();
-    let east = region("us-east");
-    // A 10-second token minted at t=1000 expires at 1010.
-    ledger
-        .mint_at(1_000, Some(&east), Duration::from_secs(10))
-        .unwrap();
-    // Still counted while unexpired…
-    assert_eq!(ledger.count_launching(Some(&east), 1_005).unwrap(), 1);
-    // …and excluded once its token has expired (the launch-deadline sweep's
-    // concern instead).
-    assert_eq!(ledger.count_launching(Some(&east), 2_000).unwrap(), 0);
 }
 
 #[test]
@@ -159,28 +153,6 @@ fn task_arn_returns_the_recorded_task_or_none() {
 }
 
 #[test]
-fn record_direction_rtt_round_trips() {
-    let ledger = ledger();
-    ledger
-        .record_direction_rtt(
-            &region("eu-west"),
-            &region("us-east"),
-            &region("us-east"),
-            87,
-            1_752_555_555,
-        )
-        .unwrap();
-
-    let rows = ledger.direction_rtts().unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].a, region("eu-west"));
-    assert_eq!(rows[0].b, region("us-east"));
-    assert_eq!(rows[0].origin, region("us-east"));
-    assert_eq!(rows[0].rtt_ms, 87);
-    assert_eq!(rows[0].measured_at, 1_752_555_555);
-}
-
-#[test]
 fn record_direction_rtt_upserts_on_pair_and_origin() {
     // The two ends of a link are two rows (one per origin); re-reporting one
     // direction upserts that row rather than inserting a duplicate. The change-only
@@ -208,6 +180,9 @@ fn record_direction_rtt_upserts_on_pair_and_origin() {
         .iter()
         .find(|r| r.origin == region("a"))
         .expect("the a-origin row is present");
+    // Every field round-trips, not only the ones the upsert overwrote.
+    assert_eq!(from_a.a, region("a"));
+    assert_eq!(from_a.b, region("b"));
     assert_eq!(
         from_a.rtt_ms, 75,
         "the later report for that direction wins"
@@ -217,7 +192,13 @@ fn record_direction_rtt_upserts_on_pair_and_origin() {
         .iter()
         .find(|r| r.origin == region("b"))
         .expect("the b-origin row is untouched");
+    assert_eq!(from_b.a, region("a"));
+    assert_eq!(from_b.b, region("b"));
     assert_eq!(from_b.rtt_ms, 60, "the other direction is left alone");
+    assert_eq!(
+        from_b.measured_at, 11,
+        "the other direction's report is untouched"
+    );
 }
 
 #[test]

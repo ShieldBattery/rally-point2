@@ -60,6 +60,9 @@ fn the_same_token_binds_at_most_one_fingerprint() {
         .unwrap();
     assert!(matches!(first, Authorized::FirstEnroll { .. }));
 
+    // Once bound, the token is ignored on a reconnect — only the certificate
+    // matters, so a different fingerprint is refused even though it still
+    // presents the same (already-consumed) token.
     let second = ledger.authorize_enroll_at(
         1_020,
         minted.relay_id,
@@ -69,7 +72,8 @@ fn the_same_token_binds_at_most_one_fingerprint() {
     );
     assert!(matches!(second, Err(EnrollRefusal::FingerprintMismatch)));
 
-    // The winner's certificate is the one that stuck.
+    // The winner's certificate is the one that stuck, and it needs no token to
+    // reconnect: only the certificate is checked once bound.
     let reconnect = ledger
         .authorize_enroll_at(1_030, minted.relay_id, fingerprint(0xAA), None, None)
         .unwrap();
@@ -148,45 +152,6 @@ fn a_broken_clock_refuses_enrollment() {
         None,
     );
     assert!(matches!(outcome, Err(EnrollRefusal::TokenInvalid)));
-}
-
-#[test]
-fn a_reenroll_with_the_same_fingerprint_needs_no_token() {
-    let ledger = ledger();
-    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
-    ledger
-        .authorize_enroll_at(
-            1_010,
-            minted.relay_id,
-            fingerprint(0xD0),
-            Some(&minted.token),
-            None,
-        )
-        .unwrap();
-
-    // A reconnect presents the bound certificate and no token.
-    let outcome = ledger
-        .authorize_enroll_at(1_020, minted.relay_id, fingerprint(0xD0), None, None)
-        .unwrap();
-    assert_eq!(outcome, Authorized::Reenroll);
-}
-
-#[test]
-fn a_reenroll_with_a_different_fingerprint_is_refused() {
-    let ledger = ledger();
-    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
-    ledger
-        .authorize_enroll_at(
-            1_010,
-            minted.relay_id,
-            fingerprint(0xD0),
-            Some(&minted.token),
-            None,
-        )
-        .unwrap();
-
-    let outcome = ledger.authorize_enroll_at(1_020, minted.relay_id, fingerprint(0xEE), None, None);
-    assert!(matches!(outcome, Err(EnrollRefusal::FingerprintMismatch)));
 }
 
 #[test]

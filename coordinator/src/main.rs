@@ -213,22 +213,7 @@ async fn main() -> Result<()> {
     // configured pairs still lacking a measurement and bootstrap relays to fill them.
     let provision_pair_rtts = pair_rtts.clone();
 
-    // Clamp the configured token lifetime to the fleet-wide ceiling. The relay
-    // retains a retired session's tombstone only long enough to outlast the
-    // longest-lived token this constant permits; minting past it would let a
-    // stale token re-dial a session after its tombstone was pruned.
-    let player_token_lifetime_secs = if cli.player_token_lifetime_secs
-        > rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS
-    {
-        tracing::warn!(
-            configured = cli.player_token_lifetime_secs,
-            ceiling = rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS,
-            "player token lifetime exceeds the fleet ceiling; clamping",
-        );
-        rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS
-    } else {
-        cli.player_token_lifetime_secs
-    };
+    let player_token_lifetime_secs = clamp_player_token_lifetime(cli.player_token_lifetime_secs);
     // The dev / loopback posture, overridden with everything this binary
     // configured: the region list, the resolved token lifetime, and the ledger,
     // pair table, and flight store opened above (the pair table already seeded
@@ -404,6 +389,27 @@ fn validate_provision_tick_secs(secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Clamps a configured player-token lifetime to the fleet-wide ceiling, warning
+/// when the configured value is past it.
+///
+/// A relay retains a retired session's tombstone only long enough to outlast the
+/// longest-lived token the ceiling permits. Minting a token past the ceiling
+/// would let it re-dial a session after that tombstone was pruned — so an
+/// over-large configuration is clamped down rather than refused, since the
+/// coordinator serving with a safe lifetime beats it not serving at all.
+fn clamp_player_token_lifetime(secs: u64) -> u64 {
+    if secs > rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS {
+        tracing::warn!(
+            configured = secs,
+            ceiling = rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS,
+            "player token lifetime exceeds the fleet ceiling; clamping",
+        );
+        rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS
+    } else {
+        secs
+    }
+}
+
 /// Builds the reconcile loop over the shared coordinator handles and the chosen
 /// provisioner, then spawns it. The loop is generic over the substrate, so this is
 /// the single construction point both the process and the ECS substrate funnel
@@ -543,16 +549,36 @@ fn init_tracing() {
 mod tests {
     use super::*;
 
+    use rally_point_proto::control::MAX_PLAYER_TOKEN_LIFETIME_SECS;
+
     #[test]
-    fn a_zero_provision_tick_is_rejected() {
+    fn a_zero_provision_tick_is_rejected_and_a_nonzero_one_accepted() {
         // `tokio::time::interval(Duration::ZERO)` panics, and the provisioning loop
         // runs detached, so a zero tick must fail startup rather than reach the loop.
         assert!(validate_provision_tick_secs(0).is_err());
+        assert!(validate_provision_tick_secs(1).is_ok());
+        assert!(validate_provision_tick_secs(5).is_ok());
     }
 
     #[test]
-    fn a_nonzero_provision_tick_is_accepted() {
-        assert!(validate_provision_tick_secs(1).is_ok());
-        assert!(validate_provision_tick_secs(5).is_ok());
+    fn a_player_token_lifetime_past_the_fleet_ceiling_is_clamped_to_it() {
+        // The ceiling is what bounds how long a relay must keep a retired
+        // session's tombstone, so a configuration past it is brought back to the
+        // ceiling rather than honoured; anything at or under it is left alone.
+        assert_eq!(
+            clamp_player_token_lifetime(MAX_PLAYER_TOKEN_LIFETIME_SECS + 1),
+            MAX_PLAYER_TOKEN_LIFETIME_SECS,
+            "past the ceiling is clamped down to it",
+        );
+        assert_eq!(
+            clamp_player_token_lifetime(MAX_PLAYER_TOKEN_LIFETIME_SECS),
+            MAX_PLAYER_TOKEN_LIFETIME_SECS,
+            "exactly at the ceiling is not clamped",
+        );
+        assert_eq!(
+            clamp_player_token_lifetime(MAX_PLAYER_TOKEN_LIFETIME_SECS - 1),
+            MAX_PLAYER_TOKEN_LIFETIME_SECS - 1,
+            "under the ceiling is served as configured",
+        );
     }
 }

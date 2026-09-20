@@ -8,7 +8,7 @@ use super::*;
 fn rehome_unavailable_for_an_unknown_session() {
     // The dead relay is gone (else the stay-guard short-circuits); an unknown
     // session has no serving set to move.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     registry::remove(setup.registry(), RelayId(1));
     assert_eq!(
         rehome(&setup, &tid(), SessionId(999_999), RelayId(1), vec![]),
@@ -20,7 +20,7 @@ fn rehome_unavailable_for_an_unknown_session() {
 fn rehome_unavailable_when_no_relay_can_take_over() {
     // Every relay has left the registry, so there is nobody to move the session
     // to.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
     registry::remove(setup.registry(), RelayId(1));
     registry::remove(setup.registry(), RelayId(2));
@@ -37,7 +37,7 @@ fn rehome_unavailable_when_the_named_relay_does_not_serve_the_session() {
     // the session's serving set must get Unavailable — with no mutation, no
     // resumed-descriptor push, and no idempotency entry recorded, so a bogus name
     // can't disturb an otherwise-healthy session.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup);
 
     // The session serves only its home relay 1. Relay 99 was never enrolled and
@@ -92,14 +92,12 @@ fn forget_session_membership_retires_maps_and_refuses_rehome() {
     // Retiring a closed session's membership must empty both `session_relays`
     // and `session_refs`, and — with no serving set left — turn any further
     // re-home ask into `Unavailable`, so a straggler cannot resurrect the game.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_session(
         &setup,
         SessionRequest {
-            tenant: tid(),
-            players: two_players(),
             external_id: Some("game-42".to_owned()),
-            latency_estimate_ms: None,
+            ..request(two_players())
         },
         ExpiresAt(u64::MAX),
     )
@@ -144,17 +142,12 @@ fn rehome_removes_the_dead_relays_descriptor_so_a_re_enroll_is_not_re_synced() {
     // When the group moves off a dead relay, that relay's descriptor outbox entry
     // for the session must be removed — else a re-enrolling dead relay would be
     // re-synced a descriptor for a session it no longer serves and rejoin it.
-    let setup = setup_with_two_relays_region_b_and_tenant();
+    let setup = region_b_fleet();
     let resp = create_session(
         &setup,
-        SessionRequest {
-            tenant: tid(),
-            // Slot 1 names region-b so both relays serve (and each has a
-            // descriptor staged).
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        // Slot 1 names region-b so both relays serve (and each has a
+        // descriptor staged).
+        request(two_players_slot_1_in_region_b()),
         ExpiresAt(u64::MAX),
     )
     .unwrap()
@@ -197,7 +190,7 @@ fn a_rehome_racing_a_full_close_bails_without_recording_or_pushing() {
     // would otherwise serve token-free) and pushing no descriptor (which could
     // resurrect the dead session on a live relay). The `before_mutation` seam
     // simulates the close landing in exactly that window.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup); // serving == {1}
     registry::remove(setup.registry(), RelayId(1)); // the home died, so not Stay
 
@@ -243,7 +236,7 @@ fn a_full_close_after_a_completed_rehome_clears_the_new_relays_descriptor_and_re
     // close takes the session's membership atomically, and that snapshot now
     // includes the new relay the completed rehome added, so the close removes the
     // new relay's descriptor too and its forget_rehomes clears the recorded entry.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let resp = create_default_session(&setup); // serving == {1}
     registry::remove(setup.registry(), RelayId(1)); // the home died, so not Stay
 

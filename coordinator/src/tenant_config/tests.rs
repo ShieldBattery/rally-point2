@@ -239,31 +239,31 @@ fn bounds_past_the_game_safe_ceiling_are_rejected() {
 }
 
 #[test]
-fn a_duplicate_id_is_rejected() {
+fn a_duplicate_id_or_kid_is_rejected() {
     let pk = client_pubkey_hex(&[0x01; 32]);
-    let json = format!(
+
+    // Same id, different kids: rejected naming the id.
+    let dup_id = format!(
         r#"{{"tenants": [
             {{"id": "dup", "state": "active", "kid": "kid-1", "signing_key_env": "E1", "client_pubkeys": ["{pk}"]}},
             {{"id": "dup", "state": "active", "kid": "kid-2", "signing_key_env": "E2", "client_pubkeys": ["{pk}"]}}
         ]}}"#,
     );
     assert!(matches!(
-        from_json(&json),
+        from_json(&dup_id),
         Err(TenantConfigError::DuplicateId(id)) if id == "dup"
     ));
-}
 
-#[test]
-fn a_duplicate_kid_is_rejected() {
-    let pk = client_pubkey_hex(&[0x01; 32]);
-    let json = format!(
+    // Different ids, same kid: rejected naming the kid — the same uniqueness
+    // check applied to the other identifier a config carries.
+    let dup_kid = format!(
         r#"{{"tenants": [
             {{"id": "t1", "state": "active", "kid": "same", "signing_key_env": "E1", "client_pubkeys": ["{pk}"]}},
             {{"id": "t2", "state": "active", "kid": "same", "signing_key_env": "E2", "client_pubkeys": ["{pk}"]}}
         ]}}"#,
     );
     assert!(matches!(
-        from_json(&json),
+        from_json(&dup_kid),
         Err(TenantConfigError::DuplicateKid(kid)) if kid == "same"
     ));
 }
@@ -305,26 +305,23 @@ fn a_missing_env_var_fails_enrollment() {
 }
 
 #[test]
-fn a_non_base64_signing_key_fails_enrollment() {
-    let json = single_tenant_json("active", "ENV", &one_valid_pubkey(), "");
-    let config = from_json(&json).unwrap();
-    let store = tenant::new_store();
-    let env = HashMap::from([("ENV".to_owned(), "not valid base64 %%%".to_owned())]);
-    assert!(matches!(
-        enroll_all(&store, &config, |name| env.get(name).cloned()),
-        Err(TenantConfigError::MalformedSigningKeyBase64 { .. })
-    ));
-}
-
-#[test]
 fn base64_of_non_pkcs8_bytes_fails_enrollment() {
     let json = single_tenant_json("active", "ENV", &one_valid_pubkey(), "");
     let config = from_json(&json).unwrap();
+
+    // Not base64 at all.
     let store = tenant::new_store();
-    // Valid base64, but the bytes are not a PKCS#8 keypair.
-    let env = HashMap::from([("ENV".to_owned(), BASE64_STANDARD.encode([0u8; 16]))]);
+    let not_base64 = HashMap::from([("ENV".to_owned(), "not valid base64 %%%".to_owned())]);
     assert!(matches!(
-        enroll_all(&store, &config, |name| env.get(name).cloned()),
+        enroll_all(&store, &config, |name| not_base64.get(name).cloned()),
+        Err(TenantConfigError::MalformedSigningKeyBase64 { .. })
+    ));
+
+    // Valid base64, but the decoded bytes are not a PKCS#8 keypair.
+    let store = tenant::new_store();
+    let not_pkcs8 = HashMap::from([("ENV".to_owned(), BASE64_STANDARD.encode([0u8; 16]))]);
+    assert!(matches!(
+        enroll_all(&store, &config, |name| not_pkcs8.get(name).cloned()),
         Err(TenantConfigError::InvalidSigningKey { .. })
     ));
 }

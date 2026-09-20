@@ -229,6 +229,15 @@ impl<P: Provisioner> ProvisionLoop<P> {
         }
     }
 
+    /// How many launches are still waiting for their address to be recorded —
+    /// the observable a test drives to confirm a launch is in flight (credited
+    /// against target, spared from the orphan sweep) without reaching into the
+    /// private `pending` field.
+    #[cfg(test)]
+    pub(crate) fn pending_launches(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Runs the loop forever, ticking on the configured interval. A tick is skipped
     /// only when the system clock is unusable — a token expiry derived from it
     /// could not be trusted, so it is safer to wait for the next tick than to sweep

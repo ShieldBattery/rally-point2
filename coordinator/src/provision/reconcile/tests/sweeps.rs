@@ -39,9 +39,10 @@ async fn the_launch_deadline_sweep_stops_and_retires_a_never_enrolled_task() {
         0,
         "the expired launch was retired, so it is gone from the launching set",
     );
-    assert!(
-        h.provision.pending.is_empty(),
-        "the swept launch left pending"
+    assert_eq!(
+        h.provision.pending_launches(),
+        0,
+        "the swept launch left pending",
     );
     // A fresh mint after the retire gets a new id (the retired one is tombstoned).
     assert_ne!(
@@ -55,12 +56,7 @@ async fn the_launch_deadline_sweep_stops_and_retires_a_never_enrolled_task() {
 
 #[tokio::test]
 async fn the_vanished_task_sweep_retires_a_bound_relay_whose_task_stopped() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     // A bound id, recorded task, but never enrolled in the registry and whose
     // task the provisioner reports stopped.
     let minted = h
@@ -90,12 +86,7 @@ async fn the_vanished_task_sweep_retires_a_bound_relay_whose_task_stopped() {
 
 #[tokio::test]
 async fn the_vanished_task_sweep_leaves_an_enrolled_relay_alone() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     let (id, _gen) = h.seed_live_relay(&east, 1_000);
     // Its task reports stopped, but it is still enrolled — a false alarm.
     h.fake
@@ -111,12 +102,7 @@ async fn the_vanished_task_sweep_leaves_an_enrolled_relay_alone() {
 
 #[tokio::test]
 async fn the_orphan_sweep_stops_an_unreferenced_task_and_spares_a_referenced_one() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
 
     // A referenced task: a live relay's recorded task.
     let (id, _gen) = h.seed_live_relay(&east, 1_000);
@@ -139,12 +125,7 @@ async fn the_orphan_sweep_stops_an_unreferenced_task_and_spares_a_referenced_one
 
 #[tokio::test]
 async fn a_provisioner_launch_error_does_not_kill_the_loop_and_next_tick_retries() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     h.warm
         .warm_at(east.clone(), Duration::from_secs(600), 1_000);
 
@@ -174,12 +155,7 @@ async fn a_provisioner_launch_error_does_not_kill_the_loop_and_next_tick_retries
 
 #[tokio::test]
 async fn provisioner_state_and_list_errors_do_not_kill_the_loop() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     h.warm
         .warm_at(east.clone(), Duration::from_secs(600), 1_000);
 
@@ -190,7 +166,7 @@ async fn provisioner_state_and_list_errors_do_not_kill_the_loop() {
     h.provision.tick(1_000).await;
     assert_eq!(h.fake.launches().len(), 1);
     // The task could not be polled, so it stays pending for a later tick.
-    assert_eq!(h.provision.pending.len(), 1);
+    assert_eq!(h.provision.pending_launches(), 1);
 
     // With polling restored, the next tick records the task.
     h.fake.set_fail_state(false);
@@ -206,12 +182,7 @@ async fn provisioner_state_and_list_errors_do_not_kill_the_loop() {
 
 #[tokio::test]
 async fn a_stop_error_during_drain_still_retires_the_id() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(5),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::with_grace(5);
     let (id, _gen) = h.seed_live_relay(&east, 1_000);
     h.fake.set_fail_stop(true);
 
@@ -234,12 +205,7 @@ async fn many_enroll_and_retire_cycles_do_not_grow_the_outbox_shells() {
     // A coordinator with a long uptime under steady scale-to-zero churn runs
     // this cycle continuously, so the descriptor and reap outboxes must not
     // grow a permanent shell per id ever minted.
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(5),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::with_grace(5);
 
     let cycles = 50;
     let mut now = 1_000u64;

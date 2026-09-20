@@ -45,20 +45,26 @@ fn a_cold_region_create_warms_and_holds_without_minting() {
 #[test]
 fn a_retry_within_the_cap_keeps_holding() {
     let (setup, _warm) = provisioning_setup(Duration::from_secs(60));
-    let req = region_a_request(Some("g1"));
+    let roster_a = region_a_request(Some("g1"));
     assert!(matches!(
-        create_or_provision_session_at(&setup, req.clone(), ExpiresAt(u64::MAX), 1_000).unwrap(),
+        create_or_provision_session_at(&setup, roster_a, ExpiresAt(u64::MAX), 1_000).unwrap(),
         CreateOutcome::Provisioning { .. }
     ));
-    // A retry at t=1_030, still inside the 60s cap, holds again on one anchor.
+    // A retry at t=1_030, still inside the 60s cap, holds again -- even under a
+    // sibling roster sharing the external_id but differing in pubkey. The
+    // pending map is keyed on external_id alone, so a second roster under the
+    // same id shares the first's anchor rather than panicking or spawning a
+    // second one.
+    let mut roster_b = region_a_request(Some("g1"));
+    roster_b.players[0].client_pubkey = ClientPublicKey([0x99; 32]);
     assert!(matches!(
-        create_or_provision_session_at(&setup, req, ExpiresAt(u64::MAX), 1_030).unwrap(),
+        create_or_provision_session_at(&setup, roster_b, ExpiresAt(u64::MAX), 1_030).unwrap(),
         CreateOutcome::Provisioning { .. }
     ));
     assert_eq!(
         setup.pending_creates.lock().len(),
         1,
-        "one anchor tracks the hold across retries",
+        "one anchor tracks the hold across retries, even a sibling roster",
     );
 }
 
@@ -97,7 +103,7 @@ fn a_relay_enrolling_while_pending_places_in_region_and_clears_the_hold() {
         CreateOutcome::Provisioning { .. }
     ));
     // A relay for region-a enrolls while the create is held.
-    enroll_relay_in_region(setup.registry(), 2, 14901, Some("region-a"));
+    enroll_fleet(setup.registry(), &[(2, 14901, Some("region-a"), false)]);
     // The next identical retry, still inside the cap, places in-region on relay 2
     // rather than falling back to the region-blind relay 1.
     let resp =
@@ -162,7 +168,7 @@ fn an_unusable_clock_never_holds() {
 fn provisioning_off_never_holds() {
     // A setup with the dormant gate (no provisioning loop): a cold-region create
     // with an external_id still falls back immediately — no hold path exists.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let outcome = create_or_provision_session_at(
         &setup,
         region_a_request(Some("g1")),
@@ -175,29 +181,4 @@ fn provisioning_off_never_holds() {
         "with no provisioning loop, create never holds",
     );
     assert!(setup.pending_creates.lock().is_empty());
-}
-
-#[test]
-fn a_pending_sibling_roster_under_one_external_id_does_not_panic() {
-    // Two different rosters share one external_id while the region is cold. The
-    // pending map is keyed by external_id, so the second roster shares the first's
-    // anchor and also holds — no session or cache exists yet, so nothing conflicts
-    // and nothing panics.
-    let (setup, _warm) = provisioning_setup(Duration::from_secs(60));
-    let roster_a = region_a_request(Some("g1"));
-    let mut roster_b = region_a_request(Some("g1"));
-    roster_b.players[0].client_pubkey = ClientPublicKey([0x99; 32]);
-    assert!(matches!(
-        create_or_provision_session_at(&setup, roster_a, ExpiresAt(u64::MAX), 1_000).unwrap(),
-        CreateOutcome::Provisioning { .. }
-    ));
-    assert!(matches!(
-        create_or_provision_session_at(&setup, roster_b, ExpiresAt(u64::MAX), 1_010).unwrap(),
-        CreateOutcome::Provisioning { .. }
-    ));
-    assert_eq!(
-        setup.pending_creates.lock().len(),
-        1,
-        "both rosters share one external_id-keyed anchor",
-    );
 }

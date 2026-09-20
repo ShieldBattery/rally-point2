@@ -144,17 +144,17 @@ mod tests {
     }
 
     #[test]
-    fn contact_uri_prepends_mailto_to_a_bare_email() {
-        assert_eq!(contact_uri("ops@example.com"), "mailto:ops@example.com");
-    }
-
-    #[test]
-    fn contact_uri_leaves_an_existing_scheme_untouched() {
-        assert_eq!(
-            contact_uri("mailto:ops@example.com"),
-            "mailto:ops@example.com"
-        );
-        assert_eq!(contact_uri("tel:+15551234"), "tel:+15551234");
+    fn contact_uri_renders_a_contact_as_an_acme_uri() {
+        // The CA wants a URI, an operator writes an email address: a bare
+        // address gains a `mailto:` prefix, and a value that already names any
+        // scheme is passed through so an explicit one is never doubled.
+        for (contact, expected) in [
+            ("ops@example.com", "mailto:ops@example.com"),
+            ("mailto:ops@example.com", "mailto:ops@example.com"),
+            ("tel:+15551234", "tel:+15551234"),
+        ] {
+            assert_eq!(contact_uri(contact), expected);
+        }
     }
 
     #[test]
@@ -174,32 +174,14 @@ mod tests {
     }
 
     #[test]
-    fn ensure_cache_dir_creates_missing_parents() {
-        let root = scratch_root();
-        let nested = root.join("nested").join("cache");
-        ensure_cache_dir(&nested).expect("a deep, missing cache path is created");
-        assert!(nested.is_dir());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn ensure_cache_dir_rejects_a_path_blocked_by_a_file() {
-        let root = scratch_root();
-        std::fs::create_dir_all(&root).unwrap();
-        let file = root.join("occupied");
-        std::fs::write(&file, b"x").unwrap();
-        // A regular file sits where a directory component is needed, so creating
-        // the cache directory under it must fail rather than silently succeed.
-        assert!(ensure_cache_dir(&file.join("cache")).is_err());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn build_state_fails_when_the_cache_dir_is_unusable() {
         let root = scratch_root();
         std::fs::create_dir_all(&root).unwrap();
         let file = root.join("occupied");
         std::fs::write(&file, b"x").unwrap();
+        // A regular file sits where a directory component is needed, so the
+        // cache directory cannot be created and startup must fail rather than
+        // degrade to re-requesting a certificate on every boot.
         let settings = AcmeSettings {
             domain: "coordinator.example.com".to_owned(),
             contact: "ops@example.com".to_owned(),
@@ -213,15 +195,23 @@ mod tests {
     #[test]
     fn build_state_assembles_for_a_writable_cache_dir() {
         let root = scratch_root();
+        // A deep, wholly missing cache path: the operator names where the account
+        // key and certificates should live, and the coordinator creates it —
+        // missing parents and all — rather than refusing to start.
+        let cache_dir = root.join("nested").join("cache");
         let settings = AcmeSettings {
             domain: "coordinator.example.com".to_owned(),
             contact: "ops@example.com".to_owned(),
-            cache_dir: root.join("cache"),
+            cache_dir: cache_dir.clone(),
             staging: true,
         };
         // Assembling the state performs no network I/O, so this exercises the whole
         // config-building path without contacting a CA.
         build_state(&settings).expect("a writable cache dir yields an ACME state");
+        assert!(
+            cache_dir.is_dir(),
+            "the cache directory exists once the state is built"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

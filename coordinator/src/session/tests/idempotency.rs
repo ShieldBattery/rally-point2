@@ -1,42 +1,20 @@
 //! Create idempotency: replaying a duplicate create for a live `external_id`,
-//! and refusing one that reuses the id for a different roster.
+//! refusing one that reuses the id for a different roster, and every field a
+//! roster can differ in that must be treated as that kind of conflict.
 
 use super::*;
 
 #[test]
-fn a_duplicate_create_within_the_window_replays_the_original_response() {
-    let setup = setup_with_two_relays_and_tenant();
-    let request = SessionRequest {
-        tenant: tid(),
-        players: two_players(),
-        external_id: Some("game-1".to_owned()),
-        latency_estimate_ms: None,
-    };
-    let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
-        .unwrap()
-        .response;
-    let second = create_session(&setup, request, ExpiresAt(u64::MAX))
-        .unwrap()
-        .response;
-    assert_eq!(
-        first, second,
-        "a retried create for the same (tenant, external_id) gets the exact original response back",
-    );
-}
-
-#[test]
 fn a_duplicate_create_mints_no_new_session() {
-    let setup = setup_with_two_relays_and_tenant();
-    let request = SessionRequest {
-        tenant: tid(),
-        players: two_players(),
+    let setup = two_relay_fleet();
+    let game = SessionRequest {
         external_id: Some("game-1".to_owned()),
-        latency_estimate_ms: None,
+        ..request(two_players())
     };
-    let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
+    let first = create_session(&setup, game.clone(), ExpiresAt(u64::MAX))
         .unwrap()
         .response;
-    let _ = create_session(&setup, request, ExpiresAt(u64::MAX))
+    let _ = create_session(&setup, game, ExpiresAt(u64::MAX))
         .unwrap()
         .response;
 
@@ -52,41 +30,34 @@ fn a_duplicate_create_mints_no_new_session() {
 }
 
 #[test]
-fn a_different_external_id_creates_a_genuinely_fresh_session() {
-    let setup = setup_with_two_relays_and_tenant();
-    let first = create_session(
-        &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: two_players(),
-            external_id: Some("game-1".to_owned()),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-    let second = create_session(
-        &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: two_players(),
-            external_id: Some("game-2".to_owned()),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-    assert_ne!(first.session, second.session);
-    assert_ne!(first.tokens, second.tokens);
+fn no_external_id_is_never_idempotent() {
+    // Neither "no external_id at all" nor "a different external_id" is a
+    // replay: both mint a genuinely fresh session with fresh tokens.
+    let setup = two_relay_fleet();
+    let game = |external_id: Option<&str>| SessionRequest {
+        external_id: external_id.map(|s| s.to_owned()),
+        ..request(two_players())
+    };
+    for (first_id, second_id) in [(None, None), (Some("game-1"), Some("game-2"))] {
+        let first = create_session(&setup, game(first_id), ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
+        let second = create_session(&setup, game(second_id), ExpiresAt(u64::MAX))
+            .unwrap()
+            .response;
+        assert_ne!(
+            first.session, second.session,
+            "external_id {first_id:?} -> {second_id:?} must not replay",
+        );
+        assert_ne!(first.tokens, second.tokens);
+    }
 }
 
 #[test]
 fn a_different_tenants_matching_external_id_is_not_a_duplicate() {
     // Tenant-scoped key: two tenants using the same external_id (plausible
     // if each mints its own game ids independently) must never collide.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let other_tenant = TenantId("sb-other".to_owned());
     tenant::enroll(
         setup.tenants(),
@@ -96,43 +67,28 @@ fn a_different_tenants_matching_external_id_is_not_a_duplicate() {
     )
     .unwrap();
 
-    let first = create_session(
-        &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: two_players(),
-            external_id: Some("shared-id".to_owned()),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-    let second = create_session(
-        &setup,
-        SessionRequest {
-            tenant: other_tenant,
-            players: two_players(),
-            external_id: Some("shared-id".to_owned()),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
+    let game = |tenant: TenantId| SessionRequest {
+        tenant,
+        external_id: Some("shared-id".to_owned()),
+        ..request(two_players())
+    };
+    let first = create_session(&setup, game(tid()), ExpiresAt(u64::MAX))
+        .unwrap()
+        .response;
+    let second = create_session(&setup, game(other_tenant), ExpiresAt(u64::MAX))
+        .unwrap()
+        .response;
     assert_ne!(first.session, second.session);
 }
 
 #[test]
 fn a_closed_sessions_external_id_can_be_reused() {
-    let setup = setup_with_two_relays_and_tenant();
-    let request = SessionRequest {
-        tenant: tid(),
-        players: two_players(),
+    let setup = two_relay_fleet();
+    let game = SessionRequest {
         external_id: Some("game-1".to_owned()),
-        latency_estimate_ms: None,
+        ..request(two_players())
     };
-    let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
+    let first = create_session(&setup, game.clone(), ExpiresAt(u64::MAX))
         .unwrap()
         .response;
 
@@ -149,7 +105,7 @@ fn a_closed_sessions_external_id_can_be_reused() {
          reuses an external_id leaks one entry per closed session forever",
     );
 
-    let second = create_session(&setup, request, ExpiresAt(u64::MAX))
+    let second = create_session(&setup, game, ExpiresAt(u64::MAX))
         .unwrap()
         .response;
     assert_ne!(
@@ -163,10 +119,8 @@ fn a_closed_sessions_external_id_can_be_reused() {
     let retried = create_session(
         &setup,
         SessionRequest {
-            tenant: tid(),
-            players: two_players(),
             external_id: Some("game-1".to_owned()),
-            latency_estimate_ms: None,
+            ..request(two_players())
         },
         ExpiresAt(u64::MAX),
     )
@@ -176,41 +130,18 @@ fn a_closed_sessions_external_id_can_be_reused() {
 }
 
 #[test]
-fn no_external_id_is_never_idempotent() {
-    let setup = setup_with_two_relays_and_tenant();
-    let request = SessionRequest {
-        tenant: tid(),
-        players: two_players(),
-        external_id: None,
-        latency_estimate_ms: None,
-    };
-    let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX))
-        .unwrap()
-        .response;
-    let second = create_session(&setup, request, ExpiresAt(u64::MAX))
-        .unwrap()
-        .response;
-    assert_ne!(
-        first.session, second.session,
-        "a request naming no external_id is never replayed, even back to back",
-    );
-}
-
-#[test]
 fn a_matching_replay_reports_replayed_while_the_first_create_does_not() {
-    let setup = setup_with_two_relays_and_tenant();
-    let request = SessionRequest {
-        tenant: tid(),
-        players: two_players(),
+    let setup = two_relay_fleet();
+    let game = SessionRequest {
         external_id: Some("game-1".to_owned()),
-        latency_estimate_ms: None,
+        ..request(two_players())
     };
-    let first = create_session(&setup, request.clone(), ExpiresAt(u64::MAX)).unwrap();
+    let first = create_session(&setup, game.clone(), ExpiresAt(u64::MAX)).unwrap();
     assert!(
         !first.replayed,
         "the create that actually minted the session is a fresh mint, not a replay",
     );
-    let second = create_session(&setup, request, ExpiresAt(u64::MAX)).unwrap();
+    let second = create_session(&setup, game, ExpiresAt(u64::MAX)).unwrap();
     assert!(
         second.replayed,
         "a retry with the identical roster is served from the idempotency cache",
@@ -226,7 +157,7 @@ fn a_replay_matches_regardless_of_player_order() {
     // The fingerprint sorts players by slot, so a retry that lists the same
     // roster in a different order is still an idempotent replay, not a
     // conflict -- request order carries no meaning.
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let players = two_players();
     let mut reversed = players.clone();
     reversed.reverse();
@@ -234,10 +165,8 @@ fn a_replay_matches_regardless_of_player_order() {
     let first = create_session(
         &setup,
         SessionRequest {
-            tenant: tid(),
-            players,
             external_id: Some("game-1".to_owned()),
-            latency_estimate_ms: None,
+            ..request(players)
         },
         ExpiresAt(u64::MAX),
     )
@@ -245,10 +174,8 @@ fn a_replay_matches_regardless_of_player_order() {
     let second = create_session(
         &setup,
         SessionRequest {
-            tenant: tid(),
-            players: reversed,
             external_id: Some("game-1".to_owned()),
-            latency_estimate_ms: None,
+            ..request(reversed)
         },
         ExpiresAt(u64::MAX),
     )
@@ -262,12 +189,10 @@ fn a_replay_matches_regardless_of_player_order() {
 
 #[test]
 fn a_conflicting_create_reusing_a_live_external_id_for_a_different_roster_is_refused() {
-    let setup = setup_with_two_relays_and_tenant();
+    let setup = two_relay_fleet();
     let original = SessionRequest {
-        tenant: tid(),
-        players: two_players(),
         external_id: Some("game-1".to_owned()),
-        latency_estimate_ms: None,
+        ..request(two_players())
     };
     let first = create_session(&setup, original.clone(), ExpiresAt(u64::MAX)).unwrap();
 
@@ -276,27 +201,8 @@ fn a_conflicting_create_reusing_a_live_external_id_for_a_different_roster_is_ref
     // minted authorize different clients than this roster asks for. Handing
     // them back, or overwriting the live session's accounting, would both be
     // wrong -- so the create is refused.
-    let conflicting = SessionRequest {
-        tenant: tid(),
-        players: vec![
-            PlayerHandoff {
-                slot: SlotId(0),
-                client_pubkey: ClientPublicKey([0xAA; 32]),
-                external_ref: None,
-                observer: false,
-                region: None,
-            },
-            PlayerHandoff {
-                slot: SlotId(1),
-                client_pubkey: ClientPublicKey([0xCC; 32]),
-                external_ref: None,
-                observer: false,
-                region: None,
-            },
-        ],
-        external_id: Some("game-1".to_owned()),
-        latency_estimate_ms: None,
-    };
+    let mut conflicting = original.clone();
+    conflicting.players[1].client_pubkey = ClientPublicKey([0xCC; 32]);
     let err = create_session(&setup, conflicting, ExpiresAt(u64::MAX)).unwrap_err();
     assert_eq!(err, SessionSetupError::IdempotentCreateMismatch);
 
@@ -320,36 +226,78 @@ fn a_conflicting_create_reusing_a_live_external_id_for_a_different_roster_is_ref
 }
 
 #[test]
-fn a_conflicting_create_differing_only_in_the_observer_flag_is_refused() {
-    // The observer flag shapes recorded state (the session's observer set and
-    // its lifecycle player/observer split) even though it alters no token, so a
-    // roster that flips it is a distinct request, not a retry.
-    let setup = setup_with_two_relays_and_tenant();
-    let players = two_players();
-    let mut with_observer = players.clone();
-    with_observer[1].observer = true;
+fn each_fingerprint_field_change_alone_is_refused_as_a_create_mismatch() {
+    // Table-driven over every field `CreateFingerprint` folds in besides the
+    // (tenant, external_id) key itself (gate.rs): flipping any one of them
+    // alone must turn a would-be replay into an `IdempotentCreateMismatch`,
+    // and must leave the cached entry serving the original roster's replays
+    // untouched -- never evicted, overwritten, or silently accepted.
+    let setup = two_relay_fleet();
+    let base = || SessionRequest {
+        external_id: Some("game-1".to_owned()),
+        latency_estimate_ms: Some(40),
+        ..request(vec![
+            PlayerHandoff {
+                external_ref: Some("ref-a".to_owned()),
+                ..player(0)
+            },
+            player(1),
+        ])
+    };
+    let original = create_session(&setup, base(), ExpiresAt(u64::MAX))
+        .unwrap()
+        .response;
 
-    create_session(
-        &setup,
-        SessionRequest {
-            tenant: tid(),
-            players,
-            external_id: Some("game-1".to_owned()),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap();
-    let err = create_session(
-        &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: with_observer,
-            external_id: Some("game-1".to_owned()),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap_err();
-    assert_eq!(err, SessionSetupError::IdempotentCreateMismatch);
+    type FingerprintCase = (&'static str, fn(&mut SessionRequest));
+    let cases: Vec<FingerprintCase> = vec![
+        // A differing client pubkey mints a non-interchangeable token for the
+        // slot; handing back the cached one would authorize the wrong client.
+        ("client pubkey", |r| {
+            r.players[0].client_pubkey = ClientPublicKey([0xEE; 32]);
+        }),
+        // The observer flag shapes recorded state (the session's observer set
+        // and its lifecycle player/observer split) even though it alters no
+        // token.
+        ("observer flag", |r| {
+            r.players[1].observer = true;
+        }),
+        // Region selects a slot's home relay, so the same external_id
+        // retried with a different per-slot region is a genuine roster
+        // mismatch, not a replay.
+        ("player region", |r| {
+            r.players[1].region = Some(region("region-b"));
+        }),
+        // external_ref is stored per slot and echoed into departure/result
+        // webhooks, so replaying the first roster's ref for a different
+        // roster would mislabel the player.
+        ("external_ref", |r| {
+            r.players[0].external_ref = Some("ref-changed".to_owned());
+        }),
+        // latency_estimate_ms is recorded into the session's correlation
+        // state and sizes the initial buffer at the authority relay, so
+        // replaying a cached response for a different estimate would bind
+        // the wrong depth input to the session.
+        ("latency_estimate_ms", |r| {
+            r.latency_estimate_ms = Some(90);
+        }),
+    ];
+
+    for (label, mutate) in cases {
+        let mut changed = base();
+        mutate(&mut changed);
+        assert_eq!(
+            create_session(&setup, changed, ExpiresAt(u64::MAX)).unwrap_err(),
+            SessionSetupError::IdempotentCreateMismatch,
+            "{label} alone must be refused as a mismatch",
+        );
+
+        // The conflict must not have evicted or overwritten the cached
+        // entry: the original roster still replays the exact first response.
+        let replay = create_session(&setup, base(), ExpiresAt(u64::MAX)).unwrap();
+        assert!(
+            replay.replayed,
+            "{label}: a conflict must leave the cache serving replays",
+        );
+        assert_eq!(replay.response, original);
+    }
 }

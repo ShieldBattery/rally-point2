@@ -6,12 +6,7 @@ use super::*;
 
 #[tokio::test]
 async fn scale_up_mints_launches_and_records_once_running() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     h.warm
         .warm_at(east.clone(), Duration::from_secs(600), 1_000);
 
@@ -35,12 +30,7 @@ async fn scale_up_mints_launches_and_records_once_running() {
 
 #[tokio::test]
 async fn launching_counts_against_target_so_no_double_launch() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     // A launch that stays Starting (its task never comes up this test).
     h.fake.set_launch_state(TaskState::Starting);
     h.warm
@@ -59,17 +49,12 @@ async fn launching_counts_against_target_so_no_double_launch() {
     );
     // And the still-pending launch is spared the orphan sweep.
     assert_eq!(h.fake.stops(), Vec::<String>::new());
-    assert_eq!(h.provision.pending.len(), 1);
+    assert_eq!(h.provision.pending_launches(), 1);
 }
 
 #[tokio::test]
 async fn a_starting_task_is_recorded_once_it_reports_running() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     h.fake.set_launch_state(TaskState::Starting);
     h.warm
         .warm_at(east.clone(), Duration::from_secs(600), 1_000);
@@ -89,20 +74,16 @@ async fn a_starting_task_is_recorded_once_it_reports_running() {
         h.ledger.task_arn(minted_id).unwrap(),
         Some("task-0".to_owned()),
     );
-    assert!(
-        h.provision.pending.is_empty(),
-        "a recorded task leaves pending"
+    assert_eq!(
+        h.provision.pending_launches(),
+        0,
+        "a recorded task leaves pending",
     );
 }
 
 #[tokio::test]
 async fn a_v6_only_running_state_stays_pending_until_the_public_ipv4_appears() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     h.fake.set_expects_public_ipv4(true);
     let v6: IpAddr = "2001:db8::1".parse().unwrap();
     let v6_addr: SocketAddr = "[2001:db8::1]:14900".parse().unwrap();
@@ -120,7 +101,7 @@ async fn a_v6_only_running_state_stays_pending_until_the_public_ipv4_appears() {
         None,
         "a v6-only address set is not recorded while the public IPv4 may still appear",
     );
-    assert_eq!(h.provision.pending.len(), 1);
+    assert_eq!(h.provision.pending_launches(), 1);
 
     // The public IPv4 association appears: a later, still-within-window tick
     // records the full dual-stack set.
@@ -139,9 +120,10 @@ async fn a_v6_only_running_state_stays_pending_until_the_public_ipv4_appears() {
         Some("task-0".to_owned()),
         "once the v4 association appears the dual-stack set is recorded",
     );
-    assert!(
-        h.provision.pending.is_empty(),
-        "the now-recorded launch leaves pending"
+    assert_eq!(
+        h.provision.pending_launches(),
+        0,
+        "the now-recorded launch leaves pending",
     );
 }
 
@@ -184,12 +166,7 @@ async fn a_v6_only_running_state_is_recorded_once_the_wait_lapses() {
 
 #[tokio::test]
 async fn a_v6_only_running_state_is_recorded_immediately_when_ipv4_is_not_expected() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     // `expects_public_ipv4` stays at its default (false): a genuinely
     // v6-only deployment must not be held waiting for a v4 that never comes.
     let v6: IpAddr = "2001:db8::1".parse().unwrap();
@@ -212,20 +189,28 @@ async fn a_v6_only_running_state_is_recorded_immediately_when_ipv4_is_not_expect
 
 #[tokio::test]
 async fn a_lapsed_warm_target_scales_back_to_zero() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(5),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::with_grace(5);
+    // Every launch stops before enrolling, so nothing lingers as "launching"
+    // between ticks (`resolve_pending` retires it the same tick it launches).
+    // Without this, the first tick's still-launching credit alone would
+    // suppress a second launch on the next tick regardless of whether the
+    // warm target had lapsed, and the assertion below could not tell the two
+    // cases apart.
+    h.fake.set_launch_state(TaskState::Stopped);
     // Warm for 5s, then let it lapse.
     h.warm.warm_at(east.clone(), Duration::from_secs(5), 1_000);
     h.provision.tick(1_000).await;
     assert_eq!(h.fake.launches().len(), 1, "warm demand launched one");
+    assert_eq!(
+        h.ledger.count_launching(Some(&east), 1_000).unwrap(),
+        0,
+        "the stopped launch left nothing credited as launching",
+    );
 
-    // Past the warm deadline (and no live relay ever enrolled): the target is 0,
-    // so nothing new launches, and the never-enrolled launch stays launching
-    // until its own deadline sweep — no runaway launching.
+    // Past the warm deadline: the target is 0, so a still-live, still-lapsed
+    // region demands nothing more. With live and launching both at 0, a
+    // target that had *not* lapsed would demand (and launch) a second relay
+    // here — the single launch below can only be explained by the lapse.
     h.provision.tick(1_010).await;
     assert_eq!(
         h.fake.launches().len(),
@@ -236,12 +221,7 @@ async fn a_lapsed_warm_target_scales_back_to_zero() {
 
 #[tokio::test]
 async fn a_draining_relay_does_not_suppress_scale_up() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(600),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::default_region();
     let (id, generation) = h.seed_live_relay(&east, 1_000);
     // The relay has asked to drain — placement can no longer land a session on
     // it (`registry::is_available` already excludes it) — but it is still
@@ -264,12 +244,7 @@ async fn a_draining_relay_does_not_suppress_scale_up() {
 
 #[tokio::test]
 async fn scale_down_drains_only_idle_zero_session_relays_past_the_grace() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(5),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::with_grace(5);
     // No warm demand: target is 0, so the single live relay is over target.
     let (id, _gen) = h.seed_live_relay(&east, 1_000);
 
@@ -300,16 +275,11 @@ async fn scale_down_drains_only_idle_zero_session_relays_past_the_grace() {
 
 #[tokio::test]
 async fn scale_down_spares_a_relay_that_gained_a_session_in_the_race() {
-    let east = region("us-east");
-    let h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(5),
-        Duration::from_secs(300),
-    );
+    let (h, east) = Harness::with_grace(5);
     let (id, generation) = h.seed_live_relay(&east, 1_000);
 
     // A session lands on the relay (the only enrolled one).
-    create_session(&h.setup, two_player_request(), ExpiresAt(u64::MAX)).unwrap();
+    create_session(&h.setup, request(two_players()), ExpiresAt(u64::MAX)).unwrap();
     assert_eq!(h.setup.session_count_for_relay(id), 1);
 
     // The drain sequence marks it, re-checks, sees the session, and spares it.
@@ -333,15 +303,13 @@ async fn scale_down_spares_a_relay_that_gained_a_session_in_the_race() {
 
 #[tokio::test]
 async fn a_stale_generation_drain_is_a_no_op() {
-    let east = region("us-east");
-    let mut h = Harness::new(
-        vec![east.clone()],
-        Duration::from_secs(5),
-        Duration::from_secs(300),
-    );
+    let (mut h, east) = Harness::with_grace(5);
     let (id, stale_generation) = h.seed_live_relay(&east, 1_000);
     // The relay reconnects: a newer generation supersedes the one selected.
-    registry::enroll(&h.reg, hello_in_region(id.0, &east));
+    registry::enroll(
+        &h.reg,
+        hello(id.0, 14_900 + id.0 as u16).with_region(east.clone()),
+    );
 
     let drained = h.provision.try_drain_one(id, stale_generation).await;
     assert!(!drained, "a stale-generation drain does not apply");

@@ -9,19 +9,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 
 use parking_lot::Mutex;
-use rally_point_proto::control::{
-    BufferBounds, PlayerHandoff, RelayHello, SessionRequest, TenantId,
-};
-use rally_point_proto::ids::SlotId;
-use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
-use rally_point_proto::version::ProtocolVersion;
+use rally_point_proto::token::ExpiresAt;
 
 use super::*;
 use crate::provision::ProvisionError;
 use crate::session::create_session;
-use crate::tenant;
-
-const TENANT: &str = "sb-test";
+use crate::test_support::{hello, region, request, tenant_store, two_players};
 
 /// A scripted, inspectable [`Provisioner`]: it records launches and stops,
 /// hands each launch a scripted initial [`TaskState`], and can be told to fail
@@ -168,10 +161,6 @@ impl Provisioner for FakeProvisioner {
     }
 }
 
-fn region(name: &str) -> RegionId {
-    RegionId(name.to_owned())
-}
-
 /// How many launches the fake provisioner has recorded for `region` so far —
 /// the coverage tests' demand signal (paired with a launch state that stops
 /// before enrolling, one demanding tick equals one launch for the region).
@@ -181,43 +170,6 @@ fn launches_for(h: &Harness, region: &RegionId) -> usize {
         .into_iter()
         .filter(|spec| spec.region.as_ref() == Some(region))
         .count()
-}
-
-/// A hello for `id`, tagged with `region`, on a per-id loopback port.
-fn hello_in_region(id: u64, region: &RegionId) -> RelayHello {
-    RelayHello::new(
-        RelayId(id),
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 14_900 + id as u16)),
-        ProtocolVersion::CURRENT,
-        vec![id as u8; 4],
-    )
-    .with_region(region.clone())
-}
-
-/// A two-player, region-blind session request — its slots home on whatever
-/// relay is available.
-fn two_player_request() -> SessionRequest {
-    SessionRequest {
-        tenant: TenantId(TENANT.to_owned()),
-        players: vec![
-            PlayerHandoff {
-                slot: SlotId(0),
-                client_pubkey: ClientPublicKey([0xAA; 32]),
-                external_ref: None,
-                observer: false,
-                region: None,
-            },
-            PlayerHandoff {
-                slot: SlotId(1),
-                client_pubkey: ClientPublicKey([0xBB; 32]),
-                external_ref: None,
-                observer: false,
-                region: None,
-            },
-        ],
-        external_id: None,
-        latency_estimate_ms: None,
-    }
 }
 
 /// A test rig: shared registry, ledger, session setup (with one enrolled
@@ -235,15 +187,7 @@ struct Harness {
 impl Harness {
     fn new(regions: Vec<RegionId>, idle_grace: Duration, launch_deadline: Duration) -> Self {
         let reg = registry::new_registry();
-        let tenants = tenant::new_store();
-        tenant::enroll(
-            &tenants,
-            KeyId("test-key-1".to_owned()),
-            TenantId(TENANT.to_owned()),
-            BufferBounds::new(1, 6).unwrap(),
-        )
-        .unwrap();
-        let setup = SessionSetup::new(reg.clone(), tenants);
+        let setup = SessionSetup::new(reg.clone(), tenant_store());
         let ledger =
             Arc::new(RelayLedger::open(Path::new(":memory:")).expect("in-memory ledger opens"));
         let warm = WarmTargets::new();
@@ -294,8 +238,35 @@ impl Harness {
                 &[],
             )
             .unwrap();
-        let generation = registry::enroll(&self.reg, hello_in_region(minted.relay_id.0, region));
+        let generation = registry::enroll(
+            &self.reg,
+            hello(minted.relay_id.0, 14_900 + minted.relay_id.0 as u16).with_region(region.clone()),
+        );
         (minted.relay_id, generation)
+    }
+
+    /// The common single-region rig every scaling/sweep test that doesn't care
+    /// about the exact durations reaches for: `us-east`, a 600s idle grace (long
+    /// enough that nothing idle-drains mid-test), a 300s launch deadline (long
+    /// enough that a launch is never swept as expired mid-test). Returns the
+    /// region alongside the harness since almost every caller needs it too.
+    fn default_region() -> (Self, RegionId) {
+        Self::with_grace(600)
+    }
+
+    /// [`default_region`](Self::default_region) with the idle grace overridden —
+    /// for scale-down tests that need a short grace to reach the drain within a
+    /// couple of ticks.
+    fn with_grace(idle_grace_secs: u64) -> (Self, RegionId) {
+        let east = region("us-east");
+        (
+            Self::new(
+                vec![east.clone()],
+                Duration::from_secs(idle_grace_secs),
+                Duration::from_secs(300),
+            ),
+            east,
+        )
     }
 }
 

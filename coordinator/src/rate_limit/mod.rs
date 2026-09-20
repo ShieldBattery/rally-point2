@@ -132,3 +132,6 @@ impl<K: Eq + Hash + Clone> KeyedTokenBuckets<K> {
         self.buckets.lock().len()
     }
 }
+
+#[cfg(test)]
+mod tests;

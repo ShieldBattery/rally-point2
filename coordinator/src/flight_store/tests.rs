@@ -106,29 +106,10 @@ fn object_key_selects_the_prefix_and_preserves_the_tenant_first_shape() {
 }
 
 #[test]
-fn plan_flight_upload_gates_then_returns_the_retention_key() {
-    // The gates surface as the same drops `classify_ingest` returns.
-    assert_eq!(
-        plan_flight_upload(false, true, &tenant(), SessionId(7), RelayId(3), false, 0),
-        Err(FlightDrop::NoStore),
-    );
-    assert_eq!(
-        plan_flight_upload(true, false, &tenant(), SessionId(7), RelayId(3), false, 0),
-        Err(FlightDrop::UnknownTenant),
-    );
-    assert_eq!(
-        plan_flight_upload(
-            true,
-            true,
-            &tenant(),
-            SessionId(7),
-            RelayId(3),
-            false,
-            MAX_FLIGHT_BLOB_BYTES as u64 + 1,
-        ),
-        Err(FlightDrop::TooLarge),
-    );
-    // An unpinned grant plans the flight-prefix key; a pinned one the desync prefix.
+fn plan_flight_upload_selects_the_flight_or_desync_key_by_pinned() {
+    // The gates themselves are `classify_ingest`'s (tested there through every
+    // arm); this covers what the wrapper adds on top — an unpinned grant plans
+    // the flight-prefix key, a pinned one the desync prefix.
     assert_eq!(
         plan_flight_upload(true, true, &tenant(), SessionId(7), RelayId(3), false, 10),
         Ok(FlightUploadPlan {
@@ -397,7 +378,8 @@ async fn presign_put_signs_a_bounded_url_for_the_key_and_size() {
 }
 
 #[test]
-fn a_valid_config_parses() {
+fn an_empty_field_is_rejected_naming_the_field() {
+    // The happy path: a well-formed config parses every field as given.
     let json = r#"{
         "endpoint": "https://nyc3.digitaloceanspaces.com",
         "region": "us-east-1",
@@ -409,10 +391,8 @@ fn a_valid_config_parses() {
     assert_eq!(config.bucket, "sb-rp2-flight");
     assert_eq!(config.access_key_env, "FLIGHT_STORE_ACCESS_KEY");
     assert_eq!(config.secret_key_env, "FLIGHT_STORE_SECRET_KEY");
-}
 
-#[test]
-fn an_empty_field_is_rejected_naming_the_field() {
+    // An empty field is refused naming which one.
     let json = r#"{
         "endpoint": "",
         "region": "us-east-1",
@@ -424,10 +404,9 @@ fn an_empty_field_is_rejected_naming_the_field() {
         from_json(json),
         Err(FlightStoreConfigError::EmptyField { field: "endpoint" }),
     ));
-}
 
-#[test]
-fn an_unknown_field_is_rejected() {
+    // A misspelled or unexpected top-level field must fail to parse rather
+    // than silently loading a config that ignores it.
     let json = r#"{
         "endpoint": "e",
         "region": "r",

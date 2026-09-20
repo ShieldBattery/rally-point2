@@ -9,18 +9,7 @@ use super::*;
 /// and the session's descriptors enable finalized drops.
 #[test]
 fn placement_prefers_the_capable_cohort_and_enables_finalized_drops() {
-    let reg = registry::new_registry();
-    enroll_relay(&reg, 1, 14900); // incapable
-    enroll_capable_relay(&reg, 2, 14901);
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
+    let setup = fleet(&[(1, 14900, None, false), (2, 14901, None, true)]).0;
 
     let resp = create_default_session(&setup);
     assert_eq!(
@@ -36,37 +25,28 @@ fn placement_prefers_the_capable_cohort_and_enables_finalized_drops() {
     );
 }
 
-/// A fleet with no capable relay places normally with the feature off —
-/// and the flag is immutable thereafter (rebuilds read the stored value).
-#[test]
-fn an_incapable_cohort_creates_the_session_with_finalized_drops_off() {
-    let setup = setup_with_two_relays_and_tenant();
-    let resp = create_default_session(&setup);
-    for relay_id in setup.serving_relays(&tid(), resp.session) {
-        let staged = setup.descriptors().current_for(relay_id);
-        assert!(!staged[0].finalized_drops);
-    }
-}
-
-/// With the finalized-drops feature switch OFF, placement still keeps
-/// build-class cohorts apart (a mixed session hands different clients
-/// different leave schedules regardless of the feature), but the session
-/// runs without the handshake — and a rehome still stays in-cohort,
-/// keyed on the recorded build class rather than the feature flag.
+/// The finalized-drops flag on a session's staged descriptors is
+/// `capable_cohort && feature_switch`: capability is what a session's relays
+/// actually support, the tenant-wide switch is a rollout lever, and only the
+/// conjunction of both ever turns the handshake on.
 #[test]
 fn the_feature_switch_off_keeps_cohorts_but_disables_the_handshake() {
+    // capable_cohort=false, feature=on (the default): an incapable fleet never
+    // enables the handshake, switch or no switch.
+    let setup = two_relay_fleet();
+    let resp = create_default_session(&setup);
+    for relay_id in setup.serving_relays(&tid(), resp.session) {
+        assert!(!setup.descriptors().current_for(relay_id)[0].finalized_drops);
+    }
+
+    // capable_cohort=true, feature=off: placement still keeps build-class
+    // cohorts apart (a mixed session hands different clients different leave
+    // schedules regardless of the feature), but the session runs without the
+    // handshake -- and a rehome still stays in-cohort, keyed on the recorded
+    // build class rather than the feature flag.
     let reg = registry::new_registry();
-    enroll_capable_relay(&reg, 1, 14900);
-    enroll_relay(&reg, 2, 14901);
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants).with_finalized_drops(false);
+    enroll_fleet(&reg, &[(1, 14900, None, true), (2, 14901, None, false)]);
+    let setup = SessionSetup::new(reg, tenant_store()).with_finalized_drops(false);
     let resp = create_default_session(&setup);
 
     let staged = setup.descriptors().current_for(RelayId(1));
@@ -91,7 +71,7 @@ fn the_feature_switch_off_keeps_cohorts_but_disables_the_handshake() {
         ),
         "the build-class cohort binds the rehome even with the feature off",
     );
-    enroll_capable_relay(setup.registry(), 4, 14903);
+    enroll_fleet(setup.registry(), &[(4, 14903, None, true)]);
     let RehomeOutcome::NewTarget(endpoint) =
         rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
     else {
@@ -107,17 +87,7 @@ fn the_feature_switch_off_keeps_cohorts_but_disables_the_handshake() {
 /// capable replacement is taken when one exists.
 #[test]
 fn a_rehome_stays_within_the_sessions_capability_cohort() {
-    let reg = registry::new_registry();
-    enroll_capable_relay(&reg, 1, 14900);
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
+    let setup = fleet(&[(1, 14900, None, true)]).0;
     let resp = create_default_session(&setup);
     assert!(
         setup.descriptors().current_for(RelayId(1))[0].finalized_drops,
@@ -126,7 +96,7 @@ fn a_rehome_stays_within_the_sessions_capability_cohort() {
 
     // The capable home dies; the only live relay is incapable.
     registry::remove(setup.registry(), RelayId(1));
-    enroll_relay(setup.registry(), 3, 14902);
+    enroll_fleet(setup.registry(), &[(3, 14902, None, false)]);
     assert!(
         matches!(
             rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
@@ -136,7 +106,7 @@ fn a_rehome_stays_within_the_sessions_capability_cohort() {
     );
 
     // A capable relay arrives: the rehome takes it.
-    enroll_capable_relay(setup.registry(), 4, 14903);
+    enroll_fleet(setup.registry(), &[(4, 14903, None, true)]);
     let RehomeOutcome::NewTarget(endpoint) =
         rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
     else {
@@ -156,32 +126,13 @@ fn a_rehome_stays_within_the_sessions_capability_cohort() {
 /// must land on an in-cohort replacement.
 #[test]
 fn a_downgraded_relay_is_evicted_from_its_finalized_drops_sessions() {
-    let reg = registry::new_registry();
-    enroll_capable_relay(&reg, 1, 14900);
-    enroll_capable_relay(&reg, 2, 14901);
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
+    let setup = fleet(&[(1, 14900, None, true), (2, 14901, None, true)]).0;
     let resp = create_default_session(&setup);
     assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
     assert!(setup.descriptors().current_for(RelayId(1))[0].finalized_drops);
 
     // The downgrade: same id, same cert, no capability.
-    let generation = registry::enroll(
-        setup.registry(),
-        RelayHello::new(
-            RelayId(1),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-            ProtocolVersion::CURRENT,
-            fake_cert(1),
-        ),
-    );
+    let generation = registry::enroll(setup.registry(), hello(1, 14900));
     assert!(
         matches!(
             rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
@@ -219,34 +170,18 @@ fn rehome_never_picks_a_serving_member_across_the_capability_boundary() {
     // the capability boundary, so the rehome must skip it and pick the
     // in-cohort idle relay 3 instead of mixing the classes placement kept
     // apart.
-    let reg = registry::new_registry();
-    enroll_relay(&reg, 1, 14900);
-    enroll_relay_in_region(&reg, 2, 14901, Some("region-b"));
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        tid(),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
+    let setup = region_b_fleet();
     let resp = create_session(
         &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: two_players_slot_1_in_region_b(),
-            external_id: None,
-            latency_estimate_ms: None,
-        },
+        request(two_players_slot_1_in_region_b()),
         ExpiresAt(u64::MAX),
     )
     .unwrap()
     .response;
 
     // Relay 2 upgrades in place; relay 3 is idle and still in-cohort.
-    enroll_capable_relay(setup.registry(), 2, 14901);
-    enroll_relay(setup.registry(), 3, 14902);
+    enroll_fleet(setup.registry(), &[(2, 14901, None, true)]);
+    enroll_fleet(setup.registry(), &[(3, 14902, None, false)]);
     registry::remove(setup.registry(), RelayId(1));
 
     let RehomeOutcome::NewTarget(endpoint) =

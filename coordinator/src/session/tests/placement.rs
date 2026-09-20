@@ -8,8 +8,7 @@ use super::*;
 fn region_placement_homes_each_slot_in_its_region() {
     // Two relays in two regions, one slot each: each slot homes on its region's
     // relay, producing the meshed cross-region shape.
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+    let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
     let resp = create_region_session(
         &setup,
         vec![
@@ -45,8 +44,7 @@ fn region_placement_homes_each_slot_in_its_region() {
 
 #[test]
 fn tied_home_relays_rotate_and_every_descriptor_matches_the_response_home() {
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+    let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
     let players = || {
         vec![
             player_in_region(0, Some("region-a")),
@@ -86,21 +84,18 @@ fn tied_home_relays_rotate_and_every_descriptor_matches_the_response_home() {
 
 #[test]
 fn replaying_a_balanced_create_keeps_its_exact_rotated_home() {
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
-    let request = |external_id: &str| SessionRequest {
-        tenant: tid(),
-        players: vec![
+    let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+    let game = |external_id: &str| SessionRequest {
+        external_id: Some(external_id.to_owned()),
+        ..request(vec![
             player_in_region(0, Some("region-a")),
             player_in_region(1, Some("region-b")),
-        ],
-        external_id: Some(external_id.to_owned()),
-        latency_estimate_ms: None,
+        ])
     };
 
-    let first = create_session(&setup, request("game-1"), ExpiresAt(u64::MAX)).unwrap();
+    let first = create_session(&setup, game("game-1"), ExpiresAt(u64::MAX)).unwrap();
     let candidate_after_first = candidate_session_id(&setup);
-    let replay = create_session(&setup, request("game-1"), ExpiresAt(u64::MAX)).unwrap();
+    let replay = create_session(&setup, game("game-1"), ExpiresAt(u64::MAX)).unwrap();
     assert!(replay.replayed);
     assert_eq!(replay.response, first.response);
     assert_eq!(
@@ -109,7 +104,7 @@ fn replaying_a_balanced_create_keeps_its_exact_rotated_home() {
         "a replay neither re-places nor consumes a session id",
     );
 
-    let next = create_session(&setup, request("game-2"), ExpiresAt(u64::MAX)).unwrap();
+    let next = create_session(&setup, game("game-2"), ExpiresAt(u64::MAX)).unwrap();
     assert_ne!(
         next.response.home_relay.relay_id, first.response.home_relay.relay_id,
         "the next fresh balanced session receives the next rotation",
@@ -120,8 +115,7 @@ fn replaying_a_balanced_create_keeps_its_exact_rotated_home() {
 fn a_slot_whose_region_has_no_relay_falls_back_to_the_global_pick() {
     // Only region-a has relays; a slot asking for region-b falls back to the
     // lowest-id available relay overall — today's region-blind pick.
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-a"))]);
+    let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-a"))]);
     let resp = create_region_session(
         &setup,
         vec![
@@ -144,8 +138,7 @@ fn a_slot_whose_region_has_no_relay_falls_back_to_the_global_pick() {
 fn the_home_relay_is_the_plurality_pick_not_merely_the_lowest_id() {
     // relay 2 (region-b) is assigned two slots, relay 1 (region-a) one: the home
     // is the plurality relay 2, even though relay 1 has the lower id.
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+    let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
     let resp = create_region_session(
         &setup,
         vec![
@@ -178,11 +171,12 @@ fn the_home_relay_is_the_plurality_pick_not_merely_the_lowest_id() {
 }
 
 #[test]
-fn placement_records_each_serving_relays_region() {
+fn placement_records_each_serving_relays_region_and_cert() {
     // The serving relays' regions are recorded so a later re-home can prefer the
-    // dead relay's region.
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+    // dead relay's region, and their client-pinned certs are recorded alongside
+    // -- both maps come out of the same placement, off the same create_session
+    // call.
+    let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
     let resp = create_region_session(
         &setup,
         vec![
@@ -193,11 +187,21 @@ fn placement_records_each_serving_relays_region() {
     let refs = session_refs(&setup, &tid(), resp.session).unwrap();
     assert_eq!(
         refs.relay_regions.get(&RelayId(1)),
-        Some(&Some(RegionId("region-a".to_owned()))),
+        Some(&Some(region("region-a"))),
     );
     assert_eq!(
         refs.relay_regions.get(&RelayId(2)),
-        Some(&Some(RegionId("region-b".to_owned()))),
+        Some(&Some(region("region-b"))),
+    );
+    assert_eq!(
+        refs.relay_certs.get(&RelayId(1)),
+        Some(&cert_fingerprint(&fake_cert(1))),
+        "relay 1's client-pinned cert is recorded",
+    );
+    assert_eq!(
+        refs.relay_certs.get(&RelayId(2)),
+        Some(&cert_fingerprint(&fake_cert(2))),
+        "the region-b relay's cert is recorded too",
     );
 }
 
@@ -205,8 +209,7 @@ fn placement_records_each_serving_relays_region() {
 fn every_descriptor_carries_the_whole_sessions_region_labels() {
     // A relay releases the *session's* map to its clients, not just its own
     // entry, so both relays' descriptors carry both labels.
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+    let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
     let resp = create_region_session(
         &setup,
         vec![
@@ -218,11 +221,11 @@ fn every_descriptor_carries_the_whole_sessions_region_labels() {
     let expected = vec![
         RelayRegionLabel {
             relay_id: RelayId(1),
-            region: RegionId("region-a".to_owned()),
+            region: region("region-a"),
         },
         RelayRegionLabel {
             relay_id: RelayId(2),
-            region: RegionId("region-b".to_owned()),
+            region: region("region-b"),
         },
     ];
     for relay_id in [RelayId(1), RelayId(2)] {
@@ -243,7 +246,7 @@ fn an_untagged_relay_is_omitted_from_the_descriptors_region_labels() {
     // A relay the coordinator never tagged has no label to release. It is left
     // out of the map entirely rather than carried with an empty region, so a
     // client can tell "no region recorded" from "recorded as nothing".
-    let setup = setup_with_region_relays(&[(1, 14900, None), (2, 14901, Some("region-b"))]);
+    let setup = region_fleet(&[(1, 14900, None), (2, 14901, Some("region-b"))]);
     let resp = create_region_session(
         &setup,
         vec![
@@ -258,7 +261,7 @@ fn an_untagged_relay_is_omitted_from_the_descriptors_region_labels() {
     let descriptor = descriptor_for(&setup, &tid(), resp.session, RelayId(1)).unwrap();
     let expected = vec![RelayRegionLabel {
         relay_id: RelayId(2),
-        region: RegionId("region-b".to_owned()),
+        region: region("region-b"),
     }];
     assert_eq!(descriptor.relay_regions, expected);
     assert_eq!(
@@ -268,44 +271,12 @@ fn an_untagged_relay_is_omitted_from_the_descriptors_region_labels() {
 }
 
 #[test]
-fn a_conflicting_create_differing_only_in_a_players_region_is_refused() {
-    // Region selects a slot's home relay, so the same external_id reused with a
-    // different per-slot region is a genuine roster mismatch (409), not a replay.
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
-    let original = SessionRequest {
-        tenant: tid(),
-        players: vec![
-            player_in_region(0, Some("region-a")),
-            player_in_region(1, Some("region-a")),
-        ],
-        external_id: Some("game-1".to_owned()),
-        latency_estimate_ms: None,
-    };
-    create_session(&setup, original.clone(), ExpiresAt(u64::MAX)).unwrap();
-
-    let mut changed = original.clone();
-    changed.players[1].region = Some(RegionId("region-b".to_owned()));
-    assert_eq!(
-        create_session(&setup, changed, ExpiresAt(u64::MAX)).unwrap_err(),
-        SessionSetupError::IdempotentCreateMismatch,
-    );
-
-    // The original roster still replays, so the conflict left the cache intact.
-    assert!(
-        create_session(&setup, original, ExpiresAt(u64::MAX))
-            .unwrap()
-            .replayed,
-    );
-}
-
-#[test]
 fn rehome_prefers_a_replacement_in_the_dead_relays_region() {
     // relay 2 (region-b) homes the single-slot session; the spares are relay 1
     // (region-a) and relay 3 (region-b). When relay 2 dies and no serving relay
     // is left to take over, the replacement is the region-b spare (relay 3), not
     // the lower-id region-a relay 1.
-    let setup = setup_with_region_relays(&[
+    let setup = region_fleet(&[
         (1, 14900, Some("region-a")),
         (2, 14901, Some("region-b")),
         (3, 14902, Some("region-b")),
@@ -329,8 +300,7 @@ fn rehome_falls_back_to_any_relay_when_the_dead_region_has_no_live_relay() {
     // relay 2 (region-b) homes the session; the only spare is relay 1 (region-a).
     // When relay 2 dies, region-b has no live relay, so the replacement is the
     // region-blind fallback (relay 1).
-    let setup =
-        setup_with_region_relays(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
+    let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
     let resp = create_region_session(&setup, vec![player_in_region(0, Some("region-b"))]);
     assert_eq!(resp.home_relay.relay_id, RelayId(2));
 

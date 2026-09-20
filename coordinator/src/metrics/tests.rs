@@ -59,6 +59,7 @@ fn escapes_label_values() {
 
 #[test]
 fn histogram_buckets_are_cumulative() {
+    // ColdStartHistogram: bucket bounds in seconds.
     let histogram = ColdStartHistogram::new();
     histogram.observe(3); // le=5
     histogram.observe(7); // le=10
@@ -74,10 +75,9 @@ fn histogram_buckets_are_cumulative() {
     assert!(out.contains("test_cold_bucket{le=\"+Inf\"} 3"), "{out}");
     assert!(out.contains("test_cold_sum 1010"), "{out}");
     assert!(out.contains("test_cold_count 3"), "{out}");
-}
 
-#[test]
-fn send_duration_histogram_buckets_are_cumulative() {
+    // SendDurationHistogram: a second, differently-bounded table (milliseconds),
+    // exercising the same cumulative semantics against different bucket edges.
     let histogram = SendDurationHistogram::new();
     histogram.observe(0); // le=1
     histogram.observe(7); // le=10
@@ -93,27 +93,6 @@ fn send_duration_histogram_buckets_are_cumulative() {
     assert!(out.contains("test_send_bucket{le=\"+Inf\"} 3"), "{out}");
     assert!(out.contains("test_send_sum 100007"), "{out}");
     assert!(out.contains("test_send_count 3"), "{out}");
-}
-
-#[test]
-fn control_connection_end_causes_are_counted_by_label() {
-    // Counter statics are process-global, so assert the delta a single increment
-    // produces. A cause word unique to this test isolates it from any other.
-    let state = test_state();
-    let before = series_value(
-        &render(&state),
-        "rp2_control_connection_ends_total",
-        "metrics-test-cause",
-    )
-    .unwrap_or(0);
-    control_connection_ended("metrics-test-cause");
-    let after = series_value(
-        &render(&state),
-        "rp2_control_connection_ends_total",
-        "metrics-test-cause",
-    )
-    .expect("the series exists after an increment");
-    assert_eq!(after - before, 1);
 }
 
 #[test]
@@ -180,7 +159,7 @@ async fn metrics_endpoint_serves_prometheus_text() {
 #[test]
 fn labeled_counter_increments_by_a_delta() {
     // Counter statics are process-global, so assert the delta a single
-    // increment produces rather than an absolute value. A tenant label unique
+    // increment produces rather than an absolute value. A label value unique
     // to this test isolates it from any other test's increments.
     let tenant = TenantId("metrics-delta-tenant".to_owned());
     let state = test_state();
@@ -198,6 +177,22 @@ fn labeled_counter_increments_by_a_delta() {
         "metrics-delta-tenant",
     )
     .expect("the series exists after an increment");
+    assert_eq!(after - before, 1);
 
+    // The same delta pattern against a different labeled counter, so a cause
+    // word (rather than a tenant) is the isolating label value.
+    let before = series_value(
+        &render(&state),
+        "rp2_control_connection_ends_total",
+        "metrics-test-cause",
+    )
+    .unwrap_or(0);
+    control_connection_ended("metrics-test-cause");
+    let after = series_value(
+        &render(&state),
+        "rp2_control_connection_ends_total",
+        "metrics-test-cause",
+    )
+    .expect("the series exists after an increment");
     assert_eq!(after - before, 1);
 }

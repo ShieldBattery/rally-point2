@@ -105,12 +105,6 @@ mod tests {
     }
 
     #[test]
-    fn an_unwarmed_region_targets_zero() {
-        let targets = WarmTargets::new();
-        assert_eq!(targets.target_at(&region("us-east"), 1_000), 0);
-    }
-
-    #[test]
     fn warming_targets_one_until_the_deadline_lapses() {
         let targets = WarmTargets::new();
         targets.warm_at(region("us-east"), Duration::from_secs(60), 1_000);
@@ -141,15 +135,23 @@ mod tests {
         let targets = WarmTargets::new();
         targets.warm_at(region("us-east"), Duration::from_secs(60), 1_000);
         assert_eq!(targets.target_at(&region("us-east"), 1_010), 1);
+        // A region that was never warmed — including one that simply isn't
+        // `us-east` — targets zero (the `_ => 0` default); warming one region
+        // must not bleed demand into another key of the same map.
         assert_eq!(
             targets.target_at(&region("us-west"), 1_010),
             0,
-            "warming one region leaves another cold",
+            "an unwarmed region targets zero, and warming one region leaves another cold",
         );
     }
 
     #[test]
     fn a_clone_shares_the_same_demand() {
+        // Load-bearing, not tautological: `POST /regions/warm` and the reconcile
+        // loop each hold their own clone of this store. Without the `Arc` behind
+        // `demand`, a clone would silently deep-copy the map and the two halves
+        // would drift apart — a warm request would never be seen by the loop
+        // reading target().
         let targets = WarmTargets::new();
         let handle = targets.clone();
         handle.warm_at(region("us-east"), Duration::from_secs(60), 1_000);

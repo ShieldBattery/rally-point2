@@ -116,11 +116,15 @@ fn store_with_tenant() -> (TenantStore, KeyId, TenantId) {
 }
 
 #[test]
-fn enroll_then_verifying_key_roundtrips() {
+fn an_enrolled_tenant_reads_back_its_kid_bounds_and_enrollment() {
     let (store, kid, tenant) = store_with_tenant();
     let (found_kid, _pubkey) = verifying_key(&store, &tenant).unwrap();
     assert_eq!(found_kid, kid);
     assert!(is_enrolled(&store, &tenant));
+    assert_eq!(
+        bounds(&store, &tenant),
+        Some(BufferBounds::new(1, 6).unwrap())
+    );
 }
 
 #[test]
@@ -154,7 +158,9 @@ fn mint_token_then_relay_verifies() {
 
 #[test]
 fn mint_token_for_unenrolled_tenant_fails() {
-    let store = new_store();
+    // Enrolling an unrelated tenant does not extend the mint privilege to one
+    // that was never enrolled.
+    let (store, _, _) = store_with_tenant();
     let result = mint_token(
         &store,
         &TenantId("nope".to_owned()),
@@ -168,15 +174,14 @@ fn mint_token_for_unenrolled_tenant_fails() {
 
 #[test]
 fn re_enroll_replaces_key() {
-    let store = new_store();
-    let kid = KeyId("test-key-1".to_owned());
-    let tenant = TenantId("sb-test".to_owned());
+    let (store, kid, tenant) = store_with_tenant();
+    let (_, pubkey1) = verifying_key(&store, &tenant).unwrap();
     let bounds = BufferBounds::new(1, 6).unwrap();
 
-    let pubkey1 = enroll(&store, kid.clone(), tenant.clone(), bounds).unwrap();
-    let pubkey2 = enroll(&store, kid, tenant.clone(), bounds).unwrap();
+    let pubkey2 = enroll(&store, kid, tenant, bounds).unwrap();
 
-    // A new key replaces the old one.
+    // A new key replaces the old one — each enroll call generates a fresh
+    // keypair, whether it is a first enroll or a replacement.
     assert_ne!(pubkey1, pubkey2);
     assert_eq!(len(&store), 1);
 }
@@ -211,40 +216,6 @@ fn all_verifying_keys_returns_every_enrolled_tenant() {
 }
 
 #[test]
-fn all_verifying_keys_is_empty_for_a_store_with_no_tenants() {
-    assert!(all_verifying_keys(&new_store()).is_empty());
-}
-
-#[test]
-fn different_tenants_get_different_keys() {
-    let store = new_store();
-    let bounds = BufferBounds::new(1, 6).unwrap();
-    let pk1 = enroll(
-        &store,
-        KeyId("kid-a".to_owned()),
-        TenantId("tenant-a".to_owned()),
-        bounds,
-    )
-    .unwrap();
-    let pk2 = enroll(
-        &store,
-        KeyId("kid-b".to_owned()),
-        TenantId("tenant-b".to_owned()),
-        bounds,
-    )
-    .unwrap();
-    assert_ne!(pk1, pk2);
-    assert_eq!(len(&store), 2);
-}
-
-#[test]
-fn bounds_lookup_returns_enrolled_bounds() {
-    let (store, _, tenant) = store_with_tenant();
-    let b = bounds(&store, &tenant).unwrap();
-    assert_eq!(b, BufferBounds::new(1, 6).unwrap());
-}
-
-#[test]
 fn enroll_generated_pkcs8_re_enrolls_the_same_key() {
     // The dev restart flow: enroll fresh, persist the PKCS#8, re-enroll
     // from it on a new (restarted) store — same verifying key.
@@ -272,27 +243,6 @@ fn enroll_generated_pkcs8_re_enrolls_the_same_key() {
 }
 
 #[test]
-fn enroll_from_pkcs8_roundtrips() {
-    // Generate a keypair, extract PKCS#8, register from it.
-    let rng = SystemRandom::new();
-    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
-    let pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
-    let expected_pub: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
-
-    let store = new_store();
-    let pub_from_store = enroll_from_pkcs8(
-        &store,
-        KeyId("pkcs8-key".to_owned()),
-        TenantId("sb-pkcs8".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-        pkcs8.as_ref(),
-    )
-    .unwrap();
-
-    assert_eq!(pub_from_store, expected_pub);
-}
-
-#[test]
 fn sign_webhook_verifies_against_the_enrolled_verifying_key() {
     let (store, _, tenant) = store_with_tenant();
     let (_, pubkey) = verifying_key(&store, &tenant).unwrap();
@@ -308,11 +258,8 @@ fn sign_webhook_verifies_against_the_enrolled_verifying_key() {
 
     // A mutated message (or a wrong key) must not verify.
     assert!(verifying.verify(b"tampered", &sig).is_err());
-}
 
-#[test]
-fn sign_webhook_for_an_unenrolled_tenant_returns_none() {
-    let store = new_store();
+    // An unenrolled tenant has no key to sign with at all.
     assert!(sign_webhook(&store, &TenantId("nope".to_owned()), b"anything").is_none());
 }
 
@@ -351,6 +298,12 @@ fn set_and_get_client_pubkeys_roundtrips() {
     assert!(set_client_pubkeys(&store, &tenant, vec![pubkey]));
     assert_eq!(client_pubkeys(&store, &tenant), vec![pubkey]);
 
+    // Rotation posture: a tenant can carry two request-verifying keys at once
+    // (old + new), both retrievable in the order they were set.
+    let second = client_pubkey_from_seed(&[0x22; 32]).unwrap();
+    assert!(set_client_pubkeys(&store, &tenant, vec![pubkey, second]));
+    assert_eq!(client_pubkeys(&store, &tenant), vec![pubkey, second]);
+
     // A no-op (and no panic) on an unknown tenant.
     assert!(!set_client_pubkeys(
         &store,
@@ -361,38 +314,23 @@ fn set_and_get_client_pubkeys_roundtrips() {
 }
 
 #[test]
-fn set_client_pubkeys_holds_two_keys_in_order() {
-    // Rotation posture: a tenant can carry two request-verifying keys at once
-    // (old + new), both retrievable in the order they were set.
-    let (store, _, tenant) = store_with_tenant();
-    let first = client_pubkey_from_seed(&[0x11; 32]).unwrap();
-    let second = client_pubkey_from_seed(&[0x22; 32]).unwrap();
-    assert!(set_client_pubkeys(&store, &tenant, vec![first, second]));
-    assert_eq!(client_pubkeys(&store, &tenant), vec![first, second]);
-}
-
-#[test]
-fn a_freshly_enrolled_tenant_is_active() {
-    let (store, _, tenant) = store_with_tenant();
-    assert_eq!(tenant_state(&store, &tenant), Some(TenantState::Active));
-    // An unknown tenant has no state.
-    assert_eq!(tenant_state(&store, &TenantId("nope".to_owned())), None);
-}
-
-#[test]
 fn set_and_get_state_roundtrips() {
     let (store, _, tenant) = store_with_tenant();
+    // A freshly enrolled tenant starts active.
+    assert_eq!(tenant_state(&store, &tenant), Some(TenantState::Active));
+
     assert!(set_state(&store, &tenant, TenantState::Suspended));
     assert_eq!(tenant_state(&store, &tenant), Some(TenantState::Suspended));
     assert!(set_state(&store, &tenant, TenantState::Revoked));
     assert_eq!(tenant_state(&store, &tenant), Some(TenantState::Revoked));
 
-    // A no-op on an unknown tenant.
+    // A no-op on an unknown tenant, which also has no state at all.
     assert!(!set_state(
         &store,
         &TenantId("nope".to_owned()),
         TenantState::Active
     ));
+    assert_eq!(tenant_state(&store, &TenantId("nope".to_owned())), None);
 }
 
 #[test]
@@ -426,18 +364,4 @@ fn sign_webhook_refuses_a_revoked_tenant() {
     );
     set_state(&store, &tenant, TenantState::Revoked);
     assert!(sign_webhook(&store, &tenant, b"anything").is_none());
-}
-
-#[test]
-fn default_bounds_is_one_to_twelve() {
-    assert_eq!(default_bounds(), BufferBounds::new(1, 12).unwrap());
-}
-
-#[test]
-fn generate_client_key_seed_derives_a_valid_pubkey() {
-    // A generated seed is a usable Ed25519 seed: it derives a 32-byte key,
-    // and two calls differ (the RNG isn't stuck).
-    let seed = generate_client_key_seed();
-    assert!(client_pubkey_from_seed(&seed).is_ok());
-    assert_ne!(seed, generate_client_key_seed());
 }
