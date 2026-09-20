@@ -15,7 +15,7 @@ use rally_point_transport::{Link, LinkError};
 use tokio::time::{Instant, sleep_until};
 
 use super::retention::redivert_pending_control;
-use super::send::{OutboundSend, check_cap, send_game_turn, send_packet};
+use super::send::{OutboundSend, send_game_turn, send_packet, window_cap_error};
 use super::state::{GameSeam, LoopState};
 use super::{inbound, outbound, teardown};
 
@@ -451,19 +451,14 @@ impl LinkDriver {
                     }
                 }
                 signal = game_started_out.recv(), if game_started_alive => {
-                    match outbound::on_game_started(
+                    outbound::on_game_started(
                         signal,
                         &mut control_send,
                         game_started_announced,
                         &mut game_started_on_stream,
                         &mut game_started_alive,
                     )
-                    .await
-                    {
-                        ArmFlow::Serve => {}
-                        ArmFlow::Teardown => break 'serve,
-                        ArmFlow::End(result) => return result,
-                    }
+                    .await;
                 }
                 bytes = lobby_out.recv(), if lobby_out_alive => {
                     match outbound::on_lobby_out(
@@ -480,33 +475,18 @@ impl LinkDriver {
                     }
                 }
                 chat = chat_out.recv(), if chat_out_alive => {
-                    match outbound::on_chat_out(chat, &mut control_send, &mut chat_out_alive).await
-                    {
-                        ArmFlow::Serve => {}
-                        ArmFlow::Teardown => break 'serve,
-                        ArmFlow::End(result) => return result,
-                    }
+                    outbound::on_chat_out(chat, &mut control_send, &mut chat_out_alive).await;
                 }
                 bytes = skin_out.recv(), if skin_out_alive => {
-                    match outbound::on_skin_out(bytes, &mut control_send, &mut skin_out_alive).await
-                    {
-                        ArmFlow::Serve => {}
-                        ArmFlow::Teardown => break 'serve,
-                        ArmFlow::End(result) => return result,
-                    }
+                    outbound::on_skin_out(bytes, &mut control_send, &mut skin_out_alive).await;
                 }
                 target = request_drop.recv(), if request_drop_alive => {
-                    match outbound::on_request_drop(
+                    outbound::on_request_drop(
                         target,
                         &mut control_send,
                         &mut request_drop_alive,
                     )
-                    .await
-                    {
-                        ArmFlow::Serve => {}
-                        ArmFlow::Teardown => break 'serve,
-                        ArmFlow::End(result) => return result,
-                    }
+                    .await;
                 }
                 // Safety timeout: the game signaled its departure but the
                 // outbound queue or unacked window hadn't drained within
@@ -531,11 +511,8 @@ impl LinkDriver {
                     match received {
                         Some((slot, cursor)) => {
                             link.retire_through(slot, cursor);
-                            if check_cap(link.payloads_in_flight()) {
-                                return Err(DriverError::UnackedWindowExhausted {
-                                    in_flight: link.payloads_in_flight(),
-                                    cap: UNACKED_WINDOW_CAP,
-                                });
+                            if let Some(error) = window_cap_error(link) {
+                                return Err(error);
                             }
                             // The beacon force-retiring turns may have just
                             // emptied the unacked window a pending leave intent

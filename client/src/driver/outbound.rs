@@ -259,7 +259,7 @@ pub(super) async fn on_game_started(
     game_started_announced: &mut bool,
     game_started_on_stream: &mut bool,
     game_started_alive: &mut bool,
-) -> ArmFlow {
+) {
     *game_started_alive = false;
     if signal.is_some() && !*game_started_announced {
         *game_started_announced = true;
@@ -271,7 +271,6 @@ pub(super) async fn on_game_started(
             ),
         }
     }
-    ArmFlow::Serve
 }
 
 /// A lobby command the game authored during setup. Send it up the
@@ -333,7 +332,7 @@ pub(super) async fn on_chat_out(
     chat: Option<ChatOut>,
     control_send: &mut noq::SendStream,
     chat_out_alive: &mut bool,
-) -> ArmFlow {
+) {
     match chat {
         Some(ChatOut {
             target_kind,
@@ -355,7 +354,6 @@ pub(super) async fn on_chat_out(
         }
         None => *chat_out_alive = false,
     }
-    ArmFlow::Serve
 }
 
 /// A cosmetic-skin blob the game authored — broadcast to the other
@@ -371,7 +369,7 @@ pub(super) async fn on_skin_out(
     bytes: Option<Vec<u8>>,
     control_send: &mut noq::SendStream,
     skin_out_alive: &mut bool,
-) -> ArmFlow {
+) {
     match bytes {
         Some(bytes) => {
             let skin = PlayerSkin {
@@ -387,7 +385,6 @@ pub(super) async fn on_skin_out(
         }
         None => *skin_out_alive = false,
     }
-    ArmFlow::Serve
 }
 
 /// A manual drop request the game authored: the survivor asked to
@@ -403,7 +400,7 @@ pub(super) async fn on_request_drop(
     target: Option<SlotId>,
     control_send: &mut noq::SendStream,
     request_drop_alive: &mut bool,
-) -> ArmFlow {
+) {
     match target {
         Some(target) => {
             if let Err(error) = send_control_request_drop(control_send, u32::from(target.0)).await {
@@ -416,5 +413,4 @@ pub(super) async fn on_request_drop(
         }
         None => *request_drop_alive = false,
     }
-    ArmFlow::Serve
 }

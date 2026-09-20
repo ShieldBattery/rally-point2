@@ -74,11 +74,8 @@ pub(super) async fn send_game_turn(
                 if carried_redundancy {
                     *flush_deadline = Instant::now() + timing.flush_interval;
                 }
-                if check_cap(link.payloads_in_flight()) {
-                    return OutboundSend::EndSession(Err(DriverError::UnackedWindowExhausted {
-                        in_flight: link.payloads_in_flight(),
-                        cap: UNACKED_WINDOW_CAP,
-                    }));
+                if let Some(error) = window_cap_error(link) {
+                    return OutboundSend::EndSession(Err(error));
                 }
             }
             // The connection went down while sending this turn. If we already
@@ -190,11 +187,16 @@ pub(super) async fn flush_delivered_cursors(
         .await;
 }
 
-/// Returns `true` if the unacked window has crossed the hard cap — the
-/// sustained forward-loss case the beacon cannot rescue (the peer is genuinely
-/// behind, not just ack-starved). The caller surfaces
-/// [`DriverError::UnackedWindowExhausted`], which the reconnect loop treats as
-/// terminal rather than re-dialing (see [`is_link_failure`]).
-pub(super) fn check_cap(in_flight: usize) -> bool {
-    in_flight > UNACKED_WINDOW_CAP
+/// The error to fail the session with when `link`'s unacked window has crossed
+/// the hard cap, or `None` while it is still within it — the sustained
+/// forward-loss case the beacon cannot rescue (the peer is genuinely behind,
+/// not just ack-starved). The reconnect loop treats
+/// [`DriverError::UnackedWindowExhausted`] as terminal rather than re-dialing
+/// (see [`is_link_failure`]).
+pub(super) fn window_cap_error(link: &Link) -> Option<DriverError> {
+    let in_flight = link.payloads_in_flight();
+    (in_flight > UNACKED_WINDOW_CAP).then_some(DriverError::UnackedWindowExhausted {
+        in_flight,
+        cap: UNACKED_WINDOW_CAP,
+    })
 }

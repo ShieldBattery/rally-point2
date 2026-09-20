@@ -20,7 +20,7 @@ use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
 
 use super::backoff::{GamePush, push_to_game};
-use super::send::{Release, check_cap, flush_delivered_cursors, release_ready};
+use super::send::{Release, flush_delivered_cursors, release_ready, window_cap_error};
 use super::session::ArmFlow;
 use super::state::{ConnectivityEpochStates, admit_connectivity_epoch};
 use super::*;
@@ -103,11 +103,8 @@ pub(super) async fn on_received(
         Release::GameStalled => return ArmFlow::End(Err(DriverError::GameStalled)),
     }
     flush_delivered_cursors(link, beacon_send, beacon_writer, next_seq).await;
-    if check_cap(link.payloads_in_flight()) {
-        return ArmFlow::End(Err(DriverError::UnackedWindowExhausted {
-            in_flight: link.payloads_in_flight(),
-            cap: UNACKED_WINDOW_CAP,
-        }));
+    if let Some(error) = window_cap_error(link) {
+        return ArmFlow::End(Err(error));
     }
     // An ack folded into the manager above may be the last one
     // a pending leave intent was waiting on.
