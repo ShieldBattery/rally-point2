@@ -82,7 +82,9 @@ impl LinkDriver {
             terminal_connectivity_slots,
             phase_slew,
             held,
+            timing,
         } = state;
+        let timing = *timing;
 
         // The ack-beacon side-channel. The client opens its outbound uni-stream
         // (open_uni completes locally, no peer round-trip); the peer's stream is
@@ -132,7 +134,7 @@ impl LinkDriver {
         // unacked turns (recovery is riding the stream, so no flush is due); left to
         // fire when a send carries no redundancy or the link is idle, so a turn the
         // fresh packets can't re-carry is still retransmitted.
-        let mut flush_deadline = Instant::now() + FLUSH_INTERVAL;
+        let mut flush_deadline = Instant::now() + timing.flush_interval;
         // Re-carry any oversize turns a resume deferred to this connection's control
         // stream. Too large to ride a datagram, they were kept out of the unacked
         // window (where the redundancy pass would skip them forever) and staged
@@ -201,6 +203,7 @@ impl LinkDriver {
                 own_slot,
                 &mut flush_deadline,
                 &mut acks_owed,
+                timing,
                 payload,
             )
             .await
@@ -225,6 +228,7 @@ impl LinkDriver {
                 own_slot,
                 &mut flush_deadline,
                 &mut acks_owed,
+                timing,
                 buffered,
             )
             .await
@@ -369,6 +373,7 @@ impl LinkDriver {
                         own_slot,
                         &mut flush_deadline,
                         &mut acks_owed,
+                        timing,
                         outbound,
                         held,
                         phase_slew,
@@ -392,6 +397,7 @@ impl LinkDriver {
                         own_slot,
                         &mut flush_deadline,
                         &mut acks_owed,
+                        timing,
                         outbound,
                         held,
                     )
@@ -418,7 +424,7 @@ impl LinkDriver {
                 signal = leave_intent.recv(), if leave_intent_alive => {
                     leave_intent_alive = false;
                     if signal.is_some() {
-                        announcer.arm(LEAVE_INTENT_TIMEOUT);
+                        announcer.arm(timing.leave_intent_timeout);
                         announcer.maybe_send(&mut control_send, outbound, held.is_empty(), link).await?;
                     }
                     // A `None` (the game dropped its sender without ever
@@ -504,7 +510,7 @@ impl LinkDriver {
                 }
                 // Safety timeout: the game signaled its departure but the
                 // outbound queue or unacked window hadn't drained within
-                // `LEAVE_INTENT_TIMEOUT`. If acks aren't coming the link is
+                // the leave-intent timeout. If acks aren't coming the link is
                 // effectively dead and the ordinary drop path (idle timeout)
                 // covers it regardless; sending here anyway is harmless even if
                 // the link is fine — the relay stops forwarding this slot's
@@ -565,7 +571,7 @@ impl LinkDriver {
                         }
                         acks_owed = false;
                     }
-                    flush_deadline = Instant::now() + FLUSH_INTERVAL;
+                    flush_deadline = Instant::now() + timing.flush_interval;
                 }
             }
         }
@@ -580,6 +586,7 @@ impl LinkDriver {
             own_slot,
             &mut flush_deadline,
             &mut acks_owed,
+            timing,
             outbound,
             held,
             leave_intent,

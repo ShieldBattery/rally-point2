@@ -13,7 +13,7 @@ async fn an_undrained_leave_channel_surfaces_a_stall_instead_of_parking() {
     use rally_point_transport::control::send_control_leave;
 
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // Push more synced leaves than the channel holds, with the receiver
@@ -54,7 +54,7 @@ async fn released_region_labels_surface_on_the_game_channel() {
     use rally_point_transport::control::send_control_region_labels;
 
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, mut chan_a) = LinkDriver::new(link_a);
+    let (driver_a, mut chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
@@ -116,7 +116,7 @@ async fn a_control_frame_kind_this_build_predates_is_skipped_without_ending_the_
     use rally_point_transport::control::send_control_session_start;
 
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, mut chan_a) = LinkDriver::new(link_a);
+    let (driver_a, mut chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
@@ -156,7 +156,7 @@ async fn undrained_best_effort_channels_drop_instead_of_stalling_turns() {
     use rally_point_transport::control::{send_control_chat, send_control_skin};
 
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     // Hold every game-side channel half open; only `inbound` is drained.
     let TurnChannels {

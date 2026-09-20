@@ -12,7 +12,7 @@ async fn a_phase_directive_holds_the_wire_handoff_without_reordering() {
     use rally_point_transport::control::send_control_phase_directive;
 
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
 
@@ -48,10 +48,11 @@ async fn a_phase_directive_holds_the_wire_handoff_without_reordering() {
         "expected the phase-applied echo, got {acked:?}"
     );
 
-    // Let the slew accumulate a few milliseconds of real delay, then send
-    // a burst. Every turn takes the hold-queue path and must still leave
-    // in production order with contiguous driver-stamped seqs.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Let the slew accumulate real delay, then send a burst. The applied
+    // delay climbs at the clamped ceiling of 10 ms per second, so this buys
+    // a couple of milliseconds: enough that every turn takes the hold-queue
+    // path, nowhere near the 30 ms a step would have jumped straight to.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     for i in 0..3u8 {
         chan_a.outbound.send(turn(0, &[i])).await.unwrap();
     }
@@ -96,7 +97,7 @@ async fn final_turn_survives_seam_drop(slewed: bool, beat: Duration) {
     use rally_point_transport::control::send_control_phase_directive;
 
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
@@ -118,8 +119,10 @@ async fn final_turn_survives_seam_drop(slewed: bool, beat: Duration) {
         .await
         .expect("the directive reaches the driver")
         .expect("the status watch stays open");
-        // Let the slew build a delay comfortably larger than the beat.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Let the slew build a delay comfortably larger than the beat. It
+        // climbs at the clamped ceiling of 10 ms per second, so this is
+        // roughly 5 ms of hold against a 1 ms beat.
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     chan_a.outbound.send(turn(0, &[0x2A])).await.unwrap();
@@ -150,7 +153,7 @@ async fn final_turn_survives_seam_drop(slewed: bool, beat: Duration) {
 
 #[tokio::test]
 async fn a_game_close_flushes_a_turn_already_moved_into_the_hold_queue() {
-    final_turn_survives_seam_drop(true, Duration::from_millis(5)).await;
+    final_turn_survives_seam_drop(true, Duration::from_millis(1)).await;
 }
 
 #[tokio::test]
@@ -178,7 +181,7 @@ async fn a_game_close_delivers_an_oversize_held_turn() {
     use rally_point_transport::control::send_control_phase_directive;
 
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
 
@@ -200,10 +203,12 @@ async fn a_game_close_delivers_an_oversize_held_turn() {
     .await
     .expect("the directive reaches the driver")
     .expect("the status watch stays open");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // The clamped slew climbs 10 ms of delay per second, so this leaves the
+    // turn below held for about 5 ms — several times the beat that follows it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     chan_a.outbound.send(turn(0, &[0x77; 4096])).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(5)).await;
+    tokio::time::sleep(Duration::from_millis(1)).await;
     drop(chan_a);
 
     // The directive's own acknowledgement echo precedes the turn on the
@@ -240,7 +245,7 @@ async fn a_game_close_fences_a_zero_delay_oversize_turn() {
     // successful write proves nothing about receipt, so the stream fence
     // must hold the connection open until the peer has read it.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
 
@@ -276,7 +281,7 @@ async fn a_last_moment_leave_intent_still_completes_the_clean_leave() {
     use rally_point_transport::control::send_control_phase_directive;
 
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
 
@@ -298,7 +303,9 @@ async fn a_last_moment_leave_intent_still_completes_the_clean_leave() {
     .await
     .expect("the directive reaches the driver")
     .expect("the status watch stays open");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Enough slew (10 ms of delay per second, clamped) that the turn below is
+    // still held when the seam drops, so the intent is genuinely withheld.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     chan_a.outbound.send(turn(0, &[0x2A])).await.unwrap();
     chan_a.leave_intent.send(()).await.unwrap();
@@ -343,7 +350,7 @@ async fn a_stalled_game_consumer_surfaces_instead_of_hanging() {
     // the driver must report the stall, not block its whole loop on the wedged
     // consumer (which would also freeze acks and link-failure detection).
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::with_capacity(link_a, 1);
+    let (driver_a, chan_a) = test_driver_with_capacity(link_a, 1);
     let task = tokio::spawn(driver_a.run());
 
     // Hold the inbound receiver open without ever draining it.
@@ -375,7 +382,7 @@ async fn a_stalled_game_consumer_surfaces_instead_of_hanging() {
 #[tokio::test]
 async fn stops_cleanly_when_the_game_drops_its_sender() {
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // No turns ever sent; dropping the seam is the game tearing down.
@@ -387,7 +394,7 @@ async fn stops_cleanly_when_the_game_drops_its_sender() {
 #[tokio::test]
 async fn stops_cleanly_when_the_game_drops_its_receiver() {
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // The game drops only its receiver on a quiet link: no turn is ever delivered
@@ -415,7 +422,7 @@ async fn stops_cleanly_when_the_game_drops_its_receiver() {
 #[tokio::test]
 async fn a_clean_stop_closes_the_connection_so_the_peer_observes_it_end() {
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let peer_connection = link_b.connection().clone();
     let task = tokio::spawn(driver_a.run());
 

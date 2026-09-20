@@ -43,6 +43,7 @@ pub(super) async fn send_game_turn(
     own_slot: SlotId,
     flush_deadline: &mut Instant,
     acks_owed: &mut bool,
+    timing: DriverTiming,
     mut payload: Payload,
 ) -> OutboundSend {
     // Assign this turn its origin seq and slot — the client is the sole
@@ -71,7 +72,7 @@ pub(super) async fn send_game_turn(
             Ok(carried_redundancy) => {
                 *acks_owed = false;
                 if carried_redundancy {
-                    *flush_deadline = Instant::now() + FLUSH_INTERVAL;
+                    *flush_deadline = Instant::now() + timing.flush_interval;
                 }
                 if check_cap(link.payloads_in_flight()) {
                     return OutboundSend::EndSession(Err(DriverError::UnackedWindowExhausted {

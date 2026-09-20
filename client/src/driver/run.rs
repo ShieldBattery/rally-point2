@@ -12,14 +12,14 @@ use super::state::{ESCALATE_AFTER, ESCALATE_RETRY, GameSeam, LoopState};
 use super::*;
 
 impl LinkDriver {
-    /// Runs the link over one connection until the game seam closes (a clean stop →
-    /// `Ok`) or the link fails (→ [`DriverError`]). No reconnection: a link failure
-    /// ends the driver and drops every channel, leaving the caller to re-dial and
-    /// rebuild. Use [`run_reconnecting`](Self::run_reconnecting) to have the driver
-    /// re-dial itself and keep the channels alive across a drop.
-    pub async fn run(self) -> Result<(), DriverError> {
+    /// Splits a driver into the three pieces a session actually runs on: the
+    /// link, the driver's half of the game seam, and the state that outlives any
+    /// one connection. Every entry point starts here, so the seam is assembled
+    /// in exactly one place and a channel added to the driver cannot be
+    /// silently dropped on one path but not the other.
+    pub(super) fn into_parts(self) -> (Link, GameSeam, LoopState) {
         let LinkDriver {
-            mut link,
+            link,
             outbound,
             inbound,
             leaves,
@@ -38,8 +38,9 @@ impl LinkDriver {
             connectivity,
             region_labels,
             phase_status,
+            timing,
         } = self;
-        let mut seam = GameSeam {
+        let seam = GameSeam {
             outbound,
             inbound,
             leaves,
@@ -58,7 +59,16 @@ impl LinkDriver {
             region_labels,
             phase_status,
         };
-        let mut state = LoopState::new(result_expected);
+        (link, seam, LoopState::new(result_expected, timing))
+    }
+
+    /// Runs the link over one connection until the game seam closes (a clean stop →
+    /// `Ok`) or the link fails (→ [`DriverError`]). No reconnection: a link failure
+    /// ends the driver and drops every channel, leaving the caller to re-dial and
+    /// rebuild. Use [`run_reconnecting`](Self::run_reconnecting) to have the driver
+    /// re-dial itself and keep the channels alive across a drop.
+    pub async fn run(self) -> Result<(), DriverError> {
+        let (mut link, mut seam, mut state) = self.into_parts();
         // The no-reconnect entry has no token to read a slot from, and it never
         // re-dials (so no resume anchor is ever computed from the unacked window).
         // It stamps slot 0 — the value the embedder already sends and the relay
@@ -124,47 +134,7 @@ impl LinkDriver {
             escalate_after: escalate_after.unwrap_or(ESCALATE_AFTER),
             escalate_retry: escalate_retry.unwrap_or(ESCALATE_RETRY),
         };
-        let LinkDriver {
-            mut link,
-            outbound,
-            inbound,
-            leaves,
-            leave_intent,
-            result,
-            result_expected,
-            game_started,
-            lobby_out,
-            lobby_in,
-            chat_out,
-            chat_in,
-            skin_out,
-            skin_in,
-            request_drop,
-            session_start,
-            connectivity,
-            region_labels,
-            phase_status,
-        } = self;
-        let mut seam = GameSeam {
-            outbound,
-            inbound,
-            leaves,
-            leave_intent,
-            result,
-            game_started,
-            lobby_out,
-            lobby_in,
-            chat_out,
-            chat_in,
-            skin_out,
-            skin_in,
-            request_drop,
-            session_start,
-            connectivity,
-            region_labels,
-            phase_status,
-        };
-        let mut state = LoopState::new(result_expected);
+        let (mut link, mut seam, mut state) = self.into_parts();
         let mut backoff = Backoff::new();
 
         loop {

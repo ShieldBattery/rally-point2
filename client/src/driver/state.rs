@@ -188,10 +188,14 @@ pub(super) struct LoopState {
     /// cannot drop a held turn: the next session flushes these first, before
     /// any outage-buffered turns, keeping that order.
     pub(super) held: VecDeque<(Instant, Payload)>,
+    /// The waiting windows this session times itself against. Carried here
+    /// because they belong to the driver, not to any one connection: a re-dialed
+    /// session must run on the same windows the first one did.
+    pub(super) timing: DriverTiming,
 }
 
 impl LoopState {
-    pub(super) fn new(result_expected: Arc<AtomicBool>) -> Self {
+    pub(super) fn new(result_expected: Arc<AtomicBool>, timing: DriverTiming) -> Self {
         Self {
             next_seq: HashMap::new(),
             pending: HashMap::new(),
@@ -207,6 +211,7 @@ impl LoopState {
             terminal_connectivity_slots: HashSet::new(),
             phase_slew: PhaseSlew::new(Instant::now()),
             held: VecDeque::new(),
+            timing,
         }
     }
 }

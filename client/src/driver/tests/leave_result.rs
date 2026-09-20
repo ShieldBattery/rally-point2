@@ -10,7 +10,7 @@ async fn leave_intent_is_sent_immediately_when_nothing_is_outstanding() {
     // are already empty: the intent must go out the moment the game
     // signals, without waiting on anything to drain.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // Watch the control stream the way the relay does.
@@ -36,7 +36,15 @@ async fn leave_intent_waits_for_unacked_turns_to_drain_before_sending() {
     // holds off announcing until the relay's view of our last turn is
     // final.
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
+    // The one window this test keeps at its production length: it asserts the
+    // intent is held back by the *drain* condition, so the safety timeout must
+    // stay far beyond the windows below rather than being what releases it.
+    // Nothing here ever waits it out, so its length costs no test time.
+    let driver_a = driver_a.with_timing(DriverTiming {
+        leave_intent_timeout: DriverTiming::default().leave_intent_timeout,
+        ..TEST_TIMING
+    });
     let task = tokio::spawn(driver_a.run());
 
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
@@ -82,7 +90,7 @@ async fn leave_intent_is_sent_after_the_safety_timeout_if_acks_never_arrive() {
     // departure — the safety timeout fires and the intent goes out
     // anyway.
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
@@ -99,7 +107,7 @@ async fn leave_intent_is_sent_after_the_safety_timeout_if_acks_never_arrive() {
         .expect("control reader ended early");
     assert!(matches!(frame, ControlInbound::LeaveIntent));
     assert!(
-        before.elapsed() >= LEAVE_INTENT_TIMEOUT,
+        before.elapsed() >= TEST_TIMING.leave_intent_timeout,
         "intent went out before the safety timeout elapsed"
     );
 
@@ -114,7 +122,7 @@ async fn run_returns_ok_when_the_link_closes_after_the_leave_intent() {
     // expected confirmation it processed the leave: `run` must return
     // `Ok`, not surface a `DriverError`.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
@@ -148,7 +156,7 @@ async fn dropping_the_leave_intent_sender_without_signaling_does_not_affect_the_
     // must keep running exactly as if leave-intent didn't exist — proven
     // here by still forwarding a turn afterward.
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     drop(chan_a.leave_intent);
@@ -170,7 +178,7 @@ async fn a_result_is_sent_immediately_over_a_live_link() {
     // A result report goes out the moment the game hands it over — mid-game,
     // with nothing draining and no leave signalled — not after any wind-down.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // Watch the control stream the way the relay does.
@@ -203,7 +211,7 @@ async fn a_game_started_signal_writes_exactly_one_frame() {
     // between. (A *fresh* connection does re-assert it; that is a separate
     // test.)
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // Watch the control stream the way the relay does.
@@ -250,7 +258,7 @@ async fn a_fence_probe_pushes_a_signalled_game_started_ahead_of_its_ack() {
     use rally_point_transport::control::send_control_load_state_probe;
 
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
     let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
@@ -285,7 +293,7 @@ async fn a_fence_probe_with_nothing_owed_is_answered_by_the_ack_alone() {
     use rally_point_transport::control::send_control_load_state_probe;
 
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
     let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
@@ -319,7 +327,7 @@ async fn a_game_started_after_an_unfenced_probe_still_reaches_the_relay() {
     use rally_point_transport::control::send_control_load_state_probe;
 
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
     let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
@@ -353,8 +361,8 @@ async fn a_game_started_announcement_is_reasserted_on_the_reconnects_control_str
     // report delivered moments before a drop leaves the tenant looking at a
     // slot that never started.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
-    let (link, seam, state) = into_session_parts(driver_a);
+    let (driver_a, chan_a) = test_driver(link_a);
+    let (link, seam, state) = driver_a.into_parts();
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
 
     chan_a.game_started.send(()).await.unwrap();
@@ -395,8 +403,8 @@ async fn a_game_started_signal_during_the_reconnect_gap_is_delivered_on_the_next
     // picks it up — losing it would be indistinguishable from a client that
     // never loaded.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
-    let (link, seam, state) = into_session_parts(driver_a);
+    let (driver_a, chan_a) = test_driver(link_a);
+    let (link, seam, state) = driver_a.into_parts();
 
     let session = spawn_session(link, seam, state);
     link_b.connection().close(0u32.into(), b"outage");
@@ -433,7 +441,7 @@ async fn a_result_is_written_before_the_leave_intent_when_both_are_signalled() {
     // frame ahead of the leave-intent frame on the one ordered control stream,
     // regardless of which channel it services first.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
@@ -473,7 +481,7 @@ async fn the_leave_intent_still_goes_out_after_the_timeout_when_no_result_arrive
     // must not be held forever — the leave-intent safety timeout fires and it
     // goes out anyway, since a missing or late result is harmless.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
@@ -488,7 +496,7 @@ async fn the_leave_intent_still_goes_out_after_the_timeout_when_no_result_arrive
         .expect("control reader ended early");
     assert!(matches!(frame, ControlInbound::LeaveIntent));
     assert!(
-        before.elapsed() >= LEAVE_INTENT_TIMEOUT,
+        before.elapsed() >= TEST_TIMING.leave_intent_timeout,
         "the intent went out before the result-hold timeout elapsed",
     );
 

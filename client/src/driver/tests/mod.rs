@@ -1,19 +1,18 @@
-//! Shared fixtures for the driver's tests: a self-signed QUIC pair, a connected
-//! link both ends of a driver can run over, a fake authorization identity, and
-//! the helpers that drive a bare `session` or read one control frame at a time.
+//! Shared fixtures for the driver's tests: a connected link both ends of a
+//! driver can run over, the shortened timing they run on, a fake authorization
+//! identity, and the helpers that drive a bare `session` or read one control
+//! frame at a time.
 //!
 //! The topic modules below inherit all of it, plus the driver's own private
 //! items, through their `use super::*;`.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 
 use rally_point_proto::beacon;
 use rally_point_transport::control::{ControlInbound, send_control_turn, spawn_control_reader};
-use rally_point_transport::quic::{client_config, server_config};
-use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rally_point_transport::{noq, rustls};
+use rally_point_transport::noq;
+use rally_point_transport::test_util::{Edge, loopback};
 
 use super::backoff::*;
 use super::reconnect::*;
@@ -31,44 +30,34 @@ mod recovery;
 mod retention;
 mod teardown;
 
-fn self_signed() -> (
-    Vec<CertificateDer<'static>>,
-    PrivateKeyDer<'static>,
-    CertificateDer<'static>,
-) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    let cert_der = cert.cert.der().clone();
-    let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-    (vec![cert_der.clone()], key, cert_der)
+/// The windows every driver test here runs on. Each is cut to the shortest span
+/// that still comfortably outlasts a loopback round trip, so a test waits on the
+/// driver reacting rather than on a window sized for a real network — and a test
+/// that asserts a window actually elapsed asserts against these, not the
+/// production defaults.
+const TEST_TIMING: DriverTiming = DriverTiming {
+    teardown_settle: Duration::from_millis(100),
+    leave_intent_timeout: Duration::from_millis(200),
+    flush_interval: Duration::from_millis(50),
+};
+
+/// [`LinkDriver::new`] on the shortened [`TEST_TIMING`] — what a test builds a
+/// driver with unless it is specifically about the production windows.
+fn test_driver(link: Link) -> (LinkDriver, TurnChannels) {
+    let (driver, channels) = LinkDriver::new(link);
+    (driver.with_timing(TEST_TIMING), channels)
+}
+
+/// [`test_driver`] with an explicit per-direction channel depth.
+fn test_driver_with_capacity(link: Link, capacity: usize) -> (LinkDriver, TurnChannels) {
+    let (driver, channels) = LinkDriver::with_capacity(link, capacity);
+    (driver.with_timing(TEST_TIMING), channels)
 }
 
 /// Brings up a loopback QUIC connection and wraps each end in a [`Link`]. The
 /// endpoints are returned so the caller keeps them alive for the test.
 async fn connected_links() -> (Link, Link, noq::Endpoint, noq::Endpoint) {
-    let (chain, key, ca) = self_signed();
-    let server_cfg = server_config(chain, key).unwrap();
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca).unwrap();
-    let client_cfg = client_config(roots).unwrap();
-
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
-    let server_addr = server.local_addr().unwrap();
-    let client = noq::Endpoint::client(bind).unwrap();
-    client.set_default_client_config(client_cfg);
-
-    let accept = {
-        let server = server.clone();
-        tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
-    };
-    let client_conn = client
-        .connect(server_addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-    let server_conn = accept.await.unwrap();
-
+    let (client_conn, server_conn, client, server) = loopback(Edge::Client).await;
     (
         Link::new(client_conn),
         Link::new(server_conn),
@@ -143,55 +132,6 @@ impl RehomeProvider for HangingProvider {
     }
 }
 
-/// Splits a [`LinkDriver`] into the pieces [`session`](LinkDriver::session)
-/// takes directly, so a test can drive exactly one session on an explicit
-/// `own_slot` and then inspect the link and loop state afterward — state that
-/// `run`/`run_reconnecting` consume and drop.
-fn into_session_parts(driver: LinkDriver) -> (Link, GameSeam, LoopState) {
-    let LinkDriver {
-        link,
-        outbound,
-        inbound,
-        leaves,
-        leave_intent,
-        result,
-        result_expected,
-        game_started,
-        lobby_out,
-        lobby_in,
-        chat_out,
-        chat_in,
-        skin_out,
-        skin_in,
-        request_drop,
-        session_start,
-        connectivity,
-        region_labels,
-        phase_status,
-    } = driver;
-    let seam = GameSeam {
-        outbound,
-        inbound,
-        leaves,
-        leave_intent,
-        result,
-        game_started,
-        lobby_out,
-        lobby_in,
-        chat_out,
-        chat_in,
-        skin_out,
-        skin_in,
-        request_drop,
-        session_start,
-        connectivity,
-        region_labels,
-        phase_status,
-    };
-    let state = LoopState::new(result_expected);
-    (link, seam, state)
-}
-
 /// Drives one session on `own_slot`, feeding it one small datagram turn per
 /// entry in `turns` and then closing the outbound seam so the session returns.
 /// The peer link is never driven, so nothing acks: every sent turn stays in the
@@ -203,14 +143,14 @@ async fn drive_unacked_session(
     turns: &[&[u8]],
 ) -> (Link, LoopState, Link, noq::Endpoint, noq::Endpoint) {
     let (link_a, link_b, ea, eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     // Buffer every turn (channel depth is ample) and then drop the sender, so
     // the session drains them all and returns Ok on the closed-seam `None`.
     for bytes in turns {
         chan_a.outbound.send(turn(0, bytes)).await.unwrap();
     }
     drop(chan_a.outbound);
-    let (mut link, mut seam, mut state) = into_session_parts(driver_a);
+    let (mut link, mut seam, mut state) = driver_a.into_parts();
     // `session_body`, not `session`: this helper's whole contract (see its
     // doc above) is inspecting the connection after the session ends, and
     // `session`'s own clean-exit close would race that inspection over

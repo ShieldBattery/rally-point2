@@ -40,6 +40,7 @@ pub(super) async fn on_outgoing_turn(
     own_slot: SlotId,
     flush_deadline: &mut Instant,
     acks_owed: &mut bool,
+    timing: DriverTiming,
     outbound: &mpsc::Receiver<Payload>,
     held: &mut VecDeque<(Instant, Payload)>,
     phase_slew: &mut PhaseSlew,
@@ -69,6 +70,7 @@ pub(super) async fn on_outgoing_turn(
                     own_slot,
                     flush_deadline,
                     acks_owed,
+                    timing,
                     payload,
                 )
                 .await
@@ -112,6 +114,7 @@ pub(super) async fn on_outgoing_turn(
                         own_slot,
                         flush_deadline,
                         acks_owed,
+                        timing,
                         early,
                     )
                     .await
@@ -147,6 +150,7 @@ pub(super) async fn on_held_due(
     own_slot: SlotId,
     flush_deadline: &mut Instant,
     acks_owed: &mut bool,
+    timing: DriverTiming,
     outbound: &mpsc::Receiver<Payload>,
     held: &mut VecDeque<(Instant, Payload)>,
 ) -> ArmFlow {
@@ -165,6 +169,7 @@ pub(super) async fn on_held_due(
             own_slot,
             flush_deadline,
             acks_owed,
+            timing,
             payload,
         )
         .await

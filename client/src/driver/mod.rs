@@ -158,42 +158,64 @@ const SKIN_CHANNEL_CAPACITY: usize = 32;
 /// phase deadline asked.
 pub(super) const HELD_TURN_CAP: usize = 64;
 
-/// How long a game-closed teardown may spend fencing delivery before letting
-/// the connection close: waiting out the unacked datagram window (with the
-/// flush re-carry running, so a lost final turn is retransmitted like a live
-/// one) and then, when anything rode the reliable control stream, waiting for
-/// the relay's own close to confirm the stream was read in full. One shared
-/// deadline across both fences, bounded so an unreachable relay cannot park
-/// teardown; comfortably past one RTT plus the relay's own flush cadence.
-pub(super) const TEARDOWN_SETTLE: Duration = Duration::from_secs(1);
-
 /// Depth of the manual-drop-request channel from the game thread to the driver.
 /// A human clicks the drop button a handful of times at most; the relay
 /// rate-limits the requests regardless, so a small backstop against a scheduling
 /// hiccup is ample.
 const REQUEST_DROP_CHANNEL_CAPACITY: usize = 16;
 
-/// How long the driver waits, after the game signals its departure, for the
-/// outbound queue and unacked window to drain before announcing the leave
-/// anyway. If acks aren't coming within this bound the link is effectively
-/// dead and the ordinary drop path (idle timeout) covers it regardless;
-/// sending the intent late is still harmless — the relay stops forwarding
-/// this slot's turns the moment it sees the intent, so a few turns still in
-/// flight change nothing.
-pub(super) const LEAVE_INTENT_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// How often the driver flushes a maintenance packet when the outbound stream is
-/// not already re-carrying unacked turns.
+/// The windows the driver spends waiting rather than reacting. Production runs
+/// on [`Default`]; a test that would otherwise pay one of them in real time
+/// injects a shorter set through [`LinkDriver::with_timing`], so it waits on the
+/// driver's behavior instead of on a window sized for a real network.
 ///
-/// The flush timer is reset whenever an outbound turn re-carries unacked turns as
-/// redundancy — the common case, where recovery rides the turn stream and the flush
-/// never fires, so it costs no extra packets. It is *not* reset by a send that
-/// carried no redundancy (a near-MTU turn that filled the datagram, or a stretch
-/// where the re-carry policy's spacing left nothing due) or by an idle stretch; in
-/// those cases it fires and sends a packet that re-carries whatever unacked turns
-/// the policy has due and folds in owed acks. It stays silent when nothing
-/// is unacked and no acks are owed. Set to a few turns at the 24-per-second turn
-pub(super) const FLUSH_INTERVAL: Duration = Duration::from_millis(150);
+/// Only the waits belong here: the capacity caps, and the unacked-window cap
+/// especially, are load-bearing against the relay's own limits and stay fixed.
+#[derive(Debug, Clone, Copy)]
+pub struct DriverTiming {
+    /// How long a game-closed teardown may spend fencing delivery before letting
+    /// the connection close: waiting out the unacked datagram window (with the
+    /// flush re-carry running, so a lost final turn is retransmitted like a live
+    /// one) and then, when anything rode the reliable control stream, waiting for
+    /// the relay's own close to confirm the stream was read in full. One shared
+    /// deadline across both fences, bounded so an unreachable relay cannot park
+    /// teardown; comfortably past one RTT plus the relay's own flush cadence.
+    pub teardown_settle: Duration,
+    /// How long the driver waits, after the game signals its departure, for the
+    /// outbound queue and unacked window to drain before announcing the leave
+    /// anyway. If acks aren't coming within this bound the link is effectively
+    /// dead and the ordinary drop path (idle timeout) covers it regardless;
+    /// sending the intent late is still harmless — the relay stops forwarding
+    /// this slot's turns the moment it sees the intent, so a few turns still in
+    /// flight change nothing.
+    pub leave_intent_timeout: Duration,
+    /// How often the driver flushes a maintenance packet when the outbound stream
+    /// is not already re-carrying unacked turns.
+    ///
+    /// The flush timer is reset whenever an outbound turn re-carries unacked turns
+    /// as redundancy — the common case, where recovery rides the turn stream and
+    /// the flush never fires, so it costs no extra packets. It is *not* reset by a
+    /// send that carried no redundancy (a near-MTU turn that filled the datagram,
+    /// or a stretch where the re-carry policy's spacing left nothing due) or by an
+    /// idle stretch; in those cases it fires and sends a packet that re-carries
+    /// whatever unacked turns the policy has due and folds in owed acks. It stays
+    /// silent when nothing is unacked and no acks are owed. Set to a few turns at
+    /// the 24-per-second turn rate: long enough that the flush stays out of a
+    /// healthy turn stream's way, short enough that a turn the stream cannot
+    /// re-carry is recovered within a handful of turn intervals rather than
+    /// stalling every peer's lockstep behind it.
+    pub flush_interval: Duration,
+}
+
+impl Default for DriverTiming {
+    fn default() -> Self {
+        Self {
+            teardown_settle: Duration::from_secs(1),
+            leave_intent_timeout: Duration::from_secs(2),
+            flush_interval: Duration::from_millis(150),
+        }
+    }
+}
 
 /// The hard ceiling on payloads sent but not yet known-delivered. Under
 /// *reverse*-path loss (the relay received the turns but the acks riding the
@@ -272,6 +294,8 @@ pub struct LinkDriver {
     /// The send-phase state to publish to the game thread as directives arrive
     /// and the applied delay slews (see [`TurnChannels::phase_status`]).
     phase_status: watch::Sender<PhaseStatus>,
+    /// The waiting windows every session this driver runs is timed against.
+    timing: DriverTiming,
 }
 
 /// Why the driver stopped with a failure, as opposed to a clean shutdown (which
@@ -412,6 +436,7 @@ impl LinkDriver {
             connectivity: connectivity_tx,
             region_labels: region_labels_tx,
             phase_status: phase_status_tx,
+            timing: DriverTiming::default(),
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
@@ -434,5 +459,13 @@ impl LinkDriver {
             phase_status: phase_status_rx,
         };
         (driver, channels)
+    }
+
+    /// Replaces the waiting windows this driver's sessions run on. Only a test
+    /// should call it: every window has a default sized against a real network,
+    /// and shortening one trades that margin for not waiting it out.
+    pub fn with_timing(mut self, timing: DriverTiming) -> Self {
+        self.timing = timing;
+        self
     }
 }

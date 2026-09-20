@@ -39,6 +39,7 @@ pub(super) async fn drain_and_settle(
     own_slot: SlotId,
     flush_deadline: &mut Instant,
     acks_owed: &mut bool,
+    timing: DriverTiming,
     outbound: &mut mpsc::Receiver<Payload>,
     held: &mut VecDeque<(Instant, Payload)>,
     leave_intent: &mut mpsc::Receiver<()>,
@@ -57,6 +58,7 @@ pub(super) async fn drain_and_settle(
             own_slot,
             flush_deadline,
             acks_owed,
+            timing,
             payload,
         )
         .await
@@ -76,6 +78,7 @@ pub(super) async fn drain_and_settle(
             own_slot,
             flush_deadline,
             acks_owed,
+            timing,
             payload,
         )
         .await
@@ -85,7 +88,7 @@ pub(super) async fn drain_and_settle(
         }
     }
     if leave_intent.try_recv().is_ok() {
-        announcer.arm(LEAVE_INTENT_TIMEOUT);
+        announcer.arm(timing.leave_intent_timeout);
     }
     if game_started_out.try_recv().is_ok() && !*game_started_announced {
         // The game closed its seam with the announcement still unread, so
@@ -116,8 +119,8 @@ pub(super) async fn drain_and_settle(
     // sent moments before the seam closed — with the ordinary flush
     // re-carry running so a lost datagram is retransmitted, the same
     // recovery a live turn gets, compressed into teardown.
-    let settle_deadline = Instant::now() + TEARDOWN_SETTLE;
-    let mut settle_flush = Instant::now() + FLUSH_INTERVAL;
+    let settle_deadline = Instant::now() + timing.teardown_settle;
+    let mut settle_flush = Instant::now() + timing.flush_interval;
     let mut link_gone = false;
     while link.payloads_in_flight() > 0 {
         tokio::select! {
@@ -133,7 +136,7 @@ pub(super) async fn drain_and_settle(
                     link_gone = true;
                     break;
                 }
-                settle_flush = Instant::now() + FLUSH_INTERVAL;
+                settle_flush = Instant::now() + timing.flush_interval;
             }
             () = sleep_until(settle_deadline) => break,
         }
@@ -199,7 +202,7 @@ pub(super) async fn drain_and_settle(
     // observes whatever the relay does about it.
     if !link_gone {
         let _ = control_send.finish();
-        let stream_deadline = Instant::now() + TEARDOWN_SETTLE;
+        let stream_deadline = Instant::now() + timing.teardown_settle;
         loop {
             tokio::select! {
                 received = link.recv() => {

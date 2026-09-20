@@ -7,7 +7,7 @@ use super::*;
 #[tokio::test]
 async fn retransmits_an_unacked_turn_during_outbound_silence() {
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // One turn, then silence: the game produces nothing more and the peer never
@@ -44,7 +44,7 @@ async fn retransmits_a_dropped_turn_under_continuous_near_mtu_traffic() {
         .connection()
         .max_datagram_size()
         .expect("loopback supports datagrams");
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // The largest datagram-admissible turns: each fresh turn is close to
@@ -119,7 +119,7 @@ async fn retransmits_a_dropped_wide_turn_under_continuous_small_traffic() {
         .connection()
         .max_datagram_size()
         .expect("loopback supports datagrams");
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // The wide turn is the largest admissible; the following turns are
@@ -197,7 +197,7 @@ async fn retransmits_a_dropped_wide_turn_under_continuous_small_traffic() {
 #[tokio::test]
 async fn an_idle_link_goes_quiet_after_a_turn_is_acked() {
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // A sends one turn; the peer receives and acks it.
@@ -212,9 +212,11 @@ async fn an_idle_link_goes_quiet_after_a_turn_is_acked() {
     link_b.send(None).unwrap();
 
     // With the turn retired and only ack-only packets left, the link must fall
-    // silent: the driver sends nothing across the several flushes in this window.
+    // silent: the driver sends nothing across the several flushes in this window
+    // — sized in flush intervals, so it stays several of them however the
+    // driver's timing is set.
     let quiet = tokio::time::timeout(
-        Duration::from_millis(600),
+        TEST_TIMING.flush_interval * 4,
         link_b.connection().read_datagram(),
     )
     .await;
@@ -249,7 +251,7 @@ async fn the_beacon_retires_acked_turns_under_reverse_path_loss() {
     // A fixed sleep can't reach that: at any point before the cap is stressed
     // in_flight is small whether the beacon works or not.
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // The peer opens its outbound beacon uni-stream and pushes its
@@ -353,7 +355,7 @@ async fn forward_path_sustained_loss_trips_the_unacked_window_cap() {
     // that catches a missing cap — a beacon-only design passes every other test
     // but fails here.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
 
     // The peer never receives: drain its datagrams but never call `recv()`, so

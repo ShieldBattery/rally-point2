@@ -2,9 +2,11 @@
 
 ## File map
 
-- `mod.rs` — channel depths and timing constants, `LinkDriver`, `DriverError`, constructors.
+- `mod.rs` — channel depths, capacity caps, `DriverTiming` (the injectable waiting
+  windows), `LinkDriver`, `DriverError`, constructors.
 - `channels.rs` — `TurnChannels`/`ChatOut`, the game thread's end of the seam.
-- `run.rs` — `run` / `run_reconnecting` / `session`: who owns closing the connection.
+- `run.rs` — `into_parts` (the one place a driver is split into link + seam + state),
+  `run` / `run_reconnecting` / `session`: who owns closing the connection.
 - `session.rs` — one connection's setup, the `select!` loop, and `ArmFlow`.
 - `inbound.rs` / `outbound.rs` — the extracted `select!` arm bodies (relay → game, game → relay).
 - `send.rs` — one turn's wire handoff, packet send, ordered release to the game.
@@ -38,7 +40,10 @@
 ## Tests
 
 `cargo test -p rally-point-client --lib driver::` (or a topic, `driver::tests::recovery::`).
-Fixtures in `tests/mod.rs`: `connected_links()` is a real QUIC pair, `into_session_parts` opens a
-bare `session` without `run`, `spawn_session` + `next_control_frame` read the control stream one
-frame at a time. Reconnect tests shorten the escalation window through
-`Reconnect::escalate_after`/`escalate_retry` instead of waiting out the real ones.
+Fixtures in `tests/mod.rs`: `connected_links()` is a real QUIC pair (the shared
+`rally_point_transport::test_util` loopback), `test_driver` builds a driver on the shortened
+`TEST_TIMING`, `LinkDriver::into_parts` opens a bare `session` without `run`, `spawn_session` +
+`next_control_frame` read the control stream one frame at a time. A test never waits out a real
+window: the teardown fences, the leave-intent safety timeout and the maintenance flush come from
+`DriverTiming`, and the escalation window from `Reconnect::escalate_after`/`escalate_retry`. A test
+that asserts a window actually elapsed asserts against the injected value, never the default.

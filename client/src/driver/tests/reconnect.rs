@@ -2,6 +2,8 @@
 //! hung re-home provider is bounded, the outage buffer's cap, the resume
 //! cursors a re-dial presents, and the backoff schedule.
 
+use std::net::Ipv4Addr;
+
 use super::*;
 
 #[tokio::test]
@@ -14,7 +16,7 @@ async fn a_classified_link_failure_closes_the_old_connection_before_the_re_dial(
     // idle timeout finally notices. The peer here stands in for the relay:
     // it must observe a deliberate application close, promptly.
     let (link_a, link_b, ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
 
     // The re-dial target is unreachable on purpose: this test is about the
     // OLD connection's fate at classification time, not the re-dial (whose
@@ -54,8 +56,8 @@ async fn a_classified_link_failure_closes_the_old_connection_before_the_re_dial(
 #[tokio::test]
 async fn a_hung_provider_ask_times_out_and_is_treated_as_unavailable() {
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
-    let (_link, mut seam, mut state) = into_session_parts(driver_a);
+    let (driver_a, chan_a) = test_driver(link_a);
+    let (_link, mut seam, mut state) = driver_a.into_parts();
     let (provider, _asked) = HangingProvider::new();
     let provider: Arc<dyn RehomeProvider> = provider;
 
@@ -81,8 +83,8 @@ async fn a_hung_provider_ask_times_out_and_is_treated_as_unavailable() {
 #[tokio::test]
 async fn game_teardown_is_observed_while_a_provider_ask_is_pending() {
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
-    let (_link, mut seam, mut state) = into_session_parts(driver_a);
+    let (driver_a, chan_a) = test_driver(link_a);
+    let (_link, mut seam, mut state) = driver_a.into_parts();
     let (provider, _asked) = HangingProvider::new();
     let provider: Arc<dyn RehomeProvider> = provider;
 
@@ -114,7 +116,7 @@ async fn a_hung_rehome_provider_does_not_freeze_the_reconnect_loop() {
     use rally_point_transport::control::send_control_session_start;
 
     let (link_a, link_b, ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let (provider, asked) = HangingProvider::new();
 
     let reconnect = Reconnect {
@@ -167,8 +169,8 @@ async fn a_hung_rehome_provider_does_not_freeze_the_reconnect_loop() {
 #[tokio::test]
 async fn wait_backoff_reports_buffer_exhausted_once_the_outage_buffer_overflows() {
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
-    let (_link, mut seam, mut state) = into_session_parts(driver_a);
+    let (driver_a, chan_a) = test_driver(link_a);
+    let (_link, mut seam, mut state) = driver_a.into_parts();
     let mut backoff = Backoff::new();
 
     // Fill to exactly the cap, then one more to tip it over. `wait_backoff`

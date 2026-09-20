@@ -6,8 +6,8 @@ use super::*;
 #[tokio::test]
 async fn carries_turns_from_one_driver_to_the_other() {
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
-    let (driver_b, chan_b) = LinkDriver::new(link_b);
+    let (driver_a, chan_a) = test_driver(link_a);
+    let (driver_b, chan_b) = test_driver(link_b);
     let task_a = tokio::spawn(driver_a.run());
     let task_b = tokio::spawn(driver_b.run());
 
@@ -38,8 +38,8 @@ async fn an_over_mtu_turn_is_delivered_via_the_control_stream() {
     // driver must fold it back into the ordered turn stream, interleaved
     // correctly with ordinary datagram turns around it.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
-    let (driver_b, chan_b) = LinkDriver::new(link_b);
+    let (driver_a, chan_a) = test_driver(link_a);
+    let (driver_b, chan_b) = test_driver(link_b);
     let task_a = tokio::spawn(driver_a.run());
     let task_b = tokio::spawn(driver_b.run());
 
@@ -94,8 +94,8 @@ async fn a_dead_control_stream_reader_surfaces_as_a_link_failure_while_the_conne
     // session. The fix treats it as a link failure the same way
     // `link.recv()`'s own error arm does.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
-    let (mut link, mut seam, mut state) = into_session_parts(driver_a);
+    let (driver_a, chan_a) = test_driver(link_a);
+    let (mut link, mut seam, mut state) = driver_a.into_parts();
 
     // The peer opens its outbound control stream -- mirroring the relay's own
     // `open_bi()` in `routing::run_slot_link` -- then immediately finishes it:
@@ -137,7 +137,7 @@ async fn delivers_reordered_payloads_to_the_game_in_seq_order() {
     use rally_point_proto::messages::Packet;
 
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut inbound = chan_a.inbound;
 
@@ -190,7 +190,7 @@ async fn a_datagram_turn_with_an_out_of_range_slot_ends_the_link_as_a_failure() 
     // that aliasing, which surfaces here as a link failure -- reconnect-
     // eligible, not a turn silently dropped while the link limps on.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut inbound = chan_a.inbound;
 
@@ -231,7 +231,7 @@ async fn an_oversize_turn_with_an_out_of_range_slot_is_dropped() {
     // of its own), so the driver itself must reject an out-of-range slot
     // here rather than alias it onto a different player's turn stream.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut inbound = chan_a.inbound;
 
@@ -264,7 +264,7 @@ async fn envelope_metadata_survives_delivery_to_the_game() {
     use rally_point_proto::messages::BufferDirective;
 
     let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
     let task = tokio::spawn(driver_a.run());
     let mut inbound = chan_a.inbound;
 

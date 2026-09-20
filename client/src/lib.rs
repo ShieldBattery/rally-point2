@@ -56,8 +56,8 @@ mod sync_generation;
 pub use dial::{ClientEndpoint, DialError, EndpointError};
 pub use directive::DirectiveTracker;
 pub use driver::{
-    ChatOut, DriverError, LinkDriver, Reconnect, RehomeFuture, RehomeOutcome, RehomeProvider,
-    TurnChannels,
+    ChatOut, DriverError, DriverTiming, LinkDriver, Reconnect, RehomeFuture, RehomeOutcome,
+    RehomeProvider, TurnChannels,
 };
 pub use identity::{Identity, IdentityError};
 pub use leave::LeaveTracker;

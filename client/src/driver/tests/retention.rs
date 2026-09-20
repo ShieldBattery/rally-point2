@@ -41,7 +41,7 @@ async fn reinject_retention_defers_oversize_turns_to_the_control_stream() {
     // got it from the dead relay. Such a turn is staged for the fresh control
     // stream instead, and it genuinely crosses that stream whole.
     let (mut link_a, link_b, _ea, _eb) = connected_links().await;
-    let mut state = LoopState::new(Arc::new(AtomicBool::new(false)));
+    let mut state = LoopState::new(Arc::new(AtomicBool::new(false)), TEST_TIMING);
 
     state.retention.push_back(turn(0, &[0x01]));
     state.retention.push_back(turn(1, &vec![0x42; 4096]));
@@ -95,7 +95,7 @@ async fn same_relay_resume_redivers_only_the_oversize_retained_turns() {
     // carries no such risk — gets staged for the resumed connection's
     // control stream.
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let mut state = LoopState::new(Arc::new(AtomicBool::new(false)));
+    let mut state = LoopState::new(Arc::new(AtomicBool::new(false)), TEST_TIMING);
 
     state.retention.push_back(turn(0, &[0x01])); // datagram-sized
     state.retention.push_back(turn(1, &vec![0x42; 4096])); // oversize
@@ -130,7 +130,7 @@ async fn same_relay_resume_redivers_only_the_oversize_retained_turns() {
 #[tokio::test]
 async fn a_same_relay_resume_redelivers_an_oversize_turn_the_relay_never_got() {
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = LinkDriver::new(link_a);
+    let (driver_a, chan_a) = test_driver(link_a);
 
     // The oversize turn is sent once (mirroring the driver's own one-time
     // control-stream write) and retained, but — simulating a drop right
@@ -139,7 +139,7 @@ async fn a_same_relay_resume_redelivers_an_oversize_turn_the_relay_never_got() {
     let oversize = turn(0, &vec![0x42; 4096]);
     chan_a.outbound.send(oversize.clone()).await.unwrap();
     drop(chan_a.outbound);
-    let (mut link, mut seam, mut state) = into_session_parts(driver_a);
+    let (mut link, mut seam, mut state) = driver_a.into_parts();
     LinkDriver::session(&mut link, &mut seam, &mut state, SlotId(0))
         .await
         .expect("session stops cleanly once the outbound seam closes");
