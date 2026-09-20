@@ -138,7 +138,7 @@ pub type SlotStartedDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
 /// (no notify config, no gameId) or the shipping relay's own desync flag was lost to
 /// a restart — the desync FACT is what selects the retention class, independent of
 /// whether a webhook was delivered. Marks live beside the dedup sets, and
-/// [`handle_desync`] inserts one on every desync it sees.
+/// a mark is inserted on every desync the coordinator ingests.
 pub type DesyncMarks = Arc<Mutex<HashMap<(TenantId, SessionId), Instant>>>;
 
 /// How long a desync mark is honored before it is pruned. Generous because a desync
