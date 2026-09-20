@@ -8,6 +8,7 @@ use crate::lifecycle::SessionLifecycle;
 use crate::turn::{TurnBuilder, sync_generation};
 
 use super::measure::Measurement;
+use super::recv_turn;
 
 /// A wedged driver must not strand the other players before the shared drain
 /// deadline exists. Normal sends enter the bounded driver queue immediately.
@@ -78,7 +79,7 @@ pub(super) async fn pump_turns(
                 measure.stats.turns_sent += 1;
                 ordinal += 1;
             }
-            maybe = channels.recv_turn() => {
+            maybe = recv_turn(channels) => {
                 match maybe {
                     Some(payload) => measure.observe(&payload),
                     None => return false,

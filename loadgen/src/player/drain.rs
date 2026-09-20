@@ -11,6 +11,7 @@ use crate::lifecycle::{DrainResolution, SessionLifecycle};
 use crate::metrics::Ending;
 
 use super::measure::Measurement;
+use super::recv_turn;
 
 /// How long a player waits for its driver to end after signaling a clean leave,
 /// before abandoning it as an errored ending.
@@ -37,7 +38,7 @@ pub(super) async fn drain_delivery_phase(
             resolution = lifecycle.wait_for_drain_resolution(&mut lifecycle_changes) => {
                 return resolution;
             },
-            maybe = channels.recv_turn() => {
+            maybe = recv_turn(channels) => {
                 match maybe {
                     Some(payload) => measure.observe(&payload),
                     None => {
@@ -72,7 +73,7 @@ pub(super) async fn drain_until_driver_ends(
                 measure.absorb_buffered(&mut channels.inbound);
                 return Ending::Errored;
             }
-            maybe = channels.recv_turn(), if channels_alive => {
+            maybe = recv_turn(channels), if channels_alive => {
                 match maybe {
                     Some(payload) => measure.observe(&payload),
                     None => channels_alive = false,

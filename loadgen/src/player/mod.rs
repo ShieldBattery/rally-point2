@@ -17,9 +17,10 @@ use std::time::Instant;
 use rally_point_client::proto::token::SignedToken;
 use rally_point_client::transport::rustls::RootCertStore;
 use rally_point_client::transport::rustls::pki_types::CertificateDer;
-use rally_point_client::{ClientEndpoint, Identity, LinkDriver};
+use rally_point_client::{ClientEndpoint, Identity, LinkDriver, TurnChannels};
 use rally_point_proto::control::RelayEndpoint;
 use rally_point_proto::ids::SlotId;
+use rally_point_proto::messages::Payload;
 use tokio::time::{Duration, timeout};
 
 use crate::lifecycle::SessionLifecycle;
@@ -275,4 +276,28 @@ pub async fn run_player(config: PlayerConfig) -> PlayerReport {
     stats.turn_deliveries_distinct = deliveries.distinct;
     stats.turn_deliveries_duplicate = deliveries.duplicate;
     stats
+}
+
+/// Awaits the next peer turn on `channels.inbound`, receiving and discarding
+/// whatever arrives meanwhile on the directive channels (`leaves`,
+/// `connectivity`, `chat_in`, `lobby_in`, `skin_in`). Returns `None` once any
+/// of those has closed, which is how the driver ending surfaces here.
+///
+/// Only a load generator may do this: a discarded `LeaveDirective` never
+/// clears the departed slot, so a real game reads the directive channels
+/// itself. Draining them is still mandatory, because a directive channel left
+/// to fill backs up the driver's control-stream dispatch. Cancel-safe, so it
+/// can sit in a `select!` arm: each underlying `recv` is cancel-safe and a
+/// turn is only consumed by returning it.
+pub(super) async fn recv_turn(channels: &mut TurnChannels) -> Option<Payload> {
+    loop {
+        tokio::select! {
+            payload = channels.inbound.recv() => return payload,
+            maybe = channels.leaves.recv() => maybe.is_some().then_some(())?,
+            maybe = channels.connectivity.recv() => maybe.is_some().then_some(())?,
+            maybe = channels.chat_in.recv() => maybe.is_some().then_some(())?,
+            maybe = channels.lobby_in.recv() => maybe.is_some().then_some(())?,
+            maybe = channels.skin_in.recv() => maybe.is_some().then_some(())?,
+        }
+    }
 }
