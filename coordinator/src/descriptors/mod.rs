@@ -1,5 +1,13 @@
-//! The per-relay descriptor outbox: the coordinator's side of the persistent
-//! control connection that delivers session descriptors to each relay.
+//! The coordinator's per-relay outboxes — everything the control connection has
+//! queued for a relay to receive.
+//!
+//! Two live here. [`RelayDescriptors`] holds each relay's current session
+//! descriptor set; [`RelayReaps`] holds each relay's pending slot-close
+//! directives. They are together because they are the same shape: per-relay
+//! state a session-side caller edits and a connection task pushes, both
+//! re-synced whole on reconnect, both safe to re-deliver. The sections below
+//! describe the descriptor outbox; [`RelayReaps`]' own docs cover how a reap
+//! directive is armed, coalesced and retired.
 //!
 //! When a session is created, the coordinator records — per relay serving it —
 //! the [`SessionDescriptor`] that relay should apply, naming its mesh peers for
@@ -32,6 +40,15 @@
 //! set edit — never held across the push itself, which happens on the connection
 //! task. Clone the outbox cheaply (the state is behind one `Arc`) to share it
 //! between session setup and the control-connection handler.
+//!
+//! # Reaps
+//!
+//! A reap directive is a *queued* close rather than current state, so
+//! [`RelayReaps`] uses an mpsc channel primed from a pending set instead of a
+//! `watch`: the relay must see each armed close, not merely the latest snapshot.
+//! It shares the descriptor outbox's disconnect behaviour — a fresh subscribe is
+//! primed with the whole pending set — and its own idempotence (a slot the relay
+//! no longer holds is a no-op) is what makes that re-delivery safe.
 
 use std::collections::HashMap;
 use std::sync::Arc;

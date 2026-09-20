@@ -12,10 +12,10 @@
 //! - **session** ([`session`]) — accept app-server session requests (N players
 //!   / regions), assign each player a home relay, issue connection-bound tokens,
 //!   and build the per-relay session descriptors that drive the mesh.
-//! - **descriptors** ([`descriptors`]) — the per-relay descriptor outbox: the
-//!   coordinator side of the control connection. Holds each relay's current
-//!   session-descriptor set behind a watch channel and pushes it down the
-//!   relay's open control connection whenever it changes.
+//! - **descriptors** ([`descriptors`]) — the per-relay outboxes: the coordinator
+//!   side of the control connection. Holds each relay's current
+//!   session-descriptor set behind a watch channel, and its pending slot-close
+//!   directives, pushing each down the relay's open control connection.
 //! - **attest** ([`attest`]) — on-demand load-state attestation: the coordinator
 //!   asks a session's serving relays what they hold for it and correlates their
 //!   answers, so a load-state read's completeness rests on every relay having
