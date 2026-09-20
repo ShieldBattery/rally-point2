@@ -17,7 +17,7 @@ use crate::flight_store::{self, S3FlightStore};
 use crate::notify;
 use crate::tenant;
 
-use super::control_inbound::{ControlInbound, bound_session_slot_lists, relay_serves_session};
+use super::control_inbound::{ControlInbound, bound_session_slot_lists};
 
 /// The shortest gap between "a request arrived but no store is configured" warnings,
 /// so a fleet asking a coordinator whose store config was forgotten to grant uploads
@@ -124,7 +124,7 @@ pub(super) fn handle_flight_upload_request(
     let tenant_known = tenant::tenant_state(inbound.setup.tenants(), &tenant).is_some();
     let pinned = desynced
         || notify::is_session_desynced(
-            &inbound.notices.desync_marks,
+            inbound.lifecycle.desync_marks(),
             &tenant,
             session,
             Instant::now(),
@@ -311,7 +311,10 @@ pub(super) fn handle_load_state_snapshot(
 ) {
     let relay_id = inbound.relay_id;
     bound_session_slot_lists(relay_id, &mut snapshot);
-    if !relay_serves_session(inbound.setup, relay_id, &snapshot.tenant, snapshot.session) {
+    if !inbound
+        .setup
+        .relay_serves_session(relay_id, &snapshot.tenant, snapshot.session)
+    {
         tracing::warn!(
             relay_id = relay_id.0,
             tenant = snapshot.tenant.as_ref(),

@@ -158,7 +158,6 @@ async fn serve_relay_control(
     // player-token lifetime are consumed before the upgrade, not here).
     let CoordinatorState {
         setup,
-        notices,
         lifecycle,
         hello_timeout,
         liveness_timeout,
@@ -471,7 +470,6 @@ async fn serve_relay_control(
     };
     let inbound = ControlInbound::new(
         &setup,
-        &notices,
         &lifecycle,
         relay_id,
         generation,

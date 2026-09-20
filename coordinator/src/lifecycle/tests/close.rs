@@ -55,8 +55,7 @@ async fn closing_a_session_prunes_its_dedup_entries_only() {
     // entries (across all three sets), without touching another session's.
     let setup = bare_setup();
     let lc = Lifecycle::new(setup);
-    let dedup = notify::NoticeDedup::new();
-    lc.attach_dedup(dedup.clone());
+    let dedup = lc.notice_dedup().clone();
     let s = SessionId(1);
     let other = SessionId(2);
     lc.register_session(

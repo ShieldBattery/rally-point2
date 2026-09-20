@@ -2,8 +2,9 @@
 //! every inbound frame's side effects.
 //!
 //! Holds the read loop, the per-frame dispatch, the wire-shape ceilings a
-//! heartbeat's vectors are bounded against, the backbone-RTT ingest, and the
-//! serving-set check that stops one relay reporting in another's name.
+//! heartbeat's vectors are bounded against, and the backbone-RTT ingest. A
+//! per-session notice is decoded here and handed straight to
+//! [`Lifecycle::ingest_notice`], which owns what a reported fact does.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,15 +12,14 @@ use std::time::Duration;
 use axum::extract::ws::Message;
 use futures_util::StreamExt;
 use rally_point_proto::control::{
-    CoordinatorToRelay, RegionId, RegionRttReport, RelayToCoordinator, TenantId,
+    CoordinatorToRelay, RegionId, RegionRttReport, RelayToCoordinator,
 };
-use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::ids::RelayId;
 use rally_point_proto::time::unix_secs_fail_open;
 
 use crate::flight_store::S3FlightStore;
 use crate::ledger::RelayLedger;
-use crate::lifecycle::Lifecycle;
-use crate::notify::{self, NoticeDedup};
+use crate::lifecycle::{Lifecycle, SessionNotice};
 use crate::pair_rtts::{self, PairRttStore};
 use crate::presence;
 use crate::regions::RegionsConfig;
@@ -42,8 +42,6 @@ pub(super) struct ControlInbound<'a> {
     /// The session-setup context: registry, membership, and outboxes a frame reads
     /// or mutates.
     pub(super) setup: &'a SessionSetup,
-    /// The relay-notice dedup sets a departure/desync/result collapses against.
-    pub(super) notices: &'a NoticeDedup,
     /// The per-session lifecycle a notice or `SessionClosed` advances.
     pub(super) lifecycle: &'a Lifecycle,
     /// The relay identity this connection enrolled as — the only id a frame may
@@ -64,7 +62,6 @@ impl<'a> ControlInbound<'a> {
     /// signature and every construction site has to answer for it.
     pub(super) fn new(
         setup: &'a SessionSetup,
-        notices: &'a NoticeDedup,
         lifecycle: &'a Lifecycle,
         relay_id: RelayId,
         generation: u64,
@@ -73,7 +70,6 @@ impl<'a> ControlInbound<'a> {
     ) -> Self {
         Self {
             setup,
-            notices,
             lifecycle,
             relay_id,
             generation,
@@ -271,21 +267,18 @@ pub(super) const MAX_HEARTBEAT_REGION_RTTS: usize = 256;
 
 /// Handles an inbound relay frame, returning what the connection loop should do
 /// next. Any frame already counts as the liveness signal; a
-/// [`RelayToCoordinator::Departure`], [`RelayToCoordinator::Desync`],
-/// [`RelayToCoordinator::Result`], or [`RelayToCoordinator::SessionClosed`]
-/// additionally drives its webhook and lifecycle paths here; a
 /// [`RelayToCoordinator::Draining`] returns [`InboundAction::DrainRequested`] so the
 /// loop can run the drain exchange (which needs the socket + generation it owns). A
 /// heartbeat is just liveness plus a presence/RTT ingest — bounded against an
 /// oversize roster and validated against the reporting relay's own serving
 /// sessions, both below — anything undecodable is flagged.
 ///
-/// The lifecycle accounting (result/departure account a slot; `SessionClosed`
-/// closes a serving relay) is fed *before* the webhook path and independent of the
-/// dedup and notify-config gates the webhook path applies — the reap and the
-/// `sessionClosed` signal must track a session even for a tenant with no webhook
-/// configured. Redundant notices from multiple relays are idempotent in the
-/// accounting (a set insert), so feeding every copy is harmless.
+/// The six per-session notice kinds are decoded into a [`SessionNotice`] and
+/// handed to [`Lifecycle::ingest_notice`], which owns the reporter authorization,
+/// the lifecycle accounting, and the webhook enqueue. This file picks none of
+/// that; it decodes a frame and calls once. `SessionClosed` is the exception and
+/// stays here: it is fenced on the connection's generation rather than on session
+/// membership, and drives no webhook of its own.
 pub(super) fn note_inbound(
     inbound: &ControlInbound<'_>,
     flight: &mut FlightUploadState,
@@ -295,7 +288,6 @@ pub(super) fn note_inbound(
     // bound here.
     let &ControlInbound {
         setup,
-        notices,
         lifecycle,
         relay_id,
         generation,
@@ -367,7 +359,7 @@ pub(super) fn note_inbound(
                 // pre-existing session's beat is unaffected.
                 sessions.retain(|session| {
                     let allowed =
-                        relay_serves_session(setup, relay_id, &session.tenant, session.session);
+                        setup.relay_serves_session(relay_id, &session.tenant, session.session);
                     if !allowed {
                         tracing::warn!(
                             relay_id = relay_id.0,
@@ -423,108 +415,27 @@ pub(super) fn note_inbound(
             InboundAction::DrainRequested
         }
         Ok(RelayToCoordinator::Departure(notice)) => {
-            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    slot = notice.slot.0,
-                    "departure notice from a relay not serving the session; rejecting",
-                );
-                return InboundAction::None;
-            }
-            lifecycle.on_departure(
-                notice.tenant.clone(),
-                notice.session,
-                notice.slot,
-                notice.kind,
-                notice.final_turn_count,
-                notice.finalized,
-            );
-            notify::handle_departure(setup, &notices.departures, lifecycle, notice);
+            lifecycle.ingest_notice(relay_id, SessionNotice::Departure(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::Desync(notice)) => {
-            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    sync_ordinal = notice.sync_ordinal,
-                    "desync notice from a relay not serving the session; rejecting",
-                );
-                return InboundAction::None;
-            }
-            notify::handle_desync(
-                setup,
-                &notices.desyncs,
-                &notices.desync_marks,
-                lifecycle,
-                notice,
-            );
+            lifecycle.ingest_notice(relay_id, SessionNotice::Desync(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::Result(notice)) => {
-            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    slot = notice.slot.0,
-                    "result notice from a relay not serving the session; rejecting",
-                );
-                return InboundAction::None;
-            }
-            lifecycle.on_result(notice.tenant.clone(), notice.session, notice.slot);
-            notify::handle_result(setup, &notices.results, lifecycle, notice);
+            lifecycle.ingest_notice(relay_id, SessionNotice::Result(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::SlotConnected(notice)) => {
-            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    slot = notice.slot.0,
-                    "slot-connected notice from a relay not serving the session; rejecting",
-                );
-                return InboundAction::None;
-            }
-            lifecycle.on_slot_connected(notice.tenant.clone(), notice.session, notice.slot);
-            notify::handle_slot_connected(setup, &notices.slot_connects, lifecycle, notice);
+            lifecycle.ingest_notice(relay_id, SessionNotice::SlotConnected(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::SessionStarted(notice)) => {
-            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    "session-started notice from a relay not serving the session; rejecting",
-                );
-                return InboundAction::None;
-            }
-            lifecycle.on_session_started(
-                notice.tenant.clone(),
-                notice.session,
-                notice.started_at_ms,
-            );
-            notify::handle_session_started(setup, &notices.session_starts, lifecycle, notice);
+            lifecycle.ingest_notice(relay_id, SessionNotice::SessionStarted(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::SlotStarted(notice)) => {
-            if !relay_serves_session(setup, relay_id, &notice.tenant, notice.session) {
-                tracing::warn!(
-                    relay_id = relay_id.0,
-                    tenant = notice.tenant.as_ref(),
-                    session = notice.session.0,
-                    slot = notice.slot.0,
-                    "slot-started notice from a relay not serving the session; rejecting",
-                );
-                return InboundAction::None;
-            }
-            lifecycle.on_slot_started(notice.tenant.clone(), notice.session, notice.slot);
-            notify::handle_slot_started(setup, &notices.slot_starts, lifecycle, notice);
+            lifecycle.ingest_notice(relay_id, SessionNotice::SlotStarted(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::SessionClosed { tenant, session }) => {
@@ -605,36 +516,6 @@ pub(super) fn bound_session_slot_lists(
             slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
         }
     }
-}
-
-/// Whether `relay_id` — the relay identity this control connection enrolled as —
-/// is allowed to report a departure/desync/result for `(tenant, session)`. A
-/// notice carries attacker-influenceable `tenant`/`session`/payload, and each one
-/// drives a webhook signed with the tenant's own key; without this gate any
-/// connected relay could name a victim tenant + session and have the coordinator
-/// sign and deliver forged bytes to that tenant's webhook.
-///
-/// The rule: the reporting relay must be one of the session's serving relays.
-/// When the coordinator holds **no** serving-relay record for the session, the
-/// notice is allowed through — this is the routine post-restart tail case, where a
-/// relay still holds a session created in a previous coordinator lifetime and
-/// reports its closing events, but the in-memory serving set was wiped, so there
-/// is nothing to check the reporter against. Enforcement therefore applies only
-/// when serving-relay information exists this lifetime.
-///
-/// Residual gap: the unverifiable no-record path still trusts the reporter, and
-/// the shared bootstrap secret authenticates "a relay," not a specific relay id,
-/// so a secret holder could forge a tail notice for a session with no live serving
-/// record. Fully closing that needs per-relay identity — the same work that binds
-/// a control connection to its claimed relay id — and is out of scope here.
-pub(super) fn relay_serves_session(
-    setup: &SessionSetup,
-    relay_id: RelayId,
-    tenant: &TenantId,
-    session: SessionId,
-) -> bool {
-    let serving = setup.serving_relays(tenant, session);
-    serving.is_empty() || serving.contains(&relay_id)
 }
 
 /// Applies the synchronous part of a relay's coordinated-drain exchange after it

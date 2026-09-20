@@ -17,27 +17,13 @@ use rally_point_proto::control::{
     DepartureNotice, DesyncNotice, ResultNotice, SessionStartedNotice, SlotConnectedNotice,
     SlotStartedNotice, TenantId,
 };
-use rally_point_proto::ids::{SessionId, SlotId};
+use rally_point_proto::ids::SessionId;
 use serde::Serialize;
 
 use super::*;
-use crate::lifecycle::Lifecycle;
+use crate::lifecycle::{Lifecycle, NoticeKey};
 use crate::session::SessionSetup;
 use crate::tenant::NotifyConfig;
-
-/// What identifies one notice within its session, for the drop logs. A
-/// departure/result/slot notice is identified by its slot, a desync by the sync
-/// ordinal at which the mismatch was seen, and a session start by the session
-/// alone. Each drop log correlates on the id that actually applies to its event
-/// rather than flattening them all to a lowest common denominator.
-enum NoticeKey {
-    /// A per-slot notice: logs `slot`.
-    Slot(SlotId),
-    /// A desync: logs `sync_ordinal`.
-    SyncOrdinal(u64),
-    /// A whole-session notice: logs neither.
-    Session,
-}
 
 /// Everything a handler needs after the shared resolution succeeded: where to
 /// POST, the gameId to embed, and this coordinator's stored session record for
@@ -101,23 +87,7 @@ fn resolve_or_drop(
             format!("no gameId ref from the notice or a stored session; dropping {kind}")
         }
     };
-    match key {
-        NoticeKey::Slot(slot) => tracing::debug!(
-            tenant = tenant.as_ref(),
-            session = session.0,
-            slot = slot.0,
-            "{reason}",
-        ),
-        NoticeKey::SyncOrdinal(sync_ordinal) => tracing::debug!(
-            tenant = tenant.as_ref(),
-            session = session.0,
-            sync_ordinal,
-            "{reason}",
-        ),
-        NoticeKey::Session => {
-            tracing::debug!(tenant = tenant.as_ref(), session = session.0, "{reason}",)
-        }
-    }
+    key.debug(tenant, session, &reason);
     None
 }
 

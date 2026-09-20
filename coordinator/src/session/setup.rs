@@ -275,6 +275,36 @@ impl SessionSetup {
             .insert((tenant.clone(), session), relays);
     }
 
+    /// Whether `relay` — the relay identity a control connection enrolled as —
+    /// is allowed to report a per-session notice for `(tenant, session)`. A
+    /// notice carries attacker-influenceable `tenant`/`session`/payload, and each
+    /// one drives a webhook signed with the tenant's own key; without this gate
+    /// any connected relay could name a victim tenant + session and have the
+    /// coordinator sign and deliver forged bytes to that tenant's webhook.
+    ///
+    /// The rule: the reporting relay must be one of the session's serving relays.
+    /// When the coordinator holds **no** serving-relay record for the session, the
+    /// notice is allowed through — this is the routine post-restart tail case,
+    /// where a relay still holds a session created in a previous coordinator
+    /// lifetime and reports its closing events, but the in-memory serving set was
+    /// wiped, so there is nothing to check the reporter against. Enforcement
+    /// therefore applies only when serving-relay information exists this lifetime.
+    ///
+    /// Residual gap: the unverifiable no-record path still trusts the reporter,
+    /// and the shared bootstrap secret authenticates "a relay," not a specific
+    /// relay id, so a secret holder could forge a tail notice for a session with
+    /// no live serving record. Fully closing that needs per-relay identity — the
+    /// same work that binds a control connection to its claimed relay id.
+    pub fn relay_serves_session(
+        &self,
+        relay: RelayId,
+        tenant: &TenantId,
+        session: SessionId,
+    ) -> bool {
+        let serving = self.serving_relays(tenant, session);
+        serving.is_empty() || serving.contains(&relay)
+    }
+
     /// The number of live sessions `relay` currently serves — how many recorded
     /// serving sets, across every tenant, name it. Zero means the relay homes no
     /// session's slots right now: a reconcile scale-down reads this to find a relay

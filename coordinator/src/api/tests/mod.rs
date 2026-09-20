@@ -21,7 +21,6 @@ use tower::ServiceExt;
 
 use crate::flight_store;
 use crate::lifecycle::Lifecycle;
-use crate::notify;
 use crate::pair_rtts;
 use crate::presence;
 use crate::regions::RegionsConfig;
@@ -206,9 +205,9 @@ fn two_players() -> Vec<PlayerHandoff> {
 
 /// A setup with one relay (id 1) and a tenant enrolled, a notify config
 /// pointed at `url`, and a session created — so the session's serving set is
-/// exactly `[RelayId(1)]`. Returns the setup, a fresh dedup, a lifecycle over
-/// it, and the created session id.
-fn setup_with_session_and_notify(url: String) -> (SessionSetup, NoticeDedup, Lifecycle, SessionId) {
+/// exactly `[RelayId(1)]`. Returns the setup, a lifecycle over it, and the
+/// created session id.
+fn setup_with_session_and_notify(url: String) -> (SessionSetup, Lifecycle, SessionId) {
     let (setup, session) = SessionFixture {
         players: vec![PlayerSpec {
             slot: 0,
@@ -221,16 +220,15 @@ fn setup_with_session_and_notify(url: String) -> (SessionSetup, NoticeDedup, Lif
     }
     .build();
     let lifecycle = Lifecycle::new(setup.clone());
-    (setup, notify::NoticeDedup::new(), lifecycle, session)
+    (setup, lifecycle, session)
 }
 
 /// The inputs `note_inbound` needs with nothing staged: a registry holding
-/// relay 1 at `generation`, an empty tenant store, a fresh lifecycle and dedup,
-/// no region config, and an idle RTT store. Returned as owned values the caller
-/// keeps alive, since the ingest view borrows the last two.
+/// relay 1 at `generation`, an empty tenant store, a fresh lifecycle, no region
+/// config, and an idle RTT store. Returned as owned values the caller keeps
+/// alive, since the ingest view borrows the last two.
 struct InboundFixture {
     setup: SessionSetup,
-    notices: NoticeDedup,
     lifecycle: Lifecycle,
     generation: u64,
     regions: RegionsConfig,
@@ -273,7 +271,6 @@ impl InboundFixture {
     fn note(&self, message: &Message) {
         note_inbound_frame(
             &self.setup,
-            &self.notices,
             &self.lifecycle,
             RelayId(1),
             self.generation,
@@ -297,7 +294,6 @@ fn bare_inbound_fixture() -> InboundFixture {
     let lifecycle = Lifecycle::new(setup.clone());
     InboundFixture {
         setup,
-        notices: notify::NoticeDedup::new(),
         lifecycle,
         generation,
         regions: RegionsConfig::default(),
@@ -340,7 +336,6 @@ fn idle_rtt_ingest<'a>(regions: &'a RegionsConfig, store: &'a PairRttStore) -> R
 /// exercise the flight-upload path, so the flight state is a throwaway.
 fn note_inbound_frame(
     setup: &SessionSetup,
-    notices: &NoticeDedup,
     lifecycle: &Lifecycle,
     relay_id: RelayId,
     generation: u64,
@@ -349,7 +344,7 @@ fn note_inbound_frame(
 ) -> InboundAction {
     let mut flight = FlightUploadState::new(tokio::sync::mpsc::unbounded_channel().0);
     note_inbound(
-        &ControlInbound::new(setup, notices, lifecycle, relay_id, generation, rtt, None),
+        &ControlInbound::new(setup, lifecycle, relay_id, generation, rtt, None),
         &mut flight,
         message,
     )

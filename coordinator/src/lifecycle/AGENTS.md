@@ -10,11 +10,18 @@ spread across these files, so grep by method name, not by file.
 - `relays.rs` — control-connection epochs, heartbeat ingestion, empty-roster
   evidence invalidation, metrics census.
 - `close.rs` — `SessionClosed` handling, retirement, both queue pushes.
+- `notices.rs` — `SessionNotice` + `ingest_notice`: the single owner of "a relay
+  reported X" (authorize the reporter, record the fact, enqueue the webhook),
+  and the notice dedup sets the lifecycle holds.
 - `reaps.rs` — every arm/fire timer pair plus the re-evaluation entry points.
 - `tests/mod.rs` — shared fixtures; topic modules beside it.
 
 ## Invariants that are easy to break
 
+- `ingest_notice` is the only way a reported notice enters: it authorizes the
+  reporter against the session's serving set, records the fact, then enqueues the
+  webhook, in that order. A new notice kind is a `SessionNotice` variant and an
+  arm there — never a second path, which would skip the authorization.
 - `sessionClosed` is enqueued only once **every** relay the coordinator assigned
   to serve the session has reported `SessionClosed`. A webhook-only state (no
   serving set) therefore never fires one — deliberate, not a gap.

@@ -32,8 +32,8 @@
 //! probe is the backstop for those.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -402,10 +402,11 @@ struct Inner {
     next_empty_timer_token: AtomicU64,
     /// Every window and capacity this tracker's reaps and queues run on.
     tunables: LifecycleTunables,
-    /// The notice dedup sets to prune when a session's state is removed, wired in
-    /// once at startup ([`Lifecycle::attach_dedup`]). Optional so a lifecycle
-    /// built without one (a test that never exercises dedup) simply skips pruning.
-    dedup: OnceLock<NoticeDedup>,
+    /// The notice dedup sets every ingested notice collapses against, pruned
+    /// when a session's state is removed. Constructed with the lifecycle — one
+    /// object graph, in production and in tests alike — because the ingest that
+    /// claims an entry and the retirement that drops it are both here.
+    notices: NoticeDedup,
 }
 
 /// A scrape-time census of the lifecycle map, produced by
@@ -494,16 +495,9 @@ impl Lifecycle {
                 relay_epochs: Mutex::new(HashMap::new()),
                 next_empty_timer_token: AtomicU64::new(1),
                 tunables,
-                dedup: OnceLock::new(),
+                notices: NoticeDedup::new(),
             }),
         }
-    }
-
-    /// Wires in the notice dedup sets this lifecycle prunes when it removes a
-    /// session's state, so they don't grow for the process lifetime. Called once
-    /// at startup, after both are constructed; a second call is ignored.
-    pub fn attach_dedup(&self, dedup: NoticeDedup) {
-        let _ = self.inner.dedup.set(dedup);
     }
 }
 
@@ -537,9 +531,13 @@ async fn drain_queue(mut rx: mpsc::Receiver<WebhookJob>, tenants: TenantStore) {
 }
 
 mod close;
+mod notices;
 mod reaps;
 mod relays;
 mod sessions;
+
+pub(crate) use notices::NoticeKey;
+pub use notices::SessionNotice;
 
 #[cfg(test)]
 mod tests;

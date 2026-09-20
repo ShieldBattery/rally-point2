@@ -201,8 +201,7 @@ async fn a_webhook_only_state_is_reaped_and_prunes_its_dedup_after_the_idle_grac
             ..Default::default()
         },
     );
-    let dedup = notify::NoticeDedup::new();
-    lc.attach_dedup(dedup.clone());
+    let dedup = lc.notice_dedup().clone();
     let s = SessionId(1);
 
     // Seed a dedup entry for this session, as the notice handler would have.

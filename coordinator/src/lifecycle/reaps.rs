@@ -69,12 +69,12 @@ impl Lifecycle {
         );
     }
 
-    /// Drops the notice dedup entries for `(tenant, session)`, if a dedup set was
-    /// wired in. A no-op for a lifecycle built without one.
+    /// Drops the notice dedup entries for `(tenant, session)` — the point the
+    /// coordinator declares it is done with the session, so the sets stay bounded
+    /// by the sessions it still tracks rather than growing for the process
+    /// lifetime.
     pub(super) fn prune_dedup(&self, tenant: &TenantId, session: SessionId) {
-        if let Some(dedup) = self.inner.dedup.get() {
-            dedup.prune_session(tenant, session);
-        }
+        self.inner.notices.prune_session(tenant, session);
     }
 
     /// Whether a lifecycle state currently exists for `(tenant, session)` — a test

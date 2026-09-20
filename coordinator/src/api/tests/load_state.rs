@@ -40,7 +40,6 @@ fn spawn_attesting_relay(
     opts: AttestOptions,
 ) -> tokio::task::JoinHandle<()> {
     let setup = state.setup.clone();
-    let notices = state.notices.clone();
     let lifecycle = state.lifecycle.clone();
     let mut asks = setup.attest().subscribe(relay);
     let AttestOptions {
@@ -68,7 +67,7 @@ fn spawn_attesting_relay(
                 .expect("a snapshot serializes")
                 .into(),
             );
-            note_inbound_frame(&setup, &notices, &lifecycle, relay, 0, &frame, &rtt);
+            note_inbound_frame(&setup, &lifecycle, relay, 0, &frame, &rtt);
         }
     })
 }
@@ -442,15 +441,7 @@ async fn a_snapshot_correlated_to_another_relays_request_is_discarded() {
         .unwrap()
         .into(),
     );
-    note_inbound_frame(
-        &state.setup,
-        &state.notices,
-        &state.lifecycle,
-        RelayId(2),
-        0,
-        &frame,
-        &rtt,
-    );
+    note_inbound_frame(&state.setup, &state.lifecycle, RelayId(2), 0, &frame, &rtt);
 
     // Relay 2's positives are still merged — they are facts about the session
     // whoever reports them — but relay 1's request is untouched.

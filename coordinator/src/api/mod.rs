@@ -84,7 +84,6 @@ use crate::attest::LOAD_STATE_ATTEST_TIMEOUT;
 use crate::flight_store::S3FlightStore;
 use crate::ledger::RelayLedger;
 use crate::lifecycle::Lifecycle;
-use crate::notify::{self, NoticeDedup};
 use crate::pair_rtts::{self, PairRttStore};
 use crate::regions::RegionsConfig;
 use crate::session::SessionSetup;
@@ -234,10 +233,6 @@ pub struct CoordinatorState {
     /// The session-setup context — relay registry, tenant store, session→relay
     /// membership, and the per-relay descriptor outbox.
     pub setup: SessionSetup,
-    /// Dedup sets for relay notices (departures + desyncs): redundant reports of
-    /// one event collapse to a single webhook. Shared across all relay control
-    /// connections.
-    pub notices: NoticeDedup,
     /// Per-session lifecycle: ordered webhook dispatch, the `sessionClosed`
     /// signal, and the reap policies. Shared across all relay control connections
     /// and the session-create + liveness endpoints.
@@ -304,22 +299,16 @@ pub struct CoordinatorState {
 
 impl CoordinatorState {
     /// Builds the dev / loopback posture over `setup` and `control_auth`: a
-    /// fresh notice-dedup set and lifecycle wired to each other, every timeout
-    /// and the token lifetime at their production defaults, and no region
-    /// config, no ledger, and no flight store.
+    /// fresh lifecycle, every timeout and the token lifetime at their production
+    /// defaults, and no region config, no ledger, and no flight store.
     ///
     /// The binary and the tests both start here and override only the fields
     /// they configure, so a new field lands in one place rather than in every
     /// state literal in the crate.
     pub fn new(setup: SessionSetup, control_auth: ControlAuth) -> Self {
-        let notices = notify::NoticeDedup::new();
         let lifecycle = Lifecycle::new(setup.clone());
-        // Let the lifecycle prune these dedup sets when it removes a session's
-        // state, so they don't grow for the process lifetime.
-        lifecycle.attach_dedup(notices.clone());
         Self {
             setup,
-            notices,
             lifecycle,
             control_auth,
             hello_timeout: HELLO_TIMEOUT,

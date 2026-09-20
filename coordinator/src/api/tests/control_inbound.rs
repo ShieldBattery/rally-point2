@@ -51,7 +51,6 @@ fn a_current_heartbeat_folds_region_rtts_and_a_stale_one_does_not() {
     let current_generation = registry::enroll(&reg, hello);
     let setup = crate::session::SessionSetup::new(reg, crate::tenant::TenantStore::new());
     let lifecycle = Lifecycle::new(setup.clone());
-    let notices = notify::NoticeDedup::new();
     let regions = regions_config(&["region-a", "region-b"]);
     let relay_region = RegionId("region-a".to_owned());
     let store = pair_rtts::PairRttStore::new();
@@ -66,7 +65,6 @@ fn a_current_heartbeat_folds_region_rtts_and_a_stale_one_does_not() {
     // The stale connection's beat writes nothing.
     note_inbound_frame(
         &setup,
-        &notices,
         &lifecycle,
         RelayId(1),
         stale_generation,
@@ -81,7 +79,6 @@ fn a_current_heartbeat_folds_region_rtts_and_a_stale_one_does_not() {
     // The current connection's beat folds the pair in.
     note_inbound_frame(
         &setup,
-        &notices,
         &lifecycle,
         RelayId(1),
         current_generation,
@@ -99,7 +96,6 @@ fn a_current_heartbeat_folds_region_rtts_and_a_stale_one_does_not() {
     let unknown = heartbeat_with_rtts(&[("region-z", 42)]);
     note_inbound_frame(
         &setup,
-        &notices,
         &lifecycle,
         RelayId(1),
         current_generation,
@@ -145,7 +141,7 @@ async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_ten
     // notice was lost. It must stay silent to the tenant, though — these facts
     // were already notified, and re-firing them every beat would flood the
     // feed.
-    let (setup, notices, lifecycle, session) =
+    let (setup, lifecycle, session) =
         setup_with_session_and_notify("http://127.0.0.1:1/hook".to_owned());
     let tenant = tenant_id();
     lifecycle.register_session(
@@ -179,7 +175,6 @@ async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_ten
     // dropped whole — load state included.
     note_inbound_frame(
         &setup,
-        &notices,
         &lifecycle,
         RelayId(1),
         stale_generation,
@@ -199,15 +194,7 @@ async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_ten
         "a stale connection's beat records nothing at all",
     );
 
-    note_inbound_frame(
-        &setup,
-        &notices,
-        &lifecycle,
-        RelayId(1),
-        generation,
-        &beat,
-        &rtt,
-    );
+    note_inbound_frame(&setup, &lifecycle, RelayId(1), generation, &beat, &rtt);
     let load = lifecycle
         .load_state(&tenant, session)
         .expect("the session was created here");
@@ -219,17 +206,18 @@ async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_ten
             vec![SlotId(1)],
         ),
     );
+    let dedup = lifecycle.notice_dedup();
     assert!(
-        notices.slot_connects.lock().is_empty()
-            && notices.session_starts.lock().is_empty()
-            && notices.slot_starts.lock().is_empty(),
+        dedup.slot_connects.lock().is_empty()
+            && dedup.session_starts.lock().is_empty()
+            && dedup.slot_starts.lock().is_empty(),
         "the beat is the durable record, never a notification source",
     );
 }
 
 #[tokio::test]
 async fn session_closed_from_a_superseded_connection_cannot_close_the_live_epoch() {
-    let (setup, notices, lifecycle, session) =
+    let (setup, lifecycle, session) =
         setup_with_session_and_notify("http://127.0.0.1:1/hook".to_owned());
     let tenant = tenant_id();
     lifecycle.register_session(
@@ -254,7 +242,6 @@ async fn session_closed_from_a_superseded_connection_cannot_close_the_live_epoch
     let occupied = heartbeat_with_sessions(vec![presence_entry(&tenant, session, &[0])]);
     note_inbound_frame(
         &setup,
-        &notices,
         &lifecycle,
         RelayId(1),
         current_generation,
@@ -272,7 +259,6 @@ async fn session_closed_from_a_superseded_connection_cannot_close_the_live_epoch
     );
     note_inbound_frame(
         &setup,
-        &notices,
         &lifecycle,
         RelayId(1),
         stale_generation,
@@ -286,7 +272,6 @@ async fn session_closed_from_a_superseded_connection_cannot_close_the_live_epoch
 
     note_inbound_frame(
         &setup,
-        &notices,
         &lifecycle,
         RelayId(1),
         current_generation,
@@ -296,28 +281,6 @@ async fn session_closed_from_a_superseded_connection_cannot_close_the_live_epoch
     assert!(
         !lifecycle.is_alive(&tenant, session),
         "the current connection's close still retires the session",
-    );
-}
-
-#[test]
-fn relay_serves_session_enforces_membership_only_when_a_serving_set_exists() {
-    let (setup, _notices, _lifecycle, session) =
-        setup_with_session_and_notify("http://127.0.0.1:1/hook".to_owned());
-    let tenant = tenant_id();
-    // The session's serving set is [RelayId(1)].
-    assert!(
-        relay_serves_session(&setup, RelayId(1), &tenant, session),
-        "the session's serving relay may report",
-    );
-    assert!(
-        !relay_serves_session(&setup, RelayId(2), &tenant, session),
-        "a relay outside the serving set may not report",
-    );
-    // A session the coordinator never recorded a serving set for: unverifiable
-    // (the post-restart tail case), so the reporter is allowed through.
-    assert!(
-        relay_serves_session(&setup, RelayId(2), &tenant, SessionId(999_999)),
-        "with no serving record there is nothing to check against, so allow",
     );
 }
 
@@ -383,7 +346,6 @@ async fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
     );
 
     let lifecycle = Lifecycle::new(setup.clone());
-    let notices = notify::NoticeDedup::new();
     let regions = RegionsConfig::default();
     let store = pair_rtts::PairRttStore::new();
     let rtt = idle_rtt_ingest(&regions, &store);
@@ -394,7 +356,6 @@ async fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
     ]);
     note_inbound_frame(
         &setup,
-        &notices,
         &lifecycle,
         RelayId(2),
         relay_2_generation,
@@ -505,7 +466,6 @@ fn heartbeat_region_rtt_reports_beyond_the_cap_are_truncated() {
     );
     let setup = session::SessionSetup::new(reg, crate::tenant::TenantStore::new());
     let lifecycle = Lifecycle::new(setup.clone());
-    let notices = notify::NoticeDedup::new();
 
     let overshoot = MAX_HEARTBEAT_REGION_RTTS + 5;
     let region_ids: Vec<String> = (0..overshoot).map(|i| format!("region-{i}")).collect();
@@ -522,15 +482,7 @@ fn heartbeat_region_rtt_reports_beyond_the_cap_are_truncated() {
 
     let rtts: Vec<(&str, u32)> = region_id_strs.iter().map(|&r| (r, 10u32)).collect();
     let beat = heartbeat_with_rtts(&rtts);
-    note_inbound_frame(
-        &setup,
-        &notices,
-        &lifecycle,
-        RelayId(1),
-        generation,
-        &beat,
-        &rtt,
-    );
+    note_inbound_frame(&setup, &lifecycle, RelayId(1), generation, &beat, &rtt);
 
     assert_eq!(
         store.snapshot().len(),
