@@ -17,8 +17,8 @@ reliable-ordered protocol). Read it before touching `ack_manager/` or `link/`.
 - `recarry_sim/` — test-only simulator (`model.rs` network + loss models,
   `scenarios.rs` the fade/burst/blackout cases). Its comparison-table dump is
   `#[ignore]`d: `cargo test -p rally-point-transport recarry_sim -- --ignored --nocapture`.
-- `quic/`, `control.rs`, `mesh_control_stream.rs`, `beacon.rs`, `sequence_buffer.rs` —
-  unchanged single files.
+- `quic/`, `control.rs`, `mesh_control_stream.rs`, `control_framing.rs` (the length-prefix
+  frame reader both control streams share), `beacon.rs`, `sequence_buffer.rs` — single files.
 
 ## Rules
 

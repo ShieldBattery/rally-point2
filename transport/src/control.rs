@@ -21,17 +21,16 @@
 //! frame kind it doesn't know, so the channel can grow chat/resync frames
 //! without a wire break.
 
-use prost::Message;
 use prost::bytes::Bytes;
-use rally_point_proto::control_stream::{
-    CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, encode_frame, frame_len,
-};
+use rally_point_proto::control_stream::{ControlStreamError, encode_frame};
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, GameStarted, LeaveDirective, LeaveIntent, LoadStateProbe,
     LoadStateProbeAck, LobbyCommand, Payload, PhaseApplied, PhaseDirective, PlayerSkin,
     RegionLabel, RegionLabels, RequestDrop, SessionStart, SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
+
+use crate::control_framing::read_one_frame;
 
 /// A frame surfaced from the reliable control stream to its consumer.
 ///
@@ -153,49 +152,6 @@ pub enum ControlInbound {
 /// common turn is tens of bytes against a ~1200-byte datagram budget), so this
 /// is a backstop against a brief scheduling hiccup, not a tuned buffer.
 const CONTROL_CHANNEL_CAPACITY: usize = 64;
-
-/// Reads one length-prefixed, decoded frame of type `M` off `recv`: the length
-/// prefix (validated against the frame cap *before* any allocation), then the
-/// body, then [`decode_frame`]. Shared by this module's client ↔ relay reader
-/// and [`mesh_control_stream`](crate::mesh_control_stream)'s relay ↔ relay
-/// reader — both frame their stream identically and differ only in the
-/// message type and in what they do with the result.
-///
-/// Returns `None` whenever the caller's read loop must stop: the stream ended
-/// (the peer closed it or the connection died), a length prefix violated the
-/// frame cap, or the body failed to decode. The latter two are protocol
-/// violations the framing can't recover from, so they are `warn!`-logged here
-/// (tagged with `label`, e.g. `"control"` or `"mesh control"`) before
-/// returning `None` — the caller has nothing more useful to add and only needs
-/// to know reading is over, not why.
-pub(crate) async fn read_one_frame<M: Message + Default>(
-    recv: &mut noq::RecvStream,
-    label: &str,
-) -> Option<M> {
-    let mut prefix = [0u8; CONTROL_LEN_PREFIX];
-    if recv.read_exact(&mut prefix).await.is_err() {
-        return None;
-    }
-    let len = match frame_len(prefix) {
-        Ok(len) => len,
-        Err(error) => {
-            // Never an allocation: the cap check precedes the buffer.
-            tracing::warn!(%error, "{label} stream framing violation; ignoring stream");
-            return None;
-        }
-    };
-    let mut body = vec![0u8; len];
-    if recv.read_exact(&mut body).await.is_err() {
-        return None;
-    }
-    match decode_frame(&body) {
-        Ok(frame) => Some(frame),
-        Err(error) => {
-            tracing::warn!(%error, "{label} frame did not decode; ignoring stream");
-            None
-        }
-    }
-}
 
 /// Spawns a dedicated task that accepts the peer's control stream, reads its
 /// length-prefixed `ControlFrame`s, and forwards each oversize-turn payload

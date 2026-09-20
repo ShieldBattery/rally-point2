@@ -28,7 +28,7 @@ use rally_point_proto::control_stream::{
 use rally_point_proto::messages::MeshControlFrame;
 use tokio::sync::mpsc;
 
-use crate::control::read_one_frame;
+use crate::control_framing::read_one_frame;
 
 /// Depth of the reader-task → driver channel. Most mesh control frames are rare,
 /// while delivered-through cursors can arrive as a maintenance burst with one

@@ -49,12 +49,11 @@ pub(crate) mod sequence_buffer;
 
 pub use ack_manager::{AckError, AckManager, GUARANTEED_DATAGRAM_BUDGET};
 pub use link::{Link, LinkError, RECEIVE_WINDOW, Received};
-pub use mesh_link::{
-    MeshLink, MeshLinkError, MeshReceived, MeshSessionKey, should_dial_mesh,
-};
+pub use mesh_link::{MeshLink, MeshLinkError, MeshReceived, MeshSessionKey, should_dial_mesh};
 
 pub mod beacon;
 pub mod control;
+pub(crate) mod control_framing;
 pub mod mesh_control_stream;
 
 #[cfg(test)]
