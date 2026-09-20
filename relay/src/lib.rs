@@ -90,6 +90,8 @@ pub(crate) mod rate_limit;
 pub mod routing;
 pub mod server;
 pub mod session;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod validation;
 
 /// Default UDP port the relay listens on for client + mesh QUIC connections.

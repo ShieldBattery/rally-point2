@@ -96,6 +96,8 @@ pub mod rehome;
 pub mod session;
 pub mod tenant;
 pub mod tenant_config;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 /// Default port the coordinator serves its app-server + relay control API on.
 pub const DEFAULT_PORT: u16 = 14_910;
