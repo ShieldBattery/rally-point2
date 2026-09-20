@@ -5,29 +5,28 @@
 
 use super::*;
 
-#[test]
-fn a_stretched_turn_period_gates_evaluation_shut() {
-    // Arrivals at a 55 ms cadence against a ~41.7 ms nominal turn: the
-    // session is stall-bound (period inflated), phases are not
-    // quasi-static, and the controller must refuse to correct however
-    // spread the (meaningless) phases look.
-    let mut controller = PhaseController::new(TURN_US);
-    let start = Instant::now();
-    let stretched = 55_000i64;
-    let mut last = start;
-    for seq in 0..600u64 {
-        for (id, offset) in [(slot(0), 0i64), (slot(1), 20_000)] {
-            let at = start + Duration::from_micros((seq as i64 * stretched + offset) as u64);
-            controller.note_arrival(id, seq, at);
-            last = last.max(at);
-        }
-    }
-    let corrections = controller.evaluate(last + Duration::from_millis(1));
-    assert!(corrections.is_empty(), "got {corrections:?}");
-}
-
+/// Evaluation is gated shut while any active slot's arrival interval is
+/// off the turn period: a stall-bound session's phases are not
+/// quasi-static, so however spread the (meaningless) phases look, no
+/// correction may issue. The hard position is after a correction, where
+/// the churn the controller itself caused must close the gate -- a loop
+/// that amplified its own churn is the failure this gate exists to stop.
 #[test]
 fn churn_after_a_correction_closes_the_gate_until_it_clears() {
+    // A session stretched from its very first sample gets no first
+    // correction at all.
+    let mut stalled = PhaseController::new(TURN_US);
+    let stalled_start = Instant::now();
+    let stalled_last = feed_at_cadence(
+        &mut stalled,
+        stalled_start,
+        &[(slot(0), 0i64), (slot(1), 20_000)],
+        0..600,
+        55_000,
+    );
+    let corrections = stalled.evaluate(stalled_last + Duration::from_millis(1));
+    assert!(corrections.is_empty(), "got {corrections:?}");
+
     let mut controller = PhaseController::new(TURN_US);
     let start = Instant::now();
     let offsets = [(slot(0), 0i64), (slot(1), 16_000)];
@@ -48,15 +47,8 @@ fn churn_after_a_correction_closes_the_gate_until_it_clears() {
     // dwell passes, the health gate — not the dwell — must be what keeps
     // the controller silent, despite the still-open spread.
     let churn_start = last + Duration::from_secs(30);
-    let stretched = 50_000i64;
-    let mut clock = churn_start;
-    for i in 0..300u64 {
-        for (id, offset) in [(slot(0), applied), (slot(1), 16_000)] {
-            let at = churn_start + Duration::from_micros((i as i64 * stretched + offset) as u64);
-            controller.note_arrival(id, 300 + i, at);
-            clock = clock.max(at);
-        }
-    }
+    let churned = [(slot(0), applied), (slot(1), 16_000)];
+    let clock = feed_at_cadence(&mut controller, churn_start, &churned, 300..600, 50_000);
     assert!(
         controller
             .evaluate(clock + Duration::from_millis(1))
@@ -69,15 +61,13 @@ fn churn_after_a_correction_closes_the_gate_until_it_clears() {
     // applied first step released the response gate, so the remaining
     // spread draws the next correction.
     let resume = clock + Duration::from_secs(1);
-    let mut clock2 = resume;
-    let turn = i64::from(TURN_US);
-    for i in 0..600u64 {
-        for (id, offset) in [(slot(0), applied), (slot(1), 16_000)] {
-            let at = resume + Duration::from_micros((i as i64 * turn + offset) as u64);
-            controller.note_arrival(id, 600 + i, at);
-            clock2 = clock2.max(at);
-        }
-    }
+    let clock2 = feed_at_cadence(
+        &mut controller,
+        resume,
+        &churned,
+        600..1200,
+        i64::from(TURN_US),
+    );
     // Drain the idle-reeval schedule: evaluate may need a couple of calls
     // spaced past IDLE_REEVAL before one actually runs.
     let mut corrected = false;
@@ -95,8 +85,9 @@ fn churn_after_a_correction_closes_the_gate_until_it_clears() {
 fn a_plant_that_never_settles_trips_the_give_up_latch() {
     // Every round the population re-scrambles (natural phases jump around
     // as a churning game's would), so no evaluation ever measures inside
-    // the dead-band. The controller must stop within the round budget and
-    // stay stopped.
+    // the dead-band. The modeled clients apply and acknowledge every
+    // command, so the per-slot response fence keeps releasing and cannot be
+    // what silences the controller: only the latch can.
     let mut controller = PhaseController::new(TURN_US);
     let start = Instant::now();
     let turn = i64::from(TURN_US);
@@ -106,25 +97,44 @@ fn a_plant_that_never_settles_trips_the_give_up_latch() {
         // A fresh scrambled offset pair each round, always ≥ 10 ms apart.
         let jitter = ((round * 7_919) % 20_000) as i64;
         let offsets = [(slot(0), jitter), (slot(1), jitter + 12_000)];
-        let mut clock = start;
-        for s in seq..seq + 1_000 {
-            for &(id, offset) in &offsets {
-                let at = start + Duration::from_micros((s as i64 * turn + offset) as u64);
-                controller.note_arrival(id, s, at);
-                clock = clock.max(at);
-            }
-        }
-        seq += 1_000;
-        if !controller
-            .evaluate(clock + Duration::from_millis(1))
-            .is_empty()
-        {
+        let clock = feed_at_cadence(
+            &mut controller,
+            at_turn(start, seq),
+            &offsets,
+            seq..seq + ROUND_TURNS,
+            turn,
+        );
+        seq += ROUND_TURNS;
+        let corrections = controller.evaluate(clock + Duration::from_millis(1));
+        if !corrections.is_empty() {
             correcting_rounds += 1;
+        }
+        for &(id, delay) in &corrections {
+            controller.note_applied(id, delay, clock + Duration::from_millis(2));
         }
     }
     assert!(
         correcting_rounds <= MAX_UNCONVERGED_ROUNDS,
         "the latch bounds correcting rounds, got {correcting_rounds}"
+    );
+    assert!(
+        controller.is_disabled(),
+        "the rounds ran out and the latch tripped",
+    );
+
+    // A later, larger misalignment with every fence released draws nothing.
+    let clock = feed_at_cadence(
+        &mut controller,
+        at_turn(start, seq),
+        &[(slot(0), 0i64), (slot(1), 30_000)],
+        seq..seq + ROUND_TURNS,
+        turn,
+    );
+    assert!(
+        controller
+            .evaluate(clock + Duration::from_millis(1))
+            .is_empty(),
+        "a latched controller never corrects again",
     );
 }
 
@@ -136,23 +146,21 @@ fn stretch_presses_only_after_the_sustain_window() {
     let mut controller = PhaseController::new(TURN_US);
     let start = Instant::now();
     let cadence = 50_000i64;
-    let mut clock = start;
-    for seq in 0..300u64 {
-        let at = start + Duration::from_micros((seq as i64 * cadence) as u64);
-        controller.note_arrival(slot(0), seq, at);
-        clock = clock.max(at);
-    }
+    let only = [(slot(0), 0i64)];
+    let mut clock = feed_at_cadence(&mut controller, start, &only, 0..300, cadence);
     assert_eq!(
         controller.stretch_turns(clock),
         0,
         "first sighting only latches"
     );
     // The stretch persists: another 300 turns (~15 s) at the same cadence.
-    for seq in 300..600u64 {
-        let at = start + Duration::from_micros((seq as i64 * cadence) as u64);
-        controller.note_arrival(slot(0), seq, at);
-        clock = clock.max(at);
-    }
+    clock = feed_at_cadence(
+        &mut controller,
+        clock + Duration::from_micros(cadence as u64),
+        &only,
+        300..600,
+        cadence,
+    );
     assert_eq!(
         controller.stretch_turns(clock),
         1,
@@ -161,12 +169,13 @@ fn stretch_presses_only_after_the_sustain_window() {
     // Recovery: the cadence returns to nominal long enough for the
     // interval estimate to re-center, and the pressure releases.
     let turn = i64::from(TURN_US);
-    let resume = clock;
-    for i in 0..200u64 {
-        let at = resume + Duration::from_micros(((i + 1) as i64 * turn) as u64);
-        controller.note_arrival(slot(0), 600 + i, at);
-        clock = clock.max(at);
-    }
+    clock = feed_at_cadence(
+        &mut controller,
+        clock + Duration::from_micros(turn as u64),
+        &only,
+        600..800,
+        turn,
+    );
     assert_eq!(
         controller.stretch_turns(clock),
         0,
@@ -180,12 +189,7 @@ fn fast_arrivals_never_press() {
     let mut controller = PhaseController::new(TURN_US);
     let start = Instant::now();
     let cadence = 35_000i64;
-    let mut clock = start;
-    for seq in 0..600u64 {
-        let at = start + Duration::from_micros((seq as i64 * cadence) as u64);
-        controller.note_arrival(slot(0), seq, at);
-        clock = clock.max(at);
-    }
+    let clock = feed_at_cadence(&mut controller, start, &[(slot(0), 0i64)], 0..600, cadence);
     assert_eq!(controller.stretch_turns(clock), 0);
     assert_eq!(
         controller.stretch_turns(clock + Duration::from_millis(1)),
@@ -266,18 +270,17 @@ fn a_population_that_ignores_directives_still_trips_the_latch() {
     let turn = i64::from(TURN_US);
     let offsets = [(slot(0), 0i64), (slot(1), 20_000)];
     let mut seq = 0u64;
-    let mut clock = start;
     let mut correcting_rounds = 0u32;
     let mut last_commanded = 0u32;
     for _ in 0..30u32 {
-        for s_ in seq..seq + 1_000 {
-            for &(id, offset) in &offsets {
-                let at = start + Duration::from_micros((s_ as i64 * turn + offset) as u64);
-                controller.note_arrival(id, s_, at);
-                clock = clock.max(at);
-            }
-        }
-        seq += 1_000;
+        let clock = feed_at_cadence(
+            &mut controller,
+            at_turn(start, seq),
+            &offsets,
+            seq..seq + ROUND_TURNS,
+            turn,
+        );
+        seq += ROUND_TURNS;
         let corrections = controller.evaluate(clock + Duration::from_millis(1));
         if !corrections.is_empty() {
             correcting_rounds += 1;
@@ -296,14 +299,13 @@ fn a_population_that_ignores_directives_still_trips_the_latch() {
         "the command parks at one cap step, got {last_commanded}"
     );
     // The latch fired: even a later, larger misalignment draws nothing.
-    let mut clock2 = clock;
-    for s_ in seq..seq + 2_000 {
-        let at = start + Duration::from_micros((s_ as i64 * turn) as u64);
-        controller.note_arrival(slot(0), s_, at);
-        let at1 = start + Duration::from_micros((s_ as i64 * turn + 15_000) as u64);
-        controller.note_arrival(slot(1), s_, at1);
-        clock2 = clock2.max(at1);
-    }
+    let clock2 = feed_at_cadence(
+        &mut controller,
+        at_turn(start, seq),
+        &[(slot(0), 0i64), (slot(1), 15_000)],
+        seq..seq + 2 * ROUND_TURNS,
+        turn,
+    );
     assert!(
         controller
             .evaluate(clock2 + Duration::from_millis(1))
@@ -320,16 +322,17 @@ fn a_latched_controller_still_presses() {
     controller.force_disable();
     let start = Instant::now();
     let cadence = 55_000i64;
-    let mut clock = start;
-    for seq in 0..600u64 {
-        let at = start + Duration::from_micros((seq as i64 * cadence) as u64);
-        controller.note_arrival(slot(0), seq, at);
-        clock = clock.max(at);
-        if seq == 300 {
-            // Latch the onset partway through so the tail sustains it.
-            let _ = controller.stretch_turns(clock);
-        }
-    }
+    let only = [(slot(0), 0i64)];
+    let mut clock = feed_at_cadence(&mut controller, start, &only, 0..301, cadence);
+    // Latch the onset partway through so the tail sustains it.
+    let _ = controller.stretch_turns(clock);
+    clock = feed_at_cadence(
+        &mut controller,
+        clock + Duration::from_micros(cadence as u64),
+        &only,
+        301..600,
+        cadence,
+    );
     assert!(
         controller
             .evaluate(clock + Duration::from_millis(1))

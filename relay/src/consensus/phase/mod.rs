@@ -603,6 +603,15 @@ impl PhaseController {
         self.disabled = true;
     }
 
+    /// Whether the give-up latch has tripped. Silence alone cannot tell a
+    /// latched controller from one whose every slot is merely fenced
+    /// awaiting an acknowledgement, so a test that means the latch asks for
+    /// it directly.
+    #[cfg(test)]
+    fn is_disabled(&self) -> bool {
+        self.disabled
+    }
+
     /// Moves the recorded stretch onset `by` further into the past, so a test
     /// can drive the sustain condition without waiting out real wall clock —
     /// the same trick [`DecisionMaker::backdate_session_start`] plays with the

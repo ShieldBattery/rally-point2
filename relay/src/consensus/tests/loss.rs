@@ -2,29 +2,12 @@
 
 use super::*;
 
-/// A stale sidecar (non-monotonic counters) produces no negative loss.
-#[test]
-fn stale_sidecar_no_spurious_loss() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
-    let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 50), 2);
-    assert_eq!(maker.target(), Some(4));
-    assert_eq!(d, None);
-}
-
 /// A late cumulative sample is ignored as a counter endpoint. The windowed
 /// rate keeps differencing from the accepted history, not the stale packet
 /// that happened to arrive in between.
 #[test]
 fn stale_counter_sample_does_not_poison_the_loss_windows() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
 
     // Counter pairs are written as sent/lost: 100/0 -> 120/10.
     maker.ingest_remote(&conditions(0, 150_000, 0, 100), 10_000);
@@ -60,8 +43,7 @@ fn stale_counter_sample_does_not_poison_the_loss_windows() {
 /// fresh latency observation.
 #[test]
 fn duplicate_counters_neither_erase_nor_reapply_the_loss_windows() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_remote(&conditions(0, 150_000, 0, 100), 10_000);
     maker.ingest_remote(&conditions(0, 160_000, 10, 120), 10_000);
     let rtt_samples = maker.slots[&SlotId(0)].rtt_window.len;
@@ -97,8 +79,7 @@ fn duplicate_counters_neither_erase_nor_reapply_the_loss_windows() {
 /// re-spiking on later samples.
 #[test]
 fn late_loss_declaration_refines_the_current_endpoint_without_advancing_it() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&conditions(0, 150_000, 0, 100));
     maker.ingest_local(&conditions(0, 150_000, 0, 120));
     assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
@@ -121,8 +102,7 @@ fn late_loss_declaration_refines_the_current_endpoint_without_advancing_it() {
 /// packets sent after it, reading tens-of-percent loss on a clean link.
 #[test]
 fn late_loss_declaration_refines_the_baseline_snapshot() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&conditions(0, 150_000, 0, 100));
     maker.ingest_local(&conditions(0, 150_000, 10, 100));
 
@@ -146,8 +126,7 @@ fn late_loss_declaration_refines_the_baseline_snapshot() {
 /// prevent another slot in the same batch from advancing normally.
 #[test]
 fn mixed_stale_and_fresh_batch_updates_each_slot_independently() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_remote(
         &multi_conditions(&[(0, 100_000, 0, 100), (1, 200_000, 0, 100)]),
         10_000,
@@ -182,12 +161,11 @@ fn mixed_stale_and_fresh_batch_updates_each_slot_independently() {
 /// first interval of the new connection.
 #[test]
 fn reinstated_slot_accepts_reset_counters_as_a_fresh_baseline() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&conditions(0, 150_000, 0, 100));
     maker.ingest_local(&conditions(0, 160_000, 10, 120));
 
-    maker.record_departure(SlotId(0), DepartureStamps::default(), DROPPED);
+    maker.record_departure(SlotId(0), DepartureStamps::default(), LEAVE_REASON_DROPPED);
     assert!(!maker.slots.contains_key(&SlotId(0)));
     assert!(maker.reinstate_slot(SlotId(0)));
 

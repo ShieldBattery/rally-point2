@@ -9,13 +9,7 @@ use super::*;
 /// law dips at most once before parking.
 #[test]
 fn a_disproven_edge_shrink_quadruples_the_next_ones_evidence_window() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     // 230ms -> target 6, raise.
     let d = ingest_at(&mut maker, &conditions(0, 230_000, 0, 100), 1);
     assert_eq!(d.unwrap().buffer, BufferSize(6));
@@ -81,13 +75,7 @@ fn a_burned_edge_does_not_slow_a_genuine_regime_drop() {
         lower_step: 1,
         ..ControlLaw::default()
     };
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law,
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = tuned_maker(law);
     // Burn the edge: raise to 6, edge-shrink to 5, disprove it.
     let d = ingest_at(&mut maker, &conditions(0, 230_000, 0, 100), 1);
     assert_eq!(d.unwrap().buffer, BufferSize(6));
@@ -154,13 +142,7 @@ fn a_burned_edge_does_not_slow_a_genuine_regime_drop() {
 /// instead, then releases it once the peaks age out of the lookback.
 #[test]
 fn recurring_target_peaks_park_the_buffer_until_they_age_out() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     // 250ms -> target 7, raise.
     let d = ingest_at(&mut maker, &conditions(0, 250_000, 0, 100), 1);
     assert_eq!(d.unwrap().buffer, BufferSize(7));
@@ -208,13 +190,7 @@ fn recurring_target_peaks_park_the_buffer_until_they_age_out() {
 /// peaks age out of the shrink floor; the headroom alone must hold.
 #[test]
 fn a_path_inside_the_shrink_headroom_of_a_boundary_never_shrinks() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     // 150ms -> target 4, raise.
     let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
     assert_eq!(d.unwrap().buffer, BufferSize(4));
@@ -238,13 +214,7 @@ fn a_path_inside_the_shrink_headroom_of_a_boundary_never_shrinks() {
 /// once the old peaks age out of the lookback.
 #[test]
 fn a_path_clear_of_the_shrink_headroom_still_shrinks() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     // 150ms -> target 4, raise.
     let d = ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
     assert_eq!(d.unwrap().buffer, BufferSize(4));
@@ -272,13 +242,7 @@ fn a_multi_turn_lower_step_lands_on_the_shrink_target_not_below_it() {
         lower_step: 2,
         ..ControlLaw::default()
     };
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law,
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = tuned_maker(law);
     // 250ms -> target 7, raise.
     let d = ingest_at(&mut maker, &conditions(0, 250_000, 0, 100), 1);
     assert_eq!(d.unwrap().buffer, BufferSize(7));

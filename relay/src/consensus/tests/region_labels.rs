@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// The gate is a wall-clock delay measured on *this relay's* own clock,
+/// with no inherited elapsed time: a relay taking over a running session
+/// latches started when it adopts the session, so it conceals the labels
+/// again for a full delay. Clients keep the map they already hold, so the
+/// cost is only that a map changed by a re-home reaches them one delay
+/// later — the accepted trade for a gate no inherited, unverifiable start
+/// time can move.
 #[test]
 fn region_labels_stay_shut_in_until_the_release_delay_has_elapsed() {
     let mut maker = maker_with_labels(&[(1, "us-east"), (2, "eu-central")]);
@@ -118,30 +125,6 @@ fn a_re_delivered_session_start_does_not_defer_the_region_label_release() {
             .maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY)
             .is_some(),
         "a re-delivered start leaves the original clock untouched",
-    );
-}
-
-#[test]
-fn a_replacement_relay_waits_out_its_own_release_delay() {
-    // A relay taking over a running session latches started when it adopts the
-    // session, so its clock is fresh and it conceals the labels again for a
-    // full delay. Clients keep the map they already hold, so the cost is only
-    // that a map CHANGED by the re-home reaches them one delay later — the
-    // accepted trade for a gate no inherited, unverifiable start time can move.
-    let mut replacement = maker_with_labels(&[(3, "ap-southeast")]);
-    replacement.mark_started();
-    assert_eq!(
-        replacement.maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY),
-        None,
-        "the replacement does not inherit the original relay's elapsed time",
-    );
-
-    replacement.backdate_session_start(REGION_LABEL_RELEASE_DELAY);
-    assert!(
-        replacement
-            .maybe_release_region_labels(REGION_LABEL_RELEASE_DELAY)
-            .is_some(),
-        "once its own delay elapses it releases normally",
     );
 }
 

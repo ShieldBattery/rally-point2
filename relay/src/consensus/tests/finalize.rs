@@ -14,7 +14,7 @@ fn finalize_drop_seals_stamps_and_the_leave_carries_the_count() {
         &k,
         SlotId(1),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
 
     let outcome = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
@@ -34,7 +34,8 @@ fn finalize_drop_seals_stamps_and_the_leave_carries_the_count() {
         "the admission seal stays after a successful finalization",
     );
 
-    let leave = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("the authority decides");
+    let leave = decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED)
+        .expect("the authority decides");
     assert_eq!(
         leave.final_turn_count,
         Some(42),
@@ -76,7 +77,7 @@ fn finalize_drop_without_a_cursor_fails_closed_and_lifts_the_seal() {
         &k,
         SlotId(1),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
 
     assert_eq!(
@@ -112,10 +113,10 @@ fn finalize_drop_is_idempotent_after_the_decide() {
         &k,
         SlotId(1),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     let _ = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
-    let _ = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("decides");
+    let _ = decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).expect("decides");
 
     assert_eq!(
         finalize_drop(&registry, &k, SlotId(1), None, || Some(999)),
@@ -133,7 +134,7 @@ fn normalize_keeps_only_proven_counts_in_enabled_sessions() {
     let proven = LeaveDirective {
         finalized: true,
         slot: 3,
-        reason: DROPPED,
+        reason: LEAVE_REASON_DROPPED,
         apply_at_frame: 51,
         leave_seq: 4,
         final_turn_count: Some(120),
@@ -166,8 +167,7 @@ fn normalize_keeps_only_proven_counts_in_enabled_sessions() {
 /// stripped everywhere else.
 #[test]
 fn a_finalized_dropped_seed_keeps_its_count_only_when_enabled() {
-    let mut enabled =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut enabled = peer_maker();
     enabled.finalized_drops_enabled = true;
     let seeded = enabled
         .seed_departed(SlotId(1), DepartureKind::Dropped, Some(9), true)
@@ -182,8 +182,7 @@ fn a_finalized_dropped_seed_keeps_its_count_only_when_enabled() {
         "an unproven dropped seed is stripped even when enabled",
     );
 
-    let mut disabled =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut disabled = peer_maker();
     let _ = disabled.seed_departed(SlotId(1), DepartureKind::Dropped, Some(9), true);
     assert_eq!(
         disabled.decided_leaves[&SlotId(1)].final_turn_count,
@@ -206,11 +205,11 @@ fn a_finalized_count_survives_a_resumed_session() {
         &k,
         SlotId(1),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     let _ = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
 
-    let leave = decide_leave(&registry, &k, SlotId(1), DROPPED).expect("decides");
+    let leave = decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).expect("decides");
     assert_eq!(leave.final_turn_count, Some(42));
     assert!(leave.finalized);
 }
@@ -236,17 +235,20 @@ fn finalize_refuses_a_home_gained_by_a_rehome() {
             ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
         },
     );
-    let framed = DepartureStamps {
-        last_frame: Some(GameFrameCount(40)),
-        ..DepartureStamps::default()
-    };
-    record_departure(&registry, &k, SlotId(1), framed.clone(), DROPPED);
+    let stamps = framed(40);
+    record_departure(
+        &registry,
+        &k,
+        SlotId(1),
+        stamps.clone(),
+        LEAVE_REASON_DROPPED,
+    );
     assert_eq!(
         finalize_drop(&registry, &k, SlotId(1), None, || Some(42)),
         FinalizeOutcome::RejectedNoCursor,
         "a rehome-gained home never seals a count, cursor or not",
     );
-    record_departure(&registry, &k, SlotId(0), framed, DROPPED);
+    record_departure(&registry, &k, SlotId(0), stamps, LEAVE_REASON_DROPPED);
     assert_eq!(
         finalize_drop(&registry, &k, SlotId(0), None, || Some(7)),
         FinalizeOutcome::Finalized {
@@ -275,16 +277,7 @@ fn finalize_refuses_every_home_of_a_resumed_created_maker() {
             ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
         },
     );
-    record_departure(
-        &registry,
-        &k,
-        SlotId(1),
-        DepartureStamps {
-            last_frame: Some(GameFrameCount(40)),
-            ..DepartureStamps::default()
-        },
-        DROPPED,
-    );
+    record_departure(&registry, &k, SlotId(1), framed(40), LEAVE_REASON_DROPPED);
     assert_eq!(
         finalize_drop(&registry, &k, SlotId(1), None, || Some(42)),
         FinalizeOutcome::RejectedNoCursor,
@@ -304,11 +297,8 @@ fn finalize_rejects_a_request_naming_a_stale_generation() {
         &registry,
         &k,
         SlotId(1),
-        DepartureStamps {
-            last_frame: Some(GameFrameCount(40)),
-            ..DepartureStamps::default()
-        },
-        DROPPED,
+        framed(40),
+        LEAVE_REASON_DROPPED,
         Some(7),
     ));
     assert_eq!(
@@ -350,7 +340,7 @@ fn finalize_refuses_a_pre_frame_drop_without_sealing() {
         &k,
         SlotId(1),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     assert_eq!(
         finalize_drop(&registry, &k, SlotId(1), None, || Some(3)),

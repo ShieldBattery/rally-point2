@@ -9,93 +9,60 @@ use super::*;
 /// gap's undeclared sends and hidden from the restarted windows instead
 /// of being priced as post-resume weather, and the interval carrying the
 /// jump is no blackout -- its own traffic got through.
+///
+/// How much the dead path managed to transmit is incidental to all of
+/// that. On a genuinely dead path Noq's congestion window collapses and
+/// PTO backoff throttles actual transmissions to a handful of packets
+/// however hard the maintenance flush queues, so the handful must absorb
+/// exactly as a full flush's worth does -- never price as ~100%
+/// post-resume weather over the two packets that followed it.
 #[test]
 fn outage_losses_declared_after_resume_are_absorbed_not_priced() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    let step = Duration::from_millis(42);
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    for gap_sends in [40u64, 10] {
+        let (mut maker, start, step) = flowing_link_at_150ms();
 
-    // 5s fade, 40 dead-path sends, none declared lost yet at resume.
-    let resume = start + Duration::from_secs(5);
-    assert_eq!(
-        sample_at(&mut maker, 0, 0, 140, resume),
-        CounterUpdate::OutageRebaselined,
-    );
-    // The next flowing sample delivers 2 sends -- and the 40 late
-    // declarations land at once.
-    assert_eq!(
-        sample_at(&mut maker, 0, 40, 142, resume + step),
-        CounterUpdate::Advanced,
-    );
-    let state = &maker.slots[&SlotId(0)];
-    assert_eq!(
-        state.blackout_run, 0,
-        "the jump is outage residue, not a fresh blackout",
-    );
+        // 5s fade, `gap_sends` dead-path sends, none declared lost yet at
+        // resume.
+        let resume = start + Duration::from_secs(5);
+        assert_eq!(
+            sample_at(&mut maker, 0, 0, 100 + gap_sends, resume),
+            CounterUpdate::OutageRebaselined,
+            "{gap_sends} dead-path sends",
+        );
+        // The next flowing sample delivers 2 sends -- and the late
+        // declarations land at once.
+        assert_eq!(
+            sample_at(&mut maker, 0, gap_sends, 102 + gap_sends, resume + step),
+            CounterUpdate::Advanced,
+            "{gap_sends} dead-path sends",
+        );
+        let state = &maker.slots[&SlotId(0)];
+        assert_eq!(
+            state.blackout_run, 0,
+            "the jump is outage residue, not a fresh blackout ({gap_sends} dead-path sends)",
+        );
 
-    // Flow on: the windows read the actual weather, not the residue.
-    for i in 2..=12u32 {
-        sample_at(
-            &mut maker,
+        // Flow on: the windows read the actual weather, not the residue.
+        for i in 2..=12u32 {
+            sample_at(
+                &mut maker,
+                0,
+                gap_sends,
+                102 + gap_sends + u64::from(i - 1) * 5,
+                resume + step * i,
+            );
+        }
+        assert_eq!(
+            slot_loss_rate(&maker, 0),
+            Some(0.0),
+            "{gap_sends} dead-path sends",
+        );
+        assert_eq!(
+            maker.target_inputs().unwrap().burst_turns,
             0,
-            40,
-            142 + u64::from(i - 1) * 5,
-            resume + step * i,
+            "absorption leaves no synthetic burst trace ({gap_sends} dead-path sends)",
         );
     }
-    assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
-    assert_eq!(maker.target_inputs().unwrap().burst_turns, 0);
-}
-
-/// Absorption is fungible bookkeeping, not provenance: a cumulative
-/// counter cannot say which packets a declaration belongs to, so banked
-/// idle credit will happily soak up genuine weather losses. That is
-/// exactly why the excluded gap leaves no burst trace: were absorbed
-/// declarations treated as dead-path evidence, two idle gaps' delivered
-/// keepalives plus four genuine weather losses would "materialize" as an
-/// outage and charge this perfectly healthy link the capped credit.
-#[test]
-fn absorbed_weather_losses_never_manufacture_burst_credit() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    let step = Duration::from_millis(42);
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
-
-    // Two idle stalls, each bridged by two delivered keepalives, bank
-    // two packets of credit apiece.
-    assert_eq!(
-        sample_at(&mut maker, 0, 0, 102, start + Duration::from_secs(2)),
-        CounterUpdate::OutageRebaselined,
-    );
-    let resume = start + Duration::from_secs(4);
-    assert_eq!(
-        sample_at(&mut maker, 0, 0, 104, resume),
-        CounterUpdate::OutageRebaselined,
-    );
-
-    // The first flowing interval genuinely loses four packets. They
-    // drain what idle credit is still unexpired (the bounded masking
-    // cost) -- but they are weather, and no burst credit may appear
-    // for them.
-    sample_at(&mut maker, 0, 4, 108, resume + step);
-    assert_eq!(
-        maker.target_inputs().unwrap().burst_turns,
-        0,
-        "no manufactured outage credit on a healthy link",
-    );
 }
 
 /// The absorption pool covers only the brief post-resume window in which
@@ -103,16 +70,7 @@ fn absorbed_weather_losses_never_manufacture_burst_credit() {
 /// as the weather it is, leftover pool or not.
 #[test]
 fn the_outage_absorption_pool_expires() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    let step = Duration::from_millis(42);
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    let (mut maker, start, step) = flowing_link_at_150ms();
 
     // 40 dead-path sends, none declared: pool of 40 banked at the gap.
     let resume = start + Duration::from_secs(5);
@@ -140,24 +98,26 @@ fn the_outage_absorption_pool_expires() {
 
 /// Gaps shorter than the outage threshold are ordinary sampling cadence:
 /// an all-lost interval across one still builds the blackout run and
-/// prices into the rate windows exactly as before.
+/// prices into the rate windows exactly as before. The threshold itself
+/// is inclusive, so a gap of exactly that length is already an outage --
+/// the boundary a strict comparison would put one sample on the wrong
+/// side of.
 #[test]
 fn a_sub_second_gap_still_prices_as_weather() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    let (mut maker, start, _step) = flowing_link_at_150ms();
 
     let update = sample_at(&mut maker, 0, 10, 110, start + Duration::from_millis(500));
     assert_eq!(update, CounterUpdate::Advanced);
     let state = &maker.slots[&SlotId(0)];
     assert_eq!(state.blackout_run, 1);
     assert_eq!(slot_loss_rate(&maker, 0), Some(1.0));
+
+    let (mut at_threshold, start, _step) = flowing_link_at_150ms();
+    assert_eq!(
+        sample_at(&mut at_threshold, 0, 10, 110, start + OUTAGE_GAP_MIN),
+        CounterUpdate::OutageRebaselined,
+        "a gap of exactly the threshold is an outage",
+    );
 }
 
 /// A mesh sidecar re-carries a cached snapshot of every co-homed slot's
@@ -170,15 +130,7 @@ fn a_sub_second_gap_still_prices_as_weather() {
 /// relay that is not the slot's home.
 #[test]
 fn cached_sidecar_duplicates_do_not_defeat_gap_detection() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    let (mut maker, start, _step) = flowing_link_at_150ms();
 
     // The slot fades; its siblings' traffic keeps re-delivering the
     // cached (sent=100, lost=0) snapshot every quarter second, the last
@@ -216,16 +168,7 @@ fn cached_sidecar_duplicates_do_not_defeat_gap_detection() {
 /// as ~100% post-resume weather.
 #[test]
 fn a_recurrent_fade_keeps_absorbing_across_overlapping_outages() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    let step = Duration::from_millis(42);
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    let (mut maker, start, step) = flowing_link_at_150ms();
 
     // Fade 1 resumes: 40 dead-path sends, none declared yet.
     let resume1 = start + Duration::from_secs(5);
@@ -273,18 +216,18 @@ fn a_recurrent_fade_keeps_absorbing_across_overlapping_outages() {
 /// is that handful, briefly -- genuine post-resume loss beyond it prices
 /// as the weather it is, and the delivered keepalives never materialize
 /// as evidence, so the episode earns no burst credit either.
+///
+/// That second half is why an excluded gap deliberately leaves no burst
+/// trace. Absorption is fungible bookkeeping, not provenance: a
+/// cumulative counter cannot say which packets a declaration belongs to,
+/// so banked idle credit will happily soak up genuine weather losses.
+/// Were absorbed declarations treated as dead-path evidence instead, two
+/// idle gaps' delivered keepalives plus a handful of genuine weather
+/// losses would "materialize" as an outage and charge a perfectly
+/// healthy link the capped credit.
 #[test]
 fn an_idle_gap_masks_at_most_its_own_sends() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    let step = Duration::from_millis(42);
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    let (mut maker, start, step) = flowing_link_at_150ms();
 
     // A 10s stall bridged by two delivered keepalive pings...
     let resume = start + Duration::from_secs(10);
@@ -305,57 +248,27 @@ fn an_idle_gap_masks_at_most_its_own_sends() {
         0,
         "absorption is masking only; it never becomes burst credit",
     );
-}
 
-/// On a genuinely dead path Noq's congestion window collapses and PTO
-/// backoff throttles *actual* transmissions to a handful of packets
-/// however hard the maintenance flush queues -- so dead-path handling
-/// must not depend on the gap's send volume. The few throttled sends
-/// still bank, and their declarations still absorb instead of pricing
-/// as ~100% post-resume weather.
-#[test]
-fn a_congestion_throttled_dead_path_still_absorbs() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    let step = Duration::from_millis(42);
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
-
-    // A 5s blackout during which Noq actually transmitted only ten
-    // congestion/PTO-limited packets, none declared lost yet at resume.
-    let resume = start + Duration::from_secs(5);
+    // Two idle stalls back to back, each bridged by two delivered
+    // keepalives, bank two packets of credit apiece; the first flowing
+    // interval after them genuinely loses four. Those four drain what
+    // idle credit is still unexpired -- the bounded masking cost -- but
+    // they are weather, and no burst credit may appear for them.
+    let (mut healthy, start, step) = flowing_link_at_150ms();
     assert_eq!(
-        sample_at(&mut maker, 0, 0, 110, resume),
+        sample_at(&mut healthy, 0, 0, 102, start + Duration::from_secs(2)),
         CounterUpdate::OutageRebaselined,
     );
-    // The declarations land over the first post-resume interval --
-    // absorbed against the banked sends, not priced over two new packets.
+    let resume = start + Duration::from_secs(4);
     assert_eq!(
-        sample_at(&mut maker, 0, 10, 112, resume + step),
-        CounterUpdate::Advanced,
+        sample_at(&mut healthy, 0, 0, 104, resume),
+        CounterUpdate::OutageRebaselined,
     );
-    let state = &maker.slots[&SlotId(0)];
-    assert_eq!(state.blackout_run, 0, "outage residue, not fresh weather");
-
-    for i in 2..=12u32 {
-        sample_at(
-            &mut maker,
-            0,
-            10,
-            112 + u64::from(i - 1) * 5,
-            resume + step * i,
-        );
-    }
-    assert_eq!(slot_loss_rate(&maker, 0), Some(0.0));
+    sample_at(&mut healthy, 0, 4, 108, resume + step);
     assert_eq!(
-        maker.target_inputs().unwrap().burst_turns,
+        healthy.target_inputs().unwrap().burst_turns,
         0,
-        "absorption leaves no synthetic burst trace",
+        "no manufactured outage credit on a healthy link",
     );
 }
 
@@ -366,16 +279,7 @@ fn a_congestion_throttled_dead_path_still_absorbs() {
 /// post-idle loss meets at most the idle gap's own tiny credit.
 #[test]
 fn an_idle_gap_does_not_extend_a_prior_pools_deadline() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    let step = Duration::from_millis(42);
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    let (mut maker, start, step) = flowing_link_at_150ms();
 
     // A dead gap banks 40 undeclared sends (deadline: 24 advancing
     // samples after this gap sample).
@@ -422,15 +326,7 @@ fn an_idle_gap_does_not_extend_a_prior_pools_deadline() {
 /// weather, even with the sample deadline nowhere near.
 #[test]
 fn banked_credit_expires_on_wall_clock_on_a_slow_advancing_link() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    let (mut maker, start, _step) = flowing_link_at_150ms();
 
     // A dead gap banks 40 undeclared sends.
     let resume = start + Duration::from_secs(5);
@@ -468,16 +364,7 @@ fn banked_credit_expires_on_wall_clock_on_a_slow_advancing_link() {
 /// loss must meet at most the idle gap's own banked sends.
 #[test]
 fn an_idle_gap_does_not_revive_expired_credit() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let start = Instant::now();
-    let step = Duration::from_millis(42);
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    let (mut maker, start, step) = flowing_link_at_150ms();
 
     // A dead gap banks 40 undeclared sends (wall deadline: 2s out)...
     let resume = start + Duration::from_secs(5);

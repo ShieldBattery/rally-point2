@@ -143,16 +143,14 @@ fn dead_band_crossings_do_not_reopen_the_command_fence() {
     let mut seq = 0u64;
     let feed =
         |controller: &mut PhaseController, seq: &mut u64, clock: &mut Instant, peer_offset: i64| {
-            for s_ in *seq..*seq + 1_000 {
-                for (id, offset) in [(slot(0), 0i64), (slot(1), peer_offset)] {
-                    let at = start + Duration::from_micros((s_ as i64 * turn + offset) as u64);
-                    controller.note_arrival(id, s_, at);
-                    if at > *clock {
-                        *clock = at;
-                    }
-                }
-            }
-            *seq += 1_000;
+            *clock = feed_at_cadence(
+                controller,
+                at_turn(start, *seq),
+                &[(slot(0), 0i64), (slot(1), peer_offset)],
+                *seq..*seq + ROUND_TURNS,
+                turn,
+            );
+            *seq += ROUND_TURNS;
         };
     // Out of band: the one and only command.
     feed(&mut controller, &mut seq, &mut clock, 4_000);
@@ -226,7 +224,6 @@ fn an_acknowledged_command_may_be_advanced() {
     // stepping, timing it already controls outright.)
     let mut controller = PhaseController::new(TURN_US);
     let start = Instant::now();
-    let turn = i64::from(TURN_US);
     let offsets = [(slot(0), 0i64), (slot(1), 20_000)];
     let mut clock = feed_steady(&mut controller, start, &offsets, 0, 300);
     let first = controller.evaluate(clock + Duration::from_millis(1));
@@ -235,13 +232,7 @@ fn an_acknowledged_command_may_be_advanced() {
 
     // The client acked but its phase never moved; the released fence
     // permits the next capped step.
-    for s_ in 300u64..1_300 {
-        for &(id, offset) in &offsets {
-            let at = start + Duration::from_micros((s_ as i64 * turn + offset) as u64);
-            controller.note_arrival(id, s_, at);
-            clock = clock.max(at);
-        }
-    }
+    clock = feed_steady(&mut controller, start, &offsets, 300, 1_000);
     let second = controller.evaluate(clock + Duration::from_millis(1));
     assert_eq!(second, vec![(slot(0), 16_000)]);
 }
@@ -273,13 +264,7 @@ fn a_late_echo_re_arms_the_evaluation_dwell() {
     // after must still hold, because the dwell restarted from receipt.
     let ack_at = clock + Duration::from_secs(1);
     controller.note_applied(slot(0), 8_000, ack_at);
-    for seq in 1_300u64..1_340 {
-        for &(id, offset) in &offsets {
-            let at = start + Duration::from_micros((seq as i64 * turn + offset) as u64);
-            controller.note_arrival(id, seq, at);
-            clock = clock.max(at);
-        }
-    }
+    feed_steady(&mut controller, start, &offsets, 1_300, 40);
     assert!(
         controller
             .evaluate(ack_at + Duration::from_millis(500))
@@ -289,15 +274,14 @@ fn a_late_echo_re_arms_the_evaluation_dwell() {
 
     // Once the re-armed dwell passes (with fresh samples), the next
     // capped step may issue.
-    let mut late = ack_at + Duration::from_secs(13);
     let resume_seq = 1_340u64;
-    for i in 0..60u64 {
-        for &(id, offset) in &offsets {
-            let at = late + Duration::from_micros((i as i64 * turn + offset) as u64);
-            controller.note_arrival(id, resume_seq + i, at);
-        }
-    }
-    late += Duration::from_micros(59 * u64::from(TURN_US));
+    let late = feed_at_cadence(
+        &mut controller,
+        ack_at + Duration::from_secs(13),
+        &offsets,
+        resume_seq..resume_seq + 60,
+        turn,
+    );
     let second = controller.evaluate(late + Duration::from_millis(1));
     assert_eq!(second, vec![(slot(0), 16_000)]);
 }

@@ -6,10 +6,8 @@ use super::*;
 /// session, so the coordinator can count serving relays that have torn down.
 #[test]
 fn session_closed_fires_a_session_closed_notice() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
 
     session_closed(&registry, &k);
     match rx.try_recv().expect("a queued notice") {
@@ -82,11 +80,7 @@ fn session_closed_without_a_maker_plants_no_seal() {
 fn session_closed_with_a_maker_still_seals() {
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
     registry.flight_recorder().record(
         &k,
         crate::observability::flight_recorder::FlightEvent::SlotConnected {
@@ -110,19 +104,13 @@ fn session_closed_with_a_maker_still_seals() {
 }
 
 /// `set_session_refs` replaces rather than accumulates on a re-apply (a
-/// changed descriptor), and `deregister_maker` forgets a session's refs so
-/// the map doesn't outlive the session it describes.
+/// changed descriptor), and `deregister_maker` drops both the maker and the
+/// session's refs, so neither outlives the session it describes.
 #[test]
 fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
     registry.set_session_refs(
         &k,
@@ -137,21 +125,19 @@ fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
     );
 
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-    assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
     let notice = recv_departure(&mut rx);
     assert_eq!(notice.external_id, Some("game-new".to_owned()));
     assert_eq!(notice.external_ref, Some("sb-user-new".to_owned()));
 
-    // Deregistering the maker also forgets the refs: a later decide_leave
-    // on a freshly re-created maker for the same key sees none.
+    // Deregistering removes the maker and forgets the refs: a later
+    // decide_leave on a freshly re-created maker for the same key sees none.
+    assert!(registry.lock().contains_key(&k));
     deregister_maker(&registry, &k);
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
+    assert!(!registry.lock().contains_key(&k));
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-    assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
     let notice2 = recv_departure(&mut rx);
     assert!(
         notice2.external_id.is_none(),

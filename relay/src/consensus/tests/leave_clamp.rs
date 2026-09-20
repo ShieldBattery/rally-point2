@@ -8,13 +8,7 @@ use super::*;
 /// regression from the pre-clamp behavior).
 #[test]
 fn decide_leave_does_not_clamp_an_honest_lead_ahead_departure() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     // Survivor slot 0 has run 6 turns (the buffer depth) past the departing
     // slot's last frame before stalling: seqs 0..=21 (frames 100..=121).
     feed_turns(&mut maker, 0, 0..=21);
@@ -35,13 +29,7 @@ fn decide_leave_does_not_clamp_an_honest_lead_ahead_departure() {
 /// `u32::MAX` (which would have stalled every survivor forever).
 #[test]
 fn decide_leave_clamps_an_inflated_departing_frame_to_a_reachable_ceiling() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     feed_turns(&mut maker, 0, 0..=21); // honest survivor, leads by the buffer
     feed_turns(&mut maker, 1, 0..=14); // the malicious slot's honest prefix
     maker.observe_turn_frame(SlotId(1), 15, GameFrameCount(u32::MAX)); // the lie
@@ -60,27 +48,14 @@ fn decide_leave_clamps_an_inflated_departing_frame_to_a_reachable_ceiling() {
         d.apply_at_frame, 116,
         "clamped to a survivor-reachable frame, not u32::MAX + 1",
     );
-}
 
-/// A moderate (2x) inflation is clamped the same way — the ceiling doesn't
-/// depend on how large the lie is.
-#[test]
-fn decide_leave_clamps_a_moderate_inflation_too() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    feed_turns(&mut maker, 0, 0..=21);
-    feed_turns(&mut maker, 1, 0..=14);
-    maker.observe_turn_frame(SlotId(1), 15, GameFrameCount(230)); // ~2x the real ~115
-    let d = home_decide_leave(&mut maker, 1);
-    assert_eq!(
-        d.apply_at_frame, 116,
-        "clamped to the survivor-reachable ceiling"
-    );
+    // How large the lie is changes nothing: the ceiling is derived from the
+    // survivors and never reads the departing slot's claim at all.
+    let mut moderate = maker_with(bounds(0, 6));
+    feed_turns(&mut moderate, 0, 0..=21);
+    feed_turns(&mut moderate, 1, 0..=14);
+    moderate.observe_turn_frame(SlotId(1), 15, GameFrameCount(230)); // ~2x the real ~115
+    assert_eq!(home_decide_leave(&mut moderate, 1).apply_at_frame, 116);
 }
 
 /// The exact case the audit's fallback would have reopened: an in-game but
@@ -89,13 +64,7 @@ fn decide_leave_clamps_a_moderate_inflation_too() {
 /// — the leave is clamped, never left unclamped at `u32::MAX` (a stall).
 #[test]
 fn decide_leave_clamps_an_early_game_inflation_no_stall() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     feed_turns(&mut maker, 0, 0..=3); // only a few turns in (< buffer_max = 6)
     feed_turns(&mut maker, 1, 0..=2);
     maker.observe_turn_frame(SlotId(1), 3, GameFrameCount(u32::MAX));
@@ -117,13 +86,7 @@ fn decide_leave_clamps_an_early_game_inflation_no_stall() {
 /// stall point, so every survivor can reach it.
 #[test]
 fn decide_leave_early_game_honest_departure_is_a_bounded_early_drop_no_stall() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     feed_turns(&mut maker, 0, 0..=3);
     feed_turns(&mut maker, 1, 0..=3); // honest last frame 103
     let d = home_decide_leave(&mut maker, 1);
@@ -147,13 +110,7 @@ fn the_clamped_apply_frame_is_reproduced_by_a_peer_and_a_promoted_authority() {
     let ceiling = Some(115u32);
 
     // The authority deciding directly from the record.
-    let mut authority = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut authority = maker_with(bounds(0, 6));
     authority.record_departure(
         SlotId(1),
         DepartureStamps {
@@ -161,16 +118,16 @@ fn the_clamped_apply_frame_is_reproduced_by_a_peer_and_a_promoted_authority() {
             reachable_frame: ceiling,
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     let a = authority
-        .decide_leave(SlotId(1), DROPPED)
+        .decide_leave(SlotId(1), LEAVE_REASON_DROPPED)
         .expect("the authority decides the leave");
     assert_eq!(a.apply_at_frame, 116);
 
     // A peer that only recorded the carried departure, then is promoted: the
     // handoff re-derivation reproduces the identical apply frame.
-    let mut peer = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
+    let mut peer = peer_maker_with(bounds(0, 6));
     peer.record_departure(
         SlotId(1),
         DepartureStamps {
@@ -178,7 +135,7 @@ fn the_clamped_apply_frame_is_reproduced_by_a_peer_and_a_promoted_authority() {
             reachable_frame: ceiling,
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     let (leaves, _fresh) = peer.set_authority(Authority::SelfRelay, &HashSet::new());
     let p = leaves

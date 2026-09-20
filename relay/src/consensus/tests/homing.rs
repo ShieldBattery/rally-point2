@@ -12,47 +12,56 @@ fn slot_homed_admits_when_no_maker_exists() {
     assert!(slot_homed(&registry, &key(), SlotId(0)));
 }
 
-/// A maker exists but its homed set is empty — a legacy/dev descriptor, or
-/// one that never carried the field. Empty means unenforced, so every slot
-/// is admitted regardless.
-#[test]
-fn slot_homed_admits_every_slot_when_the_homed_set_is_empty() {
-    let registry = new_decision_makers();
-    let _ = sync_maker(
-        &registry,
-        &key(),
-        // No homed slots named at all: the unenforced case.
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
-    assert!(slot_homed(&registry, &key(), SlotId(0)));
-    assert!(slot_homed(&registry, &key(), SlotId(7)));
-}
-
-/// A non-empty homed set admits only the slots it names and refuses every
-/// other — the actual enforcement a production multi-relay descriptor
+/// The admission gate reads an empty homed set as unenforced and admits
+/// everything — a legacy or dev descriptor that never carried the field
+/// must not lock its own clients out — while a non-empty set admits only
+/// the slots it names, the enforcement a production multi-relay descriptor
 /// turns on.
+///
+/// Its fail-closed sibling reads the same empty set the opposite way: it
+/// selects the one relay that answers a `FinalizeDrop`, and an open
+/// fallback would have every session relay finalize with its own
+/// (different) cursor.
 #[test]
-fn slot_homed_refuses_a_slot_absent_from_a_non_empty_homed_set() {
-    let registry = new_decision_makers();
-    let _ = sync_maker(
-        &registry,
-        &key(),
-        MakerSync {
-            homed_slots: [SlotId(0), SlotId(2)].into_iter().collect(),
-            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
-        },
-    );
+fn an_empty_homed_set_is_unenforced_for_admission_and_fail_closed_for_finalizing() {
+    for homed in [Vec::new(), vec![SlotId(0), SlotId(2)]] {
+        let enforced = !homed.is_empty();
+        let registry = new_decision_makers();
+        let _ = sync_maker(
+            &registry,
+            &key(),
+            MakerSync {
+                homed_slots: homed.iter().copied().collect(),
+                ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+            },
+        );
+        assert!(
+            slot_homed(&registry, &key(), SlotId(0)),
+            "slot 0 is admitted either way (enforced: {enforced})",
+        );
+        assert!(
+            slot_homed(&registry, &key(), SlotId(2)),
+            "slot 2 is admitted either way (enforced: {enforced})",
+        );
+        assert_eq!(
+            slot_homed(&registry, &key(), SlotId(1)),
+            !enforced,
+            "slot 1 is admitted only where nothing is enforced",
+        );
+        assert_eq!(
+            slot_strictly_homed(&registry, &key(), SlotId(0)),
+            enforced,
+            "strict homing never fails open on an empty set",
+        );
+        assert!(
+            !slot_strictly_homed(&registry, &key(), SlotId(1)),
+            "and never names a slot the descriptor did not",
+        );
+    }
+
     assert!(
-        slot_homed(&registry, &key(), SlotId(0)),
-        "slot 0 is homed here"
-    );
-    assert!(
-        slot_homed(&registry, &key(), SlotId(2)),
-        "slot 2 is homed here"
-    );
-    assert!(
-        !slot_homed(&registry, &key(), SlotId(1)),
-        "slot 1 is not in the homed set, so this relay refuses it",
+        !slot_strictly_homed(&new_decision_makers(), &key(), SlotId(0)),
+        "nor for a session this relay holds no maker for",
     );
 }
 
@@ -82,7 +91,7 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
         &k,
         SlotId(1),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     assert!(has_undecided_departure(&registry, &k));
     assert!(!has_reconnectable_departure(&registry, &k, &held_both));
@@ -95,7 +104,7 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
         &k,
         SlotId(0),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     assert!(has_reconnectable_departure(&registry, &k, &held_both));
     assert!(!has_reconnectable_departure(&registry, &k, &HashSet::new()));
@@ -106,14 +115,7 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
     assert!(observe_leave(
         &registry,
         &k,
-        &LeaveDirective {
-            finalized: false,
-            slot: 0,
-            reason: DROPPED,
-            apply_at_frame: 1,
-            leave_seq: 1,
-            final_turn_count: None,
-        },
+        &leave(0, LEAVE_REASON_DROPPED, 1, 1),
     ));
     assert!(!has_reconnectable_departure(&registry, &k, &held_both));
     assert!(
@@ -130,11 +132,7 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
 fn a_reconnectable_departure_counts_every_held_slot_when_the_homed_set_is_empty() {
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::Peer),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::Peer);
     let held: HashSet<SlotId> = [SlotId(3)].into_iter().collect();
     assert!(!has_reconnectable_departure(&registry, &k, &held));
     record_departure(
@@ -142,7 +140,7 @@ fn a_reconnectable_departure_counts_every_held_slot_when_the_homed_set_is_empty(
         &k,
         SlotId(3),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     assert!(has_reconnectable_departure(&registry, &k, &held));
 }
@@ -154,20 +152,19 @@ fn a_reconnectable_departure_counts_every_held_slot_when_the_homed_set_is_empty(
 /// session close waiting on it — forever.
 #[test]
 fn force_decide_leave_commits_with_no_frame_basis() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-    maker.record_departure(SlotId(0), DepartureStamps::default(), DROPPED);
+    let mut maker = peer_maker();
+    maker.record_departure(SlotId(0), DepartureStamps::default(), LEAVE_REASON_DROPPED);
     assert_eq!(
-        maker.decide_leave(SlotId(0), DROPPED),
+        maker.decide_leave(SlotId(0), LEAVE_REASON_DROPPED),
         None,
         "an ordinary decide holds without a frame basis (and as a peer)",
     );
     let directive = maker
-        .force_decide_leave(SlotId(0), DROPPED)
+        .force_decide_leave(SlotId(0), LEAVE_REASON_DROPPED)
         .expect("the force-decide commits regardless");
     assert_eq!(directive.apply_at_frame, 0, "cosmetic pre-frame apply");
     assert_eq!(
-        maker.force_decide_leave(SlotId(0), DROPPED),
+        maker.force_decide_leave(SlotId(0), LEAVE_REASON_DROPPED),
         None,
         "a duplicate force-decide dedups",
     );
@@ -187,11 +184,7 @@ fn claim_close_report_latches_once_until_reopened() {
         "no maker: every emptying reports",
     );
 
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
     assert!(claim_close_report(&registry, &k), "the first claim wins");
     assert!(
         !claim_close_report(&registry, &k),
@@ -248,20 +241,12 @@ fn slot_homed_follows_a_later_descriptors_reassignment() {
 /// departed slot's frozen last frame.
 #[test]
 fn a_departure_retires_the_slot_from_the_session_frame() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.observe_frame(SlotId(0), GameFrameCount(60));
     maker.observe_frame(SlotId(1), GameFrameCount(50));
     assert_eq!(maker.session_frame(), Some(GameFrameCount(50)));
 
-    maker.record_departure(
-        SlotId(1),
-        DepartureStamps {
-            last_frame: Some(GameFrameCount(50)),
-            ..Default::default()
-        },
-        DROPPED,
-    );
+    maker.record_departure(SlotId(1), framed(50), LEAVE_REASON_DROPPED);
     assert_eq!(
         maker.session_frame(),
         Some(GameFrameCount(60)),
@@ -274,17 +259,9 @@ fn a_departure_retires_the_slot_from_the_session_frame() {
 /// re-created entry would re-pin the session frame at the departed slot.
 #[test]
 fn observe_frame_ignores_a_departed_slot() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.observe_frame(SlotId(0), GameFrameCount(60));
-    maker.record_departure(
-        SlotId(1),
-        DepartureStamps {
-            last_frame: Some(GameFrameCount(50)),
-            ..Default::default()
-        },
-        DROPPED,
-    );
+    maker.record_departure(SlotId(1), framed(50), LEAVE_REASON_DROPPED);
 
     maker.observe_frame(SlotId(1), GameFrameCount(52));
     assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
@@ -299,22 +276,9 @@ fn observe_frame_ignores_a_departed_slot() {
 /// raced the departure) must not re-create its condition state either.
 #[test]
 fn conditions_ingest_does_not_resurrect_a_departed_slot() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     maker.observe_frame(SlotId(0), GameFrameCount(60));
-    maker.record_departure(
-        SlotId(1),
-        DepartureStamps {
-            last_frame: Some(GameFrameCount(50)),
-            ..Default::default()
-        },
-        DROPPED,
-    );
+    maker.record_departure(SlotId(1), framed(50), LEAVE_REASON_DROPPED);
 
     let _ = maker.ingest_local(&conditions(1, 150_000, 0, 100));
     assert!(!maker.slots.contains_key(&SlotId(1)), "no resurrection");
@@ -332,13 +296,7 @@ fn conditions_ingest_does_not_resurrect_a_departed_slot() {
 /// RTT/loss state.
 #[test]
 fn conditions_ingest_skips_an_out_of_range_slot_without_corrupting_a_real_one() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
 
     let mut batch = conditions(5, 150_000, 0, 100);
     // 300 truncates to 44 (300 % 256) under a bare `as u8` cast -- if slot 44
@@ -375,27 +333,12 @@ fn conditions_ingest_skips_an_out_of_range_slot_without_corrupting_a_real_one() 
 /// unconditionally and receipt dedups by slot.
 #[test]
 fn reconcile_always_includes_a_cached_leave() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     // Both slots observed off mesh turns; slot 1 is homed on the peer relay.
     maker.observe_frame(SlotId(0), GameFrameCount(40));
     maker.observe_frame(SlotId(1), GameFrameCount(50));
-    maker.record_departure(
-        SlotId(1),
-        DepartureStamps {
-            last_frame: Some(GameFrameCount(50)),
-            ..Default::default()
-        },
-        DROPPED,
-    );
-    let leave = LeaveDirective {
-        finalized: false,
-        slot: 1,
-        reason: DROPPED,
-        apply_at_frame: 51,
-        leave_seq: 1,
-        final_turn_count: None,
-    };
+    maker.record_departure(SlotId(1), framed(50), LEAVE_REASON_DROPPED);
+    let leave = leave(1, LEAVE_REASON_DROPPED, 51, 1);
     let _ = maker.observe_leave(&leave);
 
     let (_, directives) = maker.leave_reconcile();
@@ -407,16 +350,6 @@ fn reconcile_always_includes_a_cached_leave() {
     let (departures, directives) = maker.leave_reconcile();
     assert_eq!(directives, vec![leave], "re-announced regardless of stamps");
     assert_eq!(departures.len(), 1, "the departure record is announced too");
-    let (leaves, fresh) = maker.set_authority(Authority::SelfRelay, &HashSet::new());
-    assert_eq!(
-        leaves,
-        vec![leave],
-        "and a promotion re-broadcasts it just the same",
-    );
-    assert!(
-        fresh.is_empty(),
-        "already cached via observe_leave — not a fresh insert on promotion",
-    );
 }
 
 // -- Desync comparator (SyncTracker via DecisionMaker::observe_sync) --

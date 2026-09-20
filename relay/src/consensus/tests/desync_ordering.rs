@@ -7,42 +7,29 @@ fn a_delayed_run_does_not_compare_hashes_from_different_ring_cycles() {
     let mut maker = authority_maker();
     for ordinal in 0..100u16 {
         for slot in [0, 1] {
-            assert!(ordered_feed(&mut maker, slot, ordinal).is_none());
+            assert!(feed_at_seq(&mut maker, slot, ordinal).is_none());
         }
     }
     for ordinal in 100..132u16 {
-        assert!(ordered_feed(&mut maker, 1, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 1, ordinal).is_none());
     }
     for ordinal in 109..132u16 {
         assert!(
-            ordered_feed(&mut maker, 0, ordinal).is_none(),
+            feed_at_seq(&mut maker, 0, ordinal).is_none(),
             "equal simulations must not compare different ring cycles at {ordinal}"
         );
     }
     for ordinal in 100..109u16 {
-        assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 0, ordinal).is_none());
     }
     assert!(!maker.sync.dormant);
     assert!(maker.sync.base_ordinal >= 124);
 }
 
-fn ordered_feed(maker: &mut DecisionMaker, slot: u8, ordinal: u16) -> Option<SyncDivergence> {
-    maker.observe_sync(
-        SlotId(slot),
-        u64::from(ordinal),
-        Some(u32::from(ordinal)),
-        &sync_command(
-            (ordinal % 16) as u8,
-            expected_kind_for_ordinal(u64::from(ordinal)),
-            ordinal.to_le_bytes(),
-        ),
-    )
-}
-
 #[test]
 fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checksum() {
     let mut maker = authority_maker();
-    for generation in 0..=2034u64 {
+    for generation in 0..=34u64 {
         for slot in 0..3 {
             assert!(
                 maker
@@ -67,23 +54,23 @@ fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checks
             maker
                 .observe_sync_with_generation(
                     SlotId(slot),
-                    2035,
-                    Some(2035),
+                    35,
+                    Some(35),
                     &sync_command(3, SYNC_KIND_HEADER, SYNC_A),
-                    Some(2035),
+                    Some(35),
                 )
                 .is_none()
         );
     }
-    // The origin's transport sequence stays contiguous while native generation 2035 is omitted.
+    // The origin's transport sequence stays contiguous while native generation 35 is omitted.
     assert!(
         maker
             .observe_sync_with_generation(
                 SlotId(2),
-                2035,
-                Some(2036),
+                35,
+                Some(36),
                 &sync_command(4, SYNC_KIND_UNITS, SYNC_A),
-                Some(2036),
+                Some(36),
             )
             .is_none()
     );
@@ -92,10 +79,10 @@ fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checks
             maker
                 .observe_sync_with_generation(
                     SlotId(slot),
-                    2036,
-                    Some(2036),
+                    36,
+                    Some(36),
                     &sync_command(4, SYNC_KIND_UNITS, SYNC_A),
-                    Some(2036),
+                    Some(36),
                 )
                 .is_none()
         );
@@ -106,10 +93,10 @@ fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checks
             maker
                 .observe_sync_with_generation(
                     SlotId(slot),
-                    2037,
-                    Some(2037),
+                    37,
+                    Some(37),
                     &sync_command(5, SYNC_KIND_HEADER, SYNC_A),
-                    Some(2037),
+                    Some(37),
                 )
                 .is_none()
         );
@@ -118,16 +105,16 @@ fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checks
         maker
             .observe_sync_with_generation(
                 SlotId(2),
-                2036,
-                Some(2037),
+                36,
+                Some(37),
                 &sync_command(5, SYNC_KIND_HEADER, SYNC_B),
-                Some(2037),
+                Some(37),
             )
             .is_none()
     );
 
     let mut divergence = None;
-    for generation in 2038..=2044u64 {
+    for generation in 38..=44u64 {
         divergence = maker.observe_sync_with_generation(
             SlotId(0),
             generation,
@@ -143,13 +130,13 @@ fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checks
     assert_eq!(
         divergence,
         Some(SyncDivergence {
-            sync_ordinal: 2037,
-            game_frame: Some(2037),
+            sync_ordinal: 37,
+            game_frame: Some(37),
             no_majority: false,
             diverged: vec![SlotId(2)],
         })
     );
-    assert!(maker.sync.base_ordinal >= 2038);
+    assert!(maker.sync.base_ordinal >= 38);
     assert_eq!(maker.sync.evict_warns, 0);
     assert!(!maker.sync_turns.unavailable(SlotId(0)));
     assert!(!maker.sync_turns.unavailable(SlotId(1)));
@@ -196,14 +183,14 @@ fn enhanced_metadata_survives_reordering_across_promotion() {
 fn a_real_disagreement_is_detected_after_reordered_turns_recover() {
     let mut maker = authority_maker();
     for ordinal in 0..40 {
-        assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
-        assert!(ordered_feed(&mut maker, 1, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 0, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 1, ordinal).is_none());
     }
     for ordinal in 41..64 {
-        assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 0, ordinal).is_none());
     }
     for ordinal in 40..64 {
-        assert!(ordered_feed(&mut maker, 1, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 1, ordinal).is_none());
     }
     let divergence = maker
         .observe_sync(
@@ -288,35 +275,6 @@ fn reordered_startup_duplicates_do_not_shift_the_sync_ordinal() {
 }
 
 #[test]
-fn peer_ordering_survives_promotion_with_an_outstanding_gap() {
-    let mut maker = authority_maker();
-    let _ = maker.set_authority(Authority::Peer, &HashSet::new());
-    for ordinal in 0..100 {
-        for slot in [0, 1] {
-            assert!(ordered_feed(&mut maker, slot, ordinal).is_none());
-        }
-    }
-    for ordinal in 109..120 {
-        assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
-    }
-    assert!(maker.sync.members.is_empty());
-    let _ = maker.set_authority(Authority::SelfRelay, &HashSet::new());
-    // Both members join the comparison before the recovered slot advances.
-    assert!(ordered_feed(&mut maker, 1, 100).is_none());
-    for ordinal in 100..109 {
-        assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
-    }
-    for ordinal in 101..132 {
-        assert!(ordered_feed(&mut maker, 1, ordinal).is_none());
-    }
-    for ordinal in 120..132 {
-        assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
-    }
-    assert!(!maker.sync.dormant);
-    assert!(maker.sync.base_ordinal >= 124);
-}
-
-#[test]
 fn one_origins_failure_cannot_blind_the_remaining_players_even_after_promotion() {
     for ring_failure in [false, true] {
         for promote in [false, true] {
@@ -358,7 +316,7 @@ fn one_origins_failure_cannot_blind_the_remaining_players_even_after_promotion()
             // failed origin, but the three other origins still expose a desync.
             let mut verdicts = Vec::new();
             for ordinal in 1..20 {
-                assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
+                assert!(feed_at_seq(&mut maker, 0, ordinal).is_none());
                 for slot in 1..4 {
                     if let Some(verdict) = maker.observe_sync(
                         SlotId(slot),
@@ -386,31 +344,46 @@ fn one_origins_failure_cannot_blind_the_remaining_players_even_after_promotion()
     }
 }
 
+/// A peer casts no votes, so a backlog it queued while demoted only
+/// reaches the comparator on promotion -- and it must reach it as the
+/// absolute ordinals it was recorded at. Unwrapping a 32-ordinal backlog
+/// against the live ring would alias the recovering slot's 100 onto the
+/// newer cycle's 132, which share a nibble, and compare two different
+/// cycles' simulations as if they were the same turn.
 #[test]
 fn promotion_never_aliases_a_recovered_backlog_with_a_newer_ring_cycle() {
     let mut maker = authority_maker();
     let _ = maker.set_authority(Authority::Peer, &HashSet::new());
     for ordinal in 0..100 {
         for slot in [0, 1] {
-            assert!(ordered_feed(&mut maker, slot, ordinal).is_none());
+            assert!(feed_at_seq(&mut maker, slot, ordinal).is_none());
         }
     }
     for ordinal in 109..132 {
-        assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 0, ordinal).is_none());
     }
     for ordinal in 100..132 {
-        assert!(ordered_feed(&mut maker, 1, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 1, ordinal).is_none());
     }
+    assert!(
+        maker.sync.members.is_empty(),
+        "a demoted relay records ordering but casts no votes",
+    );
     let _ = maker.set_authority(Authority::SelfRelay, &HashSet::new());
     // 132 and the recovering slot's 100 have the same native ring nibble.
-    assert!(ordered_feed(&mut maker, 1, 132).is_none());
+    assert!(feed_at_seq(&mut maker, 1, 132).is_none());
     for ordinal in 100..109 {
-        assert!(ordered_feed(&mut maker, 0, ordinal).is_none());
+        assert!(feed_at_seq(&mut maker, 0, ordinal).is_none());
     }
-    assert!(ordered_feed(&mut maker, 0, 132).is_none());
+    assert!(feed_at_seq(&mut maker, 0, 132).is_none());
+    assert_eq!(
+        maker.sync.members.len(),
+        2,
+        "both origins join the comparison as the recovered gap closes",
+    );
     for ordinal in 133..156 {
         for slot in [0, 1] {
-            assert!(ordered_feed(&mut maker, slot, ordinal).is_none());
+            assert!(feed_at_seq(&mut maker, slot, ordinal).is_none());
         }
     }
     assert!(!maker.sync.dormant);
@@ -421,15 +394,15 @@ fn promotion_never_aliases_a_recovered_backlog_with_a_newer_ring_cycle() {
 fn turns_seen_during_an_undecided_departure_preserve_reconnect_ordering() {
     let mut maker = authority_maker();
     for slot in [0, 1] {
-        assert!(ordered_feed(&mut maker, slot, 0).is_none());
+        assert!(feed_at_seq(&mut maker, slot, 0).is_none());
     }
-    maker.record_departure(SlotId(0), DepartureStamps::default(), DROPPED);
-    assert!(ordered_feed(&mut maker, 0, 1).is_none());
+    maker.record_departure(SlotId(0), DepartureStamps::default(), LEAVE_REASON_DROPPED);
+    assert!(feed_at_seq(&mut maker, 0, 1).is_none());
     assert!(maker.reinstate_slot(SlotId(0)));
-    assert!(ordered_feed(&mut maker, 1, 1).is_none());
+    assert!(feed_at_seq(&mut maker, 1, 1).is_none());
     for ordinal in 2..20 {
         for slot in [0, 1] {
-            assert!(ordered_feed(&mut maker, slot, ordinal).is_none());
+            assert!(feed_at_seq(&mut maker, slot, ordinal).is_none());
         }
     }
     assert!(!maker.sync_turns.unavailable(SlotId(0)));
@@ -442,15 +415,15 @@ fn coverage_reports_missing_history_before_the_window_is_exhausted() {
     let mut maker = authority_maker();
     maker.expected_slots = [SlotId(0), SlotId(1), SlotId(2), SlotId(3)].into();
     maker.set_observers([SlotId(2)].into());
-    maker.record_departure(SlotId(3), DepartureStamps::default(), DROPPED);
+    maker.record_departure(SlotId(3), DepartureStamps::default(), LEAVE_REASON_DROPPED);
     let initial = maker.sync_coverage();
     assert_eq!(initial.expected_players, 2);
     assert_eq!(initial.waiting_slots, 2);
     assert_eq!(initial.ordered_slots, 0);
 
     // The mesh can attach after sequence zero, without replaying its prefix.
-    ordered_feed(&mut maker, 0, 12);
-    ordered_feed(&mut maker, 1, 0);
+    feed_at_seq(&mut maker, 0, 12);
+    feed_at_seq(&mut maker, 1, 0);
     let waiting = maker.sync_coverage();
     assert_eq!(waiting.waiting_slots, 1);
     assert_eq!(waiting.ordered_slots, 1);
@@ -483,18 +456,19 @@ fn coverage_reports_missing_history_before_the_window_is_exhausted() {
         "fresh authority waits for fresh votes"
     );
     assert!(promoted.authority);
-}
 
-#[test]
-fn recovered_initial_history_restores_coverage_without_guessing() {
-    let mut maker = authority_maker();
-    ordered_feed(&mut maker, 0, 2);
-    assert_eq!(maker.sync_coverage().waiting_slots, 1);
-    ordered_feed(&mut maker, 0, 0);
-    ordered_feed(&mut maker, 0, 1);
-    assert_eq!(maker.sync_coverage().waiting_slots, 0);
-    assert_eq!(maker.sync_coverage().ordered_slots, 1);
-    assert_eq!(maker.sync_coverage().unavailable_slots, 0);
+    // The other way a hole ends: it fills in. A late prefix moves the
+    // slot from waiting to ordered, and coverage never guessed at the
+    // history in between.
+    let mut recovering = authority_maker();
+    feed_at_seq(&mut recovering, 0, 2);
+    assert_eq!(recovering.sync_coverage().waiting_slots, 1);
+    feed_at_seq(&mut recovering, 0, 0);
+    feed_at_seq(&mut recovering, 0, 1);
+    let recovered = recovering.sync_coverage();
+    assert_eq!(recovered.waiting_slots, 0);
+    assert_eq!(recovered.ordered_slots, 1);
+    assert_eq!(recovered.unavailable_slots, 0);
 }
 
 #[test]
@@ -502,11 +476,9 @@ fn ordering_failures_record_once_per_origin_without_a_desync_notice() {
     use crate::observability::flight_recorder::FlightEvent;
 
     for authority in [Authority::SelfRelay, Authority::Peer] {
-        let registry = new_decision_makers();
+        let (registry, mut rx) = notifying_registry();
         let k = key();
-        let _ = sync_maker(&registry, &k, MakerSync::new(bounds(0, 6), authority));
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        registry.set_notice_notifier(tx);
+        let _ = sync_default(&registry, &k, bounds(0, 6), authority);
         observe_sync(
             &registry,
             &k,

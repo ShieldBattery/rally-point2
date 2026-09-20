@@ -2,40 +2,20 @@
 
 use super::*;
 
-fn report(
-    maker: &mut DecisionMaker,
-    slot: u8,
-    seq: u64,
-    generation: u64,
-    value: SyncValue,
-) -> Option<SyncDivergence> {
-    maker.observe_sync_with_generation(
-        SlotId(slot),
-        seq,
-        Some(seq as u32),
-        &sync_command(
-            (generation % 16) as u8,
-            expected_kind_for_ordinal(generation),
-            value,
-        ),
-        Some(generation),
-    )
-}
-
 #[test]
 fn one_players_omission_does_not_hide_a_disagreement_among_other_players() {
     let mut maker = authority_maker();
     for slot in 0..4 {
-        assert!(report(&mut maker, slot, 0, 0, SYNC_A).is_none());
+        assert!(feed_generation(&mut maker, slot, 0, 0, SYNC_A).is_none());
     }
     for slot in 0..3 {
         let value = if slot == 2 { SYNC_B } else { SYNC_A };
-        assert!(report(&mut maker, slot, 1, 1, value).is_none());
+        assert!(feed_generation(&mut maker, slot, 1, 1, value).is_none());
     }
-    assert!(report(&mut maker, 3, 1, 2, SYNC_A).is_none());
+    assert!(feed_generation(&mut maker, 3, 1, 2, SYNC_A).is_none());
     let mut verdict = None;
     for generation in 2..=1 + authority_margin() {
-        if let Some(found) = report(&mut maker, 0, generation, generation, SYNC_A) {
+        if let Some(found) = feed_generation(&mut maker, 0, generation, generation, SYNC_A) {
             verdict = Some(found);
             break;
         }
@@ -58,7 +38,7 @@ fn repeated_resizes_and_ring_wraps_preserve_comparison_without_eviction() {
         }
         let value = (generation as u16).to_le_bytes();
         for slot in [0, 1] {
-            assert!(report(&mut maker, slot, seq, generation, value).is_none());
+            assert!(feed_generation(&mut maker, slot, seq, generation, value).is_none());
             assert!(!maker.sync_turns.unavailable(SlotId(slot)));
         }
         assert!(maker.sync.pending.len() <= SYNC_WINDOW);
@@ -109,8 +89,8 @@ fn invalid_generation_transitions_exclude_only_the_origin() {
         (0, 16, 0, "generation_jump"),
     ] {
         let mut maker = authority_maker();
-        assert!(report(&mut maker, 0, 0, first, SYNC_A).is_none());
-        assert!(report(&mut maker, 1, 0, first, SYNC_A).is_none());
+        assert!(feed_generation(&mut maker, 0, 0, first, SYNC_A).is_none());
+        assert!(feed_generation(&mut maker, 1, 0, first, SYNC_A).is_none());
         assert!(
             maker
                 .observe_sync_with_generation(
@@ -132,9 +112,21 @@ fn invalid_generation_transitions_exclude_only_the_origin() {
     }
 }
 
+/// The absolute sync ordinal an origin's history was recorded at survives
+/// a promotion and out-of-order delivery -- and an omission that *both*
+/// origins share does not strand the comparison: the next generation they
+/// both reported is compared, at its true ordinal, with neither origin
+/// going unavailable and nothing evicted.
+///
+/// The session opens with six checksum-less turns, so every origin's
+/// transport sequence runs ahead of its native generation by an offset
+/// nothing on the wire states. A comparator reading the ring nibble off
+/// the sequence instead of the tagged generation lands on the wrong
+/// epoch.
 #[test]
-fn both_players_skip_2035_at_sequence_2041_and_the_next_checksum_is_compared() {
+fn enhanced_history_retains_its_ring_epoch_across_promotion_and_reordering() {
     let mut maker = authority_maker();
+    let _ = maker.set_authority(Authority::Peer, &HashSet::new());
     for seq in 0..6 {
         for slot in [0, 1] {
             assert!(
@@ -144,56 +136,29 @@ fn both_players_skip_2035_at_sequence_2041_and_the_next_checksum_is_compared() {
             );
         }
     }
-    for generation in 0..=2034 {
-        for slot in [0, 1] {
-            assert!(report(&mut maker, slot, generation + 6, generation, SYNC_A).is_none());
-        }
-    }
-    assert!(report(&mut maker, 0, 2041, 2036, SYNC_A).is_none());
-    assert!(report(&mut maker, 1, 2041, 2036, SYNC_B).is_none());
-    let mut verdict = None;
-    for generation in 2037..=2036 + authority_margin() {
-        if let Some(found) = report(&mut maker, 0, generation + 5, generation, SYNC_A) {
-            verdict = Some(found);
-            break;
-        }
-    }
-    let verdict = verdict.expect("the first checksum after the omission must be compared");
-    assert_eq!(verdict.sync_ordinal, 2036);
-    assert!(verdict.no_majority);
-    assert_eq!(maker.sync.evict_warns, 0);
-    for slot in [0, 1] {
-        assert!(!maker.sync_turns.unavailable(SlotId(slot)));
-    }
-}
-
-#[test]
-fn enhanced_history_retains_its_ring_epoch_across_promotion_and_reordering() {
-    let mut maker = authority_maker();
-    let _ = maker.set_authority(Authority::Peer, &HashSet::new());
     for generation in 0..=34 {
         for slot in [0, 1] {
-            assert!(report(&mut maker, slot, generation, generation, SYNC_A).is_none());
+            assert!(
+                feed_generation(&mut maker, slot, generation + 6, generation, SYNC_A).is_none()
+            );
         }
     }
-    // The later packet alone cannot establish that generation 35 was omitted.
-    assert!(report(&mut maker, 0, 36, 37, SYNC_A).is_none());
+    // Generation 35 is omitted by both origins: their next turns carry 36
+    // and 37. The later packet alone cannot establish that omission.
+    assert!(feed_generation(&mut maker, 0, 42, 37, SYNC_A).is_none());
     let _ = maker.set_authority(Authority::SelfRelay, &HashSet::new());
-    assert!(report(&mut maker, 1, 35, 36, SYNC_A).is_none());
-    assert!(report(&mut maker, 0, 35, 36, SYNC_B).is_none());
+    assert!(feed_generation(&mut maker, 1, 41, 36, SYNC_A).is_none());
+    assert!(feed_generation(&mut maker, 0, 41, 36, SYNC_B).is_none());
     let mut verdict = None;
     for generation in 38..=36 + authority_margin() {
-        if let Some(found) = report(&mut maker, 0, generation - 1, generation, SYNC_A) {
+        if let Some(found) = feed_generation(&mut maker, 0, generation + 5, generation, SYNC_A) {
             verdict = Some(found);
             break;
         }
     }
-    assert_eq!(
-        verdict
-            .expect("absolute epoch survives promotion")
-            .sync_ordinal,
-        36
-    );
+    let verdict = verdict.expect("the first checksum after the shared omission must be compared");
+    assert_eq!(verdict.sync_ordinal, 36);
+    assert!(verdict.no_majority, "one against one is undecidable");
     assert_eq!(maker.sync.evict_warns, 0);
     for slot in [0, 1] {
         assert!(!maker.sync_turns.unavailable(SlotId(slot)));
@@ -208,7 +173,7 @@ fn a_whole_ring_of_unreported_generations_is_rejected_instead_of_compared_at_the
         for maker in [&mut tagged, &mut inferred] {
             for slot in [0, 1] {
                 assert!(
-                    report(
+                    feed_generation(
                         maker,
                         slot,
                         generation,
@@ -225,7 +190,7 @@ fn a_whole_ring_of_unreported_generations_is_rejected_instead_of_compared_at_the
     for generation in 35..=52 {
         for maker in [&mut tagged, &mut inferred] {
             assert!(
-                report(
+                feed_generation(
                     maker,
                     1,
                     generation,
@@ -250,7 +215,7 @@ fn a_whole_ring_of_unreported_generations_is_rejected_instead_of_compared_at_the
         }
     }
     let actual_generation = 52_u64;
-    assert!(report(&mut tagged, 0, 52, actual_generation, 52_u16.to_le_bytes()).is_none());
+    assert!(feed_generation(&mut tagged, 0, 52, actual_generation, 52_u16.to_le_bytes()).is_none());
     assert_eq!(
         tagged.sync_turns.failure(SlotId(0)).unwrap().reason,
         "generation_jump"
@@ -263,7 +228,7 @@ fn a_whole_ring_of_unreported_generations_is_rejected_instead_of_compared_at_the
     let delta = (actual_generation % 16 + 16 - last_generation % 16) % 16;
     assert_eq!(delta, 2);
     let guessed_generation = last_generation + delta;
-    let false_verdict = report(
+    let false_verdict = feed_generation(
         &mut inferred,
         0,
         52,

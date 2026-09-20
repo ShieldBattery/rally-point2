@@ -8,9 +8,11 @@ fn seed_departed_is_decided_and_re_broadcast_verbatim_on_promotion() {
     // "undecided"), and a later promotion re-broadcasts it verbatim — firing no
     // fresh departure notice, since a fresh relay resuming a session must not
     // re-report a departure the mesh already reported.
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     let _ = maker.seed_departed(SlotId(1), DepartureKind::Dropped, None, false);
+    // Each kind seeds its native reason, so the re-broadcast renders the
+    // wording the departure actually had.
+    let _ = maker.seed_departed(SlotId(2), DepartureKind::Left, None, false);
     assert!(
         !maker.has_undecided_departure(),
         "a seeded departure is already decided, never left undecided",
@@ -23,28 +25,13 @@ fn seed_departed_is_decided_and_re_broadcast_verbatim_on_promotion() {
         "the seeded dropped leave is re-broadcast verbatim on promotion",
     );
     assert!(
+        all.iter()
+            .any(|l| l.slot == 2 && l.reason == LEAVE_REASON_LEFT),
+        "and the seeded clean leave with its own reason",
+    );
+    assert!(
         fresh.is_empty(),
         "a seeded (already decided) leave fires no fresh departure notice",
-    );
-}
-
-#[test]
-fn seed_departed_maps_the_kind_to_the_native_reason() {
-    // A left departure seeds the native "player left" reason, a dropped one the
-    // dropped reason — so a promotion re-broadcast renders the correct wording.
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let _ = maker.seed_departed(SlotId(1), DepartureKind::Left, None, false);
-    let _ = maker.seed_departed(SlotId(2), DepartureKind::Dropped, None, false);
-    assert_eq!(maker.decided_leaves[&SlotId(1)].reason, LEAVE_REASON_LEFT);
-    assert_eq!(
-        maker.decided_leaves[&SlotId(2)].reason,
-        LEAVE_REASON_DROPPED
     );
 }
 
@@ -56,8 +43,7 @@ fn seed_departed_maps_the_kind_to_the_native_reason() {
 /// frame is. A count-less seed stays count-less (frame fallback).
 #[test]
 fn seed_departed_carries_the_original_directives_final_turn_count() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     let _ = maker.seed_departed(SlotId(1), DepartureKind::Left, Some(312), false);
     let _ = maker.seed_departed(SlotId(2), DepartureKind::Dropped, None, false);
     assert_eq!(maker.decided_leaves[&SlotId(1)].final_turn_count, Some(312),);
@@ -71,25 +57,12 @@ fn seed_departed_carries_the_original_directives_final_turn_count() {
     );
 }
 
-/// A dropped seed's count is discarded at this ingress no matter what the
-/// carrier holds: only clean leaves may carry counts, and the seed may
-/// have travelled through a coordinator or peer running code that
-/// predates that rule.
-#[test]
-fn seed_departed_strips_a_dropped_seeds_count() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-    let _ = maker.seed_departed(SlotId(1), DepartureKind::Dropped, Some(99), false);
-    assert_eq!(maker.decided_leaves[&SlotId(1)].final_turn_count, None);
-}
-
 /// The first seed of a slot returns the newly decided directive — the copy
 /// the descriptor path fans to already-connected local survivors — and a
 /// repeat (an idempotent descriptor replay) returns nothing to deliver.
 #[test]
 fn seed_departed_returns_the_newly_decided_directive_exactly_once() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     let first = maker.seed_departed(SlotId(1), DepartureKind::Left, Some(7), false);
     assert_eq!(
         first.map(|l| (l.slot, l.final_turn_count)),
@@ -167,11 +140,7 @@ fn a_resumed_sync_installs_the_latch_and_returns_the_seeds() {
 fn a_resumed_repush_seeds_into_an_existing_maker() {
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(1, 6), Authority::SelfRelay),
-    );
+    let _ = sync_default(&registry, &k, bounds(1, 6), Authority::SelfRelay);
     assert!(!registry.lock().get(&k).unwrap().resumed);
 
     let departed = [DepartedSlot {

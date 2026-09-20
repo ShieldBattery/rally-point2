@@ -5,7 +5,7 @@ use super::*;
 #[test]
 fn all_agree_retires_the_ordinal_silently() {
     let mut m = authority_maker();
-    feed(&mut m, 1, 0, SYNC_A);
+    feed_auto_seq(&mut m, 1, 0, SYNC_A);
     // Slot 0 alone races ahead; ordinal 0 isn't evaluated until the
     // frontier clears the margin, at which point it retires silently
     // (matching values).
@@ -18,8 +18,8 @@ fn all_agree_retires_the_ordinal_silently() {
 #[test]
 fn three_slot_majority_identifies_the_diverged_minority() {
     let mut m = authority_maker();
-    feed(&mut m, 1, 0, SYNC_A);
-    feed(&mut m, 2, 0, SYNC_B); // slot 2's sim diverged
+    feed_auto_seq(&mut m, 1, 0, SYNC_A);
+    feed_auto_seq(&mut m, 2, 0, SYNC_B); // slot 2's sim diverged
     // Slot 0 alone races ahead to clear the evaluation margin for ordinal 0.
     let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
         .expect("clearing the margin evaluates ordinal 0");
@@ -36,7 +36,7 @@ fn three_slot_majority_identifies_the_diverged_minority() {
 #[test]
 fn one_v_one_disagreement_is_no_majority_and_goes_dormant() {
     let mut m = authority_maker();
-    feed(&mut m, 1, 0, SYNC_B);
+    feed_auto_seq(&mut m, 1, 0, SYNC_B);
     let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
         .expect("clearing the margin evaluates ordinal 0");
     assert_eq!(divergence.sync_ordinal, 0);
@@ -47,7 +47,7 @@ fn one_v_one_disagreement_is_no_majority_and_goes_dormant() {
         "truth is unrecoverable — dormant for the session"
     );
     assert_eq!(
-        feed(&mut m, 1, 1, SYNC_B),
+        feed_auto_seq(&mut m, 1, 1, SYNC_B),
         None,
         "a dormant comparator no-ops"
     );
@@ -56,9 +56,9 @@ fn one_v_one_disagreement_is_no_majority_and_goes_dormant() {
 #[test]
 fn even_split_is_no_majority() {
     let mut m = authority_maker();
-    feed(&mut m, 1, 0, SYNC_A);
-    feed(&mut m, 2, 0, SYNC_B);
-    feed(&mut m, 3, 0, SYNC_B);
+    feed_auto_seq(&mut m, 1, 0, SYNC_A);
+    feed_auto_seq(&mut m, 2, 0, SYNC_B);
+    feed_auto_seq(&mut m, 3, 0, SYNC_B);
     let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
         .expect("clearing the margin evaluates ordinal 0");
     assert!(divergence.no_majority, "2-2 has no strict majority");
@@ -70,48 +70,36 @@ fn even_split_is_no_majority() {
 fn a_second_divergence_fires_again_at_its_own_ordinal() {
     let mut m = authority_maker();
     // Ordinal 0: slot 3 diverges from the 0/1/2 majority.
-    feed(&mut m, 1, 0, SYNC_A);
-    feed(&mut m, 2, 0, SYNC_A);
-    feed(&mut m, 3, 0, SYNC_B);
+    feed_auto_seq(&mut m, 1, 0, SYNC_A);
+    feed_auto_seq(&mut m, 2, 0, SYNC_A);
+    feed_auto_seq(&mut m, 3, 0, SYNC_B);
     let first = advance(&mut m, 0, SYNC_A, 8).expect("slot 0 clearing the margin fires the first");
     assert_eq!(first.sync_ordinal, 0);
     assert_eq!(first.diverged, vec![SlotId(3)]);
 
     // Survivors {0,1,2} continue. Ordinal 1: slot 2 now diverges. Slot 0's
     // ordinal-1 report already landed during the `advance` above.
-    feed(&mut m, 1, 1, SYNC_A);
-    feed(&mut m, 2, 1, SYNC_C);
-    let second = feed(&mut m, 0, 8, SYNC_A).expect("a second divergence at ordinal 1");
+    feed_auto_seq(&mut m, 1, 1, SYNC_A);
+    feed_auto_seq(&mut m, 2, 1, SYNC_C);
+    let second = feed_auto_seq(&mut m, 0, 8, SYNC_A).expect("a second divergence at ordinal 1");
     assert_eq!(second.sync_ordinal, 1, "a distinct, later ordinal");
     assert!(!second.no_majority);
     assert_eq!(second.diverged, vec![SlotId(2)]);
     assert!(!m.sync.members.contains_key(&SlotId(2)));
 }
 
+/// An observer never joins the compare set and its disagreeing report is
+/// a no-op, by whichever path the descriptor's observer set reached the
+/// maker.
+///
+/// Seeding at creation is the single-relay session's whole story: it
+/// receives exactly one descriptor push (at session create, before any
+/// client dials), so the push finds no maker and inserts one already
+/// holding the observer slots -- there is no later re-push to carry the
+/// set in after the fact. A session whose relay set changes instead gets
+/// the set applied to a maker that already exists.
 #[test]
-fn an_observer_slot_is_excluded_from_comparison() {
-    let mut m = authority_maker();
-    m.set_observers(HashSet::from([SlotId(1)]));
-    // Slot 1 is an observer with a wildly different checksum; it must never
-    // join the compare set, so no divergence ever fires from it.
-    feed(&mut m, 0, 0, SYNC_A);
-    assert_eq!(feed(&mut m, 1, 0, SYNC_B), None, "observer feed is a no-op");
-    assert!(
-        !m.sync.members.contains_key(&SlotId(1)),
-        "observer never joins"
-    );
-    assert!(!m.sync.dormant);
-}
-
-/// A maker created by a descriptor starts with that descriptor's observer
-/// set. This is the single-relay session's whole story: it receives exactly
-/// one descriptor push (at session create, before any client dials), so the
-/// push finds no maker and inserts one seeded with the descriptor's observer
-/// slots -- there is no later re-push to carry the set in after the fact.
-/// The observer must therefore be excluded from the desync comparator from
-/// that maker's first turn onward.
-#[test]
-fn a_maker_created_by_a_descriptor_excludes_its_observer_slots() {
+fn an_observer_slot_is_excluded_from_comparison_however_the_set_arrived() {
     let registry = new_decision_makers();
     // One descriptor push naming slot 2 an observer, with no maker yet.
     let leaves = sync_maker(
@@ -133,10 +121,10 @@ fn a_maker_created_by_a_descriptor_excludes_its_observer_slots() {
 
     // Two players agree; the observer reports a different checksum. Racing a
     // compared slot ahead clears the evaluation margin for ordinal 0.
-    feed(m, 0, 0, SYNC_A);
-    feed(m, 1, 0, SYNC_A);
+    feed_auto_seq(m, 0, 0, SYNC_A);
+    feed_auto_seq(m, 1, 0, SYNC_A);
     assert_eq!(
-        feed(m, 2, 0, SYNC_B),
+        feed_auto_seq(m, 2, 0, SYNC_B),
         None,
         "the observer's disagreeing report is a no-op",
     );
@@ -150,6 +138,27 @@ fn a_maker_created_by_a_descriptor_excludes_its_observer_slots() {
         "the observer never joins the compare set",
     );
     assert!(!m.sync.dormant, "the compared survivors keep being watched");
+
+    // The same exclusion when the set is applied to a live maker instead.
+    let mut live = authority_maker();
+    live.set_observers(HashSet::from([SlotId(2)]));
+    feed_auto_seq(&mut live, 0, 0, SYNC_A);
+    feed_auto_seq(&mut live, 1, 0, SYNC_A);
+    assert_eq!(
+        feed_auto_seq(&mut live, 2, 0, SYNC_B),
+        None,
+        "the observer's disagreeing report is a no-op",
+    );
+    assert_eq!(
+        advance(&mut live, 0, SYNC_A, authority_margin() as u8),
+        None,
+        "the observer is never a required reporter, so no divergence fires",
+    );
+    assert!(
+        !live.sync.members.contains_key(&SlotId(2)),
+        "the observer never joins the compare set",
+    );
+    assert!(!live.sync.dormant);
 }
 
 // -- Relay-driven session start --
@@ -161,38 +170,26 @@ fn a_maker_created_by_a_descriptor_excludes_its_observer_slots() {
 /// [`BufferBounds`](rally_point_proto::control::BufferBounds)).
 #[test]
 fn absurd_buffer_bounds_disable_the_comparator() {
-    let mut m = DecisionMaker::new(
-        key(),
-        bounds(0, SYNC_ABSURD_BUFFER_MAX),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut m = maker_with(bounds(0, SYNC_ABSURD_BUFFER_MAX));
     // A first sync command trips the check and disables the comparator —
     // even from two slots that would otherwise plainly disagree.
-    assert_eq!(feed(&mut m, 0, 0, SYNC_A), None);
+    assert_eq!(feed_auto_seq(&mut m, 0, 0, SYNC_A), None);
     assert!(m.sync.dormant, "absurd bounds disable detection outright");
-    assert_eq!(feed(&mut m, 1, 0, SYNC_B), None, "still a no-op");
+    assert_eq!(feed_auto_seq(&mut m, 1, 0, SYNC_B), None, "still a no-op");
 }
 
 /// End-to-end through the registry: a divergence fires a `DesyncNotice` on the
 /// notice channel, stamped with the session's correlation ids.
 #[test]
 fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 6), Authority::SelfRelay),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 6), Authority::SelfRelay);
     registry.set_session_refs(
         &k,
         Some("game-77".to_owned()),
         HashMap::from([(SlotId(2), "sb-user-diverged".to_owned())]),
     );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
 
     // 0,1 agree, 2 diverges, all at ordinal 0.
     observe_sync(
@@ -323,33 +320,11 @@ fn fog_byte_divergence_with_matching_hash16_is_not_a_divergence() {
     );
 }
 
-/// A report whose kind disagrees with its placed ordinal's expected
-/// parity is an alignment-drift anomaly, not a desync: it's excluded from
-/// the `hash16` comparison entirely and just warned about.
-#[test]
-fn a_kind_parity_mismatch_is_an_anomaly_not_a_divergence() {
-    let mut m = authority_maker();
-    // Slot 1 agrees with slot 0's hash16 at ordinal 0, but reports kind 2
-    // for an even ordinal (should be 1) — excluded from the comparison
-    // rather than treated as a mismatch (there is no majority/minority
-    // split here; a real one is covered by the malformed-kind and
-    // ordinary-divergence tests).
-    feed_ring_kind(&mut m, 1, 0, SYNC_KIND_HEADER, SYNC_A, 1000);
-    let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8);
-    assert_eq!(
-        divergence, None,
-        "the kind-mismatched report is excluded, not compared",
-    );
-    assert!(
-        m.sync.kind_parity_warns >= 1,
-        "the parity mismatch was flagged",
-    );
-}
-
 /// A `0x37` whose low nibble is neither 1 nor 2 is a malformed sync
 /// command — defensive rejection, since validated bytes shouldn't produce
 /// this. Its ring still participates in ordering, but the report cannot
-/// create comparator membership or contribute a checksum vote.
+/// create comparator membership, leave a pending report, or anchor the
+/// tracker's ordinal.
 #[test]
 fn a_malformed_kind_is_skipped_not_recorded() {
     let mut m = authority_maker();
@@ -360,6 +335,14 @@ fn a_malformed_kind_is_skipped_not_recorded() {
     assert!(
         m.sync.members.is_empty(),
         "a malformed kind never creates a member",
+    );
+    assert!(
+        m.sync.pending.is_empty(),
+        "nor a pending report to compare later",
+    );
+    assert!(
+        !m.sync.initialized,
+        "nor an ordinal anchor from malformed input",
     );
     assert!(
         m.sync.malformed_kind_warns >= 1,

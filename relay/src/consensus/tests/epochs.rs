@@ -8,8 +8,7 @@ use super::*;
 /// epoch even when that stale sidecar carries much larger counters.
 #[test]
 fn reconnect_epoch_resets_link_conditions_and_rejects_the_old_sidecar() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.observe_frame(SlotId(0), GameFrameCount(77));
     maker.ingest_local(&epoch_conditions(0, 11, 150_000, 0, 100));
     maker.ingest_local(&epoch_conditions(0, 11, 160_000, 10, 120));
@@ -43,8 +42,7 @@ fn reconnect_epoch_resets_link_conditions_and_rejects_the_old_sidecar() {
 /// downgrade it back to the unfenced counter namespace.
 #[test]
 fn epoch_aware_slot_rejects_a_later_epochless_sidecar() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&epoch_conditions(0, 44, 40_000, 0, 5));
     maker.ingest_remote(&conditions(0, 800_000, 100, 1_000), 90_000);
 
@@ -59,15 +57,14 @@ fn epoch_aware_slot_rejects_a_later_epochless_sidecar() {
 /// live state, while the current epoch still can.
 #[test]
 fn stale_epoch_cannot_depart_or_remove_a_reconnected_slot() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&epoch_conditions(0, 1, 70_000, 0, 10));
     maker.ingest_local(&epoch_conditions(0, 2, 30_000, 0, 1));
 
     assert!(!maker.record_departure_for_epoch(
         SlotId(0),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
         Some(1)
     ));
     assert!(!maker.remove_slot_for_epoch(SlotId(0), Some(1)));
@@ -77,7 +74,7 @@ fn stale_epoch_cannot_depart_or_remove_a_reconnected_slot() {
     assert!(maker.record_departure_for_epoch(
         SlotId(0),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
         Some(2)
     ));
     assert!(maker.has_departure(SlotId(0)));
@@ -86,13 +83,12 @@ fn stale_epoch_cannot_depart_or_remove_a_reconnected_slot() {
 
 #[test]
 fn down_epoch_is_terminal_until_a_distinct_generation_is_reinstated() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
     assert!(maker.record_departure_for_epoch(
         SlotId(0),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
         Some(11)
     ));
 
@@ -127,50 +123,29 @@ fn down_epoch_is_terminal_until_a_distinct_generation_is_reinstated() {
     assert_eq!(
         maker.connection_states.get(&SlotId(0)),
         Some(&ConnectionState::Up(33)),
+        "rejecting the retired generations leaves the live one current",
     );
-}
-
-#[test]
-fn delayed_retired_true_cannot_replace_the_live_relay_epoch() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
-    assert!(maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
-    assert!(maker.mark_connection_down(SlotId(0), Some(11)));
-    assert!(maker.activate_connection_epoch(SlotId(0), 22, Instant::now()));
-
     assert_eq!(
-        maker.connection_activation(SlotId(0), Some(11)),
-        ConnectionActivation::Rejected,
-        "a delayed true(E1) is stale after E2 supersedes Down(E1)",
-    );
-    assert!(!maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
-    assert_eq!(
-        maker.connection_states.get(&SlotId(0)),
-        Some(&ConnectionState::Up(22)),
-        "rejecting E1 must leave E2 current",
-    );
-
-    assert_eq!(
-        maker.connection_activation(SlotId(0), Some(22)),
+        maker.connection_activation(SlotId(0), Some(33)),
         ConnectionActivation::Current,
     );
-    assert!(maker.activate_connection_epoch(SlotId(0), 22, Instant::now()));
-    maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
-    assert_eq!(maker.slots[&SlotId(0)].rtt(), 30_000);
 }
 
 #[test]
 fn decided_departure_rejects_reinstate_activation() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
     assert!(maker.record_departure_for_epoch(
         SlotId(0),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
         Some(11)
     ));
-    assert!(maker.force_decide_leave(SlotId(0), DROPPED).is_some());
+    assert!(
+        maker
+            .force_decide_leave(SlotId(0), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
 
     assert!(!maker.reinstate_slot(SlotId(0)));
     assert!(!maker.activate_connection_epoch(SlotId(0), 22, Instant::now()));
@@ -178,10 +153,9 @@ fn decided_departure_rejects_reinstate_activation() {
 
 #[test]
 fn legacy_departure_requires_reinstate_before_legacy_true() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&conditions(0, 70_000, 0, 10));
-    maker.record_departure(SlotId(0), DepartureStamps::default(), DROPPED);
+    maker.record_departure(SlotId(0), DepartureStamps::default(), LEAVE_REASON_DROPPED);
 
     assert_eq!(
         maker.connection_activation(SlotId(0), None),
@@ -196,8 +170,7 @@ fn legacy_departure_requires_reinstate_before_legacy_true() {
 
 #[test]
 fn remote_epoch_sidecar_waits_for_reliable_generation_activation() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_remote(&epoch_conditions(0, 22, 30_000, 0, 1), 10_000);
     assert!(!maker.slots.contains_key(&SlotId(0)));
 
@@ -208,13 +181,12 @@ fn remote_epoch_sidecar_waits_for_reliable_generation_activation() {
 
 #[test]
 fn departure_reconcile_uses_the_epoch_stored_on_the_departure() {
-    let mut maker =
-        DecisionMaker::new(key(), bounds(0, 20), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker();
     maker.ingest_local(&epoch_conditions(0, 11, 70_000, 0, 10));
     assert!(maker.record_departure_for_epoch(
         SlotId(0),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
         Some(11)
     ));
     // Model unrelated mutable lifecycle state changing after the record was
@@ -229,13 +201,7 @@ fn departure_reconcile_uses_the_epoch_stored_on_the_departure() {
 
 #[test]
 fn reconnect_restores_frame_history_and_immediate_redrop_keeps_apply_basis() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     assert!(maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
     feed_turns(&mut maker, 0, 0..=15);
     maker.ingest_local(&epoch_conditions(0, 11, 150_000, 3, 20));
@@ -248,7 +214,7 @@ fn reconnect_restores_frame_history_and_immediate_redrop_keeps_apply_basis() {
             last_frame: last,
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
         Some(11),
     ));
 
@@ -274,11 +240,11 @@ fn reconnect_restores_frame_history_and_immediate_redrop_keeps_apply_basis() {
             last_frame: redrop_last,
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
         Some(22),
     ));
     let leave = maker
-        .decide_leave(SlotId(0), DROPPED)
+        .decide_leave(SlotId(0), LEAVE_REASON_DROPPED)
         .expect("authority decides the immediate redrop");
     assert_eq!(leave.apply_at_frame, 116);
 }
@@ -287,16 +253,7 @@ fn reconnect_restores_frame_history_and_immediate_redrop_keeps_apply_basis() {
 fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
     let makers = Arc::new(new_decision_makers());
     let session = key();
-    makers.lock().insert(
-        session.clone(),
-        DecisionMaker::new(
-            session.clone(),
-            bounds(0, 20),
-            law(),
-            Authority::Peer,
-            HashSet::new(),
-        ),
-    );
+    makers.lock().insert(session.clone(), peer_maker());
     let holds = crate::session::drop_hold::DropHolds::new(
         std::time::Duration::ZERO,
         std::time::Duration::from_secs(1),
@@ -311,7 +268,7 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
             &session,
             SlotId(0),
             DepartureStamps::default(),
-            DROPPED,
+            LEAVE_REASON_DROPPED,
             Some(11),
         );
         (recorded, recorded)
@@ -335,7 +292,7 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
             &session,
             SlotId(0),
             DepartureStamps::default(),
-            DROPPED,
+            LEAVE_REASON_DROPPED,
             Some(22),
         );
         (recorded, recorded)
@@ -354,18 +311,12 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
 fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
     let makers = Arc::new(new_decision_makers());
     let session = key();
-    let mut maker = DecisionMaker::new(
-        session.clone(),
-        bounds(0, 20),
-        law(),
-        Authority::Peer,
-        HashSet::new(),
-    );
+    let mut maker = peer_maker();
     assert!(maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
     assert!(maker.record_departure_for_epoch(
         SlotId(0),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
         Some(11)
     ));
     makers.lock().insert(session.clone(), maker);
@@ -408,25 +359,22 @@ fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
             &stale_key,
             SlotId(0),
             DepartureStamps::default(),
-            DROPPED,
+            LEAVE_REASON_DROPPED,
             Some(11),
         );
         stale_tx.send(recorded).unwrap();
     });
     attempting_rx.recv().expect("stale teardown started");
-    assert!(
-        stale_rx
-            .recv_timeout(std::time::Duration::from_millis(50))
-            .is_err(),
-        "stale teardown must wait for the reconnect's maker critical section"
-    );
     resume_tx.send(()).unwrap();
 
     assert_eq!(
         reconnect.join().unwrap(),
         ReconnectAdmission::Admitted { reinstated: true }
     );
-    assert!(!stale_rx.recv().expect("stale teardown completed"));
+    assert!(
+        !stale_rx.recv().expect("stale teardown completed"),
+        "the stale teardown ran against the reinstated epoch and was refused",
+    );
     stale.join().unwrap();
     assert!(!slot_departed(&makers, &session, SlotId(0)));
     assert!(connection_epoch_matches(

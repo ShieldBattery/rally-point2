@@ -4,20 +4,8 @@ use super::*;
 
 #[test]
 fn single_slot_ingestion_matches_a_one_element_batch() {
-    let mut batch = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    let mut single = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut batch = maker();
+    let mut single = maker();
     let samples = [
         SlotConditions {
             slot: 0,
@@ -79,13 +67,7 @@ fn single_slot_ingestion_matches_a_one_element_batch() {
 
 #[test]
 fn target_fold_matches_sorting_reference_for_ties_missing_rtts_departures_and_loss() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
 
     assert_target_inputs_match_reference(&maker);
     maker.ingest_local(&conditions(3, 0, 0, 100));
@@ -120,7 +102,7 @@ fn target_fold_matches_sorting_reference_for_ties_missing_rtts_departures_and_lo
     // against the 1-turn burst) rather than their sum.
     assert_eq!(inputs.target, 10);
 
-    maker.record_departure(SlotId(1), DepartureStamps::default(), DROPPED);
+    maker.record_departure(SlotId(1), DepartureStamps::default(), LEAVE_REASON_DROPPED);
     assert_target_inputs_match_reference(&maker);
     let inputs = maker.target_inputs().unwrap();
     assert_eq!(inputs.path_us, 200_000);
@@ -129,126 +111,104 @@ fn target_fold_matches_sorting_reference_for_ties_missing_rtts_departures_and_lo
     // a turn here, so max and sum would only differ by which is doubled.
     assert_eq!(inputs.target, 6);
 
-    maker.record_departure(SlotId(2), DepartureStamps::default(), DROPPED);
+    maker.record_departure(SlotId(2), DepartureStamps::default(), LEAVE_REASON_DROPPED);
     assert_target_inputs_match_reference(&maker);
     maker.remove_slot(SlotId(0));
     assert_target_inputs_match_reference(&maker);
     assert_eq!(maker.target(), None, "only the missing-RTT slot remains");
 }
 
-/// At 150ms RTT, 0% loss: target == ceil(150000/41666.67) + 0 = 4.
+/// The target formula, case by case. Each case ingests its samples in
+/// order into a fresh maker and pins both the path the pairwise rule
+/// derived and the whole-turn target built on it.
 #[test]
-fn target_at_150ms_zero_loss() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
-    assert_eq!(maker.target(), Some(4));
-}
+fn the_target_formula_over_its_path_loss_and_clamp_cases() {
+    /// One slot sample as `(slot, rtt_us, lost_packets, sent_packets)`.
+    type Sample = (u8, u32, u64, u64);
 
-/// At 150ms RTT, 5% loss: loss_risk = 0.05 ** 150000 = 7500us.
-/// Separated: ceil(150000/41666.67) + ceil(7500/41666.67) = 4 + 1 = 5.
-#[test]
-fn target_loss_recovery_is_quantized_to_whole_turns() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
-    let _ = ingest_at(&mut maker, &conditions(0, 150_000, 5, 200), 2);
-    assert_eq!(maker.target(), Some(5));
-}
+    struct Case {
+        label: &'static str,
+        /// One entry per ingest, in order.
+        samples: &'static [&'static [Sample]],
+        path_us: Option<u32>,
+        target: Option<u32>,
+    }
 
-/// At 50ms RTT, 0% loss: target = ceil(50000/41666.67) = 2.
-#[test]
-fn target_at_low_latency() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
-    assert_eq!(maker.target(), Some(2));
-}
+    let turn_us = law().turn_duration_us;
+    let cases = [
+        Case {
+            label: "150ms, no loss: one ceil over the turn period",
+            samples: &[&[(0, 150_000, 0, 100)]],
+            path_us: Some(150_000),
+            target: Some(4),
+        },
+        Case {
+            label: "150ms with 5% loss: path and loss take separate ceils, so \
+             4 + 1 -- a combined ceil would read 4",
+            samples: &[&[(0, 150_000, 0, 100)], &[(0, 150_000, 5, 200)]],
+            path_us: Some(150_000),
+            target: Some(5),
+        },
+        Case {
+            label: "50ms: the low-latency case",
+            samples: &[&[(0, 50_000, 0, 100)]],
+            path_us: Some(50_000),
+            target: Some(2),
+        },
+        Case {
+            label: "10ms: the ceil is its own floor, so any positive path costs \
+             a turn and no separate minimum is needed",
+            samples: &[&[(0, 10_000, 0, 100)]],
+            path_us: Some(10_000),
+            target: Some(1),
+        },
+        Case {
+            label: "no RTT measurement at all: the law holds rather than guessing",
+            samples: &[&[(0, 0, 0, 100)]],
+            path_us: None,
+            target: None,
+        },
+        Case {
+            label: "two slots at 100ms and 200ms: the path is the mean of the two \
+             highest effective RTTs",
+            samples: &[&[(0, 100_000, 0, 100), (1, 200_000, 0, 100)]],
+            path_us: Some(150_000),
+            target: Some(4),
+        },
+        Case {
+            label: "one 300ms outlier against two 20ms links: the outlier is \
+             averaged against the next-highest, never taken alone",
+            samples: &[&[
+                (0, 20_000, 0, 100),
+                (1, 300_000, 0, 100),
+                (2, 20_000, 0, 100),
+            ]],
+            path_us: Some(160_000),
+            target: Some(4),
+        },
+        Case {
+            label: "a hostile near-u32::MAX RTT claim is clamped to the ingest \
+             ceiling on the way in, so it cannot saturate the sums the \
+             path is built from",
+            samples: &[&[(0, u32::MAX, 0, 100)]],
+            path_us: Some(MAX_INGEST_RTT_US),
+            target: Some(MAX_INGEST_RTT_US.div_ceil(turn_us)),
+        },
+    ];
 
-/// At 10ms RTT: target = ceil(10000/41666.67) = 1. The ceil naturally
-/// gives 1 for any positive RTT -- no separate floor.
-#[test]
-fn target_floor_falls_out_of_ceil() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(&mut maker, &conditions(0, 10_000, 0, 100), 1);
-    assert_eq!(maker.target(), Some(1));
-}
-
-/// No RTT measurement (rtt_us == 0): target is None (hold).
-#[test]
-fn target_none_when_no_rtt() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(&mut maker, &conditions(0, 0, 0, 100), 1);
-    assert_eq!(maker.target(), None);
-}
-
-// -- Pairwise path --
-
-/// Two slots at 100ms and 200ms: path = (200000 + 100000) / 2 = 150000.
-#[test]
-fn worst_pair_path_uses_two_highest_rtts() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(
-        &mut maker,
-        &multi_conditions(&[(0, 100_000, 0, 100), (1, 200_000, 0, 100)]),
-        1,
-    );
-    assert_eq!(maker.target(), Some(4));
-}
-
-/// One outlier at 300ms, rest at 20ms: path = (300000 + 20000) / 2 = 160000.
-#[test]
-fn single_outlier_does_not_over_provision() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(
-        &mut maker,
-        &multi_conditions(&[
-            (0, 20_000, 0, 100),
-            (1, 300_000, 0, 100),
-            (2, 20_000, 0, 100),
-        ]),
-        1,
-    );
-    assert_eq!(maker.target(), Some(4));
+    for case in cases {
+        let mut maker = maker();
+        for (index, sample) in case.samples.iter().enumerate() {
+            ingest_at(&mut maker, &multi_conditions(sample), index as u32 + 1);
+        }
+        assert_eq!(
+            maker.target_inputs().map(|inputs| inputs.path_us),
+            case.path_us,
+            "{}",
+            case.label,
+        );
+        assert_eq!(maker.target(), case.target, "{}", case.label);
+    }
 }
 
 // -- Mesh hop --
@@ -256,13 +216,7 @@ fn single_outlier_does_not_over_provision() {
 /// A remote slot's effective RTT includes the mesh hop.
 #[test]
 fn mesh_hop_increases_target_for_cross_relay_paths() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     ingest_at(&mut maker, &conditions(0, 50_000, 0, 100), 1);
     ingest_remote_at(&mut maker, &conditions(1, 50_000, 0, 100), 100_000, 2);
     // eff_local = 50000, eff_remote = 150000.
@@ -270,60 +224,17 @@ fn mesh_hop_increases_target_for_cross_relay_paths() {
     assert_eq!(maker.target(), Some(3));
 }
 
-/// Without the mesh hop, two 50ms slots would give target 2.
-#[test]
-fn mesh_hop_adds_turns_above_same_relay_baseline() {
-    let mut local = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(
-        &mut local,
-        &multi_conditions(&[(0, 50_000, 0, 100), (1, 50_000, 0, 100)]),
-        1,
-    );
-    let local_target = local.target().unwrap();
-
-    let mut meshed = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    ingest_at(&mut meshed, &conditions(0, 50_000, 0, 100), 1);
-    ingest_remote_at(&mut meshed, &conditions(1, 50_000, 0, 100), 100_000, 2);
-    let meshed_target = meshed.target().unwrap();
-
-    assert!(meshed_target > local_target);
-}
-
 // -- Loss on high-latency links --
 
 /// Same 20% loss on 50ms vs 300ms: the high-latency link needs more turns.
 #[test]
 fn loss_on_high_latency_link_adds_more_turns() {
-    let mut low = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut low = maker();
     ingest_at(&mut low, &conditions(0, 50_000, 0, 100), 1);
     ingest_at(&mut low, &conditions(0, 50_000, 20, 200), 2);
     let low_target = low.target().unwrap();
 
-    let mut high = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut high = maker();
     ingest_at(&mut high, &conditions(0, 300_000, 0, 100), 1);
     ingest_at(&mut high, &conditions(0, 300_000, 20, 200), 2);
     let high_target = high.target().unwrap();
@@ -382,13 +293,7 @@ fn cached_rtt_max_matches_scanned_window_across_many_wraps() {
 /// The decision-maker uses the recent max RTT, not the smoothed mean.
 #[test]
 fn jitter_uses_recent_max_rtt() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     for frame in 1..=4 {
         ingest_at(&mut maker, &conditions(0, 100_000, 0, 100), frame);
     }
@@ -397,38 +302,10 @@ fn jitter_uses_recent_max_rtt() {
     assert_eq!(maker.target(), Some(5));
 }
 
-/// Without the spike, the target would be lower.
-#[test]
-fn jitter_spike_raises_target_above_baseline() {
-    let mut spiky = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    for frame in 1..=4 {
-        ingest_at(&mut spiky, &conditions(0, 100_000, 0, 100), frame);
-    }
-    ingest_at(&mut spiky, &conditions(0, 200_000, 0, 100), 5);
+// -- Arrival stretch --
 
-    let mut stable = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    for frame in 1..=5 {
-        ingest_at(&mut stable, &conditions(0, 100_000, 0, 100), frame);
-    }
-
-    assert!(spiky.target().unwrap() > stable.target().unwrap());
-}
-
-// -- Raise fast, lower slow (asymmetric dwell) --
-
-/// Raise jumps to the target immediately, not incrementally.
+/// The relay-measured stretch term: the automatic replacement for the
+/// user-facing latency setting SC:R used to expose.
 #[test]
 fn sustained_arrival_stretch_presses_the_buffer_target() {
     // Clean tiny RTT sizes the law's own target at the minimum; a session
@@ -436,13 +313,7 @@ fn sustained_arrival_stretch_presses_the_buffer_target() {
     // raised one extra turn — the relay-measured "clients are stalling
     // anyway" backstop — and the raise routes through the ordinary
     // directive machinery.
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(1, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(1, 20));
     maker.mark_started();
     // First ingest: the initial broadcast at the held minimum, no raise.
     let d = ingest_at(&mut maker, &conditions(0, 5_000, 0, 100), 1);

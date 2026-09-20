@@ -2,12 +2,16 @@
 
 use super::*;
 
-/// The slot everyone waited on delivers a late turn just before the watch
-/// ticks. The survivor has not had the round-trip it needs to consume that
-/// turn and answer with its own, so its clock is momentarily the oldest —
-/// naming it then would evict the one slot that did nothing wrong.
+/// The late-turn case, end to end. The slot everyone waited on delivers a
+/// turn just before the watch ticks: the survivor has not had the
+/// round-trip it needs to consume that turn and answer with its own, so
+/// its clock is momentarily the oldest and naming it then would evict the
+/// one slot that did nothing wrong. Once the survivor does answer, nobody
+/// is named at all -- and when the slot that delivered goes quiet again,
+/// it is named only after the session has sat still for a full window
+/// after the survivor's answer.
 #[test]
-fn a_survivor_is_not_named_while_it_is_still_answering_a_late_turn() {
+fn a_slot_that_went_quiet_again_after_a_late_turn_is_named_after_a_full_window() {
     let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
     maker.note_forward_advance(SlotId(1), start + Duration::from_millis(11_300));
 
@@ -17,24 +21,13 @@ fn a_survivor_is_not_named_while_it_is_still_answering_a_late_turn() {
         "the session moved 100ms ago; nobody is judged until it has sat still for a window",
     );
 
-    // The survivor answers, and the session runs on: no verdict.
+    // The survivor answers, and the session runs on.
     maker.note_forward_advance(SlotId(0), start + Duration::from_millis(11_500));
     assert_eq!(
         maker.silent_slot(start + Duration::from_secs(20), SILENCE_WINDOW),
         None,
         "both moved within the window; the session is not stalled",
     );
-}
-
-/// The other half of the late-turn case: the slot that delivered one turn
-/// and went quiet again is named once the session has sat still for a full
-/// window after that turn, and the survivor that answered it is not.
-#[test]
-fn a_slot_that_went_quiet_again_after_a_late_turn_is_named_after_a_full_window() {
-    let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
-    maker.note_forward_advance(SlotId(1), start + Duration::from_millis(11_300));
-    maker.note_forward_advance(SlotId(0), start + Duration::from_millis(11_500));
-
     assert_eq!(
         maker.silent_slot(start + Duration::from_millis(21_400), SILENCE_WINDOW),
         None,
@@ -138,23 +131,6 @@ fn a_session_that_stopped_together_names_nobody() {
 }
 
 #[test]
-fn a_slot_that_forwarded_nothing_blocks_the_verdict_while_it_is_not_a_candidate() {
-    // Slot 1's link died before it ever reported its game loop running, so
-    // this relay never learned whether it was simulating at all. Its drop is
-    // the ordinary path's business, and slot 0 — which forwarded until it
-    // starved waiting for slot 1 — is not the one to close for it.
-    let (mut maker, start) = silence_maker(&[0, 1], &[0]);
-    maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
-    assert!(maker.mark_connection_down(SlotId(1), Some(1)));
-
-    assert!(
-        maker
-            .silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW)
-            .is_none(),
-    );
-}
-
-#[test]
 fn an_expected_slot_this_relay_holds_no_state_for_blocks_every_verdict() {
     // Two clients replay into a resumed game and stall waiting for a third
     // that has not connected here yet. The participant holding lockstep up is
@@ -225,46 +201,11 @@ fn a_resumed_session_stands_the_watch_down() {
     }
 }
 
-#[test]
-fn a_slot_held_for_a_drop_counts_until_its_leave_is_decided_and_absorbed() {
-    // Slot 1 disconnected and its drop has not been decided, so the survivor
-    // is stalled behind an ordinary drop hold: slot 1 froze at the instant
-    // the stall began, and it is still what everyone is waiting on.
-    let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
-    drop_slot(&mut maker, 1);
-    assert!(
-        maker
-            .silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW)
-            .is_none(),
-        "a survivor waiting out a drop hold is not the one holding the game up",
-    );
-
-    // Deciding the leave does not by itself clear the survivor: the directive
-    // still has to reach it and be applied, so the departed slot stays in the
-    // comparison and keeps explaining the stall.
-    assert!(maker.decide_leave(SlotId(1), DROPPED).is_some());
-    maker
-        .decided_leave_at
-        .insert(SlotId(1), start + Duration::from_secs(20));
-    assert!(
-        maker
-            .silent_slot(start + Duration::from_secs(60), SILENCE_WINDOW)
-            .is_none(),
-    );
-
-    // Once the survivor steps again after the decision, the departed slot is
-    // retired for good — leaving the survivor alone, with nobody left to be
-    // earlier than.
-    maker.note_forward_advance(SlotId(0), start + Duration::from_secs(61));
-    assert!(
-        maker
-            .silent_slot(start + Duration::from_secs(90), SILENCE_WINDOW)
-            .is_none(),
-        "a lone slot cannot be holding anyone up",
-    );
-    assert!(maker.recovered_leaves.contains(&SlotId(1)));
-}
-
+/// A departed slot leaves the comparison only once every live survivor
+/// has stepped past its leave -- not when it disconnects, and not when the
+/// leave is decided. Until then it froze at the instant the stall began
+/// and it is still what everyone is waiting on, so a survivor waiting out
+/// an ordinary drop hold is never the one named.
 #[test]
 fn a_decided_leave_leaves_the_comparison_only_once_the_survivors_resume_past_it() {
     // Three players: slot 0 stops first, slots 1 and 2 stop a fraction later
@@ -278,7 +219,17 @@ fn a_decided_leave_leaves_the_comparison_only_once_the_survivors_resume_past_it(
     maker.note_forward_advance(SlotId(2), start + Duration::from_millis(1300));
 
     drop_slot(&mut maker, 0);
-    assert!(maker.decide_leave(SlotId(0), DROPPED).is_some());
+    assert!(
+        maker
+            .silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW)
+            .is_none(),
+        "a survivor waiting out an undecided drop hold is not holding the game up",
+    );
+    assert!(
+        maker
+            .decide_leave(SlotId(0), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
     let decided = start + Duration::from_secs(20);
     maker.decided_leave_at.insert(SlotId(0), decided);
 
@@ -321,6 +272,27 @@ fn a_decided_leave_leaves_the_comparison_only_once_the_survivors_resume_past_it(
             lead: Duration::from_secs(28),
         }),
     );
+
+    // Slot 1 goes the same way, and slot 2 steps past its leave too. Nobody
+    // is left for slot 2 to be later than, and a lone slot cannot be
+    // holding anyone up.
+    drop_slot(&mut maker, 1);
+    assert!(
+        maker
+            .decide_leave(SlotId(1), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
+    maker
+        .decided_leave_at
+        .insert(SlotId(1), decided + Duration::from_secs(41));
+    maker.note_forward_advance(SlotId(2), decided + Duration::from_secs(42));
+    assert!(
+        maker
+            .silent_slot(decided + Duration::from_secs(80), SILENCE_WINDOW)
+            .is_none(),
+        "a lone slot cannot be holding anyone up",
+    );
+    assert!(maker.recovered_leaves.contains(&SlotId(1)));
 }
 
 #[test]
@@ -329,14 +301,7 @@ fn a_peer_authored_leave_is_retained_until_the_survivor_resumes_past_it_too() {
     // arriving here decides the slot just as much, and starts the same
     // recovery bar for the survivors it left behind.
     let (mut maker, start) = stalled_session(&[0, 1], &[0, 1]);
-    assert!(maker.observe_leave(&LeaveDirective {
-        finalized: false,
-        slot: 1,
-        reason: DROPPED,
-        apply_at_frame: 113,
-        leave_seq: 4,
-        final_turn_count: None,
-    }));
+    assert!(maker.observe_leave(&leave(1, LEAVE_REASON_DROPPED, 113, 4)));
     assert!(
         maker.decided_leave_at.contains_key(&SlotId(1)),
         "a peer-authored leave is stamped like this relay's own",

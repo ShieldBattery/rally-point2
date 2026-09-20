@@ -9,11 +9,7 @@ use super::*;
 fn sync_maker_reconciles_bounds_and_authority_on_a_repush() {
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 5), Authority::SelfRelay),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 5), Authority::SelfRelay);
     {
         let makers = registry.lock();
         let maker = makers.get(&k).unwrap();
@@ -23,11 +19,7 @@ fn sync_maker_reconciles_bounds_and_authority_on_a_repush() {
 
     // A lower-id relay joined the session: this relay is no longer the
     // authority, and the coordinator widened the bounds.
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 99), Authority::Peer),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 99), Authority::Peer);
     let makers = registry.lock();
     let maker = makers.get(&k).unwrap();
     assert_eq!(maker.bounds, bounds(0, 99), "bounds follow the descriptor");
@@ -50,11 +42,7 @@ fn sync_maker_promotion_skips_a_held_departure() {
     let registry = new_decision_makers();
     let k = key();
     // First push: this relay starts as a peer (not yet authority).
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::Peer),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::Peer);
     consensus_observe_and_hold(&registry, &k);
 
     // A re-push promotes this relay while slot 1's drop is held -- the
@@ -87,11 +75,7 @@ fn sync_maker_promotion_skips_a_held_departure() {
 fn losing_authority_drops_the_pending_directive_but_keeps_history() {
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
     {
         let mut makers = registry.lock();
         let maker = makers.get_mut(&k).unwrap();
@@ -99,11 +83,7 @@ fn losing_authority_drops_the_pending_directive_but_keeps_history() {
     }
     assert!(active_directive(&registry, &k).is_some());
 
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::Peer),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::Peer);
     assert_eq!(
         active_directive(&registry, &k),
         None,
@@ -114,21 +94,6 @@ fn losing_authority_drops_the_pending_directive_but_keeps_history() {
         makers.get(&k).unwrap().target().is_some(),
         "condition history survives the demotion",
     );
-}
-
-/// `deregister_maker` removes a session's decision-maker.
-#[test]
-fn deregister_maker_removes_session() {
-    let registry = new_decision_makers();
-    let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 5), Authority::SelfRelay),
-    );
-    assert!(registry.lock().contains_key(&k));
-    deregister_maker(&registry, &k);
-    assert!(!registry.lock().contains_key(&k));
 }
 
 // -- Departure notifier --

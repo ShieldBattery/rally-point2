@@ -17,13 +17,7 @@ fn loss_memory_holds_the_target_through_clean_stretches_then_releases() {
         shrink_lookback_turns: 120,
         ..ControlLaw::default()
     };
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law,
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = tuned_maker(law);
     // Clean baseline: 150ms -> target 4, raise.
     ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
     // 50 of the next 100 packets lost: loss_risk = 0.5 * 150000 = 75000us
@@ -71,13 +65,7 @@ fn loss_memory_holds_the_target_through_clean_stretches_then_releases() {
 /// worse rather than their sum.
 #[test]
 fn a_full_blackout_prices_its_duration_into_the_target() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     // Clean baseline at 150ms: path 4 turns.
     ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
 
@@ -105,13 +93,7 @@ fn a_full_blackout_prices_its_duration_into_the_target() {
 /// permanently, while riding it out costs one brief stall.
 #[test]
 fn the_burst_term_is_capped() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 30),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 30));
     ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
     for step in 1..=10u32 {
         let moved = u64::from(step) * 10;
@@ -134,13 +116,7 @@ fn the_burst_term_is_capped() {
 /// shorter fade must not be punished harder.
 #[test]
 fn a_stall_spanning_gap_is_excluded_from_the_loss_windows() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     let start = Instant::now();
     let step = Duration::from_millis(42);
     // Clean flowing history at 150ms: path 4 turns, no loss.

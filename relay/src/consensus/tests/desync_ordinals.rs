@@ -2,42 +2,6 @@
 
 use super::*;
 
-fn tracker_record(
-    tracker: &mut SyncTracker,
-    slot: u8,
-    ordinal: u64,
-    kind: u8,
-    value: SyncValue,
-) -> Option<SyncDivergence> {
-    tracker.record(
-        &key(),
-        SlotId(slot),
-        ordinal,
-        SyncReport {
-            kind,
-            value,
-            game_frame: u32::try_from(ordinal).ok(),
-        },
-        None,
-        authority_margin(),
-    )
-}
-
-fn tracker_feed(
-    tracker: &mut SyncTracker,
-    slot: u8,
-    ordinal: u64,
-    value: SyncValue,
-) -> Option<SyncDivergence> {
-    tracker_record(
-        tracker,
-        slot,
-        ordinal,
-        expected_kind_for_ordinal(ordinal),
-        value,
-    )
-}
-
 #[test]
 fn first_huge_ordinal_anchors_the_reset_tracker_without_retiring_from_zero() {
     let mut tracker = SyncTracker::default();
@@ -94,22 +58,6 @@ fn a_late_older_report_is_dropped_without_corrupting_future_comparisons() {
             diverged: vec![SlotId(2)],
         }),
         "a later canonical interval still compares at its true ordinal",
-    );
-}
-
-#[test]
-fn malformed_kind_does_not_create_a_member_or_pending_report() {
-    let mut tracker = SyncTracker::default();
-    assert_eq!(
-        tracker_record(&mut tracker, 0, 7, 0xF, SYNC_A),
-        None,
-        "a malformed hash-kind is skipped",
-    );
-    assert!(tracker.members.is_empty());
-    assert!(tracker.pending.is_empty());
-    assert!(
-        !tracker.initialized,
-        "no ordinal anchor from malformed input"
     );
 }
 
@@ -190,7 +138,7 @@ fn multiple_sync_commands_in_one_turn_advance_the_ordinal_by_one() {
 #[test]
 fn a_one_turn_sync_flood_cannot_vault_the_eviction_window() {
     let mut m = authority_maker();
-    feed(&mut m, 1, 0, SYNC_A);
+    feed_auto_seq(&mut m, 1, 0, SYNC_A);
 
     let mut flood = Vec::new();
     for ring in 0..(SYNC_WINDOW as u8 + 4) {

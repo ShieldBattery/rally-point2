@@ -42,6 +42,113 @@ mod shrink;
 mod silence;
 mod target;
 
+/// The session shape almost every test here runs on: this relay decides,
+/// the bounds are wide enough that clamping never interferes, and no slot
+/// is an observer.
+fn maker() -> DecisionMaker {
+    maker_with(bounds(0, 20))
+}
+
+/// [`maker`], but this relay is not the authority: it ingests everything
+/// (so a promotion is instant) and decides nothing.
+fn peer_maker() -> DecisionMaker {
+    peer_maker_with(bounds(0, 20))
+}
+
+/// [`maker`] under buffer bounds the test picks — the clamp cases and the
+/// comparator's absurd-bounds backstop both key on them.
+fn maker_with(bounds: BufferBounds) -> DecisionMaker {
+    DecisionMaker::new(key(), bounds, law(), Authority::SelfRelay, HashSet::new())
+}
+
+/// [`peer_maker`] under buffer bounds the test picks.
+fn peer_maker_with(bounds: BufferBounds) -> DecisionMaker {
+    DecisionMaker::new(key(), bounds, law(), Authority::Peer, HashSet::new())
+}
+
+/// [`maker`] running a tuned control law. The mechanisms measured in
+/// hundreds of turns of lookback and dwell are the same at a scaled-down
+/// horizon, so a test that would otherwise loop through thousands of frames
+/// shrinks the law's windows instead and derives every frame threshold it
+/// asserts from the law's own fields.
+fn tuned_maker(law: ControlLaw) -> DecisionMaker {
+    DecisionMaker::new(
+        key(),
+        bounds(0, 20),
+        law,
+        Authority::SelfRelay,
+        HashSet::new(),
+    )
+}
+
+/// [`maker`] already holding a buffer of `depth`, standing in for a session
+/// the law has already raised — the starting point every lower is measured
+/// down from.
+fn maker_at_depth(depth: u32) -> DecisionMaker {
+    DecisionMaker {
+        buffer: BufferSize(depth),
+        ..maker()
+    }
+}
+
+/// A [`maker`] whose single slot has a clean 150 ms link established, plus
+/// the instant that link's history starts from and the per-sample step the
+/// gap tests advance by. The step is comfortably inside
+/// [`OUTAGE_GAP_MIN`], so a run of steps is ordinary cadence and only a
+/// deliberate jump opens a receive gap.
+fn flowing_link_at_150ms() -> (DecisionMaker, Instant, Duration) {
+    let mut maker = maker();
+    ingest_at(&mut maker, &conditions(0, 150_000, 0, 100), 1);
+    (maker, Instant::now(), Duration::from_millis(42))
+}
+
+/// A registry with the coordinator notice channel already installed, so a
+/// notice-firing test never has to care whether the notifier was set before
+/// or after the maker was created.
+fn notifying_registry() -> (
+    DecisionMakers,
+    tokio::sync::mpsc::UnboundedReceiver<RelayNotice>,
+) {
+    let registry = new_decision_makers();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    registry.set_notice_notifier(tx);
+    (registry, rx)
+}
+
+/// Creates or reconciles `key`'s maker with nothing but bounds and an
+/// authority verdict to say — no observers, no roster, no seeds.
+fn sync_default(
+    registry: &DecisionMakers,
+    key: &SessionKey,
+    bounds: BufferBounds,
+    authority: Authority,
+) -> Vec<LeaveDirective> {
+    sync_maker(registry, key, MakerSync::new(bounds, authority))
+}
+
+/// The departure a slot that stopped at `frame` leaves behind: a last frame
+/// to schedule the leave against and nothing else claimed.
+fn framed(frame: u32) -> DepartureStamps {
+    DepartureStamps {
+        last_frame: Some(GameFrameCount(frame)),
+        ..Default::default()
+    }
+}
+
+/// The leave directive a decide or a re-derivation is expected to produce:
+/// no final turn count, not finalized. Cases that care about either say so
+/// with struct update.
+fn leave(slot: u32, reason: u32, apply_at_frame: u32, leave_seq: u32) -> LeaveDirective {
+    LeaveDirective {
+        slot,
+        reason,
+        apply_at_frame,
+        leave_seq,
+        final_turn_count: None,
+        finalized: false,
+    }
+}
+
 fn key() -> SessionKey {
     SessionKey {
         tenant: TenantId::new("sb-test").unwrap(),
@@ -239,13 +346,7 @@ fn region_labels(labels: &[(u64, &str)]) -> Vec<RegionLabel> {
 /// Builds a maker holding the given relay → region labels on a session that
 /// has NOT started — the state a descriptor push alone leaves behind.
 fn maker_with_labels(labels: &[(u64, &str)]) -> DecisionMaker {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     assert_eq!(
         maker.set_region_labels(region_labels(labels)),
         None,
@@ -280,14 +381,7 @@ fn consensus_observe_and_hold(registry: &DecisionMakers, key: &SessionKey) {
     let mut makers = registry.lock();
     let maker = makers.get_mut(key).unwrap();
     maker.observe_frame(SlotId(0), GameFrameCount(40));
-    maker.record_departure(
-        SlotId(1),
-        DepartureStamps {
-            last_frame: Some(GameFrameCount(50)),
-            ..Default::default()
-        },
-        DROPPED,
-    );
+    maker.record_departure(SlotId(1), framed(50), LEAVE_REASON_DROPPED);
 }
 
 /// Unwraps the next queued notice as a departure, panicking on anything else.
@@ -321,8 +415,6 @@ fn recv_result(rx: &mut tokio::sync::mpsc::UnboundedReceiver<RelayNotice>) -> Re
     }
 }
 
-const DROPPED: u32 = 0x4000_0006;
-
 /// Feeds a run of framed turns for `slot`, one frame per turn (frame = 100 +
 /// seq), through the seq-aware production path that populates frame history.
 fn feed_turns(maker: &mut DecisionMaker, slot: u8, seqs: std::ops::RangeInclusive<u64>) {
@@ -347,10 +439,10 @@ fn home_decide_leave(maker: &mut DecisionMaker, slot: u8) -> LeaveDirective {
             reachable_frame: ceiling,
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     maker
-        .decide_leave(SlotId(slot), DROPPED)
+        .decide_leave(SlotId(slot), LEAVE_REASON_DROPPED)
         .expect("a leave is scheduled")
 }
 
@@ -407,15 +499,95 @@ fn feed_ring(
 /// Feeds one slot's sync command with the ring nibble its true ordinal
 /// expects (`ordinal % 16`) and the kind that ordinal's parity implies.
 /// The frame is a distinct-per-ordinal marker. Calls generate consecutive
-/// transport sequences; tests of network reordering must instead call
-/// `observe_sync` with explicit origin sequences.
-fn feed(
+/// transport sequences, so the maker sees an unbroken origin prefix; tests
+/// of network reordering want [`feed_at_seq`] instead.
+fn feed_auto_seq(
     maker: &mut DecisionMaker,
     slot: u8,
     ordinal: u8,
     value: SyncValue,
 ) -> Option<SyncDivergence> {
     feed_ring(maker, slot, ordinal % 16, value, 1000 + u32::from(ordinal))
+}
+
+/// Feeds one slot's checksum at an explicit origin transport sequence (the
+/// ordinal doubles as the seq), which is what lets a test deliver a run out
+/// of order or leave a hole in an origin's prefix. The checksum value is
+/// the ordinal itself, so equal ordinals are equal simulations.
+fn feed_at_seq(maker: &mut DecisionMaker, slot: u8, ordinal: u16) -> Option<SyncDivergence> {
+    maker.observe_sync(
+        SlotId(slot),
+        u64::from(ordinal),
+        Some(u32::from(ordinal)),
+        &sync_command(
+            (ordinal % 16) as u8,
+            expected_kind_for_ordinal(u64::from(ordinal)),
+            ordinal.to_le_bytes(),
+        ),
+    )
+}
+
+/// Feeds one slot's checksum with an explicit native generation alongside
+/// its transport sequence — what an enhanced client sends, and the only
+/// form that can express an omitted or repeated generation.
+fn feed_generation(
+    maker: &mut DecisionMaker,
+    slot: u8,
+    seq: u64,
+    generation: u64,
+    value: SyncValue,
+) -> Option<SyncDivergence> {
+    maker.observe_sync_with_generation(
+        SlotId(slot),
+        seq,
+        Some(seq as u32),
+        &sync_command(
+            (generation % 16) as u8,
+            expected_kind_for_ordinal(generation),
+            value,
+        ),
+        Some(generation),
+    )
+}
+
+/// Records one report straight into a bare [`SyncTracker`], bypassing the
+/// maker's command parsing and seq ordering — the tracker's own contract in
+/// isolation.
+fn tracker_record(
+    tracker: &mut SyncTracker,
+    slot: u8,
+    ordinal: u64,
+    kind: u8,
+    value: SyncValue,
+) -> Option<SyncDivergence> {
+    tracker.record(
+        &key(),
+        SlotId(slot),
+        ordinal,
+        SyncReport {
+            kind,
+            value,
+            game_frame: u32::try_from(ordinal).ok(),
+        },
+        None,
+        authority_margin(),
+    )
+}
+
+/// [`tracker_record`] with the kind an honest client sends for `ordinal`.
+fn tracker_feed(
+    tracker: &mut SyncTracker,
+    slot: u8,
+    ordinal: u64,
+    value: SyncValue,
+) -> Option<SyncDivergence> {
+    tracker_record(
+        tracker,
+        slot,
+        ordinal,
+        expected_kind_for_ordinal(ordinal),
+        value,
+    )
 }
 
 /// Advances `slot`'s ordinal from 0 up to (but not including) `through`,
@@ -434,7 +606,7 @@ fn advance(
 ) -> Option<SyncDivergence> {
     let mut divergence = None;
     for ordinal in 0..through {
-        if let Some(d) = feed(maker, slot, ordinal, value) {
+        if let Some(d) = feed_auto_seq(maker, slot, ordinal, value) {
             divergence = Some(d);
         }
     }
@@ -445,13 +617,7 @@ fn advance(
 /// so these tests exercise the comparator exactly as it runs with
 /// detection live.
 fn authority_maker() -> DecisionMaker {
-    DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    )
+    maker_with(bounds(0, 6))
 }
 
 /// The evaluation margin [`authority_maker`]'s bounds (`max = 6`) implies
@@ -481,13 +647,7 @@ fn initial_depth_maker(
     latency_hint_ms: Option<u32>,
     single_relay: bool,
 ) -> DecisionMaker {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(min, max),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(min, max));
     maker.set_expected_slots(expected.iter().map(|&s| SlotId(s)).collect());
     maker.set_session_shape(latency_hint_ms, single_relay);
     maker
@@ -527,13 +687,7 @@ fn silence_maker_with(
     homed: &[u8],
     started: &[u8],
 ) -> (DecisionMaker, Instant) {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     maker.mark_started();
     let start = maker
         .started_at
@@ -571,11 +725,8 @@ fn stalled_session(homed: &[u8], started: &[u8]) -> (DecisionMaker, Instant) {
 fn drop_slot(maker: &mut DecisionMaker, slot: u8) {
     assert!(maker.record_departure_for_epoch(
         SlotId(slot),
-        DepartureStamps {
-            last_frame: Some(GameFrameCount(112)),
-            ..Default::default()
-        },
-        DROPPED,
+        framed(112),
+        LEAVE_REASON_DROPPED,
         Some(1),
     ));
 }

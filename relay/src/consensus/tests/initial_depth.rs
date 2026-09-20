@@ -2,104 +2,116 @@
 
 use super::*;
 
-#[test]
-fn initial_depth_fully_observed_single_relay_uses_observed_and_ignores_the_hint() {
-    // Single-relay with every expected slot sampled is "fully observed": the
-    // observed target is the truth, and a (higher) stale hint is ignored.
-    let mut maker = initial_depth_maker(0, 20, &[0, 1], Some(200), true);
-    // Both slots at 150ms: target = ceil(150000/41666) = 4. Hint 200ms = 5.
-    maker.ingest_local(&multi_conditions(&[
-        (0, 150_000, 0, 100),
-        (1, 150_000, 0, 100),
-    ]));
-    assert!(drive_to_coverage(&mut maker, &[0, 1]), "coverage fires");
-    assert_eq!(maker.target(), Some(4), "the observed target");
-    assert_eq!(
-        maker.initial_buffer_turns(),
-        Some(4),
-        "fully observed uses the observed target, not the higher hint",
-    );
-    assert_eq!(maker.buffer(), BufferSize(4), "and adopts it as the buffer");
+/// A single-relay session expecting `expected`, already sitting at a depth
+/// wide enough that a lower has somewhere to go -- the state the RTT
+/// coverage gate has to justify before it may shrink.
+fn seeded_at_six(expected: &[u8]) -> DecisionMaker {
+    DecisionMaker {
+        buffer: BufferSize(6),
+        ..initial_depth_maker(0, 20, expected, None, true)
+    }
 }
 
+/// Sizing the seed depth, case by case. Each case builds a session with
+/// the given bounds, roster, latency hint and relay span, feeds it
+/// whatever conditions it has, and drives every expected slot to the
+/// coverage latch -- which is what computes the depth and adopts it.
 #[test]
-fn initial_depth_multi_relay_uses_max_of_observed_and_hint_plus_a_hop_cushion() {
-    // A multi-relay session's per-slot conditions never cross the mesh before
-    // the game starts, so it is never fully observed: it takes
-    // max(observed, hint) and adds a one-turn hop cushion.
-    let mut maker = initial_depth_maker(0, 20, &[0, 1], Some(200), false);
-    // Observed target 4 (both at 150ms); hint 200ms = 5; max = 5; +1 = 6.
-    maker.ingest_local(&multi_conditions(&[
-        (0, 150_000, 0, 100),
-        (1, 150_000, 0, 100),
-    ]));
-    assert!(drive_to_coverage(&mut maker, &[0, 1]));
-    assert_eq!(maker.target(), Some(4));
-    assert_eq!(
-        maker.initial_buffer_turns(),
-        Some(6),
-        "max(observed 4, hint 5) + a one-turn multi-relay hop cushion",
-    );
-    assert_eq!(maker.buffer(), BufferSize(6));
-}
+fn the_initial_depth_over_its_observation_hint_and_clamp_cases() {
+    struct Case {
+        label: &'static str,
+        bounds: (u32, u32),
+        hint_ms: Option<u32>,
+        single_relay: bool,
+        samples: &'static [(u8, u32, u64, u64)],
+        depth: u32,
+    }
 
-#[test]
-fn initial_depth_single_relay_unobserved_slot_uses_the_hint_without_a_cushion() {
-    // Single-relay but one expected slot never produced an RTT sample: not
-    // fully observed, so the hint is the fallback — and no hop cushion, since
-    // the session spans one relay.
-    let mut maker = initial_depth_maker(0, 20, &[0, 1], Some(300), true);
-    // Only slot 0 is sampled (150ms → observed 4). Slot 1 is present but never
-    // measured. Hint 300ms = ceil(300000/41666) = 8; max(4, 8) = 8, no cushion.
-    maker.ingest_local(&conditions(0, 150_000, 0, 100));
-    assert!(drive_to_coverage(&mut maker, &[0, 1]));
-    assert_eq!(
-        maker.initial_buffer_turns(),
-        Some(8),
-        "the hint covers the unobserved slot, with no multi-relay cushion",
-    );
-}
+    // Every case expects slots 0 and 1. A 150ms link observes a target of
+    // 4; a 200ms hint is 5 turns and a 300ms hint is 8.
+    let both_at_150ms: &[(u8, u32, u64, u64)] = &[(0, 150_000, 0, 100), (1, 150_000, 0, 100)];
+    let cases = [
+        Case {
+            label: "single-relay with every expected slot sampled is fully \
+                    observed: the observed target is the truth and a higher \
+                    stale hint is ignored",
+            bounds: (0, 20),
+            hint_ms: Some(200),
+            single_relay: true,
+            samples: both_at_150ms,
+            depth: 4,
+        },
+        Case {
+            label: "a multi-relay session's per-slot conditions never cross \
+                    the mesh before the game starts, so it is never fully \
+                    observed: max(observed 4, hint 5) plus a one-turn hop \
+                    cushion",
+            bounds: (0, 20),
+            hint_ms: Some(200),
+            single_relay: false,
+            samples: both_at_150ms,
+            depth: 6,
+        },
+        Case {
+            label: "single-relay with one expected slot never measured is \
+                    not fully observed either: the hint covers it, and there \
+                    is no hop cushion on one relay",
+            bounds: (0, 20),
+            hint_ms: Some(300),
+            single_relay: true,
+            samples: &[(0, 150_000, 0, 100)],
+            depth: 8,
+        },
+        Case {
+            label: "nothing observed and no hint: start at the tenant minimum",
+            bounds: (3, 20),
+            hint_ms: None,
+            single_relay: true,
+            samples: &[],
+            depth: 3,
+        },
+        Case {
+            label: "a huge observed target clamps down to the ceiling",
+            bounds: (1, 5),
+            hint_ms: None,
+            single_relay: true,
+            samples: &[(0, 2_000_000, 0, 100), (1, 2_000_000, 0, 100)],
+            depth: 5,
+        },
+        Case {
+            label: "a tiny observed target clamps up to the floor",
+            bounds: (6, 20),
+            hint_ms: None,
+            single_relay: true,
+            samples: &[(0, 10_000, 0, 100), (1, 10_000, 0, 100)],
+            depth: 6,
+        },
+    ];
 
-#[test]
-fn initial_depth_falls_back_to_bounds_min_with_no_conditions_and_no_hint() {
-    // Nothing observed and no hint: start at the tenant minimum (today's
-    // behavior).
-    let mut maker = initial_depth_maker(3, 20, &[0, 1], None, true);
-    assert!(drive_to_coverage(&mut maker, &[0, 1]));
-    assert_eq!(maker.target(), None, "no RTT observed");
-    assert_eq!(
-        maker.initial_buffer_turns(),
-        Some(3),
-        "falls back to the tenant minimum",
-    );
-    assert_eq!(maker.buffer(), BufferSize(3));
-}
-
-#[test]
-fn initial_depth_clamps_to_both_bounds() {
-    // Above the ceiling: a huge observed target clamps down to max.
-    let mut hi = initial_depth_maker(1, 5, &[0, 1], None, true);
-    hi.ingest_local(&multi_conditions(&[
-        (0, 2_000_000, 0, 100),
-        (1, 2_000_000, 0, 100),
-    ]));
-    assert!(drive_to_coverage(&mut hi, &[0, 1]));
-    assert_eq!(hi.initial_buffer_turns(), Some(5), "clamped to the ceiling");
-    assert_eq!(hi.buffer(), BufferSize(5));
-
-    // Below the floor: a tiny observed target clamps up to min.
-    let mut lo = initial_depth_maker(6, 20, &[0, 1], None, true);
-    lo.ingest_local(&multi_conditions(&[
-        (0, 10_000, 0, 100),
-        (1, 10_000, 0, 100),
-    ]));
-    assert!(drive_to_coverage(&mut lo, &[0, 1]));
-    assert_eq!(
-        lo.initial_buffer_turns(),
-        Some(6),
-        "clamped up to the floor"
-    );
-    assert_eq!(lo.buffer(), BufferSize(6));
+    for case in cases {
+        let (min, max) = case.bounds;
+        let mut maker = initial_depth_maker(min, max, &[0, 1], case.hint_ms, case.single_relay);
+        if !case.samples.is_empty() {
+            maker.ingest_local(&multi_conditions(case.samples));
+        }
+        assert!(
+            drive_to_coverage(&mut maker, &[0, 1]),
+            "coverage fires: {}",
+            case.label,
+        );
+        assert_eq!(
+            maker.initial_buffer_turns(),
+            Some(case.depth),
+            "{}",
+            case.label,
+        );
+        assert_eq!(
+            maker.buffer(),
+            BufferSize(case.depth),
+            "and adopts it as the buffer: {}",
+            case.label,
+        );
+    }
 }
 
 #[test]
@@ -152,14 +164,13 @@ fn a_relay_that_only_marks_started_sizes_no_depth() {
 fn a_peer_adopts_the_authoritys_stamped_depth() {
     // A peer adopts the authority's carried depth into its buffer and stores it
     // for its own re-pushes; the value is bounds-clamped defensively.
-    let mut peer = DecisionMaker::new(key(), bounds(1, 5), law(), Authority::Peer, HashSet::new());
+    let mut peer = peer_maker_with(bounds(1, 5));
     peer.adopt_session_start(Some(4));
     assert!(peer.is_started());
     assert_eq!(peer.initial_buffer_turns(), Some(4));
     assert_eq!(peer.buffer(), BufferSize(4));
 
-    let mut clamped =
-        DecisionMaker::new(key(), bounds(1, 5), law(), Authority::Peer, HashSet::new());
+    let mut clamped = peer_maker_with(bounds(1, 5));
     clamped.adopt_session_start(Some(99));
     assert_eq!(
         clamped.buffer(),
@@ -169,8 +180,7 @@ fn a_peer_adopts_the_authoritys_stamped_depth() {
 
     // A depth-less directive (an old authority, or a resumed re-push into a
     // running game) latches started but leaves the seed buffer untouched.
-    let mut peerless =
-        DecisionMaker::new(key(), bounds(1, 5), law(), Authority::Peer, HashSet::new());
+    let mut peerless = peer_maker_with(bounds(1, 5));
     peerless.adopt_session_start(None);
     assert!(peerless.is_started());
     assert_eq!(peerless.initial_buffer_turns(), None);
@@ -189,7 +199,7 @@ fn a_peer_adopts_the_authoritys_stamped_depth() {
 #[test]
 fn emitted_depths_are_capped_at_the_game_sync_safe_ceiling_regardless_of_bounds() {
     let deep = bounds(1, GAME_SYNC_SAFE_BUFFER_MAX + 10);
-    let mut m = DecisionMaker::new(key(), deep, law(), Authority::Peer, HashSet::new());
+    let mut m = peer_maker_with(deep);
     m.adopt_session_start(Some(GAME_SYNC_SAFE_BUFFER_MAX + 10));
     assert_eq!(
         m.initial_buffer_turns(),
@@ -204,10 +214,7 @@ fn incomplete_rtt_coverage_reaffirms_the_initial_depth_without_lowering() {
     // The first fast link is enough to compute a target, but slot 1 has not
     // reported an RTT. Keep the configured initial depth until that missing
     // link is represented in the control law.
-    let mut maker = DecisionMaker {
-        buffer: BufferSize(6),
-        ..initial_depth_maker(0, 20, &[0, 1], None, true)
-    };
+    let mut maker = seeded_at_six(&[0, 1]);
     maker.mark_started();
 
     let fast = conditions(0, 32_000, 0, 100);
@@ -231,10 +238,7 @@ fn incomplete_rtt_coverage_reaffirms_the_initial_depth_without_lowering() {
 
 #[test]
 fn complete_rtt_coverage_eventually_allows_a_lower() {
-    let mut maker = DecisionMaker {
-        buffer: BufferSize(6),
-        ..initial_depth_maker(0, 20, &[0, 1], None, true)
-    };
+    let mut maker = seeded_at_six(&[0, 1]);
     maker.mark_started();
 
     let fast = conditions(0, 32_000, 0, 100);
@@ -267,10 +271,7 @@ fn complete_rtt_coverage_eventually_allows_a_lower() {
 fn incomplete_rtt_coverage_still_raises_for_a_slow_observed_link() {
     // Slot 2 remains unsampled, but the measured slow slot must still raise
     // immediately; only speculative lowers wait for complete coverage.
-    let mut maker = DecisionMaker {
-        buffer: BufferSize(6),
-        ..initial_depth_maker(0, 20, &[0, 1, 2], None, true)
-    };
+    let mut maker = seeded_at_six(&[0, 1, 2]);
     maker.mark_started();
 
     assert_eq!(
@@ -296,11 +297,8 @@ fn incomplete_rtt_coverage_still_raises_for_a_slow_observed_link() {
 fn departed_expected_slot_does_not_block_a_lower() {
     // A departed member no longer contributes to the game, so its missing
     // RTT must not prevent the surviving slot's measured safe lower.
-    let mut maker = DecisionMaker {
-        buffer: BufferSize(6),
-        ..initial_depth_maker(0, 20, &[0, 1], None, true)
-    };
-    maker.record_departure(SlotId(1), DepartureStamps::default(), DROPPED);
+    let mut maker = seeded_at_six(&[0, 1]);
+    maker.record_departure(SlotId(1), DepartureStamps::default(), LEAVE_REASON_DROPPED);
     maker.mark_started();
 
     let lowered = ingest_at(&mut maker, &conditions(0, 32_000, 0, 100), 1)

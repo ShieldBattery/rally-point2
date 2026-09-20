@@ -2,48 +2,36 @@
 
 use super::*;
 
-/// The apply frame is one past the departing slot's last observed frame.
+/// The apply frame is one past the departing slot's own last observed
+/// frame, whether that frame leads the session or trails it — a stalled
+/// survivor's simulation pins at `last_frame + 1`, so scheduling from the
+/// survivors' frames would put the leave past a frame the stalled ones can
+/// reach. The trailing case is the one with teeth: with the departing slot
+/// ahead, reading the basis off the maximum would give the same answer.
 #[test]
-fn decide_leave_schedules_one_past_the_departed_slots_last_frame() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    // Two slots; the departing slot (1) is the furthest ahead.
+fn decide_leave_schedules_from_the_departed_slot_not_the_survivors() {
+    let mut maker = maker();
+    // The departing slot (1) is the furthest ahead.
     maker.observe_frame(SlotId(0), GameFrameCount(40));
     maker.observe_frame(SlotId(1), GameFrameCount(50));
-
     let d = maker
-        .decide_leave(SlotId(1), DROPPED)
+        .decide_leave(SlotId(1), LEAVE_REASON_DROPPED)
         .expect("a leave is scheduled");
     assert_eq!(d.slot, 1);
-    assert_eq!(d.reason, DROPPED);
+    assert_eq!(d.reason, LEAVE_REASON_DROPPED);
     assert_eq!(
         d.apply_at_frame, 51,
         "one past the departed slot's last frame"
     );
     assert_eq!(d.leave_seq, 1);
-}
 
-/// The departed slot's own last frame is the basis even when a fast survivor
-/// has stamped far ahead — a stalled survivor's simulation pins at
-/// `last_frame + 1`, so scheduling from the survivors' frames would put the
-/// leave past a frame the stalled ones can reach.
-#[test]
-fn decide_leave_schedules_from_the_departed_slot_not_the_survivors() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    maker.observe_frame(SlotId(0), GameFrameCount(80)); // a fast survivor
-    maker.observe_frame(SlotId(1), GameFrameCount(30)); // the departing slot, behind
-    let d = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+    // And with the departing slot behind a fast survivor.
+    let mut trailing = maker_with(bounds(0, 20));
+    trailing.observe_frame(SlotId(0), GameFrameCount(80)); // a fast survivor
+    trailing.observe_frame(SlotId(1), GameFrameCount(30)); // the departing slot, behind
+    let d = trailing
+        .decide_leave(SlotId(1), LEAVE_REASON_DROPPED)
+        .unwrap();
     assert_eq!(
         d.apply_at_frame, 31,
         "one past the departed slot's frame, not the survivor's"
@@ -53,30 +41,18 @@ fn decide_leave_schedules_from_the_departed_slot_not_the_survivors() {
 /// No framed turn observed anywhere (pre-game / lobby): nothing to schedule.
 #[test]
 fn decide_leave_holds_without_a_frame_basis() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
-    assert_eq!(maker.decide_leave(SlotId(1), DROPPED), None);
+    let mut maker = maker();
+    assert_eq!(maker.decide_leave(SlotId(1), LEAVE_REASON_DROPPED), None);
 }
 
 /// A slot that never produced a framed turn has no frame of its own; the
 /// session frame (the survivors' slowest) is the fallback basis.
 #[test]
 fn decide_leave_falls_back_to_the_session_frame_for_a_never_framed_slot() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 20),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker();
     maker.observe_frame(SlotId(0), GameFrameCount(40)); // a framed survivor
     // Slot 1 departs having never framed a turn.
-    let d = maker.decide_leave(SlotId(1), DROPPED).unwrap();
+    let d = maker.decide_leave(SlotId(1), LEAVE_REASON_DROPPED).unwrap();
     assert_eq!(d.apply_at_frame, 41, "one past the session frame fallback");
 }
 
@@ -91,13 +67,7 @@ fn decide_leave_falls_back_to_the_session_frame_for_a_never_framed_slot() {
 /// slot's frame stays at the high-water mark and later low stamps are quiet.
 #[test]
 fn a_stamp_below_the_high_water_mark_at_a_higher_seq_is_reported_once() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     assert_eq!(
         maker.observe_turn_frame(SlotId(2), 0, GameFrameCount(215)),
         None
@@ -128,13 +98,7 @@ fn a_stamp_below_the_high_water_mark_at_a_higher_seq_is_reported_once() {
 /// turn is just late.
 #[test]
 fn an_out_of_order_lower_seq_never_trips_the_tripwire() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     assert_eq!(
         maker.observe_turn_frame(SlotId(1), 5, GameFrameCount(105)),
         None
@@ -157,16 +121,7 @@ fn an_out_of_order_lower_seq_never_trips_the_tripwire() {
 fn a_frame_regression_is_recorded_as_a_flight_event() {
     let makers = new_decision_makers();
     let k = key();
-    makers.lock().insert(
-        k.clone(),
-        DecisionMaker::new(
-            k.clone(),
-            bounds(0, 6),
-            law(),
-            Authority::SelfRelay,
-            HashSet::new(),
-        ),
-    );
+    makers.lock().insert(k.clone(), maker_with(bounds(0, 6)));
     let home = crate::consensus::delivery::DeliveryHome::Local;
     observe_turn_frame(&makers, &k, SlotId(2), 0, GameFrameCount(126), home);
     observe_turn_frame(&makers, &k, SlotId(2), 1, GameFrameCount(0), home);
@@ -199,20 +154,13 @@ fn a_frame_regression_is_recorded_as_a_flight_event() {
 /// directive.
 #[test]
 fn a_decided_clean_leave_carries_the_home_authored_final_turn_count() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     maker.observe_frame(SlotId(1), GameFrameCount(115));
     maker.record_departure(
         SlotId(1),
         DepartureStamps {
-            last_frame: Some(GameFrameCount(115)),
             final_turn_count: Some(112),
-            ..Default::default()
+            ..framed(115)
         },
         LEAVE_REASON_LEFT,
     );
@@ -232,25 +180,18 @@ fn a_decided_clean_leave_carries_the_home_authored_final_turn_count() {
 /// consistently.
 #[test]
 fn a_decided_drop_strips_the_final_turn_count() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     maker.observe_frame(SlotId(1), GameFrameCount(115));
     maker.record_departure(
         SlotId(1),
         DepartureStamps {
-            last_frame: Some(GameFrameCount(115)),
             final_turn_count: Some(112),
-            ..Default::default()
+            ..framed(115)
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     let leave = maker
-        .decide_leave(SlotId(1), DROPPED)
+        .decide_leave(SlotId(1), LEAVE_REASON_DROPPED)
         .expect("a leave is scheduled");
     assert_eq!(leave.final_turn_count, None);
 }
@@ -262,21 +203,14 @@ fn a_decided_drop_strips_the_final_turn_count() {
 /// falls back to frame scheduling.
 #[test]
 fn a_resumed_session_stamps_no_count_on_new_leaves() {
-    let mut maker = DecisionMaker::new(
-        key(),
-        bounds(0, 6),
-        law(),
-        Authority::SelfRelay,
-        HashSet::new(),
-    );
+    let mut maker = maker_with(bounds(0, 6));
     maker.resumed = true;
     maker.observe_frame(SlotId(1), GameFrameCount(115));
     maker.record_departure(
         SlotId(1),
         DepartureStamps {
-            last_frame: Some(GameFrameCount(115)),
             final_turn_count: Some(112),
-            ..Default::default()
+            ..framed(115)
         },
         LEAVE_REASON_LEFT,
     );
@@ -292,11 +226,10 @@ fn a_resumed_session_stamps_no_count_on_new_leaves() {
 #[test]
 fn a_handoff_rederivation_reproduces_the_final_turn_count() {
     let stamps = DepartureStamps {
-        last_frame: Some(GameFrameCount(115)),
         final_turn_count: Some(112),
-        ..Default::default()
+        ..framed(115)
     };
-    let mut peer = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
+    let mut peer = peer_maker_with(bounds(0, 6));
     peer.observe_frame(SlotId(1), GameFrameCount(115));
     peer.record_departure(SlotId(1), stamps, LEAVE_REASON_LEFT);
     let (leaves, _fresh) = peer.set_authority(Authority::SelfRelay, &HashSet::new());
@@ -314,7 +247,7 @@ fn a_handoff_rederivation_reproduces_the_final_turn_count() {
 /// record stays count-less too.
 #[test]
 fn an_observed_leave_folds_its_final_turn_count_into_the_record() {
-    let mut maker = DecisionMaker::new(key(), bounds(0, 6), law(), Authority::Peer, HashSet::new());
+    let mut maker = peer_maker_with(bounds(0, 6));
     let directive = LeaveDirective {
         finalized: false,
         slot: 2,
@@ -331,7 +264,7 @@ fn an_observed_leave_folds_its_final_turn_count_into_the_record() {
 
     let dropped = LeaveDirective {
         slot: 3,
-        reason: DROPPED,
+        reason: LEAVE_REASON_DROPPED,
         leave_seq: 2,
         ..directive
     };

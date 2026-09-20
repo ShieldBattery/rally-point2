@@ -44,11 +44,7 @@ fn empty_expected_slots_never_fires_session_start() {
     // that predates it): no amount of presence triggers a directive.
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(1, 6), Authority::SelfRelay),
-    );
+    let _ = sync_default(&registry, &k, bounds(1, 6), Authority::SelfRelay);
     assert!(!note_slot_present(&registry, &k, SlotId(0)));
     assert!(!note_slot_present(&registry, &k, SlotId(1)));
     assert!(!session_started(&registry, &k));
@@ -106,7 +102,7 @@ fn a_departure_uncovers_a_not_yet_started_session() {
         &k,
         SlotId(0),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
     // Slot 1 arrives: coverage is still incomplete (slot 0 left), so no fire.
     assert!(!note_slot_present(&registry, &k, SlotId(1)));
@@ -144,7 +140,7 @@ fn mark_session_started_latches_without_firing() {
 /// first-hand for the same reason.
 #[test]
 fn a_peer_shared_start_report_is_recorded_without_a_coordinator_notice() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
     let _ = sync_maker(
         &registry,
@@ -154,8 +150,6 @@ fn a_peer_shared_start_report_is_recorded_without_a_coordinator_notice() {
             ..MakerSync::new(bounds(1, 6), Authority::Peer)
         },
     );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
 
     record_peer_slot_started(&registry, &k, SlotId(1));
     assert!(

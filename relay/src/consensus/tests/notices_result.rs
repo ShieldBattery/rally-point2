@@ -2,22 +2,23 @@
 
 use super::*;
 
-/// A slot's first end-of-game result fires exactly one result notice, stamped
-/// with the reporting slot, the opaque payload, and the relay's own frame
-/// view (the session's slowest-slot frame and the reporting slot's own newest
-/// frame). A second report from the same slot records nothing and fires no
-/// second notice — the one-report-per-slot dedup.
+/// A slot's first end-of-game result fires exactly one result notice,
+/// stamped with the reporting slot, the opaque payload, the relay's own
+/// frame view (the session's slowest-slot frame and the reporting slot's
+/// own newest frame), and the session's correlation ids — the same ids a
+/// departure notice carries, so a result is self-describing across a
+/// coordinator restart. A second report from the same slot records nothing
+/// and fires no second notice — the one-report-per-slot dedup.
 #[test]
 fn record_result_fires_one_notice_per_slot() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
-    let _ = sync_maker(
-        &registry,
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+    registry.set_session_refs(
         &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
+        Some("game-3".to_owned()),
+        HashMap::from([(SlotId(1), "sb-user-5".to_owned())]),
     );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
 
     // Framed turns give the notice a session/slot frame basis: the session
     // coordinate is the slowest slot's frame (40), the reporting slot's own
@@ -38,6 +39,8 @@ fn record_result_fires_one_notice_per_slot() {
         "the reporting slot's own frame"
     );
     assert!(notice.arrival_ms > 0, "a wall-clock arrival stamp is set");
+    assert_eq!(notice.external_id, Some("game-3".to_owned()));
+    assert_eq!(notice.external_ref, Some("sb-user-5".to_owned()));
     assert!(rx.try_recv().is_err(), "just the one");
 
     // A second report from the same slot records nothing (first-writer-wins)
@@ -49,93 +52,40 @@ fn record_result_fires_one_notice_per_slot() {
     );
 }
 
-/// A result notice stamps the session's correlation ids the same way a
-/// departure does, so it is self-describing across a coordinator restart.
-#[test]
-fn record_result_stamps_session_refs_into_the_notice() {
-    let registry = new_decision_makers();
-    let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
-
-    registry.set_session_refs(
-        &k,
-        Some("game-3".to_owned()),
-        HashMap::from([(SlotId(1), "sb-user-5".to_owned())]),
-    );
-
-    record_result(&registry, &k, SlotId(1), vec![0x01]);
-    let notice = recv_result(&mut rx);
-    assert_eq!(notice.external_id, Some("game-3".to_owned()));
-    assert_eq!(notice.external_ref, Some("sb-user-5".to_owned()));
-}
-
 /// A result for a session this relay does not serve (no maker) records
 /// nothing and fires no notice, rather than erroring.
 #[test]
 fn record_result_on_a_relay_without_a_maker_is_a_no_op() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
 
     record_result(&registry, &k, SlotId(0), vec![0x01]);
     assert!(rx.try_recv().is_err(), "no maker, so no notice");
 }
 
-/// An empty payload is the wire sentinel `SlotDeparted` uses for "no result
-/// reported" -- see `wire.proto` -- so a real report can never be zero
-/// bytes. `record_result` rejects it: nothing is retained and no notice
-/// fires, the same outcome as a duplicate report.
+/// An ill-formed payload is rejected at the reporting ingress: nothing is
+/// retained and no notice fires, the same outcome as a duplicate report.
+/// Empty is the wire sentinel `SlotDeparted` uses for "no result reported"
+/// -- see `wire.proto` -- so a real report can never be zero bytes, and a
+/// payload over [`MAX_GAME_RESULT_PAYLOAD_LEN`] is past what a report may
+/// carry at all.
 #[test]
-fn record_result_rejects_an_empty_payload() {
-    let registry = new_decision_makers();
-    let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
+fn record_result_rejects_an_ill_formed_payload() {
+    for (label, payload) in [
+        ("empty", Vec::new()),
+        ("oversize", vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN + 1]),
+    ] {
+        let (registry, mut rx) = notifying_registry();
+        let k = key();
+        let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
-    record_result(&registry, &k, SlotId(0), Vec::new());
-    assert!(rx.try_recv().is_err(), "an empty payload fires no notice");
-    assert!(
-        result_for(&registry, &k, SlotId(0)).is_none(),
-        "an empty payload is never retained",
-    );
-}
-
-/// A payload over [`MAX_GAME_RESULT_PAYLOAD_LEN`] is an ill-formed report.
-/// `record_result` rejects it the same way as an empty one.
-#[test]
-fn record_result_rejects_an_oversize_payload() {
-    let registry = new_decision_makers();
-    let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
-
-    let oversize = vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN + 1];
-    record_result(&registry, &k, SlotId(0), oversize);
-    assert!(
-        rx.try_recv().is_err(),
-        "an oversize payload fires no notice"
-    );
-    assert!(
-        result_for(&registry, &k, SlotId(0)).is_none(),
-        "an oversize payload is never retained",
-    );
+        record_result(&registry, &k, SlotId(0), payload);
+        assert!(rx.try_recv().is_err(), "an {label} payload fires no notice");
+        assert!(
+            result_for(&registry, &k, SlotId(0)).is_none(),
+            "an {label} payload is never retained",
+        );
+    }
 }
 
 /// A peer relay's `SlotDeparted` can carry a payload up to the control
@@ -147,15 +97,9 @@ fn record_result_rejects_an_oversize_payload() {
 /// embeds `None` rather than the oversize payload.
 #[test]
 fn record_departure_rejects_an_oversize_mesh_folded_result() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
 
@@ -174,10 +118,10 @@ fn record_departure_rejects_an_oversize_mesh_folded_result() {
             result: Some(folded),
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
 
-    assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
     let departure = recv_departure(&mut rx);
     assert!(
         departure.result.is_none(),
@@ -192,15 +136,9 @@ fn record_departure_rejects_an_oversize_mesh_folded_result() {
 /// departure record with.
 #[test]
 fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
     observe_frame(&registry, &k, SlotId(1), GameFrameCount(52));
@@ -223,9 +161,9 @@ fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
             result: Some(retained),
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
-    assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
 
     let departure = recv_departure(&mut rx);
     let embedded = departure.result.expect("the departure carries the result");
@@ -239,18 +177,12 @@ fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
 /// `None` is the proof there provably never was one.
 #[test]
 fn a_departure_without_a_reported_result_embeds_none() {
-    let registry = new_decision_makers();
+    let (registry, mut rx) = notifying_registry();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
-    );
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_notice_notifier(tx);
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-    assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
+    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
 
     let departure = recv_departure(&mut rx);
     assert!(
@@ -267,11 +199,7 @@ fn a_departure_without_a_reported_result_embeds_none() {
 fn an_embedded_result_folds_first_non_none_wins() {
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
-        &k,
-        MakerSync::new(bounds(0, 20), Authority::Peer),
-    );
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::Peer);
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
 
     // A peer's `SlotDeparted` carries the home-authored result first.
@@ -290,7 +218,7 @@ fn an_embedded_result_folds_first_non_none_wins() {
             result: Some(first.clone()),
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
 
     // A later re-announce carrying a *different* result must not overwrite it.
@@ -309,7 +237,7 @@ fn an_embedded_result_folds_first_non_none_wins() {
             result: Some(second),
             ..Default::default()
         },
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
 
     // A `None`-carrying re-record (the home's own `decide_leave`) preserves it.
@@ -318,7 +246,7 @@ fn an_embedded_result_folds_first_non_none_wins() {
         &k,
         SlotId(1),
         DepartureStamps::default(),
-        DROPPED,
+        LEAVE_REASON_DROPPED,
     );
 
     let kept = registry
