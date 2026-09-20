@@ -20,10 +20,11 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use rally_point_proto::control::SessionResponse;
+use rally_point_proto::request_auth::{SIGNATURE_HEADER, TIMESTAMP_HEADER};
 use ring::signature::Ed25519KeyPair;
 use serde::Deserialize;
 
-use crate::signing::{self, SIGNATURE_HEADER, TIMESTAMP_HEADER};
+use crate::signing;
 
 /// The path a session create is signed for and sent to.
 const SESSION_CREATE_PATH: &str = "/session/create";

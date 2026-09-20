@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION};
 use rally_point_proto::control::TenantId;
+use rally_point_proto::request_auth;
 use ring::signature::{ED25519, UnparsedPublicKey};
 
 use crate::session::SessionSetup;
@@ -54,46 +55,28 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-/// The domain-separation prefix on a tenant request signature, the mirror of
-/// the webhook's `rp2-webhook-v1:`. Binds a signature to the request-auth
-/// scheme so it can never be confused with a webhook signature (opposite
-/// direction) or a player-token signature made by a different key.
-const REQUEST_SIG_DOMAIN: &str = "rp2-request-v1:";
 /// Header carrying the request signing timestamp: unix epoch *seconds*, decimal
 /// (the webhook direction uses milliseconds; these are independent schemes).
-pub(super) const REQUEST_TIMESTAMP_HEADER: &str = "x-rp2-timestamp";
+pub(super) const REQUEST_TIMESTAMP_HEADER: &str = request_auth::TIMESTAMP_HEADER;
 /// Header carrying the Ed25519 request signature: lowercase hex of the 64-byte
 /// signature over the domain-separated, method+path-bound, timestamped message.
-pub(super) const REQUEST_SIGNATURE_HEADER: &str = "x-rp2-signature";
+pub(super) const REQUEST_SIGNATURE_HEADER: &str = request_auth::SIGNATURE_HEADER;
 /// How far a request's `x-rp2-timestamp` may drift from now (in either
 /// direction) before it is rejected as stale/replayed. Matches the consumer
 /// window the app server enforces on webhook timestamps.
 pub(super) const REQUEST_TIMESTAMP_WINDOW_SECS: u64 = 5 * 60;
 
-/// The bytes a tenant request signature covers: `rp2-request-v1:<ts>:<METHOD>:
-/// <path>:<raw body>`. The method (uppercased — `Method::as_str` already yields
-/// the canonical uppercase form for standard methods) and the path-as-sent are
-/// bound in so a captured, validly-signed body cannot be replayed against a
-/// different endpoint or verb.
+/// The bytes a tenant request signature covers, in the shared layout every
+/// signer builds: `rp2-request-v1:<ts>:<METHOD>:<path>:<raw body>`.
+/// `Method::as_str` already yields the canonical uppercase form for standard
+/// methods, which is what the signer binds in.
 pub(super) fn build_request_message(
     timestamp: &str,
     method: &Method,
     path: &str,
     body: &[u8],
 ) -> Vec<u8> {
-    let method = method.as_str();
-    let mut message = Vec::with_capacity(
-        REQUEST_SIG_DOMAIN.len() + timestamp.len() + method.len() + path.len() + body.len() + 3,
-    );
-    message.extend_from_slice(REQUEST_SIG_DOMAIN.as_bytes());
-    message.extend_from_slice(timestamp.as_bytes());
-    message.push(b':');
-    message.extend_from_slice(method.as_bytes());
-    message.push(b':');
-    message.extend_from_slice(path.as_bytes());
-    message.push(b':');
-    message.extend_from_slice(body);
-    message
+    request_auth::request_message(timestamp, method.as_str(), path, body)
 }
 
 /// The least tenant state a tenant-authenticated endpoint accepts, passed to
