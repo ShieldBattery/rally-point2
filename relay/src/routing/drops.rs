@@ -15,17 +15,67 @@ fn elapsed_ms(elapsed: std::time::Duration) -> u64 {
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Samples rejection diagnostics independently of admission. All reasons and
+/// targets share the authenticated requester's budget, so cycling invalid
+/// targets cannot flood logs or rapidly evict the flight recorder's history.
+fn record_drop_rejection(
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+    requester: SlotId,
+    target: u32,
+    reason: DropRequestRejectionReason,
+) {
+    if !mesh
+        .session
+        .drop_holds
+        .admit_rejection_diagnostic(key, requester)
+    {
+        return;
+    }
+    mesh.session.decision_makers.flight_recorder().record(
+        key,
+        FlightEvent::DropRequestRejected {
+            requester: requester.0,
+            target,
+            reason,
+        },
+    );
+    let message = match reason {
+        DropRequestRejectionReason::OutOfRange => {
+            "ignoring drop request for a slot id out of range"
+        }
+        DropRequestRejectionReason::SelfTarget => {
+            "ignoring drop request that names its own requester"
+        }
+        DropRequestRejectionReason::NotDisconnected => {
+            "ignoring drop request for a slot that is not disconnected"
+        }
+        DropRequestRejectionReason::RateCapped => {
+            "dropping drop request; requester exceeded its request rate cap"
+        }
+    };
+    tracing::info!(
+        tenant = key.tenant.as_ref(),
+        session = key.session.0,
+        slot = requester.0,
+        requester = requester.0,
+        target,
+        ?reason,
+        "{message}",
+    );
+}
+
 /// Validates and acts on a client's manual `RequestDrop` at the relay's client
 /// edge. `requester` is the authenticated connection's slot (never a wire value);
 /// `wire_target` is the slot the requester asked to drop.
 ///
 /// Rejects without a client response or link close, because a mis-click must not
-/// disconnect the survivor who made it. Each rejection records an info log and
-/// a flight event. Requests are rejected when the target is out of range, names
-/// the requester, or is neither held nor departed, or when the requester exceeds
-/// its rate cap. A valid request is honored locally (this relay may be the
-/// authority; see [`honor_drop_request`]) and broadcast to every peer so a
-/// peer-homed authority honors it too.
+/// disconnect the survivor who made it. Rejection logs and flight events share
+/// a separate diagnostic rate cap. Requests are rejected when the target is out
+/// of range, names the requester, or is neither held nor departed, or when the
+/// requester exceeds its rate cap. A valid request is honored locally (this relay
+/// may be the authority; see [`honor_drop_request`]) and broadcast to every peer
+/// so a peer-homed authority honors it too.
 pub(super) fn handle_drop_request(
     sessions: &Sessions,
     mesh: &crate::mesh::MeshState,
@@ -37,37 +87,22 @@ pub(super) fn handle_drop_request(
     let decision_makers = &mesh.session.decision_makers;
     let mesh_links = &mesh.links;
     let Ok(target) = u8::try_from(wire_target).map(SlotId) else {
-        decision_makers.flight_recorder().record(
+        record_drop_rejection(
+            mesh,
             key,
-            FlightEvent::DropRequestRejected {
-                requester: requester.0,
-                target: wire_target,
-                reason: DropRequestRejectionReason::OutOfRange,
-            },
-        );
-        tracing::info!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            requester = requester.0,
-            target = wire_target,
-            "ignoring drop request for a slot id out of range",
+            requester,
+            wire_target,
+            DropRequestRejectionReason::OutOfRange,
         );
         return;
     };
     if target == requester {
-        decision_makers.flight_recorder().record(
+        record_drop_rejection(
+            mesh,
             key,
-            FlightEvent::DropRequestRejected {
-                requester: requester.0,
-                target: wire_target,
-                reason: DropRequestRejectionReason::SelfTarget,
-            },
-        );
-        tracing::info!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            slot = requester.0,
-            "ignoring drop request that names its own requester",
+            requester,
+            wire_target,
+            DropRequestRejectionReason::SelfTarget,
         );
         return;
     }
@@ -76,20 +111,12 @@ pub(super) fn handle_drop_request(
     // relay sees as neither held nor departed is nonsense (a stale or hostile
     // client), so drop it before spending a mesh broadcast on it.
     if !drop_holds.is_pending(key, target) && !decision_makers.has_departure(key, target) {
-        decision_makers.flight_recorder().record(
+        record_drop_rejection(
+            mesh,
             key,
-            FlightEvent::DropRequestRejected {
-                requester: requester.0,
-                target: wire_target,
-                reason: DropRequestRejectionReason::NotDisconnected,
-            },
-        );
-        tracing::info!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            requester = requester.0,
-            target = target.0,
-            "ignoring drop request for a slot that is not disconnected",
+            requester,
+            wire_target,
+            DropRequestRejectionReason::NotDisconnected,
         );
         return;
     }
@@ -97,20 +124,12 @@ pub(super) fn handle_drop_request(
     // the mesh with request broadcasts. Over-limit requests are dropped silently —
     // never a link close.
     if !drop_holds.admit_request(key, requester) {
-        decision_makers.flight_recorder().record(
+        record_drop_rejection(
+            mesh,
             key,
-            FlightEvent::DropRequestRejected {
-                requester: requester.0,
-                target: wire_target,
-                reason: DropRequestRejectionReason::RateCapped,
-            },
-        );
-        tracing::info!(
-            tenant = key.tenant.as_ref(),
-            session = key.session.0,
-            requester = requester.0,
-            target = target.0,
-            "dropping drop request; requester exceeded its request rate cap",
+            requester,
+            wire_target,
+            DropRequestRejectionReason::RateCapped,
         );
         return;
     }

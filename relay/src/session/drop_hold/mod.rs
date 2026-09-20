@@ -87,9 +87,9 @@ use crate::rate_limit::TokenBucket;
 /// undecided drop; the instant is the basis for [`DropHolds::held_for`].
 type Holds = Arc<Mutex<HashMap<(SessionKey, SlotId), Instant>>>;
 
-/// The map of per-requester drop-request rate limiters, keyed by the session and
-/// the requesting slot. Kept separate from [`Holds`] because it is keyed by *who
-/// asked*, not *who dropped*.
+/// The map of per-requester token buckets, keyed by the session and the requesting
+/// slot. Kept separate from [`Holds`] because it is keyed by *who asked*, not *who
+/// dropped*.
 type RequestLimiters = Arc<Mutex<HashMap<(SessionKey, SlotId), TokenBucket>>>;
 
 /// The map of live abandoned-session timers: one per session that has gone empty
@@ -179,6 +179,10 @@ pub struct DropHolds {
     holds: Holds,
     /// Per-requester token buckets for the drop-request rate cap.
     limiters: RequestLimiters,
+    /// Per-requester token buckets for rejection diagnostics. This is deliberately
+    /// separate from `limiters`: suppressing repeated explanations must never
+    /// change whether a `RequestDrop` itself is admitted.
+    rejection_limiters: RequestLimiters,
     /// Live abandoned-session timers, one per fully-empty session that still has an
     /// undecided departure. Deliberately kept out of [`end_session`](Self::end_session)'s
     /// sweep: a timer arms exactly when this relay's last local slot leaves, so the
@@ -217,6 +221,7 @@ impl DropHolds {
         Self {
             holds: Arc::new(Mutex::new(HashMap::new())),
             limiters: Arc::new(Mutex::new(HashMap::new())),
+            rejection_limiters: Arc::new(Mutex::new(HashMap::new())),
             abandon_timers: Arc::new(Mutex::new(HashMap::new())),
             unlock,
             abandon_timeout,
@@ -226,10 +231,12 @@ impl DropHolds {
         }
     }
 
-    /// The same registry with a different drop-request rate cap. Only the
-    /// buckets built after this call see the new numbers, so it is meant to be
-    /// chained onto [`new`](Self::new) before any request is admitted — a test
-    /// naming a cap it can exercise in full rather than the production one.
+    /// The same registry with a different per-requester rate cap. Both the
+    /// request-admission and rejection-diagnostic buckets built after this call
+    /// use these numbers, but they keep independent maps and creation instants.
+    /// It is meant to be chained onto [`new`](Self::new) before any request is
+    /// admitted — a test naming a cap it can exercise in full rather than the
+    /// production one.
     #[must_use]
     pub fn with_request_rate(self, burst: u32, refill_interval: Duration) -> Self {
         Self {
@@ -420,6 +427,32 @@ impl DropHolds {
             .try_take()
     }
 
+    /// Charges the independent diagnostic budget for a rejected request. Callers
+    /// use this only after choosing to emit a rejection diagnostic; the budget is
+    /// shared by every rejection reason and target for this requester in this
+    /// session, while request admission continues to use [`admit_request`](Self::admit_request).
+    pub(crate) fn admit_rejection_diagnostic(&self, key: &SessionKey, requester: SlotId) -> bool {
+        self.admit_rejection_diagnostic_at(key, requester, Instant::now())
+    }
+
+    /// [`admit_rejection_diagnostic`](Self::admit_rejection_diagnostic) evaluated
+    /// at `now`, so the entire registry-level bucket lifecycle can be tested on a
+    /// synthetic monotonic timeline without sleeping.
+    fn admit_rejection_diagnostic_at(
+        &self,
+        key: &SessionKey,
+        requester: SlotId,
+        now: Instant,
+    ) -> bool {
+        self.rejection_limiters
+            .lock()
+            .entry((key.clone(), requester))
+            .or_insert_with(|| {
+                TokenBucket::new_at(self.request_burst, self.request_refill_interval, now)
+            })
+            .try_take_at(now)
+    }
+
     /// Arms an abandoned-session timer for `key`: after `abandon_timeout`, `on_expire`
     /// runs — unless [`cancel_abandon`](Self::cancel_abandon) removed it first (a slot
     /// re-registered). Idempotent per session: if a timer is already running, the
@@ -578,6 +611,9 @@ impl DropHolds {
         self.limiters
             .lock()
             .retain(|(limiter_key, _), _| limiter_key != key);
+        self.rejection_limiters
+            .lock()
+            .retain(|(limiter_key, _), _| limiter_key != key);
     }
 
     /// Drops every hold and limiter for `key` unconditionally — the *terminal*
@@ -595,6 +631,9 @@ impl DropHolds {
     pub fn end_session_terminal(&self, key: &SessionKey) {
         self.holds.lock().retain(|(hold_key, _), _| hold_key != key);
         self.limiters
+            .lock()
+            .retain(|(limiter_key, _), _| limiter_key != key);
+        self.rejection_limiters
             .lock()
             .retain(|(limiter_key, _), _| limiter_key != key);
     }

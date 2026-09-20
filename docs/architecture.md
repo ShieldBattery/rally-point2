@@ -933,6 +933,13 @@ rather than the network. It **observes only**: no decision logic reads it,
 the per-turn hot path bumps pre-fetched atomics (never a lock), and the rings are size-capped with
 oldest-first eviction plus a drop counter, so a flushed blob says exactly what it lost.
 
+Client-edge drop-request rejection diagnostics have their own per-session, per-requester token
+budget: two immediate events, then one token replenished every two seconds, shared across all targets
+and rejection reasons. It gates both the flight event and its log line; excess rejections are omitted.
+The admission budget is independent, so invalid requests cannot consume a legitimate Drop click's
+allowance, and exhausting admission tokens alone does not suppress a rate-cap rejection diagnostic.
+Both budgets are local to the relay and cleared with the session's requester state.
+
 A successful leave- or connectivity-control write means the local QUIC stream accepted the complete
 frame. It does not claim the client read the frame or that the native game applied it; those later
 boundaries are recorded by the game DLL. Together with the authority decision and peer-acceptance

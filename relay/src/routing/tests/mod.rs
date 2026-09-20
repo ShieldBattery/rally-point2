@@ -18,6 +18,7 @@ use super::registry::deregister;
 use super::slot_link::{end_slot_link, should_sample_active_conditions};
 
 mod abandoned;
+mod drop_diagnostics;
 mod drop_holds;
 mod finalized_drops;
 mod forward_queue;

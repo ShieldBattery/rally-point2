@@ -4,10 +4,20 @@
 //! drop-request rate cap.
 
 use super::*;
+use rally_point_proto::control::TenantId;
+use rally_point_proto::ids::SessionId;
+
 use crate::test_support::session_key as key_of;
 
 fn key() -> SessionKey {
     key_of(1)
+}
+
+fn same_session_in_other_tenant() -> SessionKey {
+    SessionKey {
+        tenant: TenantId::new("other-test").unwrap(),
+        session: SessionId(1),
+    }
 }
 
 /// The expired-timer identity check: an old timer whose cancellation landed
@@ -290,4 +300,147 @@ fn each_requester_has_its_own_budget() {
     assert!(!holds.admit_request(&key(), SlotId(2)));
     // A different requester still has its full burst — the cap is per-slot.
     assert!(holds.admit_request(&key(), SlotId(5)));
+}
+
+#[test]
+fn rejection_diagnostics_have_a_deterministic_burst_and_refill() {
+    let interval = Duration::from_secs(2);
+    let holds =
+        DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT).with_request_rate(2, interval);
+    let requester = SlotId(2);
+    let start = Instant::now();
+
+    assert!(holds.admit_rejection_diagnostic_at(&key(), requester, start));
+    assert!(holds.admit_rejection_diagnostic_at(&key(), requester, start));
+    assert!(
+        !holds.admit_rejection_diagnostic_at(&key(), requester, start),
+        "the diagnostic burst is exhausted",
+    );
+    assert!(
+        !holds.admit_rejection_diagnostic_at(
+            &key(),
+            requester,
+            start + interval - Duration::from_millis(1),
+        ),
+        "a diagnostic token is not available before its refill interval",
+    );
+    assert!(
+        holds.admit_rejection_diagnostic_at(&key(), requester, start + interval),
+        "one elapsed interval refills one diagnostic token",
+    );
+    assert!(
+        holds.admit_rejection_diagnostic_at(&key(), requester, start + interval * 3),
+        "idle time refills only up to the same burst cap",
+    );
+    assert!(
+        holds.admit_rejection_diagnostic_at(&key(), requester, start + interval * 3),
+        "the burst cap allows its second recovered token",
+    );
+    assert!(
+        !holds.admit_rejection_diagnostic_at(&key(), requester, start + interval * 3),
+        "refill recovery remains capped at the configured burst",
+    );
+}
+
+#[test]
+fn rejection_diagnostics_are_independent_by_requester_and_session_key() {
+    let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT)
+        .with_request_rate(1, Duration::from_secs(2));
+    let requester = SlotId(2);
+    let start = Instant::now();
+    let other_session = key_of(2);
+    let other_tenant = same_session_in_other_tenant();
+
+    assert!(holds.admit_rejection_diagnostic_at(&key(), requester, start));
+    assert!(
+        !holds.admit_rejection_diagnostic_at(&key(), requester, start),
+        "one requester exhausts only that session's diagnostic budget",
+    );
+    assert!(
+        holds.admit_rejection_diagnostic_at(&key(), SlotId(5), start),
+        "another requester keeps a separate budget",
+    );
+    assert!(
+        holds.admit_rejection_diagnostic_at(&other_session, requester, start),
+        "another session keeps a separate budget",
+    );
+    assert!(
+        holds.admit_rejection_diagnostic_at(&other_tenant, requester, start),
+        "the same session id in another tenant keeps a separate budget",
+    );
+}
+
+#[test]
+fn request_admission_and_rejection_diagnostics_do_not_charge_each_other() {
+    let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT)
+        .with_request_rate(1, Duration::from_secs(2));
+    let start = Instant::now();
+
+    assert!(holds.admit_rejection_diagnostic_at(&key(), SlotId(2), start));
+    assert!(
+        !holds.admit_rejection_diagnostic_at(&key(), SlotId(2), start),
+        "the diagnostic budget is spent",
+    );
+    assert!(
+        holds.admit_request(&key(), SlotId(2)),
+        "a spent diagnostic budget does not reject a request",
+    );
+
+    assert!(
+        holds.admit_request(&key(), SlotId(5)),
+        "a fresh requester can spend an admission token",
+    );
+    assert!(
+        !holds.admit_request(&key(), SlotId(5)),
+        "the request admission budget is now spent",
+    );
+    assert!(
+        holds.admit_rejection_diagnostic_at(&key(), SlotId(5), start),
+        "a spent admission budget does not suppress its rejection diagnostic",
+    );
+}
+
+#[test]
+fn cloned_registries_share_rejection_diagnostic_budgets() {
+    let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT)
+        .with_request_rate(1, Duration::from_secs(2));
+    let clone = holds.clone();
+    let start = Instant::now();
+
+    assert!(holds.admit_rejection_diagnostic_at(&key(), SlotId(2), start));
+    assert!(
+        !clone.admit_rejection_diagnostic_at(&key(), SlotId(2), start),
+        "clones share the same diagnostic limiter map",
+    );
+}
+
+#[test]
+fn session_cleanup_removes_only_that_sessions_rejection_diagnostics() {
+    let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT)
+        .with_request_rate(1, Duration::from_secs(2));
+    let current = key();
+    let other = key_of(2);
+    let start = Instant::now();
+
+    assert!(holds.admit_rejection_diagnostic_at(&current, SlotId(2), start));
+    assert!(holds.admit_rejection_diagnostic_at(&other, SlotId(2), start));
+    holds.end_session(&current, &HashSet::new());
+    assert!(
+        holds.admit_rejection_diagnostic_at(&current, SlotId(2), start),
+        "ordinary session cleanup resets that session's diagnostic budget",
+    );
+    assert!(
+        !holds.admit_rejection_diagnostic_at(&other, SlotId(2), start),
+        "ordinary cleanup leaves another session's budget intact",
+    );
+
+    holds.end_session_terminal(&current);
+    assert!(
+        holds.admit_rejection_diagnostic_at(&current, SlotId(2), start),
+        "terminal cleanup also resets that session's diagnostic budget",
+    );
+    assert!(
+        !holds.admit_rejection_diagnostic_at(&other, SlotId(2), start),
+        "terminal cleanup leaves another session's budget intact",
+    );
 }
