@@ -1,8 +1,8 @@
 //! One mesh link: a shared QUIC connection carrying every game two relays
 //! jointly serve, with per-session transport state.
 //!
-//! A [`MeshLink`] owns one `noq::Connection` and a registry of [`SessionLink`]
-//! instances — one per game active on that relay-pair. Every datagram on the
+//! A [`MeshLink`] owns one `noq::Connection` and a registry of per-session
+//! transport state — one entry per game active on that relay-pair. Every datagram on the
 //! connection is a [`MeshPacket`]: a
 //! session id (plus an optional tenant) and the per-link [`Packet`] for that
 //! session. The link demultiplexes by [`MeshSessionKey`] — the session id
@@ -44,7 +44,7 @@ mod sizing;
 mod tests;
 
 pub use error::MeshLinkError;
-pub use session_link::SessionLink;
+use session_link::SessionLink;
 
 use std::collections::HashMap;
 
@@ -187,13 +187,12 @@ impl MeshLink {
 
     /// Opens a new session's transport state on this link. Idempotent: opening
     /// an already-open session (the same key) is a no-op (a relay may re-offer
-    /// a session its peer already announced). Returns a borrow so the caller
-    /// can drive the session without a separate lookup.
+    /// a session its peer already announced).
     ///
     /// `key` accepts a bare `SessionId` (the legacy, tenant-less path) or an
     /// explicit [`MeshSessionKey`] (tenant-scoped) — see that type's doc for
     /// what distinguishes them.
-    pub fn open_session(&mut self, key: impl Into<MeshSessionKey>) -> &mut SessionLink {
+    pub fn open_session(&mut self, key: impl Into<MeshSessionKey>) {
         self.sessions
             .entry(key.into())
             .or_insert_with(|| SessionLink {
@@ -206,7 +205,7 @@ impl MeshLink {
                 // an authenticated relay, so the collapse's trust is warranted;
                 // see `Dedup::with_forward_collapse`.
                 dedup: Dedup::with_forward_collapse(),
-            })
+            });
     }
 
     /// Anchors this link's receive window for `(key, slot)` to `anchor`,
