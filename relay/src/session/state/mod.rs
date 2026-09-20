@@ -8,14 +8,12 @@ use rally_point_proto::ids::SlotId;
 use crate::consensus::DecisionMakers;
 use crate::coordinator::load_fence::LoadStateFence;
 use crate::key::SessionKey;
-use crate::session::chat::ChatRegistry;
 use crate::session::drop_hold::DropHolds;
 use crate::session::gate::SessionGates;
-use crate::session::lobby::LobbyRegistry;
 use crate::session::presence::PresenceRegistry;
 use crate::session::provisional::ProvisionalSessions;
 use crate::session::provisional_turns::ProvisionalTurnPen;
-use crate::session::skin::SkinRegistry;
+use crate::session::side_channel::SideChannels;
 use crate::session::turn_ring::TurnRing;
 
 /// The windows and ceilings a [`SessionState`] builds its registries with.
@@ -79,23 +77,13 @@ pub struct SessionState {
     /// report the local roster into it, the mesh-link drivers deliver peers'
     /// reports, and `MeshControl` sets the order from each descriptor.
     pub presence: Arc<PresenceRegistry>,
-    /// Per-session lobby-command fan-out and its ordered replay log. The
-    /// slot-link tasks deliver their clients' lobby commands into it (and
-    /// register each member for replay), and the mesh-link drivers deliver
-    /// peers' lobby commands into it. See [`crate::session::lobby`].
-    pub lobby: LobbyRegistry,
-    /// Per-session game-chat fan-out. The mid-game counterpart to `lobby`: the
-    /// slot-link tasks deliver their clients' chat messages into it (and
-    /// register each member to receive others'), and the mesh-link drivers
-    /// deliver peers' messages into it. No replay log — chat is ephemeral. See
-    /// [`crate::session::chat`].
-    pub chat: ChatRegistry,
-    /// Per-session cosmetic-skin fan-out and its latest-blob-per-slot replay
-    /// map. The slot-link tasks deliver their clients' skin blobs into it (and
-    /// register each member to receive others' and replay the stored map), and
-    /// the mesh-link drivers deliver peers' blobs into it. See
-    /// [`crate::session::skin`].
-    pub skins: SkinRegistry,
+    /// The per-session lobby, chat and skin fan-outs. The slot-link tasks
+    /// register each member on all three as its control stream comes up and
+    /// deliver their clients' messages into them; the mesh-link drivers deliver
+    /// peers' messages into them. They differ only in what each replays to a
+    /// member that joined late — nothing, an ordered log, or the latest message
+    /// per slot. See [`crate::session::side_channel`].
+    pub side_channels: SideChannels,
     /// Per-relay holds on dropped slots' synced-leave decisions, plus the
     /// per-requester rate cap on the manual drop requests that resolve them. A
     /// slot that dropped (its link died) has its departure recorded and
@@ -157,9 +145,7 @@ impl SessionState {
                 tunables.region_release_delay,
             )),
             presence: Arc::new(crate::session::presence::new_presence_registry()),
-            lobby: crate::session::lobby::new_lobby_registry(),
-            chat: crate::session::chat::new_chat_registry(),
-            skins: crate::session::skin::new_skin_registry(),
+            side_channels: SideChannels::default(),
             drop_holds: DropHolds::new(tunables.drop_unlock, tunables.abandon_timeout),
             turn_ring: TurnRing::new(),
             provisional: ProvisionalSessions::new(tunables.provisional_window),
@@ -190,9 +176,7 @@ impl SessionState {
     /// skin blob map and the chat state belong to the session, not to this
     /// member, and a remaining or reconnecting member still replays them.
     pub(crate) fn remove_slot(&self, key: &SessionKey, slot: SlotId) {
-        crate::session::lobby::deregister_member(&self.lobby, key, slot);
-        crate::session::chat::deregister_member(&self.chat, key, slot);
-        crate::session::skin::deregister_member(&self.skins, key, slot);
+        self.side_channels.deregister_member(key, slot);
     }
 
     /// This relay's last local slot for the session is gone and the close has
@@ -210,15 +194,11 @@ impl SessionState {
         // force-decide is still owed, so the timer is marked rather than
         // cancelled.
         self.drop_holds.note_session_closed(key);
-        // The relay's last local member for the session is gone, so its lobby
-        // log and (now-empty) member set can be dropped — mirroring how the
-        // roster group is dropped when its last slot leaves.
-        crate::session::lobby::end_session(&self.lobby, key);
-        // Same for chat's (log-free) per-session state.
-        crate::session::chat::end_session(&self.chat, key);
-        // Same for the skin blob map and member set: no local member remains
-        // to replay it to, so the whole per-session state can be dropped.
-        crate::session::skin::end_session(&self.skins, key);
+        // The relay's last local member for the session is gone, so the side
+        // channels' retained state and (now-empty) member sets can be dropped:
+        // no local member remains to replay the lobby log or the skin map to —
+        // mirroring how the roster group is dropped when its last slot leaves.
+        self.side_channels.end_session(key);
         // Same for request limiters, and for any hold whose slot's leave is
         // already decided — but NOT for an undecided hold: on a session that
         // never started (where a fresh undecided drop does not defer the
@@ -341,9 +321,7 @@ impl SessionState {
         // while members are still connected never reaches that close — their
         // later teardowns are refused by the retired gate — so this is their
         // only remaining sweep. Idempotent when the emptied close already ran.
-        crate::session::lobby::end_session(&self.lobby, key);
-        crate::session::chat::end_session(&self.chat, key);
-        crate::session::skin::end_session(&self.skins, key);
+        self.side_channels.end_session(key);
     }
 }
 

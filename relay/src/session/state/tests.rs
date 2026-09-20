@@ -5,8 +5,9 @@ use super::*;
 use rally_point_proto::messages::{GameChat, LobbyCommand, PlayerSkin};
 
 use crate::mesh::{SeenRegistries, has_resumable_state, mark_seen, new_seen_registries};
+use crate::session::presence;
+use crate::session::side_channel::SideChannelReceivers;
 use crate::session::turn_ring::TurnOrigin;
-use crate::session::{chat, lobby, presence, skin};
 use crate::test_support::{seed_local_maker, session_key};
 
 /// A session with something in every store a teardown phase could sweep: two
@@ -31,19 +32,19 @@ impl Seeded {
 
         // Slot 1 is the member the assertions watch; slot 0 authors, so slot 1
         // is never skipped as the author of its own command.
-        let lobby_rx = lobby::register_member(&state.lobby, &key, SlotId(1));
-        let chat_rx = chat::register_member(&state.chat, &key, SlotId(1));
-        let skin_rx = skin::register_member(&state.skins, &key, SlotId(1));
-        lobby::deliver(
-            &state.lobby,
+        let SideChannelReceivers {
+            lobby: lobby_rx,
+            chat: chat_rx,
+            skins: skin_rx,
+        } = state.side_channels.register_member(&key, SlotId(1));
+        state.side_channels.lobby.deliver(
             &key,
             LobbyCommand {
                 slot: 0,
                 ..Default::default()
             },
         );
-        skin::deliver(
-            &state.skins,
+        state.side_channels.skins.deliver(
             &key,
             PlayerSkin {
                 slot: 0,
@@ -110,8 +111,11 @@ impl Seeded {
     /// difference between "the session's side channels are still here" and
     /// "they were swept".
     fn side_channels_retained(&self) -> bool {
-        let lobby_replay = lobby::register_member(&self.state.lobby, &self.key, SlotId(2));
-        let skin_replay = skin::register_member(&self.state.skins, &self.key, SlotId(2));
+        let replay = self
+            .state
+            .side_channels
+            .register_member(&self.key, SlotId(2));
+        let (lobby_replay, skin_replay) = (replay.lobby, replay.skins);
         !lobby_replay.is_empty() && !skin_replay.is_empty()
     }
 }
@@ -124,24 +128,21 @@ async fn remove_slot_drops_only_the_slots_side_channel_membership() {
 
     // The member is gone from all three channels: nothing delivered after the
     // removal reaches it.
-    lobby::deliver(
-        &seeded.state.lobby,
+    seeded.state.side_channels.lobby.deliver(
         &seeded.key,
         LobbyCommand {
             slot: 0,
             ..Default::default()
         },
     );
-    chat::deliver(
-        &seeded.state.chat,
+    seeded.state.side_channels.chat.deliver(
         &seeded.key,
         GameChat {
             slot: 0,
             ..Default::default()
         },
     );
-    skin::deliver(
-        &seeded.state.skins,
+    seeded.state.side_channels.skins.deliver(
         &seeded.key,
         PlayerSkin {
             slot: 0,

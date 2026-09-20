@@ -410,7 +410,8 @@ impl DropHolds {
     /// Charges one drop-request token to `requester` in `key`'s session, returning
     /// whether the request may proceed. A fresh requester starts with a full burst;
     /// over-cap requests return `false` and are dropped by the caller without ever
-    /// closing the link. Mirrors the game-chat rate cap ([`crate::session::chat`]).
+    /// closing the link. Mirrors the side channels' rate cap
+    /// ([`crate::session::side_channel`]).
     pub fn admit_request(&self, key: &SessionKey, requester: SlotId) -> bool {
         self.limiters
             .lock()

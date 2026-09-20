@@ -7,7 +7,7 @@ use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{GameChat, LobbyCommand, PlayerSkin};
 use rally_point_relay::key::SessionKey;
-use rally_point_relay::session::lobby::LOBBY_RATE_BURST;
+use rally_point_relay::session::side_channel::LOBBY;
 
 use crate::helpers::*;
 
@@ -185,7 +185,7 @@ async fn lobby_spam_past_the_rate_cap_never_reaches_the_mesh_and_a_departure_sti
 
     // Fire well past the burst, back to back with no pacing -- exactly the
     // shape a flooding or buggy client produces.
-    for i in 0..(LOBBY_RATE_BURST + 20) {
+    for i in 0..(LOBBY.rate_burst + 20) {
         rally_point_transport::control::send_control_lobby(
             &mut host_send,
             LobbyCommand {
@@ -199,12 +199,12 @@ async fn lobby_spam_past_the_rate_cap_never_reaches_the_mesh_and_a_departure_sti
     // The peer receives exactly the admitted prefix -- the refused remainder
     // was never handed to `fan_out_lobby_command` at all.
     let mut received = Vec::new();
-    for _ in 0..LOBBY_RATE_BURST {
+    for _ in 0..LOBBY.rate_burst {
         received.push(next_lobby(&mut peer_b_rx).await.1[0]);
     }
     assert_eq!(
         received,
-        (0..LOBBY_RATE_BURST as u8).collect::<Vec<_>>(),
+        (0..LOBBY.rate_burst as u8).collect::<Vec<_>>(),
         "exactly the admitted prefix, in order",
     );
     assert!(

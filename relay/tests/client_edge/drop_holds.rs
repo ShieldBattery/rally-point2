@@ -117,7 +117,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     let mesh = rally_point_relay::mesh::MeshState::default();
     let makers = mesh.session.decision_makers.clone();
     let drop_holds = mesh.session.drop_holds.clone();
-    let lobby = mesh.session.lobby.clone();
+    let lobby = mesh.session.side_channels.lobby.clone();
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
     seed_authority(&makers, &key).expecting([0]).apply();
@@ -139,8 +139,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     // A peer-authored lobby command into the replay log (a member's own
     // commands are skipped on its replay, so the survivable content must be
     // authored by another slot — here injected as a mesh delivery would be).
-    rally_point_relay::session::lobby::deliver(
-        &lobby,
+    lobby.deliver(
         &key,
         rally_point_proto::messages::LobbyCommand {
             slot: 1,

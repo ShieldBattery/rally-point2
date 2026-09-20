@@ -313,7 +313,7 @@ fn dispatch_mesh_control_frame(
             // one of them, so every local member receives it). Deliberately NOT
             // re-broadcast across the mesh: the origin already sent a copy to every
             // link serving the session, exactly as with the oversize turn above.
-            crate::session::lobby::deliver(&mesh.session.lobby, &key, command);
+            mesh.session.side_channels.lobby.deliver(&key, command);
         }
         Some(mesh_control_frame::Kind::GameChat(chat_msg)) => {
             // A chat message a peer relay's member authored, already
@@ -322,7 +322,7 @@ fn dispatch_mesh_control_frame(
             // how a mesh-received lobby command's bytes are not re-validated).
             // No log to append to; deliberately NOT re-broadcast across the
             // mesh, exactly as the lobby command and oversize turn above.
-            crate::session::chat::deliver(&mesh.session.chat, &key, chat_msg);
+            mesh.session.side_channels.chat.deliver(&key, chat_msg);
         }
         Some(mesh_control_frame::Kind::PlayerSkin(skin)) => {
             // A cosmetic-skin blob a peer relay's member authored, already
@@ -336,7 +336,7 @@ fn dispatch_mesh_control_frame(
             // only echo. `deliver`'s return is ignored here — the map cap only
             // gates whether this relay stores/fans the blob, and there is nothing
             // to re-broadcast either way.
-            crate::session::skin::deliver(&mesh.session.skins, &key, skin);
+            mesh.session.side_channels.skins.deliver(&key, skin);
         }
         Some(mesh_control_frame::Kind::SlotPresent(present)) => {
             let Ok(slot) = u8::try_from(present.slot).map(SlotId) else {

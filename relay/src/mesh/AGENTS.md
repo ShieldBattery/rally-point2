@@ -67,7 +67,7 @@
 (`control_key`, `register_link_channels`, `test_mesh_state`, `test_maker`,
 `joined_state`, `finalize_fixture`); `test_mesh_state()` is production wiring with
 a zero drop-unlock floor, so reach registries through it (`mesh.links`,
-`mesh.session.chat`) and override a field with `MeshState { links,
+`mesh.session.side_channels.chat`) and override a field with `MeshState { links,
 ..test_mesh_state() }` rather than building registries up front. Real connections
 come from `rally_point_transport::test_util::loopback(Edge::Mesh)`. Shrink a
 production timing window with `SessionState::with_tunables(Tunables { .. ,

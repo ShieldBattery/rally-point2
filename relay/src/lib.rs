@@ -10,17 +10,13 @@
 //!   control commands.
 //! - **routing** ([`routing`]) — group authorized connections by session and fan
 //!   each validated turn out to that session's other slots.
-//! - **lobby** ([`session::lobby`]) — fan pre-game lobby commands out to a session's local
-//!   members and keep the per-session ordered replay log a late-joining member
-//!   catches up from.
-//! - **chat** ([`session::chat`]) — fan in-game chat messages out to a session's local
-//!   members. The mid-game counterpart to `lobby`: no replay log (chat is
-//!   ephemeral), plus a per-slot size and rate cap enforced at the relay.
-//! - **skin** ([`session::skin`]) — fan members' opaque cosmetic-skin blobs out to a
-//!   session's local members and replay them on register. One-shot state, not
-//!   events: a latest-blob-per-slot map (a re-send replaces) replayed to late or
-//!   reconnecting members, with the same size and rate caps `chat` enforces.
-//! - **server** ([`server`]) — the client-facing accept loop tying the three
+//! - **side channels** ([`session::side_channel`]) — the reliable non-turn traffic
+//!   members exchange over their control streams: pre-game lobby commands, in-game
+//!   chat and cosmetic skin blobs, fanned out to a session's local members under
+//!   per-slot size and rate caps. One registry with three replay policies — an
+//!   ordered log a late-joining member catches up from (lobby), none at all (chat
+//!   is ephemeral), and a latest-blob-per-slot map a re-send replaces (skins).
+//! - **server** ([`server`]) — the client-facing accept loop tying the above
 //!   together: the single-relay `C–S–C` edge, no mesh.
 //! - **mesh + dedup** — one QUIC connection per relay-pair, direct origin-relay
 //!   fan-out, one-hop mesh delivery, and session-level duplicate gating.

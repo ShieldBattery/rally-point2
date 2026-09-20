@@ -192,9 +192,10 @@ pub(super) fn handle_control_frame(
         // locals. The bytes are opaque; the relay frames nothing of
         // its own around them.
         Some(ControlInbound::Lobby(mut command)) => {
-            if crate::session::lobby::admit(&ctx.lobby, &ctx.key, ctx.slot) {
+            let lobby = &ctx.side_channels.lobby;
+            if lobby.admit(&ctx.key, ctx.slot, command.payload.len()) {
                 command.slot = u32::from(ctx.slot.0);
-                if crate::session::lobby::deliver(&ctx.lobby, &ctx.key, command.clone()) {
+                if lobby.deliver(&ctx.key, command.clone()) {
                     crate::mesh::fan_out_lobby_command(&ctx.mesh_links, &ctx.key, command);
                 }
             }
@@ -210,9 +211,10 @@ pub(super) fn handle_control_frame(
         // echoed) and forwarded once across each mesh link serving
         // the session.
         Some(ControlInbound::Chat(mut chat_msg)) => {
-            if crate::session::chat::admit(&ctx.chat, &ctx.key, ctx.slot, chat_msg.text.len()) {
+            let chat = &ctx.side_channels.chat;
+            if chat.admit(&ctx.key, ctx.slot, chat_msg.text.len()) {
                 chat_msg.slot = u32::from(ctx.slot.0);
-                crate::session::chat::deliver(&ctx.chat, &ctx.key, chat_msg.clone());
+                chat.deliver(&ctx.key, chat_msg.clone());
                 crate::mesh::fan_out_chat(&ctx.mesh_links, &ctx.key, chat_msg);
             }
         }
@@ -231,9 +233,10 @@ pub(super) fn handle_control_frame(
         // to their locals. The bytes are opaque; the relay frames
         // nothing of its own around them.
         Some(ControlInbound::Skin(mut skin)) => {
-            if crate::session::skin::admit(&ctx.skins, &ctx.key, ctx.slot, skin.payload.len()) {
+            let skins = &ctx.side_channels.skins;
+            if skins.admit(&ctx.key, ctx.slot, skin.payload.len()) {
                 skin.slot = u32::from(ctx.slot.0);
-                if crate::session::skin::deliver(&ctx.skins, &ctx.key, skin.clone()) {
+                if skins.deliver(&ctx.key, skin.clone()) {
                     crate::mesh::fan_out_skin(&ctx.mesh_links, &ctx.key, skin);
                 }
             }

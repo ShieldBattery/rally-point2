@@ -56,9 +56,7 @@ pub(super) struct SlotLinkCtx {
     mesh_links: crate::mesh::MeshLinks,
     conditions: crate::mesh::ConditionsRegistry,
     decision_makers: Arc<crate::consensus::DecisionMakers>,
-    lobby: crate::session::lobby::LobbyRegistry,
-    chat: crate::session::chat::ChatRegistry,
-    skins: crate::session::skin::SkinRegistry,
+    side_channels: crate::session::side_channel::SideChannels,
     turn_ring: crate::session::turn_ring::TurnRing,
     load_fence: crate::coordinator::load_fence::LoadStateFence,
     /// The flight recorder's per-slot counter handle, fetched once so the
@@ -150,9 +148,7 @@ pub async fn run_slot_link(
         session:
             crate::session::SessionState {
                 decision_makers,
-                lobby,
-                chat,
-                skins,
+                side_channels,
                 turn_ring,
                 load_fence,
                 ..
@@ -264,39 +260,29 @@ pub async fn run_slot_link(
     // disarmed defensively the same way.
     let mut probe_push_alive = true;
     setup::push_connect_time_state(&sessions, &decision_makers, &key, slot);
-    // Register this member for lobby fan-out now that its control stream is up:
-    // it starts receiving other members' lobby commands, and — crucially — the
-    // per-session replay log is snapshotted into `lobby_rx` under the lobby lock
-    // right here, so a member that joined after the host already sent its setup
-    // commands catches up on every earlier command, in order, before any live
-    // one. The exactly-once handoff is the lobby module's (append + fan-out and
-    // register + snapshot share one lock); this task just drains `lobby_rx` in the
-    // branch below and writes each command down its own control stream.
-    let mut lobby_rx = crate::session::lobby::register_member(&lobby, &key, slot);
-    // Mirrors `leave_push_alive`: this member's lobby sender lives in the lobby
-    // registry until its own teardown drops it, so a `None` is unreachable during
-    // the loop; the flag disarms the branch defensively.
+    // Register this member on all three side channels now that its control
+    // stream is up: it starts receiving other members' lobby commands, chat and
+    // skin blobs, and — crucially — each channel's retained state is snapshotted
+    // into the receiver under that channel's own lock right here. So a member
+    // that joined after the host already sent its setup commands catches up on
+    // every earlier command, in order, before any live one, and a member that
+    // dialed in after other members broadcast their skins replays each one
+    // (unordered — a map, not a sequence) before any live blob. Chat has nothing
+    // to snapshot: it keeps none, so this member simply starts tailing whatever
+    // other members send from here on. The exactly-once handoff is the side
+    // channel's (retain + fan-out and register + snapshot share one lock); this
+    // task just drains the receivers in the branches below and writes each
+    // message down its own control stream.
+    let crate::session::side_channel::SideChannelReceivers {
+        lobby: mut lobby_rx,
+        chat: mut chat_rx,
+        skins: mut skin_rx,
+    } = side_channels.register_member(&key, slot);
+    // Mirrors `leave_push_alive`: this member's senders live in the side-channel
+    // registries until its own teardown drops them, so a `None` is unreachable
+    // during the loop; the flags disarm the branches defensively.
     let mut lobby_alive = true;
-    // Register this member for chat fan-out too — the mid-game counterpart to
-    // the lobby registration above. No log to snapshot: chat keeps none, so this
-    // member simply starts tailing whatever other members send from here on.
-    let mut chat_rx = crate::session::chat::register_member(&chat, &key, slot);
-    // Mirrors `lobby_alive`: this member's chat sender lives in the chat
-    // registry until its own teardown drops it, so a `None` is unreachable
-    // during the loop; the flag disarms the branch defensively.
     let mut chat_alive = true;
-    // Register this member for cosmetic-skin fan-out too. Like the lobby log,
-    // the per-session latest-blob-per-slot map is snapshotted into `skin_rx`
-    // under the skin lock right here, so a member that dialed in after other
-    // members already broadcast their blobs replays each one (before any live
-    // blob); unlike the lobby log the replay is unordered (a map, not a
-    // sequence). The exactly-once handoff is the skin module's (store + fan-out
-    // and register + snapshot share one lock); this task drains `skin_rx` in the
-    // branch below and writes each blob down its own control stream.
-    let mut skin_rx = crate::session::skin::register_member(&skins, &key, slot);
-    // Mirrors `chat_alive`: this member's skin sender lives in the skin registry
-    // until its own teardown drops it, so a `None` is unreachable during the
-    // loop; the flag disarms the branch defensively.
     let mut skin_alive = true;
     // Pushes only advancing cursors and reuses one batch buffer for the life of
     // this link.
@@ -351,9 +337,7 @@ pub async fn run_slot_link(
         mesh_links,
         conditions,
         decision_makers,
-        lobby,
-        chat,
-        skins,
+        side_channels,
         turn_ring,
         load_fence,
         flight_counters,
