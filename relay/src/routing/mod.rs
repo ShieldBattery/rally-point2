@@ -90,14 +90,11 @@ pub(crate) use departure::{
 };
 pub(crate) use drops::{complete_finalized_drop, honor_drop_request};
 pub(crate) use fan_out::{
-    broadcast_connectivity, deliver_phase_directive_to_slot, deliver_region_labels_to_slot,
-    fan_out, fan_out_connectivity, fan_out_leave, fan_out_phase_directives, fan_out_region_labels,
-    fan_out_session_start,
+    broadcast_connectivity, deliver_load_state_probe_to_slot, deliver_phase_directive_to_slot,
+    deliver_region_labels_to_slot, deliver_session_start_to_slot, fan_out, fan_out_connectivity,
+    fan_out_leave, fan_out_phase_directives, fan_out_region_labels, fan_out_session_start,
 };
-pub(crate) use lifecycle::{
-    abandon_refused_admission, deliver_load_state_probe_to_slot, deliver_session_start,
-    reap_provisional,
-};
+pub(crate) use lifecycle::{abandon_refused_admission, deliver_session_start, reap_provisional};
 
 /// How many outbound payloads may queue for one slot before fan-out to it applies
 /// backpressure. Turns are small and drained promptly; a slot this far behind is
@@ -334,7 +331,7 @@ pub struct SlotEntry {
     /// Session-start directives to push down THIS client's reliable control
     /// stream. Fed by [`fan_out_session_start`] when the session's authority
     /// decides every expected slot has connected, and by
-    /// [`deliver_session_start_to_slot`](lifecycle::deliver_session_start_to_slot) for a slot that registers after the
+    /// [`deliver_session_start_to_slot`] for a slot that registers after the
     /// session already started; drained by this slot's link task, which writes a
     /// `SessionStart` frame to its control stream. Carries the session's computed
     /// initial latency-buffer depth (`None` when the authoring relay sized none),

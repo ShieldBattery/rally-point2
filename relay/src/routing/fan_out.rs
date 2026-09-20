@@ -1,12 +1,96 @@
-//! Delivering one thing to many slots: turns onto the datagram forward queues,
-//! and leaves, session starts, region labels, phase directives and connectivity
-//! changes onto each slot's reliable control-stream push channel. Every function
-//! here clones the senders out under the roster lock and drops the lock before it
-//! sends, so no slow client can park the caller.
+//! Delivering one thing to many slots — or to one named slot: turns onto the
+//! datagram forward queues, and leaves, session starts, region labels, phase
+//! directives, connectivity changes and load-state probes onto each slot's
+//! reliable control-stream push channel. Every function here clones the senders
+//! out under the roster lock and drops the lock before it sends, so no slow
+//! client can park the caller.
 
 use super::*;
 
 use super::forward::ForwardOutcome;
+
+/// Clones one push sender per registered slot out from under the roster lock,
+/// so nothing is ever sent with the lock held. `select` names which of a slot's
+/// push channels to take; `except` drops one slot from the result (the departing
+/// slot on a leave), and `None` keeps every slot.
+fn collect_slot_senders<T>(
+    sessions: &Sessions,
+    key: &SessionKey,
+    except: Option<SlotId>,
+    select: impl Fn(&SlotEntry) -> mpsc::Sender<T>,
+) -> Vec<(SlotId, mpsc::Sender<T>)> {
+    let roster = sessions.lock();
+    match roster.get(key) {
+        Some(slots) => slots
+            .iter()
+            .filter(|(slot, _)| Some(**slot) != except)
+            .map(|(slot, entry)| (*slot, select(entry)))
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Offers each collected target its value without blocking, which is all any of
+/// the control-stream fan-outs do once the roster lock is gone. `what` names the
+/// frame in the log line, and `subject` is the slot a frame is *about* when that
+/// differs from the slot receiving it.
+fn push_to_slots<T>(
+    key: &SessionKey,
+    what: &str,
+    subject: Option<SlotId>,
+    targets: impl IntoIterator<Item = (SlotId, mpsc::Sender<T>, T)>,
+) {
+    for (slot, tx, value) in targets {
+        match tx.try_send(value) {
+            // A full push queue is unexpected — these frames are rare and each
+            // slot's link drains its queue promptly — so say so rather than let
+            // the push vanish silently. What a lost one costs varies by frame: a
+            // missed leave can leave a survivor stalled, a missed label map only
+            // costs a display name.
+            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
+                tenant = key.tenant.as_ref(),
+                session = key.session.0,
+                slot = slot.0,
+                subject = subject.map(|subject| subject.0),
+                "{what} queue full; the push may be delayed for this slot",
+            ),
+            // The slot's task already ended; it needs nothing pushed to it.
+            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Ok(()) => {}
+        }
+    }
+}
+
+/// Clones one named slot's push sender out from under the roster lock — `None`
+/// when that slot is not currently registered.
+fn slot_sender<T>(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    select: impl Fn(&SlotEntry) -> mpsc::Sender<T>,
+) -> Option<mpsc::Sender<T>> {
+    let roster = sessions.lock();
+    roster
+        .get(key)
+        .and_then(|slots| slots.get(&slot))
+        .map(select)
+}
+
+/// Offers one value down one named slot's control-stream push channel. A slot
+/// absent from the roster (already gone) is skipped, and a full queue is simply
+/// dropped: every caller is a connect-time re-push of state that a later
+/// session-wide push restates anyway.
+fn deliver_to_slot<T>(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    select: impl Fn(&SlotEntry) -> mpsc::Sender<T>,
+    value: T,
+) {
+    if let Some(tx) = slot_sender(sessions, key, slot, select) {
+        let _ = tx.try_send(value);
+    }
+}
 
 /// Delivers `payload` to every slot in the `key` routing group except `source`,
 /// without ever blocking on a slow peer.
@@ -75,32 +159,15 @@ pub(crate) fn fan_out_leave(
     departing: SlotId,
     leave: LeaveDirective,
 ) {
-    let targets: Vec<(SlotId, mpsc::Sender<LeaveDirective>)> = {
-        let roster = sessions.lock();
-        match roster.get(key) {
-            Some(slots) => slots
-                .iter()
-                .filter(|(slot, _)| **slot != departing)
-                .map(|(slot, entry)| (*slot, entry.leave_push.clone()))
-                .collect(),
-            None => Vec::new(),
-        }
-    };
-    for (slot, tx) in targets {
-        match tx.try_send(leave) {
-            // A full leave-push queue is unexpected (leaves are rare); log rather
-            // than drop silently — a missed leave leaves that survivor stalled.
-            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                slot = slot.0,
-                "leave-push queue full; a synced leave may be delayed for this slot",
-            ),
-            // The peer already left; it needs no leave for a third slot.
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Ok(()) => {}
-        }
-    }
+    let targets = collect_slot_senders(sessions, key, Some(departing), |entry| {
+        entry.leave_push.clone()
+    });
+    push_to_slots(
+        key,
+        "leave-push",
+        Some(departing),
+        targets.into_iter().map(|(slot, tx)| (slot, tx, leave)),
+    );
 }
 
 /// Pushes the session-start directive down every slot's control stream in the
@@ -114,29 +181,35 @@ pub(crate) fn fan_out_session_start(
     key: &SessionKey,
     initial_buffer_turns: Option<u32>,
 ) {
-    let targets: Vec<(SlotId, mpsc::Sender<Option<u32>>)> = {
-        let roster = sessions.lock();
-        match roster.get(key) {
-            Some(slots) => slots
-                .iter()
-                .map(|(slot, entry)| (*slot, entry.start_push.clone()))
-                .collect(),
-            None => Vec::new(),
-        }
-    };
-    for (slot, tx) in targets {
-        match tx.try_send(initial_buffer_turns) {
-            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                slot = slot.0,
-                "session-start queue full; the start directive may be delayed for this slot",
-            ),
-            // The slot's task already ended; it needs no start.
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Ok(()) => {}
-        }
-    }
+    let targets = collect_slot_senders(sessions, key, None, |entry| entry.start_push.clone());
+    push_to_slots(
+        key,
+        "session-start",
+        None,
+        targets
+            .into_iter()
+            .map(|(slot, tx)| (slot, tx, initial_buffer_turns)),
+    );
+}
+
+/// Pushes the session-start directive down a single slot's control stream — the
+/// re-push a slot gets when it registers after the session already started —
+/// stamping the session's stored initial buffer depth (`None` when the authoring
+/// relay sized none, e.g. a resumed re-home). A slot absent from the roster
+/// (already gone) is skipped.
+pub(crate) fn deliver_session_start_to_slot(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    initial_buffer_turns: Option<u32>,
+) {
+    deliver_to_slot(
+        sessions,
+        key,
+        slot,
+        |entry| entry.start_push.clone(),
+        initial_buffer_turns,
+    );
 }
 
 /// Pushes the session's relay → region-label map down every currently-registered
@@ -149,29 +222,15 @@ pub(crate) fn fan_out_session_start(
 /// silently, though a lost map costs only a missing display label — a later map
 /// (or the slot's own reconnect push) carries the whole thing again.
 pub(crate) fn fan_out_region_labels(sessions: &Sessions, key: &SessionKey, labels: &[RegionLabel]) {
-    let targets: Vec<(SlotId, mpsc::Sender<Vec<RegionLabel>>)> = {
-        let roster = sessions.lock();
-        match roster.get(key) {
-            Some(slots) => slots
-                .iter()
-                .map(|(slot, entry)| (*slot, entry.region_push.clone()))
-                .collect(),
-            None => Vec::new(),
-        }
-    };
-    for (slot, tx) in targets {
-        match tx.try_send(labels.to_vec()) {
-            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                slot = slot.0,
-                "region-label queue full; the label map may be delayed for this slot",
-            ),
-            // The slot's task already ended; it needs no labels.
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Ok(()) => {}
-        }
-    }
+    let targets = collect_slot_senders(sessions, key, None, |entry| entry.region_push.clone());
+    push_to_slots(
+        key,
+        "region-label",
+        None,
+        targets
+            .into_iter()
+            .map(|(slot, tx)| (slot, tx, labels.to_vec())),
+    );
 }
 
 /// Pushes the session's relay → region-label map down a single slot's control
@@ -185,16 +244,13 @@ pub(crate) fn deliver_region_labels_to_slot(
     slot: SlotId,
     labels: Vec<RegionLabel>,
 ) {
-    let sender = {
-        let roster = sessions.lock();
-        roster
-            .get(key)
-            .and_then(|slots| slots.get(&slot))
-            .map(|entry| entry.region_push.clone())
-    };
-    if let Some(tx) = sender {
-        let _ = tx.try_send(labels);
-    }
+    deliver_to_slot(
+        sessions,
+        key,
+        slot,
+        |entry| entry.region_push.clone(),
+        labels,
+    );
 }
 
 /// Pushes each corrected slot's new send-phase delay down that slot's own
@@ -210,37 +266,30 @@ pub(crate) fn fan_out_phase_directives(
     key: &SessionKey,
     corrections: &[(SlotId, u32)],
 ) {
-    let targets: Vec<(SlotId, u32, mpsc::Sender<PhaseDirective>)> = {
+    // Collected per correction rather than per roster entry: only the named
+    // slots are being corrected, so the roster is queried, not walked.
+    let targets: Vec<(SlotId, mpsc::Sender<PhaseDirective>, PhaseDirective)> = {
         let roster = sessions.lock();
         match roster.get(key) {
             Some(slots) => corrections
                 .iter()
                 .filter_map(|&(slot, delay_us)| {
-                    slots
-                        .get(&slot)
-                        .map(|entry| (slot, delay_us, entry.phase_push.clone()))
+                    slots.get(&slot).map(|entry| {
+                        (
+                            slot,
+                            entry.phase_push.clone(),
+                            PhaseDirective {
+                                delay_us,
+                                slew_us_per_s: crate::consensus::phase::SLEW_US_PER_S,
+                            },
+                        )
+                    })
                 })
                 .collect(),
             None => Vec::new(),
         }
     };
-    for (slot, delay_us, tx) in targets {
-        let directive = PhaseDirective {
-            delay_us,
-            slew_us_per_s: crate::consensus::phase::SLEW_US_PER_S,
-        };
-        match tx.try_send(directive) {
-            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                slot = slot.0,
-                "send-phase directive queue full; the correction may be delayed for this slot",
-            ),
-            // The slot's task already ended; it needs no correction.
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Ok(()) => {}
-        }
-    }
+    push_to_slots(key, "send-phase directive", None, targets);
 }
 
 /// Pushes the current commanded send-phase delay down a single slot's control
@@ -254,16 +303,13 @@ pub(crate) fn deliver_phase_directive_to_slot(
     slot: SlotId,
     directive: PhaseDirective,
 ) {
-    let sender = {
-        let roster = sessions.lock();
-        roster
-            .get(key)
-            .and_then(|slots| slots.get(&slot))
-            .map(|entry| entry.phase_push.clone())
-    };
-    if let Some(tx) = sender {
-        let _ = tx.try_send(directive);
-    }
+    deliver_to_slot(
+        sessions,
+        key,
+        slot,
+        |entry| entry.phase_push.clone(),
+        directive,
+    );
 }
 
 /// Pushes a slot-connectivity change down every currently-registered local
@@ -280,30 +326,49 @@ pub(crate) fn fan_out_connectivity(
     connected: bool,
     connection_epoch: Option<u64>,
 ) {
-    let targets: Vec<(SlotId, mpsc::Sender<ConnectivityChange>)> = {
+    let targets = collect_slot_senders(sessions, key, None, |entry| entry.conn_push.clone());
+    push_to_slots(
+        key,
+        "connectivity",
+        Some(slot),
+        targets
+            .into_iter()
+            .map(|(target, tx)| (target, tx, (slot, connected, connection_epoch))),
+    );
+}
+
+/// Pushes a load-state fence probe carrying `probe_id` down the control stream of
+/// the link registered for `slot` on `connection_epoch`, returning whether it was
+/// queued.
+///
+/// The epoch is what makes this target one *link* rather than one seat, and why it
+/// does not go through the plain single-slot delivery above. A slot the caller read
+/// from the roster can be replaced by a reconnect before this call runs, and the
+/// replacement is a different client stream with its own queue of owed reports —
+/// probing it would answer a question about a connection the caller never asked
+/// about. So a registration whose epoch differs is treated exactly like an absent
+/// one.
+///
+/// `false` means there is no fence for this link and the caller must read it as
+/// unfenced: the slot is no longer registered, the registration is a different
+/// connection's, or the push queue is full. Never blocks — the caller is the
+/// relay's coordinator connection, which must not be parked by one slow client.
+pub(crate) fn deliver_load_state_probe_to_slot(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    connection_epoch: u64,
+    probe_id: u64,
+) -> bool {
+    let sender = {
         let roster = sessions.lock();
-        match roster.get(key) {
-            Some(slots) => slots
-                .iter()
-                .map(|(s, entry)| (*s, entry.conn_push.clone()))
-                .collect(),
-            None => Vec::new(),
-        }
+        roster
+            .get(key)
+            .and_then(|slots| slots.get(&slot))
+            .filter(|entry| entry.connection_epoch == connection_epoch)
+            .map(|entry| entry.probe_push.clone())
     };
-    for (target, tx) in targets {
-        match tx.try_send((slot, connected, connection_epoch)) {
-            Err(mpsc::error::TrySendError::Full(_)) => tracing::warn!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                slot = target.0,
-                subject = slot.0,
-                "connectivity queue full; a slot-connectivity frame may be dropped for this slot",
-            ),
-            // The slot's task already ended; it needs no connectivity update.
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Ok(()) => {}
-        }
-    }
+    sender.is_some_and(|tx| tx.try_send(probe_id).is_ok())
 }
 
 /// Broadcasts a slot-connectivity change session-wide: fans it to every local

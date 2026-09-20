@@ -1,69 +1,14 @@
 //! Session-scoped lifecycle steps a slot's arrival or a directive triggers:
-//! delivering the session-start directive, announcing a fresh slot's presence,
-//! signalling slots to close, and the two teardowns for admissions that were
-//! refused or never claimed by a descriptor.
+//! deciding when the session-start directive goes out, announcing a fresh slot's
+//! presence, signalling slots to close, and the two teardowns for admissions that
+//! were refused or never claimed by a descriptor. The pushes themselves live in
+//! [`fan_out`].
 
 use super::*;
 
 use crate::consensus;
 
 use std::sync::atomic::Ordering;
-
-/// Pushes the session-start directive down a single slot's control stream — the
-/// re-push a slot gets when it registers after the session already started —
-/// stamping the session's stored initial buffer depth (`None` when the authoring
-/// relay sized none, e.g. a resumed re-home). A slot absent from the roster
-/// (already gone) is skipped.
-pub(crate) fn deliver_session_start_to_slot(
-    sessions: &Sessions,
-    key: &SessionKey,
-    slot: SlotId,
-    initial_buffer_turns: Option<u32>,
-) {
-    let sender = {
-        let roster = sessions.lock();
-        roster
-            .get(key)
-            .and_then(|slots| slots.get(&slot))
-            .map(|entry| entry.start_push.clone())
-    };
-    if let Some(tx) = sender {
-        let _ = tx.try_send(initial_buffer_turns);
-    }
-}
-
-/// Pushes a load-state fence probe carrying `probe_id` down the control stream of
-/// the link registered for `slot` on `connection_epoch`, returning whether it was
-/// queued.
-///
-/// The epoch is what makes this target one *link* rather than one seat. A slot the
-/// caller read from the roster can be replaced by a reconnect before this call
-/// runs, and the replacement is a different client stream with its own queue of
-/// owed reports — probing it would answer a question about a connection the caller
-/// never asked about. So a registration whose epoch differs is treated exactly like
-/// an absent one.
-///
-/// `false` means there is no fence for this link and the caller must read it as
-/// unfenced: the slot is no longer registered, the registration is a different
-/// connection's, or the push queue is full. Never blocks — the caller is the
-/// relay's coordinator connection, which must not be parked by one slow client.
-pub(crate) fn deliver_load_state_probe_to_slot(
-    sessions: &Sessions,
-    key: &SessionKey,
-    slot: SlotId,
-    connection_epoch: u64,
-    probe_id: u64,
-) -> bool {
-    let sender = {
-        let roster = sessions.lock();
-        roster
-            .get(key)
-            .and_then(|slots| slots.get(&slot))
-            .filter(|entry| entry.connection_epoch == connection_epoch)
-            .map(|entry| entry.probe_push.clone())
-    };
-    sender.is_some_and(|tx| tx.try_send(probe_id).is_ok())
-}
 
 /// Delivers the session-start directive session-wide: fans it to every local
 /// slot ([`fan_out_session_start`]) and broadcasts it across the mesh so every
