@@ -29,6 +29,7 @@ pub mod control;
 pub mod handshake;
 pub mod ids;
 pub mod mesh;
+pub mod time;
 pub mod token;
 pub mod version;
 
