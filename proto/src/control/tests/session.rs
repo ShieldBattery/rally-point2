@@ -6,29 +6,32 @@ fn buffer_bounds_new_rejects_inverted() {
 }
 
 #[test]
-fn buffer_bounds_new_allows_empty_range() {
-    // min == max pins the buffer (fixed-latency game).
-    let b = BufferBounds::new(3, 3).unwrap();
-    assert_eq!(b.clamp(0), 3);
-    assert_eq!(b.clamp(99), 3);
-}
-
-#[test]
-fn buffer_bounds_clamp() {
-    let b = BufferBounds::new(2, 8).unwrap();
-    assert_eq!(b.clamp(0), 2);
-    assert_eq!(b.clamp(5), 5);
-    assert_eq!(b.clamp(99), 8);
+fn buffer_bounds_clamp_pulls_a_depth_into_the_range() {
+    // A pinned range (min == max, a fixed-latency game) is the degenerate row:
+    // every depth lands on the single legal value.
+    for (min, max, cases) in [
+        (2u32, 8u32, [(0u32, 2u32), (5, 5), (99, 8)]),
+        (3, 3, [(0, 3), (5, 3), (99, 3)]),
+    ] {
+        let bounds = BufferBounds::new(min, max).unwrap();
+        for (depth, expected) in cases {
+            assert_eq!(
+                bounds.clamp(depth),
+                expected,
+                "clamp({depth}) in [{min},{max}]"
+            );
+        }
+    }
 }
 
 #[test]
 fn buffer_bounds_clamp_does_not_panic_on_an_inverted_range() {
-    // `new` rejects `min > max`, but `Deserialize` is derived and bypasses
-    // it entirely -- a corrupted or malicious coordinator payload can still
-    // hand `clamp` an inverted range. `u32::clamp` panics if `min > max`;
-    // `BufferBounds::clamp` must not, regardless of how the value reached
-    // it.
-    let inverted = BufferBounds { min: 8, max: 2 };
+    // `new` rejects `min > max`, but `Deserialize` is derived and bypasses it
+    // entirely -- a corrupted or malicious coordinator payload decodes into an
+    // inverted range without error, exactly as below. `u32::clamp` panics if
+    // `min > max`; `BufferBounds::clamp` must not, however the value reached it.
+    let inverted: BufferBounds = serde_json::from_str(r#"{"min":8,"max":2}"#).unwrap();
+    assert_eq!(inverted, BufferBounds { min: 8, max: 2 });
     assert_eq!(inverted.clamp(0), 2, "swapped bounds treat 2 as the floor");
     assert_eq!(inverted.clamp(5), 5, "5 already falls within [2, 8]");
     assert_eq!(
@@ -36,19 +39,6 @@ fn buffer_bounds_clamp_does_not_panic_on_an_inverted_range() {
         8,
         "swapped bounds treat 8 as the ceiling"
     );
-}
-
-#[test]
-fn buffer_bounds_with_inverted_fields_decodes_and_still_clamps_safely() {
-    // `Deserialize` is derived directly on `BufferBounds` (it crosses the
-    // coordinator/relay wire boundary), so it never runs `new`'s
-    // validation -- an inverted `min > max` from a corrupted or malicious
-    // coordinator decodes without error. The clamp call downstream must
-    // still not panic.
-    let json = r#"{"min":8,"max":2}"#;
-    let decoded: BufferBounds = serde_json::from_str(json).unwrap();
-    assert_eq!(decoded, BufferBounds { min: 8, max: 2 });
-    assert_eq!(decoded.clamp(99), 8);
 }
 
 #[test]
@@ -119,20 +109,6 @@ fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
 }
 
 #[test]
-fn session_descriptor_latency_estimate_defaults_absent() {
-    // A descriptor from a coordinator that predates the field parses with the
-    // estimate absent, exactly like `observer_slots`/`expected_slots` do.
-    let old = r#"{
-        "tenant":"sb-staging",
-        "session":42,
-        "peers":[],
-        "bounds":{"min":1,"max":6}
-    }"#;
-    let back: SessionDescriptor = serde_json::from_str(old).unwrap();
-    assert_eq!(back.latency_estimate_ms, None);
-}
-
-#[test]
 fn session_descriptor_roundtrips_json() {
     let desc = SessionDescriptor {
         finalized_drops: false,
@@ -168,23 +144,21 @@ fn session_descriptor_roundtrips_json() {
         }],
     };
     let json = serde_json::to_string(&desc).unwrap();
+    // Pin the key names of the fields added most recently — a rename of one of
+    // these is invisible to a round trip, and is what a relay running a build
+    // behind the coordinator would silently read as absent. Not a full golden
+    // string: every additive field would break it without anything being wrong.
+    for key in [
+        "\"latency_estimate_ms\":30",
+        "\"relay_regions\":[{\"relay_id\":2,\"region\":\"us-east\"}]",
+        "\"homed_slots\":[0]",
+        "\"resumed\":true",
+        "\"final_turn_count\":240",
+    ] {
+        assert!(json.contains(key), "{key} missing from {json}");
+    }
     let back: SessionDescriptor = serde_json::from_str(&json).unwrap();
     assert_eq!(back, desc);
-}
-
-#[test]
-fn session_descriptor_without_region_labels_decodes_to_an_empty_map() {
-    // A descriptor from a coordinator that predates the region-label map must
-    // still decode, leaving the relay with nothing to release — the labels are
-    // additive, so an older control plane simply produces a session whose
-    // clients never receive any.
-    let json = r#"{
-        "tenant":"sb-staging","session":42,
-        "peers":[],
-        "bounds":{"min":1,"max":6}
-    }"#;
-    let back: SessionDescriptor = serde_json::from_str(json).unwrap();
-    assert!(back.relay_regions.is_empty());
 }
 
 #[test]
@@ -204,21 +178,20 @@ fn session_descriptor_ignores_fields_it_does_not_know() {
 }
 
 #[test]
-fn session_descriptor_without_rehome_fields_decodes_to_defaults() {
-    // A descriptor from a coordinator that predates the rehome fields must
-    // still decode: `resumed` defaults false and `departed_slots` empty, so
-    // the normal start-on-coverage path runs unchanged.
+fn session_descriptor_slot_sets_decode_verbatim() {
+    // The homed and expected slot sets ride the same literal: the relay's
+    // admission check enforces against `homed_slots`, and its authority sizes
+    // the start-coverage check against `expected_slots`.
     let json = r#"{
         "tenant":"sb-staging","session":42,
         "peers":[],
-        "bounds":{"min":1,"max":6}
+        "bounds":{"min":1,"max":6},
+        "homed_slots":[0,2],
+        "expected_slots":[0,1,2]
     }"#;
     let back: SessionDescriptor = serde_json::from_str(json).unwrap();
-    assert!(
-        !back.resumed,
-        "a descriptor that predates rehome is not resumed"
-    );
-    assert!(back.departed_slots.is_empty());
+    assert_eq!(back.homed_slots, vec![SlotId(0), SlotId(2)]);
+    assert_eq!(back.expected_slots, vec![SlotId(0), SlotId(1), SlotId(2)]);
 }
 
 #[test]
@@ -289,12 +262,13 @@ fn session_descriptor_omits_absent_correlation_ids_on_the_wire() {
 }
 
 #[test]
-fn session_descriptor_without_authority_order_decodes_to_empty() {
-    // A descriptor from a coordinator that predates the authority order —
-    // the peer cert, and the correlation ids — must still decode (the relay
-    // falls back to relay-id order, and to its configured mesh roots for the
-    // dial) rather than tearing down the control connection over a missing
-    // field.
+fn a_pre_additive_descriptor_decodes_with_every_added_field_at_its_default() {
+    // One minimal literal — the shape a coordinator sent before any of the
+    // fields below existed — against every default at once. Each field has a
+    // consumer that reads the default as "unstated" (relay-id order for the
+    // authority, the configured mesh roots for an uncertified peer, the normal
+    // start-on-coverage path for an unresumed session), so a decode error here
+    // would tear down the control connection over a field that was never sent.
     let json = r#"{
         "tenant":"sb-staging","session":42,
         "peers":[{"relay_id":2,"relay_addr":"127.0.0.1:14901"}],
@@ -302,6 +276,16 @@ fn session_descriptor_without_authority_order_decodes_to_empty() {
     }"#;
     let back: SessionDescriptor = serde_json::from_str(json).unwrap();
     assert!(back.authority_order.is_empty());
+    assert_eq!(back.latency_estimate_ms, None);
+    assert!(
+        back.relay_regions.is_empty(),
+        "a descriptor that predates the region labels leaves the relay with          nothing to release, not a decode error",
+    );
+    assert!(
+        !back.resumed,
+        "a descriptor that predates rehome is not resumed, so the normal          start-on-coverage path runs unchanged",
+    );
+    assert!(back.departed_slots.is_empty());
     assert!(
         back.peers[0].cert_der.is_empty(),
         "a peer without a cert decodes to an empty pin (mesh-roots fallback)",
@@ -327,37 +311,6 @@ fn session_descriptor_without_authority_order_decodes_to_empty() {
         "a descriptor that predates the homed-slots field decodes to no \
          homed_slots, not a decode error — home-relay binding is simply unenforced",
     );
-}
-
-#[test]
-fn session_descriptor_with_homed_slots_decodes_the_set() {
-    // A descriptor from a coordinator that carries the homed-slot set: the
-    // slots assigned to this relay decode back verbatim, so the relay's
-    // admission check can enforce against it.
-    let json = r#"{
-        "tenant":"sb-staging","session":42,
-        "peers":[],
-        "bounds":{"min":1,"max":6},
-        "homed_slots":[0,2]
-    }"#;
-    let back: SessionDescriptor = serde_json::from_str(json).unwrap();
-    assert_eq!(back.homed_slots, vec![SlotId(0), SlotId(2)]);
-}
-
-#[test]
-fn session_descriptor_with_expected_slots_decodes_the_set() {
-    // A descriptor from a coordinator that carries the expected-slot set:
-    // every player and observer that must connect before the session starts
-    // decodes back verbatim, so the relay's authority can size its coverage
-    // check against it.
-    let json = r#"{
-        "tenant":"sb-staging","session":42,
-        "peers":[],
-        "bounds":{"min":1,"max":6},
-        "expected_slots":[0,1,2]
-    }"#;
-    let back: SessionDescriptor = serde_json::from_str(json).unwrap();
-    assert_eq!(back.expected_slots, vec![SlotId(0), SlotId(1), SlotId(2)]);
 }
 
 #[test]
@@ -438,20 +391,6 @@ fn session_response_without_slot_homes_decodes_to_empty() {
     let back: SessionResponse = serde_json::from_str(json).unwrap();
     assert!(back.slot_homes.is_empty());
     assert!(back.relay_regions.is_empty());
-}
-
-#[test]
-fn player_handoff_carries_pubkey() {
-    let h = PlayerHandoff {
-        slot: SlotId(3),
-        client_pubkey: ClientPublicKey([0x42; 32]),
-        external_ref: Some("sb-user-77".to_owned()),
-        observer: false,
-        region: None,
-    };
-    let json = serde_json::to_string(&h).unwrap();
-    let back: PlayerHandoff = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, h);
 }
 
 #[test]

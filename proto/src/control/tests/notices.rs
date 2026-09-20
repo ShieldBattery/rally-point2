@@ -26,6 +26,11 @@ fn departure_roundtrips_json() {
     // the kind serializes snake_case.
     assert!(json.contains("\"type\":\"departure\""));
     assert!(json.contains("\"kind\":\"dropped\""));
+    // The other kind spells itself the same way — snake_case, no adjacent tag.
+    assert_eq!(
+        serde_json::to_string(&DepartureKind::Left).unwrap(),
+        r#""left""#
+    );
     // The embedded result rides along.
     assert!(json.contains("\"result\""));
     let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
@@ -81,12 +86,6 @@ fn departure_omits_absent_correlation_ids_on_the_wire() {
         !json.contains("final_turn_count"),
         "an absent final turn count is omitted, not sent as null",
     );
-}
-
-#[test]
-fn departure_kind_left_serializes_snake_case() {
-    let json = serde_json::to_string(&DepartureKind::Left).unwrap();
-    assert_eq!(json, r#""left""#);
 }
 
 #[test]
@@ -153,28 +152,6 @@ fn desync_without_optionals_decodes() {
 }
 
 #[test]
-fn desync_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
-    // Forward compatibility: a `Desync` up-frame decoded by the down-direction
-    // `CoordinatorToRelay` (which has no such variant) folds into `Unknown`
-    // rather than erroring — the "old peer sees a new frame" path.
-    let json = r#"{"type":"desync","tenant":"sb-staging","session":42,"sync_ordinal":9,"detected_at_ms":7,"no_majority":false,"diverged":[]}"#;
-    let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
-    assert_eq!(decoded, CoordinatorToRelay::Unknown);
-}
-
-#[test]
-fn departure_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
-    // Forward compatibility, made concrete: `Departure` is an up-frame the
-    // relay sends. A decoder that predates it — here the *down*-direction
-    // `CoordinatorToRelay`, which has no `Departure` — must fold the frame
-    // into its `Unknown` catch-all rather than erroring, exactly as an older
-    // coordinator build would. This is the "old peer sees a new frame" path.
-    let json = r#"{"type":"departure","tenant":"sb-staging","session":42,"slot":2,"kind":"dropped","reason":1073741830,"leave_seq":1}"#;
-    let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
-    assert_eq!(decoded, CoordinatorToRelay::Unknown);
-}
-
-#[test]
 fn result_roundtrips_json() {
     let notice = ResultNotice {
         tenant: TenantId("sb-staging".to_owned()),
@@ -212,17 +189,6 @@ fn result_without_optionals_decodes() {
     assert!(notice.session_frame.is_none());
     assert!(notice.slot_frame.is_none());
     assert_eq!(notice.payload, vec![1, 2, 3]);
-}
-
-#[test]
-fn result_frame_decodes_to_unknown_on_a_decoder_without_the_variant() {
-    // Forward compatibility: a `Result` up-frame decoded by the
-    // down-direction `CoordinatorToRelay` (which has no such variant) folds
-    // into `Unknown` rather than erroring — the "old peer sees a new frame"
-    // path an older coordinator build would take.
-    let json = r#"{"type":"result","tenant":"sb-staging","session":42,"slot":0,"payload":[1,2,3],"arrival_ms":7}"#;
-    let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
-    assert_eq!(decoded, CoordinatorToRelay::Unknown);
 }
 
 #[test]
@@ -330,17 +296,55 @@ fn slot_started_without_optionals_decodes() {
 }
 
 #[test]
-fn the_load_progress_frames_decode_to_unknown_on_a_decoder_without_them() {
-    // Forward compatibility for all three load-progress up-frames: a decoder
-    // that predates them — here the down-direction `CoordinatorToRelay`,
-    // which has no such variants — folds each into `Unknown` rather than
-    // erroring, exactly as an older coordinator build would.
+fn an_up_frame_decodes_to_unknown_on_a_decoder_that_predates_it() {
+    // Forward compatibility for every relay-authored frame at once: a decoder
+    // that predates one — modeled here by the down-direction
+    // `CoordinatorToRelay`, which has no such variants — folds it into
+    // `Unknown` rather than erroring, exactly as an older coordinator build
+    // would. One literal per up-frame; they all lean on the same `#[serde(other)]`
+    // catch-all, so a rename that broke it would break every row together.
     for json in [
+        r#"{"type":"departure","tenant":"sb-staging","session":42,"slot":2,"kind":"dropped","reason":1073741830,"leave_seq":1}"#,
+        r#"{"type":"desync","tenant":"sb-staging","session":42,"sync_ordinal":9,"detected_at_ms":7,"no_majority":false,"diverged":[]}"#,
+        r#"{"type":"result","tenant":"sb-staging","session":42,"slot":0,"payload":[1,2,3],"arrival_ms":7}"#,
         r#"{"type":"slot_connected","tenant":"sb-staging","session":42,"slot":0,"resumed":false,"connected_at_ms":7}"#,
         r#"{"type":"session_started","tenant":"sb-staging","session":42,"started_at_ms":7}"#,
         r#"{"type":"slot_started","tenant":"sb-staging","session":42,"slot":0,"arrival_ms":7}"#,
+        r#"{"type":"identity_proof","signature":[1,2,3]}"#,
+        r#"{"type":"draining"}"#,
+        r#"{"type":"session_closed","tenant":"sb-staging","session":42}"#,
+        r#"{"type":"flight_upload_request","request":1,"tenant":"sb-staging","session":42,"desynced":false,"bytes":10}"#,
+        // A coordinator that predates the snapshot skips it; the relay's answer
+        // going unread is why a missing answer reads as "did not attest" rather
+        // than as an empty snapshot.
+        r#"{"type":"load_state_snapshot","request_id":9,"state":{"tenant":"sb-staging","session":42,"slots":[]}}"#,
     ] {
         let decoded: CoordinatorToRelay = serde_json::from_str(json).unwrap();
-        assert_eq!(decoded, CoordinatorToRelay::Unknown);
+        assert_eq!(decoded, CoordinatorToRelay::Unknown, "{json}");
+    }
+}
+
+#[test]
+fn a_down_frame_decodes_to_unknown_on_a_decoder_that_predates_it() {
+    // The mirror direction, and the one that carries real operational weight: a
+    // relay too old for a frame the coordinator sends skips it instead of
+    // tearing its control connection down. `RelayToCoordinator` stands in for
+    // that older build, having none of these variants. The silent skip is
+    // exactly the drift the coordinator's version gate exists to prevent — an
+    // older relay is sent full descriptor sets, never a delta.
+    for json in [
+        r#"{"type":"descriptor_delta","upserts":[],"removals":[{"tenant":"sb-staging","session":7}]}"#,
+        r#"{"type":"close_slot","tenant":"sb-staging","session":42,"slots":[1]}"#,
+        r#"{"type":"mesh_peers","peers":[]}"#,
+        r#"{"type":"tenant_keys","keys":[]}"#,
+        r#"{"type":"identity_challenge","nonce":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#,
+        r#"{"type":"drain_ack"}"#,
+        // A relay that predates the grant degrades to lost blobs, not a torn
+        // connection; one that predates the request answers nothing at all.
+        r#"{"type":"flight_upload_grant","request":1,"url":"https://x/y"}"#,
+        r#"{"type":"load_state_request","tenant":"sb-staging","session":42,"request_id":9}"#,
+    ] {
+        let decoded: RelayToCoordinator = serde_json::from_str(json).unwrap();
+        assert_eq!(decoded, RelayToCoordinator::Unknown, "{json}");
     }
 }

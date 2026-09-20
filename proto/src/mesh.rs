@@ -147,12 +147,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hello_round_trips_through_its_fixed_frame() {
-        let hello = MeshHello::new(RelayId(0x0102_0304_0506_0708), ProtocolVersion(0x0A0B));
-        assert_eq!(MeshHello::decode(hello.encode()), hello);
-    }
-
-    #[test]
     fn frame_is_little_endian_id_then_version() {
         let hello = MeshHello::new(RelayId(1), ProtocolVersion::CURRENT);
         let frame = hello.encode();
@@ -162,9 +156,17 @@ mod tests {
     }
 
     #[test]
-    fn decodes_max_values_without_panicking() {
-        let hello = MeshHello::new(RelayId(u64::MAX), ProtocolVersion(u16::MAX));
-        assert_eq!(MeshHello::decode(hello.encode()), hello);
+    fn hello_round_trips_through_its_fixed_frame() {
+        // A distinctive id/version pair catches a field swap or a byte-order
+        // flip; the all-ones pair catches a width mistake that would truncate or
+        // panic on the widest value each field can hold.
+        for (relay, version) in [
+            (RelayId(0x0102_0304_0506_0708), ProtocolVersion(0x0A0B)),
+            (RelayId(u64::MAX), ProtocolVersion(u16::MAX)),
+        ] {
+            let hello = MeshHello::new(relay, version);
+            assert_eq!(MeshHello::decode(hello.encode()), hello);
+        }
     }
 
     #[test]

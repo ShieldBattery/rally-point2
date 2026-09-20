@@ -1,6 +1,6 @@
 use crate::messages::{
-    ControlFrame, LeaveDirective, MeshControlFrame, Payload, SlotDeparted, control_frame,
-    mesh_control_frame,
+    ControlFrame, LeaveDirective, MeshControlFrame, Payload, SlotConnectivity, SlotDeparted,
+    control_frame, mesh_control_frame,
 };
 
 use super::*;
@@ -95,62 +95,6 @@ fn an_over_cap_frame_is_refused_at_encode() {
 }
 
 #[test]
-fn load_state_fence_frames_round_trip_through_the_shared_framing() {
-    use crate::messages::{LoadStateProbe, LoadStateProbeAck};
-
-    // The fence is two frames whose whole content is one correlation id, so
-    // the id surviving the framing verbatim in both directions is the only
-    // thing there is to check.
-    let probe = ControlFrame {
-        kind: Some(control_frame::Kind::LoadStateProbe(LoadStateProbe {
-            probe_id: u64::MAX,
-        })),
-    };
-    let encoded = encode_frame(&probe).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, probe);
-
-    let ack = ControlFrame {
-        kind: Some(control_frame::Kind::LoadStateProbeAck(LoadStateProbeAck {
-            probe_id: u64::MAX,
-        })),
-    };
-    let encoded = encode_frame(&ack).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, ack);
-}
-
-#[test]
-fn lobby_command_frames_round_trip_through_the_shared_framing() {
-    use crate::messages::LobbyCommand;
-
-    // A lobby command rides the client-edge control frame with its author slot
-    // and opaque bytes intact.
-    let frame = ControlFrame {
-        kind: Some(control_frame::Kind::LobbyCommand(LobbyCommand {
-            slot: 3,
-            payload: vec![0x0C, 1, 2, 3].into(),
-        })),
-    };
-    let encoded = encode_frame(&frame).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, frame);
-
-    // And it rides the mesh control frame the same way, for cross-relay
-    // fan-out.
-    let mesh = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::LobbyCommand(LobbyCommand {
-            slot: 3,
-            payload: vec![0x0C, 1, 2, 3].into(),
-        })),
-    };
-    let encoded = encode_frame(&mesh).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, mesh);
-}
-
-#[test]
 fn game_started_frames_round_trip_through_the_shared_framing() {
     use crate::messages::GameStarted;
 
@@ -167,174 +111,6 @@ fn game_started_frames_round_trip_through_the_shared_framing() {
 
     // Field 14, length-delimited, zero-length body.
     assert_eq!(&encoded[CONTROL_LEN_PREFIX..], &[0x72, 0x00]);
-}
-
-#[test]
-fn game_chat_frames_round_trip_through_the_shared_framing() {
-    use crate::messages::GameChat;
-
-    // A game-chat message rides the client-edge control frame with its
-    // author slot, scope hint, and text intact.
-    let frame = ControlFrame {
-        kind: Some(control_frame::Kind::GameChat(GameChat {
-            slot: 3,
-            target_kind: 1,
-            target_slot: 2,
-            text: "gl hf".to_owned(),
-        })),
-    };
-    let encoded = encode_frame(&frame).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, frame);
-
-    // And it rides the mesh control frame the same way, for cross-relay
-    // fan-out.
-    let mesh = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::GameChat(GameChat {
-            slot: 3,
-            target_kind: 1,
-            target_slot: 2,
-            text: "gl hf".to_owned(),
-        })),
-    };
-    let encoded = encode_frame(&mesh).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, mesh);
-}
-
-#[test]
-fn player_skin_frames_round_trip_through_the_shared_framing() {
-    use crate::messages::PlayerSkin;
-
-    // A player-skin blob rides the client-edge control frame with its author
-    // slot and opaque bytes intact.
-    let frame = ControlFrame {
-        kind: Some(control_frame::Kind::PlayerSkin(PlayerSkin {
-            slot: 3,
-            payload: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
-        })),
-    };
-    let encoded = encode_frame(&frame).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, frame);
-
-    // And it rides the mesh control frame the same way, for cross-relay
-    // fan-out.
-    let mesh = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::PlayerSkin(PlayerSkin {
-            slot: 3,
-            payload: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
-        })),
-    };
-    let encoded = encode_frame(&mesh).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, mesh);
-}
-
-#[test]
-fn an_unknown_frame_kind_decodes_with_the_oneof_unset() {
-    // A frame kind a newer peer added: a field number past every one this
-    // build knows, carrying some bytes. It must decode (kind = None) so the
-    // reader can skip it, not fail the stream. The field number has to stay
-    // ahead of the last one `ControlFrame` actually assigns — a number the
-    // oneof now claims would decode as that kind (or fail to) instead of
-    // exercising the skip.
-    let unknown = [0x8A, 0x01, 0x03, 1, 2, 3]; // field 17, wire type 2, len 3
-    let frame: ControlFrame = decode_frame(&unknown).unwrap();
-    assert_eq!(frame.kind, None);
-}
-
-#[test]
-fn mesh_control_frames_round_trip_through_the_shared_framing() {
-    // A SlotDeparted frame and a LeaveDirective frame both ride the same
-    // length-prefixed codec the client-edge ControlFrame uses.
-    let departed = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
-            finalized: false,
-            slot: 2,
-            last_frame: Some(41),
-            reachable_frame: Some(38),
-            reason: 0x4000_0006,
-            result_payload: Vec::new().into(),
-            result_arrival_ms: 0,
-            result_session_frame: None,
-            result_slot_frame: None,
-            connection_epoch: None,
-            final_turn_count: None,
-        })),
-    };
-    let encoded = encode_frame(&departed).unwrap();
-    let mut prefix = [0u8; CONTROL_LEN_PREFIX];
-    prefix.copy_from_slice(&encoded[..CONTROL_LEN_PREFIX]);
-    let len = frame_len(prefix).unwrap();
-    assert_eq!(len, encoded.len() - CONTROL_LEN_PREFIX);
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, departed);
-
-    let leave = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::LeaveDirective(LeaveDirective {
-            finalized: false,
-            slot: 2,
-            reason: 3,
-            apply_at_frame: 42,
-            leave_seq: 1,
-            final_turn_count: Some(43),
-        })),
-    };
-    let encoded = encode_frame(&leave).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, leave);
-
-    // An oversize turn diverted onto the mesh control stream: the same
-    // Payload shape the client-edge ControlFrame carries, well past any
-    // datagram budget but under the shared frame cap.
-    let oversize = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::OversizeTurn(Payload {
-            seq: 9,
-            slot: 2,
-            commands: vec![0x0C; 2000].into(),
-            game_frame_count: Some(41),
-            sync_generation: Some(73),
-            buffer_directive: None,
-        })),
-    };
-    let encoded = encode_frame(&oversize).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, oversize);
-}
-
-#[test]
-fn a_never_framed_departure_omits_last_frame() {
-    // A lobby/pre-game departure carries no frame basis: `last_frame` is
-    // absent, distinct from a present frame 0.
-    let departed = MeshControlFrame {
-        session: 3,
-        kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
-            finalized: false,
-            slot: 1,
-            last_frame: None,
-            reachable_frame: None,
-            reason: 3,
-            result_payload: Vec::new().into(),
-            result_arrival_ms: 0,
-            result_session_frame: None,
-            result_slot_frame: None,
-            connection_epoch: None,
-            final_turn_count: None,
-        })),
-    };
-    let encoded = encode_frame(&departed).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, departed);
-    match decoded.kind {
-        Some(mesh_control_frame::Kind::SlotDeparted(sd)) => assert_eq!(sd.last_frame, None),
-        other => panic!("expected SlotDeparted, got {other:?}"),
-    }
 }
 
 #[test]
@@ -361,41 +137,34 @@ fn a_slot_departed_carries_an_embedded_result_through_the_frame() {
     let encoded = encode_frame(&departed).unwrap();
     let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
     assert_eq!(decoded, departed);
-    match decoded.kind {
-        Some(mesh_control_frame::Kind::SlotDeparted(sd)) => {
-            assert_eq!(sd.result_payload.as_ref(), &[0xDE, 0xAD, 0xBE, 0xEF]);
-            assert_eq!(sd.result_arrival_ms, 1_700_000_000_000);
-        }
-        other => panic!("expected SlotDeparted, got {other:?}"),
-    }
-}
 
-#[test]
-fn session_start_frames_round_trip_through_the_shared_framing() {
-    use crate::messages::SessionStart;
-
-    // The relay-driven session-start directive rides the client-edge control
-    // frame, carrying the computed initial buffer depth.
-    let frame = ControlFrame {
-        kind: Some(control_frame::Kind::SessionStart(SessionStart {
-            initial_buffer_turns: Some(6),
+    // A lobby/pre-game departure is the empty end of the same frame: no result
+    // to echo and no frame basis at all. `last_frame` must come back absent,
+    // which is a different fact from a present frame 0 — one says "this slot
+    // never framed", the other says "it framed once, at the start".
+    let never_framed = MeshControlFrame {
+        session: 3,
+        kind: Some(mesh_control_frame::Kind::SlotDeparted(SlotDeparted {
+            finalized: false,
+            slot: 1,
+            last_frame: None,
+            reachable_frame: None,
+            reason: 3,
+            result_payload: Vec::new().into(),
+            result_arrival_ms: 0,
+            result_session_frame: None,
+            result_slot_frame: None,
+            connection_epoch: None,
+            final_turn_count: None,
         })),
     };
-    let encoded = encode_frame(&frame).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, frame);
-
-    // And it rides the mesh control frame the same way, for the authority's
-    // cross-relay broadcast.
-    let mesh = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {
-            initial_buffer_turns: Some(6),
-        })),
-    };
-    let encoded = encode_frame(&mesh).unwrap();
+    let encoded = encode_frame(&never_framed).unwrap();
     let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, mesh);
+    assert_eq!(decoded, never_framed);
+    let Some(mesh_control_frame::Kind::SlotDeparted(sd)) = decoded.kind else {
+        panic!("expected SlotDeparted");
+    };
+    assert_eq!(sd.last_frame, None);
 }
 
 #[test]
@@ -437,177 +206,6 @@ fn a_session_start_without_a_depth_round_trips_and_matches_old_fieldless_bytes()
 }
 
 #[test]
-fn slot_present_frames_round_trip_through_the_shared_framing() {
-    use crate::messages::SlotPresent;
-
-    // A slot-presence announcement rides only the mesh control frame — it is
-    // relay ↔ relay, never sent to a client.
-    let mesh = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::SlotPresent(SlotPresent {
-            slot: 3,
-        })),
-    };
-    let encoded = encode_frame(&mesh).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, mesh);
-    match decoded.kind {
-        Some(mesh_control_frame::Kind::SlotPresent(sp)) => assert_eq!(sp.slot, 3),
-        other => panic!("expected SlotPresent, got {other:?}"),
-    }
-}
-
-#[test]
-fn a_slot_started_frame_round_trips_through_the_shared_framing() {
-    use crate::messages::SlotStarted;
-
-    // Mesh-only: a client's game-started report reaches its home relay on the
-    // client-edge stream carrying no slot at all, and the home shares it with
-    // its peers as this frame, stamped with the authenticated slot.
-    let frame = MeshControlFrame {
-        session: 12,
-        kind: Some(mesh_control_frame::Kind::SlotStarted(SlotStarted {
-            slot: 4,
-        })),
-    };
-    let encoded = encode_frame(&frame).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, frame);
-    match decoded.kind {
-        Some(mesh_control_frame::Kind::SlotStarted(ss)) => assert_eq!(ss.slot, 4),
-        other => panic!("expected SlotStarted, got {other:?}"),
-    }
-}
-
-#[test]
-fn slot_connectivity_frames_round_trip_through_the_shared_framing() {
-    use crate::messages::SlotConnectivity;
-
-    // A disconnect signal rides the client-edge control frame (relay → its
-    // local slots), carrying the slot and its new connectivity verbatim.
-    let down = ControlFrame {
-        kind: Some(control_frame::Kind::SlotConnectivity(SlotConnectivity {
-            slot: 2,
-            connected: false,
-            connection_epoch: Some(17),
-        })),
-    };
-    let encoded = encode_frame(&down).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, down);
-    match decoded.kind {
-        Some(control_frame::Kind::SlotConnectivity(sc)) => {
-            assert_eq!(sc.slot, 2);
-            assert!(!sc.connected);
-        }
-        other => panic!("expected SlotConnectivity, got {other:?}"),
-    }
-
-    // And a (re)connect signal rides the mesh control frame the same way, for
-    // the origin relay's cross-relay broadcast.
-    let up = MeshControlFrame {
-        session: 9,
-        kind: Some(mesh_control_frame::Kind::SlotConnectivity(
-            SlotConnectivity {
-                slot: 5,
-                connected: true,
-                connection_epoch: Some(18),
-            },
-        )),
-    };
-    let encoded = encode_frame(&up).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, up);
-    match decoded.kind {
-        Some(mesh_control_frame::Kind::SlotConnectivity(sc)) => {
-            assert_eq!(sc.slot, 5);
-            assert!(sc.connected);
-        }
-        other => panic!("expected SlotConnectivity, got {other:?}"),
-    }
-}
-
-#[test]
-fn a_region_label_frame_round_trips_through_the_shared_framing() {
-    use crate::messages::{RegionLabel, RegionLabels};
-
-    // The whole-session label map rides the client-edge control frame only
-    // (relay → its local slots): every relay gets the map from its own
-    // descriptor, so there is no mesh counterpart to exchange.
-    let frame = ControlFrame {
-        kind: Some(control_frame::Kind::RegionLabels(RegionLabels {
-            labels: vec![
-                RegionLabel {
-                    relay_id: 7,
-                    region: "us-east".to_owned(),
-                },
-                RegionLabel {
-                    relay_id: 9,
-                    region: "eu-central".to_owned(),
-                },
-            ],
-        })),
-    };
-    let encoded = encode_frame(&frame).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, frame);
-    match decoded.kind {
-        Some(control_frame::Kind::RegionLabels(map)) => {
-            assert_eq!(map.labels.len(), 2);
-            assert_eq!(map.labels[0].relay_id, 7);
-            assert_eq!(map.labels[1].region, "eu-central");
-        }
-        other => panic!("expected RegionLabels, got {other:?}"),
-    }
-
-    // An empty map is a valid frame that decodes back to an empty map, not
-    // to an unset oneof — "the relay has no labels" and "this build predates
-    // the kind" stay distinguishable.
-    let empty = ControlFrame {
-        kind: Some(control_frame::Kind::RegionLabels(RegionLabels::default())),
-    };
-    let encoded = encode_frame(&empty).unwrap();
-    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, empty);
-}
-
-#[test]
-fn delivery_cursor_frames_round_trip_through_the_shared_framing() {
-    use crate::messages::{DeliveryCursor, DeliveryCursors};
-
-    // A destination's delivered-through cursors ride only the mesh control
-    // frame — relay ↔ relay, never sent to a client — carrying the complete
-    // per-origin map verbatim.
-    let mesh = MeshControlFrame {
-        session: 7,
-        kind: Some(mesh_control_frame::Kind::DeliveryCursors(DeliveryCursors {
-            dest_slot: 1,
-            cursors: vec![
-                DeliveryCursor {
-                    origin_slot: 0,
-                    delivered_seq: 4200,
-                },
-                DeliveryCursor {
-                    origin_slot: 2,
-                    delivered_seq: 17,
-                },
-            ],
-        })),
-    };
-    let encoded = encode_frame(&mesh).unwrap();
-    let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
-    assert_eq!(decoded, mesh);
-    match decoded.kind {
-        Some(mesh_control_frame::Kind::DeliveryCursors(dc)) => {
-            assert_eq!(dc.dest_slot, 1);
-            assert_eq!(dc.cursors.len(), 2);
-            assert_eq!(dc.cursors[0].delivered_seq, 4200);
-        }
-        other => panic!("expected DeliveryCursors, got {other:?}"),
-    }
-}
-
-#[test]
 fn a_control_frame_kind_a_peer_predates_decodes_with_the_oneof_unset() {
     // Forward/backward compatibility, mirroring the mesh-side test below: a
     // build that predates a newer `ControlFrame.kind` (the slot-connectivity
@@ -627,4 +225,234 @@ fn an_unknown_mesh_control_kind_decodes_with_the_oneof_unset() {
     let empty: MeshControlFrame = decode_frame(&[]).unwrap();
     assert_eq!(empty.session, 0);
     assert_eq!(empty.kind, None);
+}
+
+#[test]
+fn every_control_frame_kind_round_trips_through_the_shared_framing() {
+    use crate::messages::{
+        GameChat, LoadStateProbe, LoadStateProbeAck, LobbyCommand, PlayerSkin, RegionLabel,
+        RegionLabels, SessionStart,
+    };
+
+    // The framing is kind-agnostic — one length prefix, one prost body — so
+    // this table is not re-testing prost per field. What it catches is a oneof
+    // arm that cannot make the trip at all: removed, renumbered, or carrying a
+    // shape the generated codec no longer produces. The kinds below are the
+    // ones the *client-edge* stream carries. `OversizeTurn` has its own framing
+    // smoke test and `GameStarted` its own golden-byte test, so neither is
+    // repeated here.
+    let kinds = [
+        // The load-state fence is two frames whose whole content is one
+        // correlation id, so the id surviving verbatim is all there is to check.
+        (
+            "load_state_probe",
+            control_frame::Kind::LoadStateProbe(LoadStateProbe { probe_id: u64::MAX }),
+        ),
+        (
+            "load_state_probe_ack",
+            control_frame::Kind::LoadStateProbeAck(LoadStateProbeAck { probe_id: u64::MAX }),
+        ),
+        (
+            "lobby_command",
+            control_frame::Kind::LobbyCommand(LobbyCommand {
+                slot: 3,
+                payload: vec![0x0C, 1, 2, 3].into(),
+            }),
+        ),
+        (
+            "game_chat",
+            control_frame::Kind::GameChat(GameChat {
+                slot: 3,
+                target_kind: 1,
+                target_slot: 2,
+                text: "gl hf".to_owned(),
+            }),
+        ),
+        (
+            "player_skin",
+            control_frame::Kind::PlayerSkin(PlayerSkin {
+                slot: 3,
+                payload: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
+            }),
+        ),
+        // The relay-driven start directive, carrying the depth its authority
+        // computed.
+        (
+            "session_start",
+            control_frame::Kind::SessionStart(SessionStart {
+                initial_buffer_turns: Some(6),
+            }),
+        ),
+        (
+            "slot_connectivity",
+            control_frame::Kind::SlotConnectivity(SlotConnectivity {
+                slot: 2,
+                connected: false,
+                connection_epoch: Some(17),
+            }),
+        ),
+        // The whole-session label map: client-edge only, since every relay gets
+        // its own copy from its descriptor and has nothing to exchange.
+        (
+            "region_labels",
+            control_frame::Kind::RegionLabels(RegionLabels {
+                labels: vec![
+                    RegionLabel {
+                        relay_id: 7,
+                        region: "us-east".to_owned(),
+                    },
+                    RegionLabel {
+                        relay_id: 9,
+                        region: "eu-central".to_owned(),
+                    },
+                ],
+            }),
+        ),
+    ];
+
+    for (name, kind) in kinds {
+        let frame = ControlFrame { kind: Some(kind) };
+        let encoded = encode_frame(&frame).unwrap();
+        let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, frame, "{name}");
+    }
+}
+
+#[test]
+fn an_empty_region_label_map_is_a_set_oneof_not_an_unset_one() {
+    use crate::messages::RegionLabels;
+
+    // "The relay has no labels to hand out" and "this build predates the kind"
+    // must stay distinguishable: an empty map is a *set* oneof arm carrying an
+    // empty message, and it must not come back as `kind: None`.
+    let empty = ControlFrame {
+        kind: Some(control_frame::Kind::RegionLabels(RegionLabels::default())),
+    };
+    let encoded = encode_frame(&empty).unwrap();
+    let decoded: ControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+    assert_eq!(decoded, empty);
+    assert!(decoded.kind.is_some());
+}
+
+#[test]
+fn every_mesh_control_frame_kind_round_trips_through_the_shared_framing() {
+    use crate::messages::{
+        DeliveryCursor, DeliveryCursors, GameChat, LobbyCommand, PlayerSkin, SessionStart,
+        SlotPresent, SlotStarted,
+    };
+
+    // The relay ↔ relay half of the same kind-agnostic framing. Several kinds
+    // here are the cross-relay twins of client-edge ones — a lobby command, a
+    // chat line, or a skin blob reaches a peer's slots by being re-framed for
+    // the mesh — while presence, started, delivery cursors and the leave
+    // directive are mesh-only and never reach a client. Every mesh frame also
+    // carries a session id outside the oneof, and the length prefix is checked
+    // per row because these bodies vary from a few bytes to a diverted turn.
+    let kinds = [
+        (
+            "lobby_command",
+            mesh_control_frame::Kind::LobbyCommand(LobbyCommand {
+                slot: 3,
+                payload: vec![0x0C, 1, 2, 3].into(),
+            }),
+        ),
+        (
+            "game_chat",
+            mesh_control_frame::Kind::GameChat(GameChat {
+                slot: 3,
+                target_kind: 1,
+                target_slot: 2,
+                text: "gl hf".to_owned(),
+            }),
+        ),
+        (
+            "player_skin",
+            mesh_control_frame::Kind::PlayerSkin(PlayerSkin {
+                slot: 3,
+                payload: vec![0xDE, 0xAD, 0xBE, 0xEF].into(),
+            }),
+        ),
+        (
+            "session_start",
+            mesh_control_frame::Kind::SessionStart(SessionStart {
+                initial_buffer_turns: Some(6),
+            }),
+        ),
+        (
+            "slot_present",
+            mesh_control_frame::Kind::SlotPresent(SlotPresent { slot: 3 }),
+        ),
+        // A client reports its game start to its home relay carrying no slot at
+        // all; the home shares it stamped with the authenticated slot.
+        (
+            "slot_started",
+            mesh_control_frame::Kind::SlotStarted(SlotStarted { slot: 4 }),
+        ),
+        (
+            "slot_connectivity",
+            mesh_control_frame::Kind::SlotConnectivity(SlotConnectivity {
+                slot: 5,
+                connected: true,
+                connection_epoch: Some(18),
+            }),
+        ),
+        (
+            "delivery_cursors",
+            mesh_control_frame::Kind::DeliveryCursors(DeliveryCursors {
+                dest_slot: 1,
+                cursors: vec![
+                    DeliveryCursor {
+                        origin_slot: 0,
+                        delivered_seq: 4200,
+                    },
+                    DeliveryCursor {
+                        origin_slot: 2,
+                        delivered_seq: 17,
+                    },
+                ],
+            }),
+        ),
+        (
+            "leave_directive",
+            mesh_control_frame::Kind::LeaveDirective(LeaveDirective {
+                finalized: false,
+                slot: 2,
+                reason: 3,
+                apply_at_frame: 42,
+                leave_seq: 1,
+                final_turn_count: Some(43),
+            }),
+        ),
+        // An oversize turn diverted onto the mesh control stream: the same
+        // Payload the client edge carries, well past any datagram budget but
+        // under the shared frame cap.
+        (
+            "oversize_turn",
+            mesh_control_frame::Kind::OversizeTurn(Payload {
+                seq: 9,
+                slot: 2,
+                commands: vec![0x0C; 2000].into(),
+                game_frame_count: Some(41),
+                sync_generation: Some(73),
+                buffer_directive: None,
+            }),
+        ),
+    ];
+
+    for (name, kind) in kinds {
+        let frame = MeshControlFrame {
+            session: 7,
+            kind: Some(kind),
+        };
+        let encoded = encode_frame(&frame).unwrap();
+        let mut prefix = [0u8; CONTROL_LEN_PREFIX];
+        prefix.copy_from_slice(&encoded[..CONTROL_LEN_PREFIX]);
+        assert_eq!(
+            frame_len(prefix).unwrap(),
+            encoded.len() - CONTROL_LEN_PREFIX,
+            "{name}"
+        );
+        let decoded: MeshControlFrame = decode_frame(&encoded[CONTROL_LEN_PREFIX..]).unwrap();
+        assert_eq!(decoded, frame, "{name}");
+    }
 }

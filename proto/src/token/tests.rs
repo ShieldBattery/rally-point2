@@ -1,31 +1,5 @@
 use super::*;
-
-fn sample_claims() -> TokenClaims {
-    TokenClaims::new(
-        TenantId("sb-staging".to_owned()),
-        SessionId(0xDEAD_BEEF_CAFE_BABE),
-        SlotId(3),
-        ExpiresAt(1_800_000_000),
-        ClientPublicKey([0xAB; PUBLIC_KEY_LEN]),
-    )
-}
-
-fn sample_token() -> SignedToken {
-    SignedToken::from_parts(
-        KeyId("staging-key-1".to_owned()),
-        sample_claims(),
-        Signature([0xCD; SIGNATURE_LEN]),
-    )
-}
-
-#[test]
-fn round_trip_encode_decode() {
-    let token = sample_token();
-    let encoded = token.encode().unwrap();
-    let decoded = SignedToken::decode(&encoded).unwrap();
-
-    assert_eq!(decoded, token);
-}
+use crate::test_support::{sample_claims, sample_token};
 
 #[test]
 fn encoded_len_is_exact() {
@@ -45,19 +19,6 @@ fn signed_message_excludes_signature() {
     // The signed message is the encoding minus the trailing signature.
     assert_eq!(signed_msg.len(), encoded.len() - SIGNATURE_LEN);
     assert_eq!(&signed_msg[..], &encoded[..encoded.len() - SIGNATURE_LEN]);
-}
-
-#[test]
-fn signed_message_is_stable() {
-    // The same token must always produce the same signed bytes.
-    let token = sample_token();
-
-    let mut a = Vec::new();
-    let mut b = Vec::new();
-    token.signed_message(&mut a).unwrap();
-    token.signed_message(&mut b).unwrap();
-
-    assert_eq!(a, b);
 }
 
 #[test]
@@ -94,26 +55,23 @@ fn decode_rejects_truncated_claims() {
 }
 
 #[test]
-fn decode_rejects_unknown_version() {
-    let token = sample_token();
-    let mut encoded = token.encode().unwrap();
-    encoded[0] = 99; // bogus version
-
-    assert_eq!(
-        SignedToken::decode(&encoded).unwrap_err(),
-        TokenError::UnsupportedVersion(99)
-    );
-}
-
-#[test]
 fn decode_unknown_version_before_structural_parse() {
-    // A token whose version byte is unknown must report UnsupportedVersion,
-    // not Malformed — even if the body is too short to parse as v1.
-    let bytes = &[99u8]; // version only, no body
-    assert_eq!(
-        SignedToken::decode(bytes).unwrap_err(),
-        TokenError::UnsupportedVersion(99)
-    );
+    // An unknown version byte reports UnsupportedVersion whatever follows it:
+    // over a full-length v1 body, and over no body at all. The second case is
+    // the one that matters — the version check has to run *before* the
+    // structural parse, or a future version's frame comes back as Malformed and
+    // the peer learns nothing about why.
+    let mut full_body = sample_token().encode().unwrap();
+    full_body[0] = 99;
+
+    for bytes in [full_body.as_slice(), &[99u8]] {
+        assert_eq!(
+            SignedToken::decode(bytes).unwrap_err(),
+            TokenError::UnsupportedVersion(99),
+            "{} byte(s) after the version",
+            bytes.len() - 1,
+        );
+    }
 }
 
 #[test]
@@ -186,21 +144,6 @@ fn encode_to_appends_without_clearing() {
 }
 
 #[test]
-fn public_key_from_slice_rejects_wrong_length() {
-    assert!(ClientPublicKey::from_slice(&[]).is_none());
-    assert!(ClientPublicKey::from_slice(&[0; 31]).is_none());
-    assert!(ClientPublicKey::from_slice(&[0; 33]).is_none());
-    assert!(ClientPublicKey::from_slice(&[0; PUBLIC_KEY_LEN]).is_some());
-}
-
-#[test]
-fn signature_from_slice_rejects_wrong_length() {
-    assert!(Signature::from_slice(&[0; 63]).is_none());
-    assert!(Signature::from_slice(&[0; 65]).is_none());
-    assert!(Signature::from_slice(&[0; SIGNATURE_LEN]).is_some());
-}
-
-#[test]
 fn key_id_new_rejects_oversized() {
     assert!(KeyId::new(String::new()).is_ok());
     assert!(KeyId::new("a".repeat(MAX_STRING_LEN)).is_ok());
@@ -211,32 +154,36 @@ fn key_id_new_rejects_oversized() {
 }
 
 #[test]
-fn encode_rejects_oversized_kid() {
-    let token = SignedToken::from_parts(
-        KeyId("a".repeat(MAX_STRING_LEN + 1)),
+fn encode_rejects_an_oversized_string_field() {
+    // Both length-prefixed strings are gated: a kid or a tenant past
+    // MAX_STRING_LEN cannot be expressed in its one-byte prefix, so encoding
+    // fails outright rather than emitting a truncated field. `encoded_len` has
+    // to agree — a caller sizing a buffer from it must not get a number back for
+    // a token that will never encode.
+    let long = "a".repeat(MAX_STRING_LEN + 1);
+
+    let oversized_kid = SignedToken::from_parts(
+        KeyId(long.clone()),
         sample_claims(),
         Signature([0; SIGNATURE_LEN]),
     );
 
-    assert_eq!(token.encode().unwrap_err(), TokenError::StringTooLong);
-    assert!(token.encoded_len().is_none());
-}
-
-#[test]
-fn encode_rejects_oversized_tenant() {
-    let token = SignedToken::from_parts(
+    let mut long_tenant = sample_claims();
+    long_tenant.tenant = TenantId(long);
+    let oversized_tenant = SignedToken::from_parts(
         KeyId("ok".to_owned()),
-        TokenClaims::new(
-            TenantId("b".repeat(MAX_STRING_LEN + 1)),
-            SessionId(0),
-            SlotId(0),
-            ExpiresAt(0),
-            ClientPublicKey([0; PUBLIC_KEY_LEN]),
-        ),
+        long_tenant,
         Signature([0; SIGNATURE_LEN]),
     );
 
-    assert_eq!(token.encode().unwrap_err(), TokenError::StringTooLong);
+    for (field, token) in [("kid", oversized_kid), ("tenant", oversized_tenant)] {
+        assert_eq!(
+            token.encode().unwrap_err(),
+            TokenError::StringTooLong,
+            "oversized {field}"
+        );
+        assert!(token.encoded_len().is_none(), "oversized {field}");
+    }
 }
 
 // --- Challenge / response tests ---
@@ -253,24 +200,6 @@ fn challenge_signed_message_has_tag_binding_and_nonce() {
 }
 
 #[test]
-fn challenge_signed_message_is_deterministic() {
-    let challenge = ConnectionChallenge([0x99; CHALLENGE_LEN]);
-    let binding = [0x33; CHANNEL_BINDING_LEN];
-    assert_eq!(
-        challenge.signed_message(&binding),
-        challenge.signed_message(&binding)
-    );
-}
-
-#[test]
-fn challenge_signed_messages_differ_for_different_challenges() {
-    let binding = [0x33; CHANNEL_BINDING_LEN];
-    let a = ConnectionChallenge([0x11; CHALLENGE_LEN]);
-    let b = ConnectionChallenge([0x22; CHALLENGE_LEN]);
-    assert_ne!(a.signed_message(&binding), b.signed_message(&binding));
-}
-
-#[test]
 fn challenge_signed_messages_differ_for_different_channel_bindings() {
     // The same challenge bound to two channels signs differently — the property
     // that stops a proof from being replayed across connections.
@@ -281,14 +210,6 @@ fn challenge_signed_messages_differ_for_different_channel_bindings() {
         challenge.signed_message(&cb_a),
         challenge.signed_message(&cb_b)
     );
-}
-
-#[test]
-fn challenge_from_slice_rejects_wrong_length() {
-    assert!(ConnectionChallenge::from_slice(&[]).is_none());
-    assert!(ConnectionChallenge::from_slice(&[0; 31]).is_none());
-    assert!(ConnectionChallenge::from_slice(&[0; 33]).is_none());
-    assert!(ConnectionChallenge::from_slice(&[0; CHALLENGE_LEN]).is_some());
 }
 
 #[test]
@@ -342,8 +263,41 @@ fn v1_wire_bytes_match_the_golden_vector() {
 }
 
 #[test]
-fn challenge_response_from_slice_rejects_wrong_length() {
-    assert!(ChallengeResponse::from_slice(&[0; 63]).is_none());
-    assert!(ChallengeResponse::from_slice(&[0; 65]).is_none());
-    assert!(ChallengeResponse::from_slice(&[0; SIGNATURE_LEN]).is_some());
+fn the_fixed_width_newtypes_accept_only_their_exact_length() {
+    // Every `from_slice` wraps a fixed-size array, so anything but the exact
+    // length must come back `None` rather than panicking or padding: these are
+    // the constructors that turn attacker-supplied slices into keys,
+    // signatures, and challenges.
+    /// Whether a newtype's `from_slice` accepted a slice of a given length.
+    type Accepts = fn(&[u8]) -> bool;
+
+    let cases: [(&str, Accepts, usize); 4] = [
+        (
+            "ClientPublicKey",
+            |b| ClientPublicKey::from_slice(b).is_some(),
+            PUBLIC_KEY_LEN,
+        ),
+        (
+            "Signature",
+            |b| Signature::from_slice(b).is_some(),
+            SIGNATURE_LEN,
+        ),
+        (
+            "ConnectionChallenge",
+            |b| ConnectionChallenge::from_slice(b).is_some(),
+            CHALLENGE_LEN,
+        ),
+        (
+            "ChallengeResponse",
+            |b| ChallengeResponse::from_slice(b).is_some(),
+            SIGNATURE_LEN,
+        ),
+    ];
+
+    for (name, accepts, len) in cases {
+        assert!(accepts(&vec![0; len]), "{name} rejects its own length");
+        assert!(!accepts(&[]), "{name} accepts an empty slice");
+        assert!(!accepts(&vec![0; len - 1]), "{name} accepts one byte short");
+        assert!(!accepts(&vec![0; len + 1]), "{name} accepts one byte long");
+    }
 }

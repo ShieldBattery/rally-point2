@@ -36,6 +36,9 @@ pub mod version;
 pub mod beacon;
 pub mod control_stream;
 
+#[cfg(test)]
+mod test_support;
+
 /// Generated protobuf wire messages — the turn-datagram framing.
 ///
 /// Built from `proto/wire.proto` by this crate's `build.rs`. See

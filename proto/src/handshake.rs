@@ -165,25 +165,9 @@ pub fn decode_resume_cursor_entry(bytes: [u8; RESUME_CURSOR_ENTRY_LEN]) -> (Slot
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::control::TenantId;
-    use crate::ids::{SessionId, SlotId};
-    use crate::token::{
-        ClientPublicKey, ExpiresAt, KeyId, PUBLIC_KEY_LEN, SIGNATURE_LEN, Signature, TokenClaims,
-    };
-
-    fn sample_token() -> SignedToken {
-        SignedToken::from_parts(
-            KeyId("staging-key-1".to_owned()),
-            TokenClaims::new(
-                TenantId("sb-staging".to_owned()),
-                SessionId(7),
-                SlotId(3),
-                ExpiresAt(1_800_000_000),
-                ClientPublicKey([0xAB; PUBLIC_KEY_LEN]),
-            ),
-            Signature([0xCD; SIGNATURE_LEN]),
-        )
-    }
+    use crate::ids::SlotId;
+    use crate::test_support::sample_token;
+    use crate::token::{KeyId, SIGNATURE_LEN, Signature};
 
     #[test]
     fn token_frame_round_trips_through_the_length_prefix() {
@@ -200,7 +184,13 @@ mod tests {
     }
 
     #[test]
-    fn decode_token_len_refuses_an_over_long_prefix() {
+    fn decode_token_len_accepts_the_maximum_and_refuses_one_past_it() {
+        // Both sides of the cap: MAX_TOKEN_LEN is a legal frame, one byte more
+        // is refused before anything is read, so an off-by-one in the bound
+        // shows up whichever way it slips.
+        let max = u16::try_from(MAX_TOKEN_LEN).unwrap();
+        assert_eq!(decode_token_len(max.to_le_bytes()), Ok(MAX_TOKEN_LEN));
+
         let too_long = u16::try_from(MAX_TOKEN_LEN + 1).unwrap();
         assert_eq!(
             decode_token_len(too_long.to_le_bytes()),
@@ -208,12 +198,6 @@ mod tests {
                 len: MAX_TOKEN_LEN + 1
             })
         );
-    }
-
-    #[test]
-    fn decode_token_len_accepts_the_maximum() {
-        let max = u16::try_from(MAX_TOKEN_LEN).unwrap();
-        assert_eq!(decode_token_len(max.to_le_bytes()), Ok(MAX_TOKEN_LEN));
     }
 
     #[test]
@@ -249,7 +233,8 @@ mod tests {
     }
 
     #[test]
-    fn resume_cursor_count_refuses_an_over_long_prefix() {
+    fn the_resume_cursor_cap_is_refused_on_both_the_read_and_the_write_side() {
+        // A peer-supplied count over the cap never reaches the entry loop...
         let too_many = u16::try_from(MAX_RESUME_CURSORS + 1).unwrap();
         assert_eq!(
             decode_resume_cursor_count(too_many.to_le_bytes()),
@@ -257,10 +242,8 @@ mod tests {
                 count: MAX_RESUME_CURSORS + 1,
             }),
         );
-    }
 
-    #[test]
-    fn encode_resume_cursors_refuses_too_many() {
+        // ...and we never emit a frame a conforming reader would then refuse.
         let cursors: Vec<(SlotId, u64)> = (0..=MAX_RESUME_CURSORS)
             .map(|i| (SlotId(i as u8), 0))
             .collect();

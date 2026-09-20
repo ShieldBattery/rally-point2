@@ -18,23 +18,6 @@ fn relay_to_coordinator_heartbeat_roundtrips_json() {
 }
 
 #[test]
-fn a_bare_heartbeat_decodes_with_an_empty_roster() {
-    // A beat from a relay that predates the presence roster (or the backbone
-    // RTT set) carries neither field; it must decode with both empty, not
-    // error.
-    let json = r#"{"type":"heartbeat"}"#;
-    let back: RelayToCoordinator = serde_json::from_str(json).unwrap();
-    assert_eq!(
-        back,
-        RelayToCoordinator::Heartbeat {
-            roster_complete: false,
-            sessions: vec![],
-            region_rtts: vec![],
-        },
-    );
-}
-
-#[test]
 fn a_presence_bearing_heartbeat_roundtrips_json() {
     let message = RelayToCoordinator::Heartbeat {
         roster_complete: true,

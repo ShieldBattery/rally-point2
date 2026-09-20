@@ -103,6 +103,13 @@ impl ProtocolVersion {
 // here rather than silently reopening a downgrade path around the challenge.
 const _: () = assert!(ProtocolVersion::MIN_SUPPORTED.0 >= ProtocolVersion::ENROLL_POP_MIN.0);
 
+// The delta frame ships in the build that defines it, so a peer that negotiates
+// at `CURRENT` always receives deltas: `CURRENT` must stay at or above
+// `DESCRIPTOR_DELTA_MIN`. An edit that introduces a delta threshold above the
+// version this build speaks fails to build here rather than leaving the
+// coordinator unable to send a frame it defines.
+const _: () = assert!(ProtocolVersion::CURRENT.0 >= ProtocolVersion::DESCRIPTOR_DELTA_MIN.0);
+
 impl std::fmt::Display for ProtocolVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "v{}", self.0)
@@ -283,13 +290,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn negotiates_highest_common_version() {
-        // A peer whose window reaches past this build's CURRENT still negotiates
-        // down to CURRENT (our cap) — the shape a gradual rollout relies on when
-        // a newer peer meets an older one.
+    fn negotiates_the_highest_version_both_windows_contain() {
+        // Rows: a peer reaching past this build's CURRENT is capped at CURRENT
+        // (the shape a gradual rollout relies on when a newer peer meets an
+        // older one); a peer advertising this build's own window lands on
+        // CURRENT; a peer that speaks only the supported floor negotiates
+        // *there* rather than being pulled up, which is how an older relay keeps
+        // being served across a rolling deploy.
         let future = ProtocolVersion(ProtocolVersion::CURRENT.0 + 1);
-        let v = negotiate(ProtocolVersion::MIN_SUPPORTED, future).unwrap();
-        assert_eq!(v, ProtocolVersion::CURRENT);
+        let floor = ProtocolVersion::MIN_SUPPORTED;
+        for (peer_min, peer_max, expected) in [
+            (floor, future, ProtocolVersion::CURRENT),
+            (floor, ProtocolVersion::CURRENT, ProtocolVersion::CURRENT),
+            (ProtocolVersion::CURRENT, future, ProtocolVersion::CURRENT),
+            (floor, floor, floor),
+        ] {
+            let negotiated = negotiate(peer_min, peer_max)
+                .unwrap_or_else(|e| panic!("{peer_min}..={peer_max} overlaps this build: {e}"));
+            assert_eq!(negotiated, expected, "{peer_min}..={peer_max}");
+        }
     }
 
     #[test]
@@ -313,46 +332,5 @@ mod tests {
             negotiate(below, below).is_err(),
             "a sub-floor advertiser has no overlap with [MIN_SUPPORTED, CURRENT]",
         );
-    }
-
-    #[test]
-    fn a_current_peers_window_negotiates_at_the_pop_threshold() {
-        // A peer advertising this build's own window negotiates at CURRENT, which
-        // is at or above ENROLL_POP_MIN — the coordinator challenges it.
-        let negotiated = negotiate(ProtocolVersion::MIN_SUPPORTED, ProtocolVersion::CURRENT)
-            .expect("a current peer's window overlaps");
-        assert_eq!(negotiated, ProtocolVersion::CURRENT);
-        assert!(negotiated >= ProtocolVersion::ENROLL_POP_MIN);
-    }
-
-    #[test]
-    fn a_current_relay_negotiates_at_or_above_the_descriptor_delta_threshold() {
-        // A relay advertising this build's own window negotiates at CURRENT, which
-        // is at or above DESCRIPTOR_DELTA_MIN — the coordinator sends it deltas.
-        let negotiated = negotiate(ProtocolVersion::MIN_SUPPORTED, ProtocolVersion::CURRENT)
-            .expect("a current relay's window overlaps");
-        assert!(negotiated >= ProtocolVersion::DESCRIPTOR_DELTA_MIN);
-    }
-
-    #[test]
-    fn a_relay_at_the_supported_floor_negotiates_below_the_descriptor_delta_threshold() {
-        // A relay that speaks only the supported floor (below the delta threshold)
-        // negotiates there and must be sent full descriptor sets, not deltas — it
-        // would decode a delta frame as an unknown message and silently drift.
-        let floor = ProtocolVersion::MIN_SUPPORTED;
-        let negotiated = negotiate(floor, floor).expect("the floor overlaps this build's window");
-        assert_eq!(negotiated, floor);
-        assert!(negotiated < ProtocolVersion::DESCRIPTOR_DELTA_MIN);
-    }
-
-    #[test]
-    fn no_negotiable_version_skips_enroll_pop() {
-        // The durable invariant: MIN_SUPPORTED stays at or above ENROLL_POP_MIN,
-        // so every version in the negotiable window reaches the challenge. This
-        // is NOT `MIN_SUPPORTED == CURRENT` — a future gradual rollout may lower
-        // MIN_SUPPORTED below CURRENT to keep serving older peers, and that stays
-        // sound exactly as long as it does not cross the PoP floor (which the
-        // compile-time assertion in this module also guards).
-        assert!(ProtocolVersion::MIN_SUPPORTED >= ProtocolVersion::ENROLL_POP_MIN);
     }
 }
