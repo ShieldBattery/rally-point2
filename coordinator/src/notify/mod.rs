@@ -43,7 +43,8 @@
 //! - `payloads` — the `*Webhook` JSON body shapes and the `sessionClosed`
 //!   dispatch builder.
 //! - `handlers` — one `handle_*` function per notice kind: dedup, correlation-id
-//!   resolution, body construction, enqueue.
+//!   resolution, body construction, enqueue. The parts that do not vary per kind
+//!   live in its own `resolve_or_drop`.
 //! - `dispatch` — the signed-POST retry/backoff delivery loop shared by every
 //!   notice kind.
 //!
@@ -326,11 +327,11 @@ static DISPATCH_PERMITS: tokio::sync::Semaphore =
 /// shapes it can't share.
 ///
 /// The three ways a notice goes no further (a duplicate, no notify config, no
-/// gameId from either source) are each a case the caller debug-logs with its
-/// own event-specific fields (a departure/result logs `slot`, a desync logs
-/// `sync_ordinal`) and message text — that logging stays with the caller so
-/// the fields correlate on the id that actually applies to the event, rather
-/// than this helper flattening them to a lowest common denominator.
+/// gameId from either source) are returned as variants rather than logged here:
+/// `handlers`' own `resolve_or_drop` turns each into a debug log carrying the
+/// event-specific field that applies to the notice (a departure/result logs
+/// `slot`, a desync logs `sync_ordinal`, a session start neither), so no drop is
+/// flattened to a lowest common denominator.
 enum NoticePrefix {
     /// The dedup key was already present.
     Duplicate,

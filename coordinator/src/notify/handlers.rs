@@ -1,10 +1,12 @@
 //! The notice handlers: one `handle_*` function per relay-reported notice
 //! kind, each following the same shape — claim the dedup entry, resolve the
-//! tenant's notify config and correlation ids via
-//! [`super::resolve_notice_prefix`], build the notice's `*Webhook` body, and
-//! hand it to [`enqueue_dispatch`] for ordered delivery. Grouped separately
-//! from `payloads` and `dispatch` because this is the one piece of logic that
-//! actually varies per notice kind.
+//! tenant's notify config and correlation ids via [`resolve_or_drop`], build
+//! the notice's `*Webhook` body, and hand it to [`enqueue_dispatch`] for
+//! ordered delivery. Grouped separately from `payloads` and `dispatch` because
+//! this is the one piece of logic that actually varies per notice kind — and
+//! what does *not* vary (the resolution, and the three ways a notice goes no
+//! further) is factored into [`resolve_or_drop`] so a new kind spells out only
+//! its own key, its own body, and nothing else.
 
 use std::time::Instant;
 
@@ -15,13 +17,109 @@ use rally_point_proto::control::{
     DepartureNotice, DesyncNotice, ResultNotice, SessionStartedNotice, SlotConnectedNotice,
     SlotStartedNotice, TenantId,
 };
-use rally_point_proto::ids::SessionId;
+use rally_point_proto::ids::{SessionId, SlotId};
 use serde::Serialize;
 
 use super::*;
 use crate::lifecycle::Lifecycle;
 use crate::session::SessionSetup;
 use crate::tenant::NotifyConfig;
+
+/// What identifies one notice within its session, for the drop logs. A
+/// departure/result/slot notice is identified by its slot, a desync by the sync
+/// ordinal at which the mismatch was seen, and a session start by the session
+/// alone. Each drop log correlates on the id that actually applies to its event
+/// rather than flattening them all to a lowest common denominator.
+enum NoticeKey {
+    /// A per-slot notice: logs `slot`.
+    Slot(SlotId),
+    /// A desync: logs `sync_ordinal`.
+    SyncOrdinal(u64),
+    /// A whole-session notice: logs neither.
+    Session,
+}
+
+/// Everything a handler needs after the shared resolution succeeded: where to
+/// POST, the gameId to embed, and this coordinator's stored session record for
+/// whatever per-slot reference resolution the kind still does itself.
+struct ResolvedNotice {
+    config: NotifyConfig,
+    external_id: String,
+    /// Boxed for the same reason [`NoticePrefix::Resolved`] boxes it: the
+    /// per-relay cert map makes `SessionRefs` far larger than everything else
+    /// here.
+    stored: Box<Option<SessionRefs>>,
+}
+
+impl ResolvedNotice {
+    /// The stored per-slot correlation ref for `slot`, if this coordinator
+    /// still holds the session's record. The fallback behind every notice's
+    /// own `external_ref`: notice-carried first, stored second, so a
+    /// coordinator restart that wiped the session store still names whom the
+    /// notice itself named.
+    fn stored_slot_ref(&self, slot: SlotId) -> Option<String> {
+        (*self.stored)
+            .as_ref()
+            .and_then(|refs| refs.slots.get(&slot).cloned())
+    }
+}
+
+/// The shared opening of every handler: resolve the tenant's notify config and
+/// the notice's gameId, or debug-log why this notice goes no further and return
+/// `None`.
+///
+/// The three ways a notice stops here — a duplicate, a tenant with no notify
+/// config, and no gameId from either the notice or a stored session — are each
+/// a deliberate, best-effort drop rather than an error: the webhook feed is an
+/// optimization, so silence is correct. `kind` names the notice in those log
+/// messages (`departure`, `slot-connected`, …) and `key` decides which
+/// event-specific field they correlate on.
+fn resolve_or_drop(
+    setup: &SessionSetup,
+    tenant: &TenantId,
+    session: SessionId,
+    key: NoticeKey,
+    kind: &str,
+    notice_external_id: Option<String>,
+    is_new: bool,
+) -> Option<ResolvedNotice> {
+    let reason = match resolve_notice_prefix(setup, tenant, session, notice_external_id, is_new) {
+        NoticePrefix::Resolved {
+            config,
+            external_id,
+            stored,
+        } => {
+            return Some(ResolvedNotice {
+                config,
+                external_id,
+                stored,
+            });
+        }
+        NoticePrefix::Duplicate => format!("duplicate {kind} notice; already handled"),
+        NoticePrefix::NoNotifyConfig => format!("no notify config for tenant; dropping {kind}"),
+        NoticePrefix::NoExternalId => {
+            format!("no gameId ref from the notice or a stored session; dropping {kind}")
+        }
+    };
+    match key {
+        NoticeKey::Slot(slot) => tracing::debug!(
+            tenant = tenant.as_ref(),
+            session = session.0,
+            slot = slot.0,
+            "{reason}",
+        ),
+        NoticeKey::SyncOrdinal(sync_ordinal) => tracing::debug!(
+            tenant = tenant.as_ref(),
+            session = session.0,
+            sync_ordinal,
+            "{reason}",
+        ),
+        NoticeKey::Session => {
+            tracing::debug!(tenant = tenant.as_ref(), session = session.0, "{reason}",)
+        }
+    }
+    None
+}
 
 /// Handles one relay's departure notice.
 ///
@@ -39,11 +137,10 @@ use crate::tenant::NotifyConfig;
 /// still delivers a correct webhook as long as the notice carries its own refs.
 /// Each field falls back independently to the stored session (for a notice
 /// from a relay that predates the fields, or one whose descriptor never carried
-/// them) rather than requiring the whole pair from one source. Unlike the
-/// previous behavior, an unresolved *session* is no longer a hard drop on its
-/// own — only the absence of a `gameId` (`external_id`) from *both* sources is,
-/// since a webhook naming no game is useless to the consumer regardless of
-/// whether a player ref is available.
+/// them) rather than requiring the whole pair from one source. An unresolved
+/// *session* is not a hard drop on its own — only the absence of a `gameId`
+/// (`external_id`) from *both* sources is, since a webhook naming no game is
+/// useless to the consumer regardless of whether a player ref is available.
 ///
 /// The dedup entry is claimed before the later lookups, so those terminal
 /// drops are not re-processed by a later duplicate either.
@@ -57,58 +154,28 @@ pub fn handle_departure(
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.slot));
 
-    let (config, external_id, stored) = match resolve_notice_prefix(
+    let Some(resolved) = resolve_or_drop(
         setup,
         &notice.tenant,
         notice.session,
+        NoticeKey::Slot(notice.slot),
+        "departure",
         notice.external_id.clone(),
         is_new,
-    ) {
-        NoticePrefix::Duplicate => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "duplicate departure notice; already handled",
-            );
-            return;
-        }
-        NoticePrefix::NoNotifyConfig => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "no notify config for tenant; dropping departure",
-            );
-            return;
-        }
-        NoticePrefix::NoExternalId => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "no gameId ref from the notice or a stored session; dropping departure",
-            );
-            return;
-        }
-        NoticePrefix::Resolved {
-            config,
-            external_id,
-            stored,
-        } => (config, external_id, stored),
+    ) else {
+        return;
     };
 
-    let external_ref = notice.external_ref.clone().or_else(|| {
-        (*stored)
-            .as_ref()
-            .and_then(|refs| refs.slots.get(&notice.slot).cloned())
-    });
+    let external_ref = notice
+        .external_ref
+        .clone()
+        .or_else(|| resolved.stored_slot_ref(notice.slot));
 
     let payload = DepartureWebhook {
         event: "departure",
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
-        external_id: Some(external_id),
+        external_id: Some(resolved.external_id),
         slot: notice.slot.0,
         external_ref,
         kind: notice.kind,
@@ -121,7 +188,7 @@ pub fn handle_departure(
         lifecycle,
         notice.tenant,
         notice.session,
-        config,
+        resolved.config,
         &payload,
         "departure",
     );
@@ -171,45 +238,16 @@ pub fn handle_desync(
         lifecycle.ensure_orphan_tracked(notice.tenant.clone(), notice.session);
     }
 
-    let (config, external_id, stored) = match resolve_notice_prefix(
+    let Some(resolved) = resolve_or_drop(
         setup,
         &notice.tenant,
         notice.session,
+        NoticeKey::SyncOrdinal(notice.sync_ordinal),
+        "desync",
         notice.external_id.clone(),
         is_new,
-    ) {
-        NoticePrefix::Duplicate => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                sync_ordinal = notice.sync_ordinal,
-                "duplicate desync notice; already handled",
-            );
-            return;
-        }
-        NoticePrefix::NoNotifyConfig => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                sync_ordinal = notice.sync_ordinal,
-                "no notify config for tenant; dropping desync",
-            );
-            return;
-        }
-        NoticePrefix::NoExternalId => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                sync_ordinal = notice.sync_ordinal,
-                "no gameId ref from the notice or a stored session; dropping desync",
-            );
-            return;
-        }
-        NoticePrefix::Resolved {
-            config,
-            external_id,
-            stored,
-        } => (config, external_id, stored),
+    ) else {
+        return;
     };
 
     let diverged = notice
@@ -217,11 +255,10 @@ pub fn handle_desync(
         .iter()
         .map(|d| DivergedSlotWebhook {
             slot: d.slot.0,
-            external_ref: d.external_ref.clone().or_else(|| {
-                (*stored)
-                    .as_ref()
-                    .and_then(|refs| refs.slots.get(&d.slot).cloned())
-            }),
+            external_ref: d
+                .external_ref
+                .clone()
+                .or_else(|| resolved.stored_slot_ref(d.slot)),
         })
         .collect();
 
@@ -229,7 +266,7 @@ pub fn handle_desync(
         event: "desync",
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
-        external_id: Some(external_id),
+        external_id: Some(resolved.external_id),
         sync_ordinal: notice.sync_ordinal,
         game_frame: notice.game_frame,
         detected_at_ms: notice.detected_at_ms,
@@ -241,7 +278,7 @@ pub fn handle_desync(
         lifecycle,
         notice.tenant,
         notice.session,
-        config,
+        resolved.config,
         &payload,
         "desync",
     );
@@ -270,58 +307,28 @@ pub fn handle_result(
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.slot));
 
-    let (config, external_id, stored) = match resolve_notice_prefix(
+    let Some(resolved) = resolve_or_drop(
         setup,
         &notice.tenant,
         notice.session,
+        NoticeKey::Slot(notice.slot),
+        "result",
         notice.external_id.clone(),
         is_new,
-    ) {
-        NoticePrefix::Duplicate => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "duplicate result notice; already handled",
-            );
-            return;
-        }
-        NoticePrefix::NoNotifyConfig => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "no notify config for tenant; dropping result",
-            );
-            return;
-        }
-        NoticePrefix::NoExternalId => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "no gameId ref from the notice or a stored session; dropping result",
-            );
-            return;
-        }
-        NoticePrefix::Resolved {
-            config,
-            external_id,
-            stored,
-        } => (config, external_id, stored),
+    ) else {
+        return;
     };
 
-    let external_ref = notice.external_ref.clone().or_else(|| {
-        (*stored)
-            .as_ref()
-            .and_then(|refs| refs.slots.get(&notice.slot).cloned())
-    });
+    let external_ref = notice
+        .external_ref
+        .clone()
+        .or_else(|| resolved.stored_slot_ref(notice.slot));
 
     let payload = ResultWebhook {
         event: "result",
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
-        external_id: Some(external_id),
+        external_id: Some(resolved.external_id),
         slot: notice.slot.0,
         external_ref,
         payload: BASE64_STANDARD.encode(&notice.payload),
@@ -334,7 +341,7 @@ pub fn handle_result(
         lifecycle,
         notice.tenant,
         notice.session,
-        config,
+        resolved.config,
         &payload,
         "result",
     );
@@ -361,58 +368,28 @@ pub fn handle_slot_connected(
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.slot));
 
-    let (config, external_id, stored) = match resolve_notice_prefix(
+    let Some(resolved) = resolve_or_drop(
         setup,
         &notice.tenant,
         notice.session,
+        NoticeKey::Slot(notice.slot),
+        "slot-connected",
         notice.external_id.clone(),
         is_new,
-    ) {
-        NoticePrefix::Duplicate => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "duplicate slot-connected notice; already handled",
-            );
-            return;
-        }
-        NoticePrefix::NoNotifyConfig => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "no notify config for tenant; dropping slot-connected",
-            );
-            return;
-        }
-        NoticePrefix::NoExternalId => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "no gameId ref from the notice or a stored session; dropping slot-connected",
-            );
-            return;
-        }
-        NoticePrefix::Resolved {
-            config,
-            external_id,
-            stored,
-        } => (config, external_id, stored),
+    ) else {
+        return;
     };
 
-    let external_ref = notice.external_ref.clone().or_else(|| {
-        (*stored)
-            .as_ref()
-            .and_then(|refs| refs.slots.get(&notice.slot).cloned())
-    });
+    let external_ref = notice
+        .external_ref
+        .clone()
+        .or_else(|| resolved.stored_slot_ref(notice.slot));
 
     let payload = SlotConnectedWebhook {
         event: "slotConnected",
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
-        external_id: Some(external_id),
+        external_id: Some(resolved.external_id),
         slot: notice.slot.0,
         external_ref,
         resumed: notice.resumed,
@@ -423,7 +400,7 @@ pub fn handle_slot_connected(
         lifecycle,
         notice.tenant,
         notice.session,
-        config,
+        resolved.config,
         &payload,
         "slotConnected",
     );
@@ -446,49 +423,23 @@ pub fn handle_session_started(
 ) {
     let is_new = dedup.lock().insert((notice.tenant.clone(), notice.session));
 
-    let (config, external_id) = match resolve_notice_prefix(
+    let Some(resolved) = resolve_or_drop(
         setup,
         &notice.tenant,
         notice.session,
+        NoticeKey::Session,
+        "session-started",
         notice.external_id.clone(),
         is_new,
-    ) {
-        NoticePrefix::Duplicate => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                "duplicate session-started notice; already handled",
-            );
-            return;
-        }
-        NoticePrefix::NoNotifyConfig => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                "no notify config for tenant; dropping session-started",
-            );
-            return;
-        }
-        NoticePrefix::NoExternalId => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                "no gameId ref from the notice or a stored session; dropping session-started",
-            );
-            return;
-        }
-        NoticePrefix::Resolved {
-            config,
-            external_id,
-            ..
-        } => (config, external_id),
+    ) else {
+        return;
     };
 
     let payload = SessionStartedWebhook {
         event: "sessionStarted",
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
-        external_id: Some(external_id),
+        external_id: Some(resolved.external_id),
         started_at_ms: notice.started_at_ms,
         initial_buffer_turns: notice.initial_buffer_turns,
     };
@@ -497,7 +448,7 @@ pub fn handle_session_started(
         lifecycle,
         notice.tenant,
         notice.session,
-        config,
+        resolved.config,
         &payload,
         "sessionStarted",
     );
@@ -519,58 +470,28 @@ pub fn handle_slot_started(
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.slot));
 
-    let (config, external_id, stored) = match resolve_notice_prefix(
+    let Some(resolved) = resolve_or_drop(
         setup,
         &notice.tenant,
         notice.session,
+        NoticeKey::Slot(notice.slot),
+        "slot-started",
         notice.external_id.clone(),
         is_new,
-    ) {
-        NoticePrefix::Duplicate => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "duplicate slot-started notice; already handled",
-            );
-            return;
-        }
-        NoticePrefix::NoNotifyConfig => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "no notify config for tenant; dropping slot-started",
-            );
-            return;
-        }
-        NoticePrefix::NoExternalId => {
-            tracing::debug!(
-                tenant = notice.tenant.as_ref(),
-                session = notice.session.0,
-                slot = notice.slot.0,
-                "no gameId ref from the notice or a stored session; dropping slot-started",
-            );
-            return;
-        }
-        NoticePrefix::Resolved {
-            config,
-            external_id,
-            stored,
-        } => (config, external_id, stored),
+    ) else {
+        return;
     };
 
-    let external_ref = notice.external_ref.clone().or_else(|| {
-        (*stored)
-            .as_ref()
-            .and_then(|refs| refs.slots.get(&notice.slot).cloned())
-    });
+    let external_ref = notice
+        .external_ref
+        .clone()
+        .or_else(|| resolved.stored_slot_ref(notice.slot));
 
     let payload = SlotStartedWebhook {
         event: "slotStarted",
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
-        external_id: Some(external_id),
+        external_id: Some(resolved.external_id),
         slot: notice.slot.0,
         external_ref,
         arrival_ms: notice.arrival_ms,
@@ -582,7 +503,7 @@ pub fn handle_slot_started(
         lifecycle,
         notice.tenant,
         notice.session,
-        config,
+        resolved.config,
         &payload,
         "slotStarted",
     );
