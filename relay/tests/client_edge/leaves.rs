@@ -62,8 +62,8 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
     // Seed this relay as the session's authority: `decide_leave` is a no-op on
     // a non-authority relay, and a lone relay with no descriptor never becomes
     // one on its own outside a real coordinator-driven deployment.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     seed_authority(&makers, &key).apply();
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
@@ -145,8 +145,8 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
         session,
     };
 
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     seed_authority(&makers, &key).apply();
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
@@ -198,8 +198,8 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
         session,
     };
 
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     seed_authority(&makers, &key).apply();
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);

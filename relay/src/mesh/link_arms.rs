@@ -28,8 +28,8 @@ use super::join::{
 };
 use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};
 use super::links::{
-    LeaseAwait, MESH_STREAM_WRITE_TIMEOUT, MeshControlTx, MeshForwardTx, MeshLinkExit,
-    MeshLinkLease, MeshLinks, MeshRttCache, SessionState, await_while_current,
+    JoinedSession, LeaseAwait, MESH_STREAM_WRITE_TIMEOUT, MeshControlTx, MeshForwardTx,
+    MeshLinkExit, MeshLinkLease, MeshLinks, MeshRttCache, await_while_current,
     mesh_window_exhausted,
 };
 use super::seen::SeenRegistries;
@@ -60,7 +60,7 @@ pub(super) struct LinkDriver {
     /// The delivered-through cursor last pushed to the peer, per (session, slot).
     pub(super) ack_cursors_sent: HashMap<(SessionId, SlotId), u64>,
     /// Per-session driver state, keyed by the wire's bare session id.
-    pub(super) joined: HashMap<SessionId, SessionState>,
+    pub(super) joined: HashMap<SessionId, JoinedSession>,
     /// When the last session left; `None` while any is joined, and before the
     /// first Join.
     pub(super) idle_since: Option<tokio::time::Instant>,

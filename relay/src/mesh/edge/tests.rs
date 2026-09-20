@@ -105,7 +105,7 @@ async fn mesh_accept_permits_cap_concurrency_queue_and_are_held_only_across_the_
     let accept_task = tokio::spawn(run_mesh_accept(
         mesh_accept_rx,
         Sessions::default(),
-        mesh::new_mesh_state(),
+        mesh::MeshState::default(),
         links_tx,
         crate::coordinator::client::FleetMeshPeers::new().reader(),
         false,

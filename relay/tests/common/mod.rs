@@ -372,7 +372,7 @@ impl Relay {
         let endpoint = noq::Endpoint::server(cfg, bind).unwrap();
         let addr = endpoint.local_addr().unwrap();
         let sessions: Sessions = Arc::default();
-        let mesh = mesh::new_mesh_state();
+        let mesh = mesh::MeshState::default();
         let (mesh_tx, mesh_rx) = mpsc::channel(8);
 
         tokio::spawn(server::serve(

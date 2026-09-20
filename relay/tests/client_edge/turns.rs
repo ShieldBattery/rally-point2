@@ -61,8 +61,8 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
     // high-RTT sample so it decides to raise the buffer and queues that change
     // for broadcast. Holding the registry that `MeshState` carries is what lets
     // the test set this up; the relay's turn path then stamps it.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,

@@ -38,13 +38,13 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
     let mut relay_b = Relay::start(&tenant, 2);
     let control_a = control::MeshControl::new(
         RelayId(1),
-        relay_a.mesh.decision_makers.clone(),
-        relay_a.mesh.presence.clone(),
+        relay_a.mesh.session.decision_makers.clone(),
+        relay_a.mesh.session.presence.clone(),
     );
     let control_b = control::MeshControl::new(
         RelayId(2),
-        relay_b.mesh.decision_makers.clone(),
-        relay_b.mesh.presence.clone(),
+        relay_b.mesh.session.decision_makers.clone(),
+        relay_b.mesh.session.presence.clone(),
     );
 
     let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
@@ -81,6 +81,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
     let a_is_authority = || {
         relay_a
             .mesh
+            .session
             .decision_makers
             .lock()
             .get(&key)
@@ -89,6 +90,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
     let b_is_authority = || {
         relay_b
             .mesh
+            .session
             .decision_makers
             .lock()
             .get(&key)
@@ -148,14 +150,14 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     let mut relay_b = Relay::start(&tenant, 2);
     let control_a = control::MeshControl::new(
         RelayId(1),
-        Arc::clone(&relay_a.mesh.decision_makers),
-        Arc::clone(&relay_a.mesh.presence),
+        Arc::clone(&relay_a.mesh.session.decision_makers),
+        Arc::clone(&relay_a.mesh.session.presence),
     )
     .with_broadcast(Arc::clone(&relay_a.sessions), relay_a.mesh.links.clone());
     let control_b = control::MeshControl::new(
         RelayId(2),
-        Arc::clone(&relay_b.mesh.decision_makers),
-        Arc::clone(&relay_b.mesh.presence),
+        Arc::clone(&relay_b.mesh.session.decision_makers),
+        Arc::clone(&relay_b.mesh.session.presence),
     )
     .with_broadcast(Arc::clone(&relay_b.sessions), relay_b.mesh.links.clone());
 
@@ -229,7 +231,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     // relay hops.
     let mut view = (None, None);
     for _ in 0..150 {
-        view = consensus::session_e2e(&relay_a.mesh.decision_makers, &key);
+        view = consensus::session_e2e(&relay_a.mesh.session.decision_makers, &key);
         if matches!(view, (Some(lag), Some(2)) if lag <= 1) {
             break;
         }
@@ -248,7 +250,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     }
     let mut lag = 0;
     for _ in 0..150 {
-        if let (Some(l), _) = consensus::session_e2e(&relay_a.mesh.decision_makers, &key) {
+        if let (Some(l), _) = consensus::session_e2e(&relay_a.mesh.session.decision_makers, &key) {
             lag = l;
             if lag >= 20 {
                 break;

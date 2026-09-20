@@ -5,7 +5,7 @@ use super::*;
 
 #[tokio::test]
 async fn newer_mesh_link_generation_invalidates_and_tombstones_the_old_one() {
-    let mesh = new_mesh_state();
+    let mesh = MeshState::default();
     let peer = RelayId(9);
     let old = new_mesh_link_attempt();
     let replacement = new_mesh_link_attempt();
@@ -35,7 +35,7 @@ async fn newer_mesh_link_generation_invalidates_and_tombstones_the_old_one() {
 
 #[test]
 fn mesh_link_claims_for_different_peers_do_not_share_the_dispatch_lock() {
-    let mesh = new_mesh_state();
+    let mesh = MeshState::default();
     let first = new_mesh_link_attempt();
     assert!(claim_mesh_link(&mesh, RelayId(1), &first).is_some());
     let first_state = mesh.current_links.lock()[&RelayId(1)].clone();
@@ -64,7 +64,7 @@ fn mesh_link_claims_for_different_peers_do_not_share_the_dispatch_lock() {
 fn a_superseded_lease_runs_neither_a_queued_dispatch_nor_a_queued_join() {
     let sessions: routing::Sessions = Arc::default();
     let mesh = test_mesh_state();
-    let makers = Arc::clone(&mesh.decision_makers);
+    let makers = Arc::clone(&mesh.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
     assert!(crate::consensus::activate_connection_epoch(
@@ -133,7 +133,7 @@ fn a_superseded_lease_runs_neither_a_queued_dispatch_nor_a_queued_join() {
 async fn an_under_floor_attempt_is_refused_before_it_can_claim_the_peer() {
     use rally_point_transport::test_util::{Edge, loopback, loopback_with_datagram_limit};
 
-    let mesh = new_mesh_state();
+    let mesh = MeshState::default();
     let peer = RelayId(3);
     let healthy_attempt = new_mesh_link_attempt();
     let healthy = claim_mesh_link(&mesh, peer, &healthy_attempt).expect("the healthy link claims");
@@ -168,7 +168,7 @@ async fn an_under_floor_attempt_is_refused_before_it_can_claim_the_peer() {
 
 #[tokio::test]
 async fn supersession_cancels_an_inline_driver_wait_promptly() {
-    let mesh = new_mesh_state();
+    let mesh = MeshState::default();
     let peer = RelayId(9);
     let old = new_mesh_link_attempt();
     let replacement = new_mesh_link_attempt();

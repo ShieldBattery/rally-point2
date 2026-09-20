@@ -375,7 +375,7 @@ async fn serve_connection(
     // descriptor exists for its session is admitted unconditionally, with no
     // new wait or window introduced here. Enforcement only ever refuses once
     // a non-empty homed set says this slot belongs to a different relay.
-    if !consensus::slot_homed(&mesh.decision_makers, &key, authorized.slot) {
+    if !consensus::slot_homed(&mesh.session.decision_makers, &key, authorized.slot) {
         connection.close(
             VarInt::from_u32(close_codes::SLOT_NOT_HOMED),
             b"slot not homed on this relay",
@@ -399,8 +399,8 @@ async fn serve_connection(
     // way, so a "departed" read here is never a false positive. The real
     // admission decision — the one this snapshot must never be reused for — is
     // below, keyed on current state after `register` succeeds.
-    let departed = consensus::slot_departed(&mesh.decision_makers, &key, authorized.slot);
-    let hold_pending = mesh.drop_holds.is_pending(&key, authorized.slot);
+    let departed = consensus::slot_departed(&mesh.session.decision_makers, &key, authorized.slot);
+    let hold_pending = mesh.session.drop_holds.is_pending(&key, authorized.slot);
     if departed && !hold_pending {
         connection.close(
             VarInt::from_u32(close_codes::SLOT_DEPARTED),
@@ -421,7 +421,12 @@ async fn serve_connection(
     // leave's drained count with post-count turns. The seal outlives the
     // journal's drain (the drained decided leave then refuses through the
     // maker), so this check is monotone-safe read here before registration.
-    if mesh.provisional_turns.armed() && mesh.provisional_turns.slot_sealed(&key, authorized.slot) {
+    if mesh.session.provisional_turns.armed()
+        && mesh
+            .session
+            .provisional_turns
+            .slot_sealed(&key, authorized.slot)
+    {
         connection.close(
             VarInt::from_u32(close_codes::SLOT_DEPARTED),
             b"slot already departed",
@@ -438,7 +443,7 @@ async fn serve_connection(
     // a concurrent descriptor retirement, so a stale dial can neither slip in
     // behind the sweep (recreating roster/seen state for a session with no
     // lifecycle left) nor land between the check and the register.
-    let Some(registered) = mesh.gates.with_ingress(&key, || {
+    let Some(registered) = mesh.session.gates.with_ingress(&key, || {
         routing::register(&sessions, &key, authorized.slot, connection_epoch)
     }) else {
         connection.close(
@@ -477,10 +482,10 @@ async fn serve_connection(
     // Refusing here, the connection has been told nothing and changed
     // nothing beyond its roster seat and possibly this reservation — both
     // rolled back below.
-    if mesh.provisional_turns.armed() {
-        let reserved = mesh.gates.with_ingress(&key, || {
-            consensus::maker_exists(&mesh.decision_makers, &key)
-                || mesh.provisional_turns.reserve(&key)
+    if mesh.session.provisional_turns.armed() {
+        let reserved = mesh.session.gates.with_ingress(&key, || {
+            consensus::maker_exists(&mesh.session.decision_makers, &key)
+                || mesh.session.provisional_turns.reserve(&key)
         });
         match reserved {
             Some(true) => {}
@@ -545,7 +550,7 @@ async fn serve_connection(
     // and start a link on a session the coordinator already ended. The gate
     // re-check makes the sweep and this resolution mutually exclusive; a
     // retirement that lands first refuses the admission here.
-    let Some(admission) = mesh.gates.with_ingress(&key, || {
+    let Some(admission) = mesh.session.gates.with_ingress(&key, || {
         // Re-check the journal seal now that registration succeeded: the
         // pre-register check can race the sealing link itself — the old
         // link's clean intent installs the seal and only then frees the
@@ -554,14 +559,17 @@ async fn serve_connection(
         // succeeding proves the old link deregistered, which proves its
         // seal (if any) was already installed — so this post-register read
         // is authoritative where the pre-register one was only a fast-fail.
-        if mesh.provisional_turns.armed()
-            && mesh.provisional_turns.slot_sealed(&key, authorized.slot)
+        if mesh.session.provisional_turns.armed()
+            && mesh
+                .session
+                .provisional_turns
+                .slot_sealed(&key, authorized.slot)
         {
             return consensus::ReconnectAdmission::Rejected;
         }
         let admission = consensus::admit_reconnect(
-            &mesh.decision_makers,
-            &mesh.drop_holds,
+            &mesh.session.decision_makers,
+            &mesh.session.drop_holds,
             &key,
             authorized.slot,
             Some(connection_epoch),
@@ -576,8 +584,9 @@ async fn serve_connection(
         // Inside the ingress section so the mark and the maker existence it
         // keys on are read atomically against a retirement sweep.
         if matches!(admission, consensus::ReconnectAdmission::Admitted { .. }) {
-            mesh.provisional
-                .mark_if_undescribed(&mesh.decision_makers, &key);
+            mesh.session
+                .provisional
+                .mark_if_undescribed(&mesh.session.decision_makers, &key);
         }
         admission
     }) else {

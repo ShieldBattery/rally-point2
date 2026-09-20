@@ -96,7 +96,7 @@ pub(super) fn start_relay_on(
         endpoint,
         Arc::new(registry),
         std::sync::Arc::default(),
-        rally_point_relay::mesh::new_mesh_state(),
+        rally_point_relay::mesh::MeshState::default(),
         None,
     ));
     (addr, ca)
@@ -171,7 +171,7 @@ pub(super) fn seed_session_authority(
         session,
     };
     let _ = consensus::sync_maker(
-        &mesh.decision_makers,
+        &mesh.session.decision_makers,
         &key,
         consensus::MakerSync {
             expected_slots: slots.iter().copied().collect(),
@@ -188,7 +188,7 @@ pub(super) fn started_session_relay(
     session: SessionId,
     slots: &[SlotId],
 ) -> (SocketAddr, CertificateDer<'static>) {
-    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let mesh = rally_point_relay::mesh::MeshState::default();
     seed_session_authority(&mesh, tenant, session, slots);
     start_relay_with_mesh(registry_for(&[tenant]), mesh)
 }

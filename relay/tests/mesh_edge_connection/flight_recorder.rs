@@ -24,7 +24,7 @@ async fn the_flight_recorder_captures_a_client_lifecycle_and_flushes_on_close()
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
-    let flight = relay.mesh.decision_makers.flight_recorder().clone();
+    let flight = relay.mesh.session.decision_makers.flight_recorder().clone();
     // A directory of this run's own: process-scoped alone would collide with a
     // rerun inside the same test process.
     let dir = std::env::temp_dir().join(format!(

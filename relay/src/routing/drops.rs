@@ -26,8 +26,8 @@ pub(super) fn handle_drop_request(
     requester: SlotId,
     wire_target: u32,
 ) {
-    let drop_holds = &mesh.drop_holds;
-    let decision_makers = &mesh.decision_makers;
+    let drop_holds = &mesh.session.drop_holds;
+    let decision_makers = &mesh.session.decision_makers;
     let mesh_links = &mesh.links;
     let Ok(target) = u8::try_from(wire_target).map(SlotId) else {
         tracing::info!(
@@ -122,8 +122,8 @@ pub(crate) fn honor_drop_request(
     target: SlotId,
     requester: u32,
 ) {
-    let drop_holds = &mesh.drop_holds;
-    let decision_makers = &mesh.decision_makers;
+    let drop_holds = &mesh.session.drop_holds;
+    let decision_makers = &mesh.session.decision_makers;
     let mesh_links = &mesh.links;
     let seen = &mesh.seen;
     if !consensus::is_authority(decision_makers, key) {

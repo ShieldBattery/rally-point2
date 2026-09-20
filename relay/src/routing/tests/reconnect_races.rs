@@ -56,9 +56,9 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
     use rally_point_proto::messages::SlotConditions;
 
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state();
+    let mesh = crate::mesh::MeshState::default();
     let k = key();
-    seed_maker(&mesh.decision_makers, &k, Authority::Peer, &[], &[]);
+    seed_maker(&mesh.session.decision_makers, &k, Authority::Peer, &[], &[]);
     let replacement = SlotConditions {
         slot: 0,
         rtt_us: 30_000,
@@ -67,8 +67,13 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
         connection_epoch: Some(22),
     };
     crate::mesh::activate_conditions(&mesh.conditions, &k, SlotId(0), replacement);
-    let _ = consensus::ingest_local_condition(&mesh.decision_makers, &k, &replacement);
-    consensus::observe_frame(&mesh.decision_makers, &k, SlotId(0), GameFrameCount(40));
+    let _ = consensus::ingest_local_condition(&mesh.session.decision_makers, &k, &replacement);
+    consensus::observe_frame(
+        &mesh.session.decision_makers,
+        &k,
+        SlotId(0),
+        GameFrameCount(40),
+    );
 
     // The old task has already freed its roster seat and is finishing its
     // cleanup after the replacement published epoch 22.
@@ -78,15 +83,15 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
         .expect("replacement conditions survive stale teardown");
     assert_eq!(published.slots[0].connection_epoch, Some(22));
     assert_eq!(
-        consensus::slot_frame(&mesh.decision_makers, &k, SlotId(0)),
+        consensus::slot_frame(&mesh.session.decision_makers, &k, SlotId(0)),
         Some(GameFrameCount(40)),
     );
     assert!(!consensus::slot_departed(
-        &mesh.decision_makers,
+        &mesh.session.decision_makers,
         &k,
         SlotId(0),
     ));
-    assert!(!mesh.drop_holds.is_pending(&k, SlotId(0)));
+    assert!(!mesh.session.drop_holds.is_pending(&k, SlotId(0)));
 }
 
 /// The reconnection race caught live: on a single relay, both clients' links

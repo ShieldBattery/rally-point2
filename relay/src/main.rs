@@ -130,7 +130,7 @@ async fn main() -> Result<()> {
     };
 
     let sessions: Sessions = Arc::default();
-    let mesh_state = mesh::new_mesh_state();
+    let mesh_state = mesh::MeshState::default();
 
     // Shared observable of the coordinator control connection: the coordinator
     // client's writer refreshes its outbound queue depths and its reader refreshes the
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
     // Obtain the recorder handle before spawning task stats so its
     // relay-lifetime work totals can be sampled alongside Docker CPU. The
     // remaining recorder identity/sink/sampler wiring stays below.
-    let flight = mesh_state.decision_makers.flight_recorder().clone();
+    let flight = mesh_state.session.decision_makers.flight_recorder().clone();
 
     // Self-reported Fargate task resources: a no-op outside Fargate (see the
     // module doc), so this is safe to call unconditionally in dev/loopback too.
@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
         cli.task_stats_interval_secs,
         cli.relay_id,
         Arc::clone(&sessions),
-        mesh_state.turn_ring.clone(),
+        mesh_state.session.turn_ring.clone(),
         control_conn_stats.clone(),
         flight.clone(),
     );
@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
         rally_point_relay::observability::flight_recorder::run_sampler(
             flight.clone(),
             mesh_state.conditions.clone(),
-            Arc::clone(&mesh_state.decision_makers),
+            Arc::clone(&mesh_state.session.decision_makers),
             rally_point_relay::observability::flight_recorder::SAMPLE_INTERVAL,
         ),
     );
@@ -219,7 +219,7 @@ async fn main() -> Result<()> {
         secs => {
             tracing::info!(window_secs = secs, "silent-slot eviction enabled");
             tokio::spawn(rally_point_relay::consensus::run_silence_watch(
-                Arc::clone(&mesh_state.decision_makers),
+                Arc::clone(&mesh_state.session.decision_makers),
                 Arc::clone(&sessions),
                 Duration::from_secs(secs),
                 rally_point_relay::consensus::SILENCE_CHECK_INTERVAL,
@@ -328,8 +328,8 @@ async fn main() -> Result<()> {
         // slot-link and mesh-link tasks feed conditions into and stamp decisions on.
         let mesh_control = control::MeshControl::new(
             RelayId(our_id),
-            mesh_state.decision_makers.clone(),
-            mesh_state.presence.clone(),
+            mesh_state.session.decision_makers.clone(),
+            mesh_state.session.presence.clone(),
         )
         // Wire the turn-path handles so a descriptor-driven authority promotion
         // (e.g. the coordinator dropping a crashed former authority) can
@@ -340,16 +340,16 @@ async fn main() -> Result<()> {
         // promotion already does — without this, a descriptor re-push racing a
         // reconnect would decide (and broadcast) a leave for a slot a client is
         // actively returning to.
-        .with_drop_holds(mesh_state.drop_holds.clone())
+        .with_drop_holds(mesh_state.session.drop_holds.clone())
         // Wire the real provisional-admission registry so a descriptor
         // applying here clears the provisional mark client admission may have
         // left on the session (`server.rs`), rather than leaving it to expire
         // on a relay the descriptor already covers.
-        .with_provisional(mesh_state.provisional.clone())
+        .with_provisional(mesh_state.session.provisional.clone())
         // Wire the relay-wide session gates, so the descriptor retirement this
         // control plane performs closes the same ingress boundary the turn
         // path, mesh dispatch, and client admission run through.
-        .with_gates(mesh_state.gates.clone())
+        .with_gates(mesh_state.session.gates.clone())
         // Wire the full turn-path state, so a descriptor applying here drains
         // the provisional-turn pen through the ordinary forward path — the
         // freshly created maker's seeded decided leaves then fence a departed
@@ -358,9 +358,10 @@ async fn main() -> Result<()> {
         // The flight recorder's create-on-first-touch consults the same gates,
         // so a retired session's straggling event cannot begin a recording.
         mesh_state
+            .session
             .decision_makers
             .flight_recorder()
-            .set_gates(mesh_state.gates.clone());
+            .set_gates(mesh_state.session.gates.clone());
 
         // The descriptor source. When a coordinator URL is configured, hold a
         // control connection open to it and apply the session-descriptor sets it
@@ -375,7 +376,7 @@ async fn main() -> Result<()> {
             // slot current (or seeds it departed, fencing them). A standalone
             // dev/loopback relay has no descriptor source and leaves the pen
             // disarmed, keeping its descriptor-less sessions flowing.
-            mesh_state.provisional_turns.arm();
+            mesh_state.session.provisional_turns.arm();
             // The on-demand dialer: establish (and re-establish) mesh links to the
             // peers the coordinator's descriptors name, driven by the Join source's
             // desired-peer set. This is the production dial path — the static
@@ -455,7 +456,10 @@ async fn main() -> Result<()> {
             // wired when a coordinator is configured; a standalone relay leaves
             // the notifier unset (firing is then a no-op).
             let (notices_tx, notices_rx) = tokio::sync::mpsc::unbounded_channel();
-            mesh_state.decision_makers.set_notice_notifier(notices_tx);
+            mesh_state
+                .session
+                .decision_makers
+                .set_notice_notifier(notices_tx);
 
             // The provisional-admission sweep's arming signal: `true` only
             // while the control connection below is actually established (see
@@ -489,17 +493,17 @@ async fn main() -> Result<()> {
                 coordinator::client::OutboundQueues::new(notices_rx, flight_rx, control_conn_stats),
                 coordinator::client::HeartbeatSources {
                     sessions: Arc::clone(&sessions),
-                    decision_makers: Arc::clone(&mesh_state.decision_makers),
+                    decision_makers: Arc::clone(&mesh_state.session.decision_makers),
                     region_rtt_cache: region_rtt_cache.clone(),
-                    load_fence: mesh_state.load_fence.clone(),
+                    load_fence: mesh_state.session.load_fence.clone(),
                 },
                 drain_rx.clone(),
                 control_connected_tx,
             ));
             tokio::spawn(provisional::run_sweep(
-                mesh_state.provisional.clone(),
+                mesh_state.session.provisional.clone(),
                 Arc::clone(&sessions),
-                Arc::clone(&mesh_state.decision_makers),
+                Arc::clone(&mesh_state.session.decision_makers),
                 control_connected_rx,
             ));
             // Measure backbone round-trips to the coordinator's region beacons and

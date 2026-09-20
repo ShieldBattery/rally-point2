@@ -2,8 +2,11 @@
 
 ## Who owns what
 
-- `mod.rs` — `MeshState` (the registry bundle every task carries) plus the
-  re-exports: everything outside reaches mesh items through `crate::mesh::X`.
+- `mod.rs` — `MeshState` (the four mesh registries plus the
+  `crate::session::SessionState` the same tasks carry) and the re-exports:
+  everything outside reaches mesh items through `crate::mesh::X`. A function
+  that needs no mesh registry takes `&SessionState` and is called with
+  `&mesh.session`.
 - `seen.rs` forward-once gate · `links.rs` link registry, provenance lease, RTT
   cache · `conditions.rs` outgoing sidecar samples · `frames.rs` frame builders ·
   `fan_out.rs` what leaves this relay · `forward.rs` turn delivery both ways ·
@@ -58,9 +61,10 @@
 `cargo test -p rally-point-relay --lib mesh::tests::`. Fixtures in `tests/mod.rs`
 (`control_key`, `register_link_channels`, `test_mesh_state`, `test_maker`,
 `joined_state`, `finalize_fixture`); `test_mesh_state()` is production wiring with
-a zero drop-unlock floor, so reach registries through it (`mesh.links`, `mesh.chat`)
-and override a field with `MeshState { links, ..test_mesh_state() }` rather than
-building registries up front. Real connections come from
-`rally_point_transport::test_util::loopback(Edge::Mesh)`. Shrink a production timing
-window with a `new_mesh_state_with_*` / `new_decision_makers_with_*` constructor,
-don't sleep; wait on a real observable (a `Notify`, a permit count) when you must.
+a zero drop-unlock floor, so reach registries through it (`mesh.links`,
+`mesh.session.chat`) and override a field with `MeshState { links,
+..test_mesh_state() }` rather than building registries up front. Real connections
+come from `rally_point_transport::test_util::loopback(Edge::Mesh)`. Shrink a
+production timing window with `SessionState::with_tunables(Tunables { .. ,
+..Default::default() })`, don't sleep; wait on a real observable (a `Notify`, a
+permit count) when you must.

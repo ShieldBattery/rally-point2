@@ -251,7 +251,7 @@ const AGGREGATE_TURN_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 /// coordinator legitimized it, and its entry is reclaimed at retirement).
 /// With per-session state capped in the low tens of KiB, the ceiling puts
 /// the journal's worst-case footprint near 100 MiB, finite by construction.
-const MAX_JOURNALED_SESSIONS: usize = 4096;
+pub(crate) const MAX_JOURNALED_SESSIONS: usize = 4096;
 
 /// The flat per-turn allowance the journal adds to a payload's command bytes.
 /// Unlike the forward queue and the replay ring, the journal retains a whole
@@ -692,10 +692,11 @@ impl ProvisionalTurnPen {
         }
     }
 
-    /// A pen with an explicit session ceiling — a test seam (like
-    /// `mesh::new_mesh_state_with_provisional_window`) so an end-to-end test
-    /// can drive the admission-time capacity refusal without four thousand
-    /// fixture sessions. Production always builds the default ceiling.
+    /// A pen with an explicit session ceiling, the one the relay is built with
+    /// (`crate::session::Tunables::journal_max_sessions`). Production passes
+    /// [`MAX_JOURNALED_SESSIONS`]; a test shrinks it so an end-to-end test can
+    /// drive the admission-time capacity refusal without four thousand fixture
+    /// sessions.
     pub fn with_session_ceiling(max_sessions: usize) -> Self {
         ProvisionalTurnPen {
             inner: Arc::new(PenInner {

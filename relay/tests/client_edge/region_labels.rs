@@ -6,6 +6,8 @@ use std::time::Duration;
 use crate::helpers::*;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
+use rally_point_relay::mesh::MeshState;
+use rally_point_relay::session::{SessionState, Tunables};
 
 /// End to end over real client connections: a coordinator descriptor's region
 /// labels stay entirely inside the relay until the release delay has elapsed
@@ -30,10 +32,17 @@ async fn region_labels_reach_clients_only_after_the_release_delay() {
     let session = SessionId(410);
 
     let release_delay = Duration::from_millis(400);
-    let mesh = rally_point_relay::mesh::new_mesh_state_with_region_release_delay(release_delay);
+    let mesh = MeshState::new(SessionState::with_tunables(Tunables {
+        region_release_delay: release_delay,
+        ..Tunables::default()
+    }));
     // The same decision-maker registry the relay's turn path holds, so the
     // descriptor applied here lands on the very maker the release gate reads.
-    let control = MeshControl::new(RelayId(1), mesh.decision_makers.clone(), Arc::default());
+    let control = MeshControl::new(
+        RelayId(1),
+        mesh.session.decision_makers.clone(),
+        Arc::default(),
+    );
     let labels = vec![
         RelayRegionLabel {
             relay_id: RelayId(1),

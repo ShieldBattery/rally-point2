@@ -134,7 +134,14 @@ async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
     // authority over an expected {0, 1} set is what makes the session start, so
     // a decided leave is real.
     let unlock = Duration::from_millis(300);
-    let mesh = rally_point_relay::mesh::new_mesh_state_with_drop_unlock(unlock);
+    let mesh = rally_point_relay::mesh::MeshState::new(
+        rally_point_relay::session::SessionState::with_tunables(
+            rally_point_relay::session::Tunables {
+                drop_unlock: unlock,
+                ..Default::default()
+            },
+        ),
+    );
     seed_session_authority(&mesh, &tenant, session, &[SlotId(0), SlotId(1)]);
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);

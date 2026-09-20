@@ -358,8 +358,8 @@ impl MeshControl {
         // so nothing else would ever sweep a retained pair whose reconnect
         // never came. Idempotent when the emptied close already removed them.
         if let Some(turn_path) = &self.turn_path {
-            turn_path.provisional_turns.discard(key);
-            turn_path.turn_ring.end_session(key);
+            turn_path.session.provisional_turns.discard(key);
+            turn_path.session.turn_ring.end_session(key);
             crate::mesh::deregister_seen(&turn_path.seen, key);
         }
         // Retirement is terminal for the session's drop bookkeeping: with the

@@ -29,25 +29,29 @@ fn peer_zero_closes_a_never_started_session_on_a_relay_with_no_local_slots() {
 
     let k = key();
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state_with_timings(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+    let mesh = crate::mesh::MeshState::new(SessionState::with_tunables(Tunables {
+        drop_unlock: UNREACHABLE_UNLOCK,
+        abandon_timeout: UNREACHABLE_UNLOCK,
+        ..Tunables::default()
+    }));
     seed_maker(
-        &mesh.decision_makers,
+        &mesh.session.decision_makers,
         &k,
         Authority::SelfRelay,
         &[0, 1],
         &[0],
     );
     assert!(
-        !consensus::session_started(&mesh.decision_makers, &k),
+        !consensus::session_started(&mesh.session.decision_makers, &k),
         "only one peer ever connected, so the session never started",
     );
     crate::session::presence::set_order(
-        &mesh.presence,
+        &mesh.session.presence,
         &k,
         vec![Candidate::SelfRelay, Candidate::Peer(RelayId(2))],
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    mesh.decision_makers.set_notice_notifier(tx);
+    mesh.session.decision_makers.set_notice_notifier(tx);
 
     // No slot was ever inserted into `sessions`, and deliberately no
     // `record_own(0)` call was made. The local roster itself is authoritative.
@@ -61,7 +65,7 @@ fn peer_zero_closes_a_never_started_session_on_a_relay_with_no_local_slots() {
     // The peer was briefly live, matching the incident: activity happened,
     // but the full expected roster never formed on this relay.
     assert!(
-        !crate::session::presence::record_peer(&mesh.presence, &k, RelayId(2), 1,),
+        !crate::session::presence::record_peer(&mesh.session.presence, &k, RelayId(2), 1,),
         "the unknown peer was already conservatively treated as live"
     );
     reconcile_abandon(&sessions, &mesh, &k);
@@ -70,7 +74,7 @@ fn peer_zero_closes_a_never_started_session_on_a_relay_with_no_local_slots() {
         "a live peer keeps the serving state open",
     );
     assert!(crate::session::presence::record_peer(
-        &mesh.presence,
+        &mesh.session.presence,
         &k,
         RelayId(2),
         0,
@@ -85,7 +89,7 @@ fn peer_zero_closes_a_never_started_session_on_a_relay_with_no_local_slots() {
         }),
     );
     assert!(
-        !mesh.drop_holds.abandon_armed(&k),
+        !mesh.session.drop_holds.abandon_armed(&k),
         "a clean empty session has no departures to time out",
     );
 }
@@ -346,12 +350,12 @@ async fn duplicate_arm_and_expiry_decide_at_most_once() {
 #[test]
 fn a_retired_sessions_emptied_close_reports_nothing() {
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state();
+    let mesh = crate::mesh::MeshState::default();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    mesh.decision_makers.set_notice_notifier(tx);
+    mesh.session.decision_makers.set_notice_notifier(tx);
     let k = key();
 
-    mesh.gates.retire(&k);
+    mesh.session.gates.retire(&k);
     maybe_close_emptied_session(&sessions, &mesh, &k);
     assert!(
         rx.try_recv().is_err(),

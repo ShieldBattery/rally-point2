@@ -217,10 +217,13 @@ fn a_pre_descriptor_turn_is_held_and_drained_current_by_the_descriptor() {
     let makers = Arc::new(consensus::new_decision_makers());
     let sessions = Sessions::default();
     let mesh_state = crate::mesh::MeshState {
-        decision_makers: makers.clone(),
-        ..crate::mesh::new_mesh_state()
+        session: crate::session::SessionState {
+            decision_makers: makers.clone(),
+            ..crate::session::SessionState::default()
+        },
+        ..crate::mesh::MeshState::default()
     };
-    mesh_state.provisional_turns.arm();
+    mesh_state.session.provisional_turns.arm();
     let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
         .with_broadcast(sessions.clone(), mesh_state.links.clone())
         .with_turn_path(mesh_state.clone());
@@ -242,14 +245,14 @@ fn a_pre_descriptor_turn_is_held_and_drained_current_by_the_descriptor() {
         survivor.try_recv_forward().is_none(),
         "a pre-descriptor turn is held, not fanned out",
     );
-    assert_eq!(mesh_state.provisional_turns.held(&key(1)), 1);
+    assert_eq!(mesh_state.session.provisional_turns.held(&key(1)), 1);
 
     control.apply_descriptor(&descriptor(1, &[]));
     assert!(
         survivor.try_recv_forward().is_some(),
         "the descriptor drains the held turn to the survivor",
     );
-    assert_eq!(mesh_state.provisional_turns.held(&key(1)), 0);
+    assert_eq!(mesh_state.session.provisional_turns.held(&key(1)), 0);
 }
 
 /// The drain runs AFTER a resumed descriptor's departure seeding, so a
@@ -261,10 +264,13 @@ fn a_seeded_departed_slots_held_turns_die_at_the_fence() {
     let makers = Arc::new(consensus::new_decision_makers());
     let sessions = Sessions::default();
     let mesh_state = crate::mesh::MeshState {
-        decision_makers: makers.clone(),
-        ..crate::mesh::new_mesh_state()
+        session: crate::session::SessionState {
+            decision_makers: makers.clone(),
+            ..crate::session::SessionState::default()
+        },
+        ..crate::mesh::MeshState::default()
     };
-    mesh_state.provisional_turns.arm();
+    mesh_state.session.provisional_turns.arm();
     let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
         .with_broadcast(sessions.clone(), mesh_state.links.clone())
         .with_turn_path(mesh_state.clone());
@@ -305,7 +311,7 @@ fn a_seeded_departed_slots_held_turns_die_at_the_fence() {
         survivor.try_recv_forward().is_none(),
         "the departed slot's held turn dies at the fence, never fanned",
     );
-    assert_eq!(mesh_state.provisional_turns.held(&key(1)), 0);
+    assert_eq!(mesh_state.session.provisional_turns.held(&key(1)), 0);
 }
 
 /// A clean leave that lands before the session's descriptor is journaled,
@@ -319,10 +325,13 @@ fn a_pre_descriptor_clean_leave_is_journaled_and_drained_with_its_count() {
     let makers = Arc::new(consensus::new_decision_makers());
     let sessions = Sessions::default();
     let mesh_state = crate::mesh::MeshState {
-        decision_makers: makers.clone(),
-        ..crate::mesh::new_mesh_state()
+        session: crate::session::SessionState {
+            decision_makers: makers.clone(),
+            ..crate::session::SessionState::default()
+        },
+        ..crate::mesh::MeshState::default()
     };
-    mesh_state.provisional_turns.arm();
+    mesh_state.session.provisional_turns.arm();
     let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
         .with_broadcast(sessions.clone(), mesh_state.links.clone())
         .with_turn_path(mesh_state.clone());
@@ -345,13 +354,13 @@ fn a_pre_descriptor_clean_leave_is_journaled_and_drained_with_its_count() {
             },
         );
     }
-    let announced = mesh_state.gates.with_ingress(&key(1), || {
+    let announced = mesh_state.session.gates.with_ingress(&key(1), || {
         crate::routing::announce_departure(
-            &mesh_state.drop_holds,
+            &mesh_state.session.drop_holds,
             &makers,
             &sessions,
             &mesh_state.links,
-            &mesh_state.provisional_turns,
+            &mesh_state.session.provisional_turns,
             &key(1),
             SlotId(1),
             consensus::LEAVE_REASON_LEFT,
@@ -404,10 +413,13 @@ fn a_journaled_leave_with_no_local_survivors_still_drains_and_decides() {
     let makers = Arc::new(consensus::new_decision_makers());
     let sessions = Sessions::default();
     let mesh_state = crate::mesh::MeshState {
-        decision_makers: makers.clone(),
-        ..crate::mesh::new_mesh_state()
+        session: crate::session::SessionState {
+            decision_makers: makers.clone(),
+            ..crate::session::SessionState::default()
+        },
+        ..crate::mesh::MeshState::default()
     };
-    mesh_state.provisional_turns.arm();
+    mesh_state.session.provisional_turns.arm();
     let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
         .with_broadcast(sessions.clone(), mesh_state.links.clone())
         .with_turn_path(mesh_state.clone());
@@ -427,13 +439,13 @@ fn a_journaled_leave_with_no_local_survivors_still_drains_and_decides() {
             ..Default::default()
         },
     );
-    let announced = mesh_state.gates.with_ingress(&key(1), || {
+    let announced = mesh_state.session.gates.with_ingress(&key(1), || {
         crate::routing::announce_departure(
-            &mesh_state.drop_holds,
+            &mesh_state.session.drop_holds,
             &makers,
             &sessions,
             &mesh_state.links,
-            &mesh_state.provisional_turns,
+            &mesh_state.session.provisional_turns,
             &key(1),
             SlotId(1),
             consensus::LEAVE_REASON_LEFT,

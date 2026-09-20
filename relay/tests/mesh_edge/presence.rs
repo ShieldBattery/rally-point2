@@ -38,12 +38,12 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     // Relay B is the authority. That choice is load-bearing for the regression:
     // A joins first, so B must recover A's early slot announcement after B's own
     // later Join rather than starting from the announcement B sends to A.
-    seed_authority(&relay_a.mesh.decision_makers, &key)
+    seed_authority(&relay_a.mesh.session.decision_makers, &key)
         .expecting([0, 1])
         .homed([0])
         .authority(Authority::Peer)
         .apply();
-    seed_authority(&relay_b.mesh.decision_makers, &key)
+    seed_authority(&relay_b.mesh.session.decision_makers, &key)
         .expecting([0, 1])
         .homed([1])
         .apply();
@@ -58,7 +58,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     wait_for_slots(&relay_a.sessions, &key, 1).await;
     wait_for_slots(&relay_b.sessions, &key, 1).await;
     assert!(!consensus::session_started(
-        &relay_b.mesh.decision_makers,
+        &relay_b.mesh.session.decision_makers,
         &key
     ));
 
@@ -75,7 +75,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     // B is one loopback hop away.
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!consensus::session_started(
-        &relay_b.mesh.decision_makers,
+        &relay_b.mesh.session.decision_makers,
         &key
     ));
 
@@ -92,7 +92,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
         ControlInbound::SessionStart(_)
     ));
     assert!(consensus::session_started(
-        &relay_b.mesh.decision_makers,
+        &relay_b.mesh.session.decision_makers,
         &key
     ));
 
@@ -107,7 +107,7 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
 #[tokio::test]
 async fn first_peer_presence_forces_exactly_one_current_reply() -> Result<(), AnyError> {
     let sessions: Sessions = Arc::default();
-    let mesh_state = mesh::new_mesh_state();
+    let mesh_state = mesh::MeshState::default();
     let (local_link, peer_link, _local_endpoint, _peer_endpoint) = mesh_link_pair().await;
     let local_connection = local_link.connection().clone();
     let peer_connection = peer_link.connection().clone();

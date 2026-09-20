@@ -346,29 +346,33 @@ fn handle_leave_intent(link: &mut Link, ctx: &mut SlotLinkCtx) -> ControlFlow<()
     // Gated like the teardown announce: a clean leave
     // landing after the session's retirement must not
     // write into swept state.
-    let announced = ctx.mesh_for_teardown.gates.with_ingress(&ctx.key, || {
-        announce_departure(
-            &ctx.drop_holds,
-            &ctx.decision_makers,
-            &ctx.sessions,
-            &ctx.mesh_links,
-            &ctx.mesh_for_teardown.provisional_turns,
-            &ctx.key,
-            ctx.slot,
-            LEAVE_REASON_LEFT,
-            // The one intent-origin exact count: this
-            // handler is the slot's single ingress, it
-            // stops forwarding in the same step (`break
-            // 'serve` below), and a decided leave refuses
-            // readmission, so nothing past this count can
-            // ever reach a client. Every other departure
-            // origin passes `None` — see `end_slot_link`
-            // (a finalized drop's count comes through
-            // `finalize_drop`'s own seal instead).
-            crate::mesh::forwarded_count(&ctx.mesh_for_teardown.seen, &ctx.key, ctx.slot),
-            Some(ctx.connection_epoch),
-        )
-    });
+    let announced = ctx
+        .mesh_for_teardown
+        .session
+        .gates
+        .with_ingress(&ctx.key, || {
+            announce_departure(
+                &ctx.drop_holds,
+                &ctx.decision_makers,
+                &ctx.sessions,
+                &ctx.mesh_links,
+                &ctx.mesh_for_teardown.session.provisional_turns,
+                &ctx.key,
+                ctx.slot,
+                LEAVE_REASON_LEFT,
+                // The one intent-origin exact count: this
+                // handler is the slot's single ingress, it
+                // stops forwarding in the same step (`break
+                // 'serve` below), and a decided leave refuses
+                // readmission, so nothing past this count can
+                // ever reach a client. Every other departure
+                // origin passes `None` — see `end_slot_link`
+                // (a finalized drop's count comes through
+                // `finalize_drop`'s own seal instead).
+                crate::mesh::forwarded_count(&ctx.mesh_for_teardown.seen, &ctx.key, ctx.slot),
+                Some(ctx.connection_epoch),
+            )
+        });
     // Marked announced only when the announce (or its
     // journal deposit) actually happened: a refused gate
     // or a stood-down announce leaves the teardown's

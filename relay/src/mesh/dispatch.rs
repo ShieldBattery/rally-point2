@@ -12,7 +12,7 @@ use crate::key::SessionKey;
 use crate::routing;
 
 use super::dispatch_finalize::{dispatch_finalize_drop, dispatch_finalize_drop_result};
-use super::links::SessionState;
+use super::links::JoinedSession;
 use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 
 /// Handles one control frame received from the peer relay over the mesh control
@@ -76,7 +76,7 @@ use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 pub(super) fn dispatch_mesh_control(
     frame: MeshControlFrame,
     peer_id: RelayId,
-    joined: &HashMap<SessionId, SessionState>,
+    joined: &HashMap<SessionId, JoinedSession>,
     sessions: &routing::Sessions,
     mesh: &MeshState,
 ) {
@@ -103,7 +103,7 @@ pub(super) fn dispatch_mesh_control(
     // mutations (and then sweeps them) or has already marked the session, in
     // which case the frame is dropped here — a frame can no longer check one
     // piece of state and then mutate another across the sweep.
-    let dispatched = mesh.gates.with_ingress(&key, || {
+    let dispatched = mesh.session.gates.with_ingress(&key, || {
         dispatch_mesh_control_frame(frame, peer_id, &key, sessions, mesh)
     });
     if dispatched.is_none() {
@@ -161,7 +161,7 @@ fn dispatch_mesh_control_frame(
             // straggler reconnect's replayed directive.
             let finalized_accepted = departed.reason == crate::consensus::LEAVE_REASON_DROPPED
                 && departed.finalized
-                && crate::consensus::finalized_drops_enabled(&mesh.decision_makers, &key);
+                && crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, &key);
             let stamps = crate::consensus::DepartureStamps {
                 last_frame: departed
                     .last_frame
@@ -175,22 +175,24 @@ fn dispatch_mesh_control_frame(
                 finalized: finalized_accepted,
             };
             let outcome = if departed.reason == crate::consensus::LEAVE_REASON_DROPPED {
-                mesh.drop_holds.record_and_maybe_hold(&key, slot, || {
-                    let outcome = crate::consensus::record_departure_for_epoch_outcome(
-                        &mesh.decision_makers,
-                        &key,
-                        slot,
-                        stamps.clone(),
-                        departed.reason,
-                        departed.connection_epoch,
-                    );
-                    (
-                        outcome,
-                        outcome == crate::consensus::DepartureRecordOutcome::Pending,
-                    )
-                })
+                mesh.session
+                    .drop_holds
+                    .record_and_maybe_hold(&key, slot, || {
+                        let outcome = crate::consensus::record_departure_for_epoch_outcome(
+                            &mesh.session.decision_makers,
+                            &key,
+                            slot,
+                            stamps.clone(),
+                            departed.reason,
+                            departed.connection_epoch,
+                        );
+                        (
+                            outcome,
+                            outcome == crate::consensus::DepartureRecordOutcome::Pending,
+                        )
+                    })
             } else if crate::consensus::record_departure_for_epoch(
-                &mesh.decision_makers,
+                &mesh.session.decision_makers,
                 &key,
                 slot,
                 stamps,
@@ -213,8 +215,8 @@ fn dispatch_mesh_control_frame(
             // already-decided slot. The departure is recorded above regardless, so a
             // promotion can still re-derive it.
             routing::hold_or_decide_leave(
-                &mesh.drop_holds,
-                &mesh.decision_makers,
+                &mesh.session.drop_holds,
+                &mesh.session.decision_makers,
                 sessions,
                 &mesh.links,
                 &key,
@@ -243,7 +245,7 @@ fn dispatch_mesh_control_frame(
             // cache and the clients must never disagree about the count.
             let leave = crate::consensus::normalize_observed_leave(
                 &leave,
-                crate::consensus::finalized_drops_enabled(&mesh.decision_makers, &key),
+                crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, &key),
             );
             // A `false` here means this relay's own consensus state didn't
             // accept the directive as new: either an ordinary redundant copy
@@ -253,10 +255,10 @@ fn dispatch_mesh_control_frame(
             // local clients. Forwarding it anyway would hand them a decision
             // this relay's own cache just flagged as disagreeing with what it
             // already holds.
-            if !crate::consensus::observe_leave(&mesh.decision_makers, &key, &leave) {
+            if !crate::consensus::observe_leave(&mesh.session.decision_makers, &key, &leave) {
                 return;
             }
-            mesh.decision_makers.flight_recorder().record(
+            mesh.session.decision_makers.flight_recorder().record(
                 &key,
                 crate::observability::flight_recorder::FlightEvent::LeaveMeshAccepted {
                     source_relay: peer_id.0,
@@ -272,7 +274,7 @@ fn dispatch_mesh_control_frame(
             // hold for this subject. Keeping it would not permit resurrection --
             // atomic admission rejects the decided leave -- but it would let the
             // cheap handshake precheck report an avoidable provisional success.
-            let _ = mesh.drop_holds.release(&key, slot);
+            let _ = mesh.session.drop_holds.release(&key, slot);
             // A final leave can outrun the matching SlotDeparted on another
             // peer link after this relay already admitted a replacement. The
             // subject intentionally does not receive its own LeaveDirective,
@@ -311,7 +313,7 @@ fn dispatch_mesh_control_frame(
             // one of them, so every local member receives it). Deliberately NOT
             // re-broadcast across the mesh: the origin already sent a copy to every
             // link serving the session, exactly as with the oversize turn above.
-            crate::session::lobby::deliver(&mesh.lobby, &key, command);
+            crate::session::lobby::deliver(&mesh.session.lobby, &key, command);
         }
         Some(mesh_control_frame::Kind::GameChat(chat_msg)) => {
             // A chat message a peer relay's member authored, already
@@ -320,7 +322,7 @@ fn dispatch_mesh_control_frame(
             // how a mesh-received lobby command's bytes are not re-validated).
             // No log to append to; deliberately NOT re-broadcast across the
             // mesh, exactly as the lobby command and oversize turn above.
-            crate::session::chat::deliver(&mesh.chat, &key, chat_msg);
+            crate::session::chat::deliver(&mesh.session.chat, &key, chat_msg);
         }
         Some(mesh_control_frame::Kind::PlayerSkin(skin)) => {
             // A cosmetic-skin blob a peer relay's member authored, already
@@ -334,7 +336,7 @@ fn dispatch_mesh_control_frame(
             // only echo. `deliver`'s return is ignored here — the map cap only
             // gates whether this relay stores/fans the blob, and there is nothing
             // to re-broadcast either way.
-            crate::session::skin::deliver(&mesh.skins, &key, skin);
+            crate::session::skin::deliver(&mesh.session.skins, &key, skin);
         }
         Some(mesh_control_frame::Kind::SlotPresent(present)) => {
             let Ok(slot) = u8::try_from(present.slot).map(SlotId) else {
@@ -351,12 +353,14 @@ fn dispatch_mesh_control_frame(
             // every peer (including the origin, harmlessly: it latches started and
             // fans to its own locals, but the frame is idempotent). A non-authority
             // relay just records it, for a later promotion.
-            if crate::consensus::note_slot_present(&mesh.decision_makers, &key, slot) {
+            if crate::consensus::note_slot_present(&mesh.session.decision_makers, &key, slot) {
                 // Coverage fired here (this relay is the authority): the maker
                 // sized and stored the initial buffer depth as the latch fired, so
                 // both fan-out legs carry it.
-                let initial_buffer_turns =
-                    crate::consensus::session_initial_buffer_turns(&mesh.decision_makers, &key);
+                let initial_buffer_turns = crate::consensus::session_initial_buffer_turns(
+                    &mesh.session.decision_makers,
+                    &key,
+                );
                 routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
                 fan_out_session_start(&mesh.links, &key, initial_buffer_turns);
             }
@@ -377,7 +381,7 @@ fn dispatch_mesh_control_frame(
             // fires no coordinator notice: the home already reported the slot,
             // and a second relay reporting it would attribute one load twice.
             // Not re-broadcast either — the origin sent a copy to every peer.
-            crate::consensus::record_peer_slot_started(&mesh.decision_makers, &key, slot);
+            crate::consensus::record_peer_slot_started(&mesh.session.decision_makers, &key, slot);
         }
         Some(mesh_control_frame::Kind::SessionStart(start)) => {
             // The authority's session-start directive. Adopt the carried initial
@@ -391,12 +395,12 @@ fn dispatch_mesh_control_frame(
             // already sent a copy to every link serving the session, so re-flooding
             // would only echo.
             crate::consensus::adopt_session_start(
-                &mesh.decision_makers,
+                &mesh.session.decision_makers,
                 &key,
                 start.initial_buffer_turns,
             );
             let initial_buffer_turns =
-                crate::consensus::session_initial_buffer_turns(&mesh.decision_makers, &key);
+                crate::consensus::session_initial_buffer_turns(&mesh.session.decision_makers, &key);
             routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
         }
         Some(mesh_control_frame::Kind::SlotConnectivity(change)) => {
@@ -427,8 +431,8 @@ fn dispatch_mesh_control_frame(
             // arrived first, and fanning out true would resurrect that slot.
             if change.connected {
                 if crate::consensus::admit_reconnect(
-                    &mesh.decision_makers,
-                    &mesh.drop_holds,
+                    &mesh.session.decision_makers,
+                    &mesh.session.drop_holds,
                     &key,
                     slot,
                     change.connection_epoch,
@@ -437,7 +441,7 @@ fn dispatch_mesh_control_frame(
                     return;
                 }
             } else if !crate::consensus::mark_connection_down(
-                &mesh.decision_makers,
+                &mesh.session.decision_makers,
                 &key,
                 slot,
                 change.connection_epoch,
@@ -501,7 +505,7 @@ fn dispatch_mesh_control_frame(
                     continue;
                 };
                 crate::consensus::observe_delivery(
-                    &mesh.decision_makers,
+                    &mesh.session.decision_makers,
                     &key,
                     dest,
                     origin,

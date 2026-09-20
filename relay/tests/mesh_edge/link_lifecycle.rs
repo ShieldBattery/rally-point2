@@ -20,7 +20,7 @@ use crate::helpers::*;
 /// and then leave nothing in its place.
 #[tokio::test]
 async fn an_under_floor_mesh_attempt_never_supersedes_the_healthy_link() {
-    let mesh = mesh::new_mesh_state();
+    let mesh = mesh::MeshState::default();
     let peer = RelayId(3);
     let healthy_attempt = mesh::new_mesh_link_attempt();
     let healthy =
@@ -72,7 +72,7 @@ async fn idle_link_tears_down_after_timeout_post_session() -> Result<(), AnyErro
 
     let (mesh_a, mesh_b, _ep_a, _ep_b) = mesh_link_pair().await;
     let sessions: Sessions = Arc::default();
-    let mesh = mesh::new_mesh_state();
+    let mesh = mesh::MeshState::default();
     let idle_timeout = Duration::from_millis(200);
 
     let (cmds_a, handle_a) =
@@ -105,7 +105,7 @@ async fn idle_link_tears_down_after_timeout_post_session() -> Result<(), AnyErro
 async fn never_joined_link_survives_past_idle_timeout() -> Result<(), AnyError> {
     let (mesh_a, mesh_b, _ep_a, _ep_b) = mesh_link_pair().await;
     let sessions: Sessions = Arc::default();
-    let mesh = mesh::new_mesh_state();
+    let mesh = mesh::MeshState::default();
     let idle_timeout = Duration::from_millis(150);
 
     let (_cmds_a, handle_a) =

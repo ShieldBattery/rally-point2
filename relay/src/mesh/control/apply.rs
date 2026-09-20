@@ -220,7 +220,7 @@ impl MeshControl {
         // announced ahead of ingress it should have ordered behind, and
         // nothing deposits past the completed drain.
         if let Some(turn_path) = &self.turn_path
-            && let Some(mut batch) = turn_path.provisional_turns.begin_drain(&key)
+            && let Some(mut batch) = turn_path.session.provisional_turns.begin_drain(&key)
         {
             loop {
                 // The batch stays charged against the journal's byte budget
@@ -263,8 +263,9 @@ impl MeshControl {
                             // superseding deposit sits in the Draining
                             // queue, so a later pass of this loop replays
                             // it.
-                            let _ = turn_path.gates.with_exclusive(&key, || {
+                            let _ = turn_path.session.gates.with_exclusive(&key, || {
                                 if !turn_path
+                                    .session
                                     .provisional_turns
                                     .departure_is_current(&key, slot, revision)
                                 {
@@ -295,8 +296,11 @@ impl MeshControl {
                         }
                     }
                 }
-                turn_path.provisional_turns.release_drained(batch_bytes);
-                match turn_path.provisional_turns.continue_drain(&key) {
+                turn_path
+                    .session
+                    .provisional_turns
+                    .release_drained(batch_bytes);
+                match turn_path.session.provisional_turns.continue_drain(&key) {
                     crate::session::provisional_turns::DrainStep::More(next) => batch = next,
                     crate::session::provisional_turns::DrainStep::Done => break,
                 }

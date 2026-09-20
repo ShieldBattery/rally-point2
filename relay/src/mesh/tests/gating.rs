@@ -10,8 +10,8 @@ use super::*;
 async fn journal_overflow_closes_the_overflowing_slots_link() {
     let sessions = routing::Sessions::default();
     let key = control_key();
-    let mesh_state = new_mesh_state();
-    mesh_state.provisional_turns.arm();
+    let mesh_state = MeshState::default();
+    mesh_state.session.provisional_turns.arm();
     let (_reg, inbox) =
         routing::register(&sessions, &key, SlotId(1), 1).expect("the flooder registers");
     let shutdown = inbox.shutdown_handle();
@@ -34,12 +34,15 @@ async fn journal_overflow_closes_the_overflowing_slots_link() {
         .await
         .expect("the overflowing slot's link is signaled closed");
     assert_eq!(
-        mesh_state.provisional_turns.held(&key),
+        mesh_state.session.provisional_turns.held(&key),
         crate::session::provisional_turns::PER_SESSION_CAP,
         "the journal keeps everything below the cap",
     );
     assert!(
-        mesh_state.provisional_turns.slot_sealed(&key, SlotId(1)),
+        mesh_state
+            .session
+            .provisional_turns
+            .slot_sealed(&key, SlotId(1)),
         "overflow seals the slot terminally — an ordinary reconnect would \
          resume past the permanent hole",
     );
@@ -52,9 +55,9 @@ async fn journal_overflow_closes_the_overflowing_slots_link() {
 fn a_retired_sessions_client_turn_never_grows_the_journal() {
     let sessions = routing::Sessions::default();
     let key = control_key();
-    let mesh_state = new_mesh_state();
-    mesh_state.provisional_turns.arm();
-    mesh_state.gates.retire(&key);
+    let mesh_state = MeshState::default();
+    mesh_state.session.provisional_turns.arm();
+    mesh_state.session.gates.retire(&key);
     forward_client_turn(
         &sessions,
         &mesh_state,
@@ -68,7 +71,7 @@ fn a_retired_sessions_client_turn_never_grows_the_journal() {
         },
     );
     assert_eq!(
-        mesh_state.provisional_turns.held(&key),
+        mesh_state.session.provisional_turns.held(&key),
         0,
         "the gate refuses before the journal deposit",
     );
@@ -81,11 +84,11 @@ fn a_retired_sessions_client_turn_never_grows_the_journal() {
 fn a_retired_sessions_mesh_turn_is_dropped_by_the_gate() {
     let sessions = routing::Sessions::default();
     let key = control_key();
-    let mesh_state = new_mesh_state();
+    let mesh_state = MeshState::default();
     let (_reg, mut survivor) =
         routing::register(&sessions, &key, SlotId(1), 1).expect("survivor registers");
 
-    mesh_state.gates.retire(&key);
+    mesh_state.session.gates.retire(&key);
     deliver_mesh_turn(
         &sessions,
         &mesh_state,

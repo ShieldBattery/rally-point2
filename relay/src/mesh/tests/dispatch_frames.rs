@@ -17,7 +17,7 @@ fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
 
     let sessions: routing::Sessions = Arc::default();
     let mesh_state = test_mesh_state();
-    let makers = Arc::clone(&mesh_state.decision_makers);
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
 
@@ -71,7 +71,7 @@ fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
 fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
     let sessions: routing::Sessions = Arc::default();
     let mesh_state = test_mesh_state();
-    let makers = Arc::clone(&mesh_state.decision_makers);
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     let serve = || test_maker(&makers, &key, crate::consensus::Authority::Peer);
     serve();
@@ -97,33 +97,33 @@ fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
     // Control: while the session is live, the same frame installs a hold.
     dispatch_mesh_control(departed(1), RelayId(9), &joined, &sessions, &mesh_state);
     assert!(
-        mesh_state.drop_holds.is_pending(&key, SlotId(1)),
+        mesh_state.session.drop_holds.is_pending(&key, SlotId(1)),
         "a live session's dropped SlotDeparted marks a hold",
     );
 
     // Retirement, as end_session performs it: close the gate first, then
     // the sweep — while this driver's joined map still lists the session.
-    mesh_state.gates.retire(&key);
+    mesh_state.session.gates.retire(&key);
     crate::consensus::deregister_maker(&makers, &key);
-    mesh_state.drop_holds.end_session_terminal(&key);
+    mesh_state.session.drop_holds.end_session_terminal(&key);
 
     dispatch_mesh_control(departed(2), RelayId(9), &joined, &sessions, &mesh_state);
     assert!(
-        !mesh_state.drop_holds.is_pending(&key, SlotId(2)),
+        !mesh_state.session.drop_holds.is_pending(&key, SlotId(2)),
         "a retired session's straggler frame resurrects nothing",
     );
     assert!(
-        !mesh_state.drop_holds.is_pending(&key, SlotId(1)),
+        !mesh_state.session.drop_holds.is_pending(&key, SlotId(1)),
         "the swept hold stays swept",
     );
 
     // A genuine re-serve: apply_descriptor reopens the gate before it
     // syncs the maker; model both halves here.
-    mesh_state.gates.reopen(&key);
+    mesh_state.session.gates.reopen(&key);
     serve();
     dispatch_mesh_control(departed(3), RelayId(9), &joined, &sessions, &mesh_state);
     assert!(
-        mesh_state.drop_holds.is_pending(&key, SlotId(3)),
+        mesh_state.session.drop_holds.is_pending(&key, SlotId(3)),
         "a re-served session dispatches normally again",
     );
 }
@@ -138,8 +138,8 @@ fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
 fn a_decided_slots_client_turn_is_fenced_at_its_home_only() {
     let sessions = routing::Sessions::default();
     let key = control_key();
-    let mesh_state = new_mesh_state();
-    let makers = Arc::clone(&mesh_state.decision_makers);
+    let mesh_state = MeshState::default();
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
     let (_reg, mut survivor) =
         routing::register(&sessions, &key, SlotId(1), 1).expect("survivor registers");

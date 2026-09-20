@@ -79,7 +79,7 @@ fn broadcast_leaves_drops_an_out_of_range_slot_and_still_delivers_the_rest() {
 fn a_mesh_slot_started_marks_the_slot_without_notifying_or_echoing() {
     let sessions = routing::Sessions::default();
     let mesh_state = test_mesh_state();
-    let makers = Arc::clone(&mesh_state.decision_makers);
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
@@ -198,11 +198,16 @@ fn client_turn_enters_each_mesh_link_once() {
         routing::register(&sessions, &key, SlotId(1), 1).expect("local slot registers");
     let (mut peer_b_rx, _peer_b_control_rx) = register_link_channels(&links, &key);
     let (mut peer_c_rx, _peer_c_control_rx) = register_link_channels(&links, &key);
-    let mut mesh_state = new_mesh_state();
-    mesh_state.links = links.clone();
-    mesh_state.seen = seen.clone();
-    mesh_state.decision_makers = makers.clone();
-    mesh_state.turn_ring = turn_ring.clone();
+    let mesh_state = MeshState {
+        links: links.clone(),
+        seen: seen.clone(),
+        session: crate::session::SessionState {
+            decision_makers: makers.clone(),
+            turn_ring: turn_ring.clone(),
+            ..crate::session::SessionState::default()
+        },
+        ..MeshState::default()
+    };
 
     forward_client_turn(
         &sessions,
@@ -258,10 +263,15 @@ fn mesh_turn_delivers_locally_and_never_reenters_the_mesh() {
         ..Default::default()
     };
 
-    let mut mesh_state = new_mesh_state();
-    mesh_state.seen = seen.clone();
-    mesh_state.decision_makers = makers.clone();
-    mesh_state.turn_ring = turn_ring.clone();
+    let mesh_state = MeshState {
+        seen: seen.clone(),
+        session: crate::session::SessionState {
+            decision_makers: makers.clone(),
+            turn_ring: turn_ring.clone(),
+            ..crate::session::SessionState::default()
+        },
+        ..MeshState::default()
+    };
     deliver_mesh_turn(
         &sessions,
         &mesh_state,

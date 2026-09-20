@@ -20,7 +20,7 @@ async fn a_mesh_request_drop_decides_the_leave_at_the_authority_only_and_never_e
     ] {
         let sessions: routing::Sessions = Arc::default();
         let mesh_state = test_mesh_state();
-        let makers = Arc::clone(&mesh_state.decision_makers);
+        let makers = Arc::clone(&mesh_state.session.decision_makers);
         let key = control_key();
         test_maker(&makers, &key, authority);
         // The target slot dropped: a frame basis for its leave, a recorded
@@ -38,7 +38,7 @@ async fn a_mesh_request_drop_decides_the_leave_at_the_authority_only_and_never_e
             },
             0x4000_0006,
         );
-        mesh_state.drop_holds.hold(key.clone(), SlotId(0));
+        mesh_state.session.drop_holds.hold(key.clone(), SlotId(0));
 
         // A peer mesh link, to observe the decided leave broadcast and prove
         // the request was not re-broadcast.
@@ -55,7 +55,7 @@ async fn a_mesh_request_drop_decides_the_leave_at_the_authority_only_and_never_e
         dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
         assert_eq!(
-            mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+            mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),
             !decides,
             "the honored request releases the hold; a non-authority leaves it standing",
         );

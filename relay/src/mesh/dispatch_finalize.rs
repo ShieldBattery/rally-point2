@@ -33,13 +33,13 @@ pub(super) fn dispatch_finalize_drop(request: FinalizeDrop, key: &SessionKey, me
     // different cursor), and only in a session whose descriptor runs
     // the handshake at all. Everyone else stays silent — the request
     // was broadcast, so the one home is among the receivers.
-    if !crate::consensus::finalized_drops_enabled(&mesh.decision_makers, key)
-        || !crate::consensus::slot_strictly_homed(&mesh.decision_makers, key, slot)
+    if !crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, key)
+        || !crate::consensus::slot_strictly_homed(&mesh.session.decision_makers, key, slot)
     {
         return;
     }
     let outcome = crate::consensus::finalize_drop(
-        &mesh.decision_makers,
+        &mesh.session.decision_makers,
         key,
         slot,
         request.connection_epoch,
@@ -57,7 +57,7 @@ pub(super) fn dispatch_finalize_drop(request: FinalizeDrop, key: &SessionKey, me
         // remain stalled and may retry), never a frame fallback. Make
         // it observable — a session stuck here is the signal for the
         // coordinated-abort follow-up.
-        mesh.decision_makers.flight_recorder().record(
+        mesh.session.decision_makers.flight_recorder().record(
             key,
             crate::observability::flight_recorder::FlightEvent::DropFinalizeRejected {
                 slot: slot.0,
@@ -89,8 +89,8 @@ pub(super) fn dispatch_finalize_drop_result(
     // The home's answer. Only the session authority acts on it (the
     // broadcast reaches everyone; a non-authority has no decide to
     // make), and only in a handshake-enabled session.
-    if !crate::consensus::is_authority(&mesh.decision_makers, key)
-        || !crate::consensus::finalized_drops_enabled(&mesh.decision_makers, key)
+    if !crate::consensus::is_authority(&mesh.session.decision_makers, key)
+        || !crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, key)
     {
         return;
     }
@@ -104,7 +104,7 @@ pub(super) fn dispatch_finalize_drop_result(
     // either drift rejects the stale answer here; the requester's
     // next honored drop request re-asks with the current epoch.
     if result.connection_epoch
-        != crate::consensus::departure_epoch(&mesh.decision_makers, key, slot)
+        != crate::consensus::departure_epoch(&mesh.session.decision_makers, key, slot)
     {
         tracing::warn!(
             tenant = key.tenant.as_ref(),
@@ -118,8 +118,8 @@ pub(super) fn dispatch_finalize_drop_result(
     match (result.outcome, result.final_turn_count) {
         (FINALIZE_OUTCOME_FINALIZED, Some(final_turn_count)) => {
             routing::complete_finalized_drop(
-                &mesh.drop_holds,
-                &mesh.decision_makers,
+                &mesh.session.drop_holds,
+                &mesh.session.decision_makers,
                 sessions,
                 &mesh.links,
                 &mesh.seen,
@@ -146,7 +146,7 @@ pub(super) fn dispatch_finalize_drop_result(
                 slot = slot.0,
                 "drop finalization rejected with no gap-free cursor; the drop stays                          undecided",
             );
-            mesh.decision_makers.flight_recorder().record(
+            mesh.session.decision_makers.flight_recorder().record(
                 key,
                 crate::observability::flight_recorder::FlightEvent::DropFinalizeRejected {
                     slot: slot.0,

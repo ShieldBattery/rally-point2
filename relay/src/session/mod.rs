@@ -21,7 +21,10 @@ pub mod presence;
 pub mod provisional;
 pub mod provisional_turns;
 pub mod skin;
+mod state;
 pub mod turn_ring;
+
+pub use state::{SessionState, Tunables};
 
 /// What one payload costs wherever the relay bounds the turns it is holding:
 /// the length of its command stream, and nothing else. Only the commands vary

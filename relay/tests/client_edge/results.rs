@@ -29,8 +29,8 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
         session,
     };
 
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     seed_authority(&makers, &key).apply();
     // Watch the notices the relay would send up its coordinator connection.
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -120,8 +120,8 @@ async fn a_malformed_result_report_is_dropped_without_closing_the_link() {
     use rally_point_transport::control::send_control_game_result;
 
     let tenant = make_default_tenant();
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
 

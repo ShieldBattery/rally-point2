@@ -188,12 +188,12 @@ async fn a_held_reconnect_after_a_never_started_close_seeds_from_retained_receip
 
     // Descriptor-backed but never started: the maker exists, and the expected
     // set is never covered by slot 1 alone, so no session-start ever fires.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let mesh = rally_point_relay::mesh::MeshState::default();
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
-    seed_authority(&mesh.decision_makers, &key)
+    seed_authority(&mesh.session.decision_makers, &key)
         .expecting([0, 1])
         .apply();
     let relay = start_relay_with_mesh(registry_for_one(&tenant), mesh);
@@ -219,7 +219,7 @@ async fn a_held_reconnect_after_a_never_started_close_seeds_from_retained_receip
     // faster would still work, but by replacing the live seat rather than
     // exercising the retention.)
     wait_until("the relay never ran the never-started emptying", || {
-        relay.mesh.drop_holds.is_pending(&key, SlotId(1))
+        relay.mesh.session.drop_holds.is_pending(&key, SlotId(1))
             && relay.sessions.lock().get(&key).is_none()
     })
     .await;

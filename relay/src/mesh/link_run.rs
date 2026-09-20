@@ -18,7 +18,7 @@ use crate::routing;
 
 use super::MeshState;
 use super::link_arms::LinkDriver;
-use super::links::{MeshLinkExit, MeshLinkLease, MeshRttCache, SessionState};
+use super::links::{JoinedSession, MeshLinkExit, MeshLinkLease, MeshRttCache};
 
 /// A command to a mesh-link driver, telling it to start or stop serving one
 /// session on its shared relay-pair connection.
@@ -165,7 +165,7 @@ pub(super) fn defer_flush_after_send(
 /// The wire carries a bare `session: u64` with no tenant (see `MeshPacket`).
 /// Session ids are unique only *within* a tenant, so the driver keys its
 /// per-session state by `SessionKey` (tenant + session) — never the bare id —
-/// and a `SessionId -> SessionState` map demultiplexes a received datagram to
+/// and a `SessionId -> JoinedSession` map demultiplexes a received datagram to
 /// the right session. The collision guard runs on every `Join`, so two tenants
 /// sharing a session id can never be silently cross-wired — the second is
 /// logged and dropped, never overwrites the first. This is fail-closed, not
@@ -189,18 +189,22 @@ pub async fn run_mesh_link(
     // Cloned (cheap — every field is an `Arc`) before the destructure below
     // pulls `mesh` apart, so `dispatch_mesh_control` can take the whole bundle
     // as one argument rather than a growing list of its individual registries
-    // (mirroring `run_slot_link`'s `mesh_for_teardown`). `lobby`, `chat`, and
-    // `skins` are used only inside that dispatch, via the clone, so this
-    // destructure omits them (`..`) rather than binding names this function
-    // never reads.
+    // (mirroring `run_slot_link`'s `mesh_for_teardown`). The session registries
+    // this loop does not itself touch are reached only inside that dispatch,
+    // via the clone, so this destructure names just the three it does rather
+    // than binding a bundle the function never reads.
     let mesh_for_dispatch = mesh.clone();
     let MeshState {
         links: mesh_links,
         seen: seen_registries,
         conditions,
-        decision_makers,
-        presence,
-        drop_holds,
+        session:
+            crate::session::SessionState {
+                decision_makers,
+                presence,
+                drop_holds,
+                ..
+            },
         ..
     } = mesh;
     let crate::session::presence::PresenceIo {
@@ -267,7 +271,7 @@ pub async fn run_mesh_link(
     // The collision guard runs on Join: if two tenants share a session id, the
     // wire can't tell them apart, so the second is logged and skipped — never
     // overwrites the first.
-    let joined: HashMap<rally_point_proto::ids::SessionId, SessionState> = HashMap::new();
+    let joined: HashMap<rally_point_proto::ids::SessionId, JoinedSession> = HashMap::new();
 
     // Idle teardown state. `idle_since` is the instant the last session left
     // (None while sessions are joined, or before the first Join); the driver
@@ -283,7 +287,7 @@ pub async fn run_mesh_link(
     // One cadence for every per-session maintenance responsibility on this
     // relay-pair link. It is armed by the first Join and disarmed by the last
     // Leave, so an idle connection has no periodic wakeup. Per-session flush
-    // deadlines remain independent inside `SessionState`; the shared tick only
+    // deadlines remain independent inside `JoinedSession`; the shared tick only
     // decides when to scan them (along with presence, ack cursors, and the
     // unacked-window safety cap) once as a batch.
     let maintenance = MeshMaintenanceTimer::default();
@@ -459,7 +463,7 @@ pub async fn run_mesh_link(
         MeshLinkExit::Superseded
     };
 
-    // No explicit teardown here: each joined session's `SessionState`
+    // No explicit teardown here: each joined session's `JoinedSession`
     // deregisters its own forward channel when dropped, and the driver holding
     // them is dropped as this function returns — or when the driver task is
     // cancelled — so the cleanup runs on every exit path.

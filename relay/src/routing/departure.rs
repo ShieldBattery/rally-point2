@@ -303,18 +303,22 @@ pub(super) fn report_own_presence(
         let roster = sessions.lock();
         roster.get(key).map_or(0, |slots| slots.len() as u32)
     };
-    if crate::session::presence::record_own(&mesh.presence, key, live) {
+    if crate::session::presence::record_own(&mesh.session.presence, key, live) {
         // Slots whose drop is still held on this relay must not be decided by the
         // promotion a re-derive may trigger: a held drop is decided only by an
         // honored manual request, never by a promotion.
-        let held = mesh.drop_holds.pending_slots(key);
-        let leaves =
-            crate::session::presence::recompute(&mesh.presence, &mesh.decision_makers, key, &held);
+        let held = mesh.session.drop_holds.pending_slots(key);
+        let leaves = crate::session::presence::recompute(
+            &mesh.session.presence,
+            &mesh.session.decision_makers,
+            key,
+            &held,
+        );
         crate::mesh::broadcast_leaves(sessions, &mesh.links, key, leaves);
         // A recompute that promotes this relay to authority may make it the one
         // to observe full slot presence: re-evaluate and fire the session-start
         // directive if the accumulated live slots already cover the expected set.
-        maybe_start_session(sessions, &mesh.decision_makers, &mesh.links, key);
+        maybe_start_session(sessions, &mesh.session.decision_makers, &mesh.links, key);
         // This liveness change may have emptied the session session-wide (arming
         // the abandoned-session timer) or refilled it (cancelling any armed timer).
         reconcile_abandon(sessions, mesh, key);
@@ -347,11 +351,11 @@ pub(crate) fn reconcile_abandon(
         let roster = sessions.lock();
         roster.get(key).map_or(0, |slots| slots.len() as u32)
     };
-    let session_started = consensus::session_started(&mesh.decision_makers, key);
-    let globally_empty = crate::session::presence::all_empty(&mesh.presence, key, own_live);
+    let session_started = consensus::session_started(&mesh.session.decision_makers, key);
+    let globally_empty = crate::session::presence::all_empty(&mesh.session.presence, key, own_live);
     let abandoned = session_started
         && globally_empty
-        && consensus::has_undecided_departure(&mesh.decision_makers, key);
+        && consensus::has_undecided_departure(&mesh.session.decision_makers, key);
     if abandoned {
         // Owned clones for the timer task: it fires after the window with no
         // borrowed state, holding the shared registries by `Arc` (`MeshState`
@@ -359,7 +363,8 @@ pub(crate) fn reconcile_abandon(
         let sessions_for_expire = Arc::clone(sessions);
         let mesh_for_expire = mesh.clone();
         let key_for_expire = key.clone();
-        mesh.drop_holds
+        mesh.session
+            .drop_holds
             .arm_abandon(key.clone(), move |close_reported| {
                 decide_and_broadcast_abandoned(
                     &sessions_for_expire,
@@ -369,7 +374,7 @@ pub(crate) fn reconcile_abandon(
                 );
             });
     } else {
-        mesh.drop_holds.cancel_abandon(key);
+        mesh.session.drop_holds.cancel_abandon(key);
     }
 
     // `end_slot_link` already evaluates the close when this relay's own last
@@ -444,7 +449,7 @@ pub(super) fn decide_and_broadcast_abandoned(
         let roster = sessions.lock();
         roster.get(key).map_or(0, |slots| slots.len() as u32)
     };
-    if own_live > 0 || !crate::session::presence::all_empty(&mesh.presence, key, own_live) {
+    if own_live > 0 || !crate::session::presence::all_empty(&mesh.session.presence, key, own_live) {
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
@@ -452,7 +457,7 @@ pub(super) fn decide_and_broadcast_abandoned(
         );
         return;
     }
-    let leaves = consensus::decide_abandoned_departures(&mesh.decision_makers, key);
+    let leaves = consensus::decide_abandoned_departures(&mesh.session.decision_makers, key);
     if !leaves.is_empty() {
         tracing::info!(
             tenant = key.tenant.as_ref(),
@@ -462,7 +467,7 @@ pub(super) fn decide_and_broadcast_abandoned(
         );
         for leave in &leaves {
             if let Ok(slot) = u8::try_from(leave.slot) {
-                let _ = mesh.drop_holds.release(key, SlotId(slot));
+                let _ = mesh.session.drop_holds.release(key, SlotId(slot));
             }
         }
         crate::mesh::broadcast_leaves(sessions, &mesh.links, key, leaves);

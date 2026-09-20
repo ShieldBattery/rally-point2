@@ -21,7 +21,7 @@ use super::join::{
 use super::link_arms::LinkDriver;
 use super::link_run::{MeshCommand, defer_flush_after_send};
 use super::links::{
-    LeaseAwait, MESH_STREAM_WRITE_TIMEOUT, MeshLinkExit, SessionState, await_while_current,
+    JoinedSession, LeaseAwait, MESH_STREAM_WRITE_TIMEOUT, MeshLinkExit, await_while_current,
 };
 use super::seen::resume_cursor_snapshot;
 use super::{mesh_session_key, register_mesh_link};
@@ -210,7 +210,7 @@ impl LinkDriver {
                     let joined_at = tokio::time::Instant::now();
                     joined.insert(
                         session_id,
-                        SessionState {
+                        JoinedSession {
                             key,
                             flush_deadline: joined_at + routing::FLUSH_INTERVAL,
                             _registration: registration,
@@ -274,7 +274,7 @@ impl LinkDriver {
                         .get(&session_id)
                         .is_some_and(|state| state.key == key)
                     {
-                        // Dropping the removed `SessionState` deregisters this
+                        // Dropping the removed `JoinedSession` deregisters this
                         // session's mesh forward channel (its RAII guard).
                         joined.remove(&session_id);
                         link.close_session(mesh_session_key(&key));

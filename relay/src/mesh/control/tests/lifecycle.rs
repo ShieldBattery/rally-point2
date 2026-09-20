@@ -45,14 +45,14 @@ async fn end_session_sweeps_undecided_holds_and_the_abandon_timer() {
 /// came.
 #[tokio::test]
 async fn end_session_sweeps_retained_receipts_and_replay_state() {
-    let mesh_state = crate::mesh::new_mesh_state();
+    let mesh_state = crate::mesh::MeshState::default();
     let makers = Arc::new(consensus::new_decision_makers());
     let control =
         MeshControl::new(RelayId(1), makers, Arc::default()).with_turn_path(mesh_state.clone());
     control.apply_descriptor(&descriptor(1, &[]));
 
     crate::mesh::mark_seen(&mesh_state.seen, &key(1), SlotId(0), 0);
-    mesh_state.turn_ring.record(
+    mesh_state.session.turn_ring.record(
         &key(1),
         &rally_point_proto::messages::Payload {
             seq: 0,
@@ -71,7 +71,7 @@ async fn end_session_sweeps_retained_receipts_and_replay_state() {
         "the seen receipts are swept by retirement",
     );
     assert_eq!(
-        mesh_state.turn_ring.totals().sessions,
+        mesh_state.session.turn_ring.totals().sessions,
         0,
         "the replay ring is swept by retirement",
     );

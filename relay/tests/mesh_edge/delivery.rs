@@ -103,11 +103,11 @@ async fn a_leave_decided_at_the_authority_reaches_the_peer_relays_client() -> Re
 
     // A decides for this session and is home to slot 0; B defers and is home to
     // slot 1 — the coordinator-assigned split a two-region game runs with.
-    seed_authority(&relay_a.mesh.decision_makers, &key)
+    seed_authority(&relay_a.mesh.session.decision_makers, &key)
         .expecting([0, 1])
         .homed([0])
         .apply();
-    seed_authority(&relay_b.mesh.decision_makers, &key)
+    seed_authority(&relay_b.mesh.session.decision_makers, &key)
         .expecting([0, 1])
         .homed([1])
         .authority(Authority::Peer)
@@ -124,7 +124,7 @@ async fn a_leave_decided_at_the_authority_reaches_the_peer_relays_client() -> Re
     // departure against — without one the leave would be held, not decided.
     leaver.send(Some(build_turn(0, 0, Some(10))))?;
     wait_until("the authority never observed the leaver's turn", || {
-        consensus::slot_frame(&relay_a.mesh.decision_makers, &key, SlotId(0)).is_some()
+        consensus::slot_frame(&relay_a.mesh.session.decision_makers, &key, SlotId(0)).is_some()
     })
     .await;
 

@@ -271,9 +271,9 @@ async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_chann
     // multi-relay session is never fully observed, so the depth is
     // max(observed, 10) + 1 hop cushion = 11 (the localhost handshake RTT stays
     // far below the hint).
-    let mesh = rally_point_relay::mesh::new_mesh_state();
+    let mesh = rally_point_relay::mesh::MeshState::default();
     let key = seed_session_authority(&mesh, &tenant, session, &[SlotId(0), SlotId(1)]);
-    consensus::set_session_shape(&mesh.decision_makers, &key, Some(400), false);
+    consensus::set_session_shape(&mesh.session.decision_makers, &key, Some(400), false);
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
     let endpoint = client_endpoint(&ca);

@@ -16,7 +16,7 @@ use super::*;
 async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepted_copy() {
     let sessions: routing::Sessions = Arc::default();
     let mesh_state = test_mesh_state();
-    let makers = Arc::clone(&mesh_state.decision_makers);
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     // A maker for the session -- `observe_leave` (a Peer-relay concern:
     // only a non-authority relay observes a leave off the mesh) is a
@@ -140,7 +140,7 @@ async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepte
 async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
     let sessions: routing::Sessions = Arc::default();
     let mesh_state = test_mesh_state();
-    let makers = Arc::clone(&mesh_state.decision_makers);
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
     crate::consensus::record_departure(
@@ -153,9 +153,9 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
 
     // This relay observed slot 0 drop and marked a hold on its leave. A hold
     // never fires on its own — the release is what clears it.
-    mesh_state.drop_holds.hold(key.clone(), SlotId(0));
+    mesh_state.session.drop_holds.hold(key.clone(), SlotId(0));
     assert!(
-        mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+        mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),
         "the drop marked a hold",
     );
 
@@ -176,7 +176,7 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
     dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
 
     assert!(
-        !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+        !mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),
         "the it's-back signal released the held drop",
     );
 }
@@ -185,7 +185,7 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
 async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
     let sessions: routing::Sessions = Arc::default();
     let mesh_state = test_mesh_state();
-    let makers = Arc::clone(&mesh_state.decision_makers);
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
     assert!(crate::consensus::activate_connection_epoch(
@@ -207,7 +207,7 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
         routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");
     guard.disarm();
     let joined = joined_state(&mesh_state.links, &key);
-    mesh_state.drop_holds.hold(key.clone(), SlotId(0));
+    mesh_state.session.drop_holds.hold(key.clone(), SlotId(0));
 
     let connected = |epoch| MeshControlFrame {
         session: key.session.0,
@@ -221,7 +221,7 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
     };
 
     dispatch_mesh_control(connected(11), RelayId(9), &joined, &sessions, &mesh_state);
-    assert!(mesh_state.drop_holds.is_pending(&key, SlotId(0)));
+    assert!(mesh_state.session.drop_holds.is_pending(&key, SlotId(0)));
     assert_eq!(inbox.try_recv_connectivity(), None);
 
     // A decided leave makes reinstate fail even for a distinct epoch. The
@@ -232,7 +232,7 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
         .expect("maker exists")
         .force_decide_leave(SlotId(0), 0x4000_0006);
     dispatch_mesh_control(connected(22), RelayId(9), &joined, &sessions, &mesh_state);
-    assert!(!mesh_state.drop_holds.is_pending(&key, SlotId(0)));
+    assert!(!mesh_state.session.drop_holds.is_pending(&key, SlotId(0)));
     assert_eq!(inbox.try_recv_connectivity(), None);
     assert!(!crate::consensus::connection_epoch_matches(
         &makers,
@@ -247,7 +247,7 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
     for true_before_leave in [false, true] {
         let sessions: routing::Sessions = Arc::default();
         let mesh_state = test_mesh_state();
-        let makers = Arc::clone(&mesh_state.decision_makers);
+        let makers = Arc::clone(&mesh_state.session.decision_makers);
         let key = control_key();
         test_maker(&makers, &key, crate::consensus::Authority::Peer);
         assert!(crate::consensus::activate_connection_epoch(
@@ -309,11 +309,11 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
         }
         // Model a local E1 drop hold that the peer's final decision outran.
         // The final leave must retire it immediately in either ordering.
-        mesh_state.drop_holds.hold(key.clone(), SlotId(0));
+        mesh_state.session.drop_holds.hold(key.clone(), SlotId(0));
         dispatch_mesh_control(leave, RelayId(8), &joined, &sessions, &mesh_state);
         assert!(inbox.try_recv_leave().is_some());
         assert!(
-            !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+            !mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),
             "a final peer leave clears an older local reconnect hold"
         );
 
@@ -327,7 +327,7 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
         }
         dispatch_mesh_control(departed, RelayId(9), &joined, &sessions, &mesh_state);
         assert!(
-            !mesh_state.drop_holds.is_pending(&key, SlotId(0)),
+            !mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),
             "a delayed departed frame may merge terminal metadata but cannot recreate a hold"
         );
         dispatch_mesh_control(connected(33), RelayId(9), &joined, &sessions, &mesh_state);

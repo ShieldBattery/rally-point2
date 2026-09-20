@@ -130,6 +130,7 @@ pub async fn run_slot_link(
     // hot path. The connect event marks a resumed dial (any presented resume
     // cursors: a reconnect or a re-home re-dial) apart from a fresh one.
     let flight_counters = mesh
+        .session
         .decision_makers
         .flight_recorder()
         .slot_counters(&key, slot);
@@ -137,7 +138,7 @@ pub async fn run_slot_link(
     // not this slot's first arrival. Read before the cursors are consumed below,
     // and reported both to the recording and up the coordinator connection.
     let resumed_dial = !resume_cursors.is_empty();
-    mesh.decision_makers.flight_recorder().record(
+    mesh.session.decision_makers.flight_recorder().record(
         &key,
         crate::observability::flight_recorder::FlightEvent::SlotConnected {
             slot: slot.0,
@@ -147,13 +148,17 @@ pub async fn run_slot_link(
     let crate::mesh::MeshState {
         links: mesh_links,
         conditions,
-        decision_makers,
-        lobby,
-        chat,
-        skins,
-        drop_holds,
-        turn_ring,
-        load_fence,
+        session:
+            crate::session::SessionState {
+                decision_makers,
+                lobby,
+                chat,
+                skins,
+                drop_holds,
+                turn_ring,
+                load_fence,
+                ..
+            },
         ..
     } = mesh;
     if !setup::activate_slot(

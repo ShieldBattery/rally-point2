@@ -29,7 +29,7 @@ pub struct TestRelay {
 
 /// Binds an ephemeral relay endpoint serving `registry`.
 pub fn start_relay(registry: Registry) -> TestRelay {
-    start_relay_with_mesh(registry, rally_point_relay::mesh::new_mesh_state())
+    start_relay_with_mesh(registry, rally_point_relay::mesh::MeshState::default())
 }
 
 /// [`start_relay`] with a caller-supplied mesh state, so a test can hold its

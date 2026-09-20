@@ -42,7 +42,7 @@ async fn a_client_connects_through_a_self_signed_relay_and_is_authorized() -> Re
         endpoint,
         Arc::new(registry),
         Arc::default(),
-        rally_point_relay::mesh::new_mesh_state(),
+        rally_point_relay::mesh::MeshState::default(),
         None,
     ));
 

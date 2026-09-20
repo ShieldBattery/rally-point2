@@ -272,10 +272,10 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
     // ring actually records what's about to be flooded through it —
     // `deliver_turn_to_locals` only buffers into the ring once the session
     // has started (pre-start traffic has its own, separate replay log).
-    seed_authority(&relay_a.mesh.decision_makers, &key)
+    seed_authority(&relay_a.mesh.session.decision_makers, &key)
         .bounds(1, 6)
         .apply();
-    consensus::mark_session_started(&relay_a.mesh.decision_makers, &key);
+    consensus::mark_session_started(&relay_a.mesh.session.decision_makers, &key);
 
     cmds_a1.send(mesh::MeshCommand::Join(key.clone()))?;
     cmds_b1.send(mesh::MeshCommand::Join(key.clone()))?;

@@ -269,9 +269,9 @@ fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
     // The ring can hold both locally and remotely originated entries; a
     // resume reply must carry only the `Local` ones so this relay never
     // forwards a peer-origin payload to another relay.
-    let mesh = new_mesh_state();
+    let mesh = MeshState::default();
     let key = control_key();
-    mesh.turn_ring.record(
+    mesh.session.turn_ring.record(
         &key,
         &Payload {
             slot: 0,
@@ -281,7 +281,7 @@ fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
         crate::session::turn_ring::TurnOrigin::Local,
         crate::session::turn_ring::MAX_GAME_SLOTS,
     );
-    mesh.turn_ring.record(
+    mesh.session.turn_ring.record(
         &key,
         &Payload {
             slot: 0,
@@ -291,7 +291,7 @@ fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
         crate::session::turn_ring::TurnOrigin::Mesh,
         crate::session::turn_ring::MAX_GAME_SLOTS,
     );
-    mesh.turn_ring.record(
+    mesh.session.turn_ring.record(
         &key,
         &Payload {
             slot: 0,
@@ -305,7 +305,7 @@ fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
     let mut joined = HashMap::new();
     joined.insert(
         key.session,
-        SessionState {
+        JoinedSession {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
             _registration: register_mesh_link(
@@ -350,9 +350,9 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
     // but exercised through the actual wire frame and `resume_replay_for_frame`
     // -- proves the `resuming` bit is correctly read off the frame and
     // threaded through, not just that `TurnRing` honors it in isolation.
-    let mesh = new_mesh_state();
+    let mesh = MeshState::default();
     let key = control_key();
-    mesh.turn_ring.record(
+    mesh.session.turn_ring.record(
         &key,
         &Payload {
             slot: 0,
@@ -362,7 +362,7 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
         crate::session::turn_ring::TurnOrigin::Local,
         crate::session::turn_ring::MAX_GAME_SLOTS,
     );
-    mesh.turn_ring.record(
+    mesh.session.turn_ring.record(
         &key,
         &Payload {
             slot: 0,
@@ -376,7 +376,7 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
     let mut joined = HashMap::new();
     joined.insert(
         key.session,
-        SessionState {
+        JoinedSession {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
             _registration: register_mesh_link(
@@ -429,7 +429,7 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
 
 #[test]
 fn resume_replay_is_none_for_an_unjoined_session_or_an_empty_result() {
-    let mesh = new_mesh_state();
+    let mesh = MeshState::default();
     let key = control_key();
     let joined = HashMap::new();
 

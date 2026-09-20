@@ -65,6 +65,7 @@ pub(super) fn payload_of(len: usize) -> Payload {
 // -- drop holds, manual drop requests, and connectivity fan-out --
 
 use crate::session::drop_hold::DropHolds;
+use crate::session::{SessionState, Tunables};
 
 /// A drop-unlock floor a test can never reach by waiting, so a `RequestDrop`
 /// before it is provably refused.
@@ -91,11 +92,14 @@ impl DropHarness {
     /// test's own bindings and the bundle observe the same state.
     pub(super) fn mesh(&self, holds: &DropHolds) -> crate::mesh::MeshState {
         crate::mesh::MeshState {
-            drop_holds: holds.clone(),
-            decision_makers: Arc::clone(&self.makers),
             links: self.mesh_links.clone(),
             seen: self.seen.clone(),
-            ..crate::mesh::new_mesh_state()
+            session: SessionState {
+                drop_holds: holds.clone(),
+                decision_makers: Arc::clone(&self.makers),
+                ..SessionState::default()
+            },
+            ..crate::mesh::MeshState::default()
         }
     }
 }
@@ -178,11 +182,14 @@ pub(super) fn mesh_with(
     presence: &Arc<crate::session::presence::PresenceRegistry>,
 ) -> crate::mesh::MeshState {
     crate::mesh::MeshState {
-        drop_holds: holds.clone(),
-        decision_makers: Arc::clone(makers),
         links: mesh_links.clone(),
-        presence: Arc::clone(presence),
-        ..crate::mesh::new_mesh_state()
+        session: SessionState {
+            drop_holds: holds.clone(),
+            decision_makers: Arc::clone(makers),
+            presence: Arc::clone(presence),
+            ..SessionState::default()
+        },
+        ..crate::mesh::MeshState::default()
     }
 }
 

@@ -7,6 +7,8 @@ use crate::helpers::*;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
+use rally_point_relay::mesh::MeshState;
+use rally_point_relay::session::{SessionState, Tunables};
 
 #[tokio::test]
 async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_missed_turns() {
@@ -26,9 +28,12 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
     // thing a long one would — it only bounds how long the test must outlast before
     // asserting no leave ever fired.
     let unlock = Duration::from_millis(150);
-    let mesh = rally_point_relay::mesh::new_mesh_state_with_drop_unlock(unlock);
-    let makers = mesh.decision_makers.clone();
-    let ring = mesh.turn_ring.clone();
+    let mesh = MeshState::new(SessionState::with_tunables(Tunables {
+        drop_unlock: unlock,
+        ..Tunables::default()
+    }));
+    let makers = mesh.session.decision_makers.clone();
+    let ring = mesh.session.turn_ring.clone();
     seed_authority(&makers, &key).expecting([0, 1]).apply();
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
@@ -139,8 +144,8 @@ async fn a_reconnecting_client_is_replayed_a_leave_decided_while_it_was_gone() {
 
     // Authority over an expected {0, 1} set, so the session starts and a clean
     // leave-intent is decided here rather than merely recorded.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     seed_authority(&makers, &key).expecting([0, 1]).apply();
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);

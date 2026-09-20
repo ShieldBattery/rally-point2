@@ -30,8 +30,8 @@ use super::join::{
 };
 use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};
 use super::links::{
-    LeaseAwait, MESH_RTT_CACHE_TTL, MESH_UNACKED_WINDOW_CAP, MeshLinkRegistration, MeshRttCache,
-    SessionState, await_while_current, mesh_window_exhausted, next_mesh_link_id,
+    JoinedSession, LeaseAwait, MESH_RTT_CACHE_TTL, MESH_UNACKED_WINDOW_CAP, MeshLinkRegistration,
+    MeshRttCache, await_while_current, mesh_window_exhausted, next_mesh_link_id,
 };
 use super::seen::{SPARSE_SEEN_CAP, SlotSeen};
 
@@ -85,7 +85,7 @@ pub(super) fn register_link_channels(
 
 /// The `MeshState` a `dispatch_mesh_control` test runs against: production
 /// wiring throughout, so a test registers its members and observes echoes
-/// through the state's own registries (`mesh.links`, `mesh.chat`, …) rather
+/// through the state's own registries (`mesh.links`, `mesh.session.chat`, …) rather
 /// than building six of them up front. A test that needs to shape a field
 /// itself overrides it: `MeshState { links, ..test_mesh_state() }`.
 ///
@@ -95,13 +95,12 @@ pub(super) fn register_link_channels(
 /// and release a drop are unaffected by the floor, and the abandoned-session
 /// window keeps its production value — no dispatch test drives that path.
 pub(super) fn test_mesh_state() -> MeshState {
-    MeshState {
-        drop_holds: crate::session::drop_hold::DropHolds::new(
-            std::time::Duration::ZERO,
-            crate::session::drop_hold::ABANDONED_SESSION_TIMEOUT,
-        ),
-        ..new_mesh_state()
-    }
+    MeshState::new(crate::session::SessionState::with_tunables(
+        crate::session::Tunables {
+            drop_unlock: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+    ))
 }
 
 /// Makes a decision-maker exist for `key` under `authority`, with the wide
@@ -142,7 +141,7 @@ pub(super) struct FinalizeFixture {
     pub(super) sessions: routing::Sessions,
     pub(super) mesh: MeshState,
     pub(super) key: SessionKey,
-    joined: HashMap<SessionId, SessionState>,
+    joined: HashMap<SessionId, JoinedSession>,
 }
 
 impl FinalizeFixture {
@@ -168,7 +167,7 @@ pub(super) fn finalize_fixture(
     let mesh = test_mesh_state();
     let sessions: routing::Sessions = Arc::default();
     let _ = crate::consensus::sync_maker(
-        &mesh.decision_makers,
+        &mesh.session.decision_makers,
         &key,
         crate::consensus::MakerSync {
             homed_slots: homed.iter().map(|&slot| SlotId(slot)).collect(),
@@ -183,7 +182,7 @@ pub(super) fn finalize_fixture(
     let subject = SlotId(FINALIZE_SUBJECT_SLOT);
     match departure {
         PeerDrop::Recorded(None) => crate::consensus::record_departure(
-            &mesh.decision_makers,
+            &mesh.session.decision_makers,
             &key,
             subject,
             crate::consensus::DepartureStamps::default(),
@@ -191,7 +190,7 @@ pub(super) fn finalize_fixture(
         ),
         PeerDrop::Recorded(epoch) => assert!(
             crate::consensus::record_departure_for_epoch(
-                &mesh.decision_makers,
+                &mesh.session.decision_makers,
                 &key,
                 subject,
                 crate::consensus::DepartureStamps::default(),
@@ -204,8 +203,8 @@ pub(super) fn finalize_fixture(
     }
     if !matches!(departure, PeerDrop::Untouched) {
         routing::hold_or_decide_leave(
-            &mesh.drop_holds,
-            &mesh.decision_makers,
+            &mesh.session.drop_holds,
+            &mesh.session.decision_makers,
             &sessions,
             &mesh.links,
             &key,
@@ -213,7 +212,7 @@ pub(super) fn finalize_fixture(
             crate::consensus::LEAVE_REASON_DROPPED,
         );
         assert!(
-            mesh.drop_holds.is_pending(&key, subject),
+            mesh.session.drop_holds.is_pending(&key, subject),
             "the peer-homed drop is held undecided until a finalize result lands",
         );
     }
@@ -232,11 +231,11 @@ pub(super) fn finalize_fixture(
 pub(super) fn joined_state(
     mesh_links: &MeshLinks,
     key: &SessionKey,
-) -> HashMap<SessionId, SessionState> {
+) -> HashMap<SessionId, JoinedSession> {
     let mut joined = HashMap::new();
     joined.insert(
         key.session,
-        SessionState {
+        JoinedSession {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
             _registration: MeshLinkRegistration {

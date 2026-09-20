@@ -13,7 +13,9 @@ use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ConnectionChallenge,
 };
+use rally_point_relay::mesh::MeshState;
 use rally_point_relay::server;
+use rally_point_relay::session::{SessionState, Tunables};
 use rally_point_transport::noq;
 use rally_point_transport::quic::server_config;
 
@@ -191,7 +193,7 @@ async fn refuses_connections_beyond_the_handshake_limit() {
         relay,
         Arc::new(registry_for_one(&tenant)),
         std::sync::Arc::default(),
-        rally_point_relay::mesh::new_mesh_state(),
+        rally_point_relay::mesh::MeshState::default(),
         None,
         1,
     ));
@@ -224,8 +226,8 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     };
 
     // Authority over {0, 1} so the session starts and a decided leave is real.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     seed_authority(&makers, &key).expecting([0, 1]).apply();
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
@@ -279,8 +281,11 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
 #[tokio::test]
 async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
     let tenant = make_default_tenant();
-    let mesh = rally_point_relay::mesh::new_mesh_state_with_journal_ceiling(1);
-    mesh.provisional_turns.arm();
+    let mesh = MeshState::new(SessionState::with_tunables(Tunables {
+        journal_max_sessions: 1,
+        ..Tunables::default()
+    }));
+    mesh.session.provisional_turns.arm();
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
@@ -329,8 +334,8 @@ async fn a_slot_not_homed_on_this_relay_is_refused() {
 
     // The descriptor assigns only slot 0 to this relay -- standing in for a
     // multi-relay session where slot 1 is homed elsewhere.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     seed_authority(&makers, &key).homed([0]).apply();
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);

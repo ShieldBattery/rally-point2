@@ -6,6 +6,8 @@ use std::time::Duration;
 use crate::helpers::*;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
+use rally_point_relay::mesh::MeshState;
+use rally_point_relay::session::{SessionState, Tunables};
 
 /// `end_slot_link`'s session-emptied teardown must not sweep away a hold its
 /// own disconnect just marked: the sweep may only discard *decided* holds, not
@@ -37,9 +39,9 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
     // A single local slot: it is always "the last local slot" for this relay, so
     // its own disconnect always empties the roster and runs the session-emptied
     // teardown in the same breath that marks its hold.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
-    let drop_holds = mesh.drop_holds.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
+    let drop_holds = mesh.session.drop_holds.clone();
     seed_authority(&makers, &key).apply();
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
@@ -112,14 +114,14 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     // first in its own presence order: slot 0 arriving is full coverage, so the
     // session starts — the deferral applies only to a started session, whose
     // abandoned-session timer bounds it.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
-    let drop_holds = mesh.drop_holds.clone();
-    let lobby = mesh.lobby.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
+    let drop_holds = mesh.session.drop_holds.clone();
+    let lobby = mesh.session.lobby.clone();
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
     seed_authority(&makers, &key).expecting([0]).apply();
-    presence::set_order(&mesh.presence, &key, vec![Candidate::SelfRelay]);
+    presence::set_order(&mesh.session.presence, &key, vec![Candidate::SelfRelay]);
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
@@ -241,10 +243,14 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     // own presence order so its own roster count drives the authority verdict.
     let unlock = Duration::from_millis(200);
     let abandon_timeout = Duration::from_millis(300);
-    let mesh = rally_point_relay::mesh::new_mesh_state_with_timings(unlock, abandon_timeout);
-    let makers = mesh.decision_makers.clone();
-    let presence_registry = mesh.presence.clone();
-    let drop_holds = mesh.drop_holds.clone();
+    let mesh = MeshState::new(SessionState::with_tunables(Tunables {
+        drop_unlock: unlock,
+        abandon_timeout,
+        ..Tunables::default()
+    }));
+    let makers = mesh.session.decision_makers.clone();
+    let presence_registry = mesh.session.presence.clone();
+    let drop_holds = mesh.session.drop_holds.clone();
     seed_authority(&makers, &key).expecting([0, 1]).apply();
     presence::set_order(&presence_registry, &key, vec![Candidate::SelfRelay]);
 

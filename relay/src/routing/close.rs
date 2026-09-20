@@ -77,7 +77,7 @@ fn maybe_close_emptied_session_inner(
     // retired session's close evaluation would find no maker, claim the
     // no-maker close default, and report a second SessionClosed. Recursive
     // for the dispatch arms that already hold the gate.
-    let _ = mesh.gates.with_ingress(key, || {
+    let _ = mesh.session.gates.with_ingress(key, || {
         maybe_close_emptied_session_gated(sessions, mesh, key, close_claim_requires_maker)
     });
 }
@@ -94,9 +94,9 @@ fn maybe_close_emptied_session_gated(
         // that link's own teardown re-evaluates when it ends.
         return;
     }
-    let held = mesh.drop_holds.pending_slots(key);
-    if consensus::session_started(&mesh.decision_makers, key)
-        && consensus::has_reconnectable_departure(&mesh.decision_makers, key, &held)
+    let held = mesh.session.drop_holds.pending_slots(key);
+    if consensus::session_started(&mesh.session.decision_makers, key)
+        && consensus::has_reconnectable_departure(&mesh.session.decision_makers, key, &held)
     {
         tracing::info!(
             tenant = key.tenant.as_ref(),
@@ -112,33 +112,33 @@ fn maybe_close_emptied_session_gated(
     // ever reach. The abandon timer's expiry does not: that timer arms only
     // while a maker exists, so a missing one proves the descriptor was retired
     // mid-window and the close already ran and reached the coordinator.
-    let claimed = consensus::claim_close_report(&mesh.decision_makers, key)
+    let claimed = consensus::claim_close_report(&mesh.session.decision_makers, key)
         .unwrap_or(!close_claim_requires_maker);
     if !claimed {
         return;
     }
-    consensus::session_closed(&mesh.decision_makers, key);
+    consensus::session_closed(&mesh.session.decision_makers, key);
     // An abandoned-session timer running for this session must not re-run the
     // close when its window elapses: the close has been reported now, and the
     // teardown below is what it would otherwise repeat. Its force-decide is still
     // owed, so the timer is marked rather than cancelled.
-    mesh.drop_holds.note_session_closed(key);
+    mesh.session.drop_holds.note_session_closed(key);
     // The relay's last local member for the session is gone, so its lobby log
     // and (now-empty) member set can be dropped — mirroring how the roster
     // group is dropped when its last slot leaves.
-    crate::session::lobby::end_session(&mesh.lobby, key);
+    crate::session::lobby::end_session(&mesh.session.lobby, key);
     // Same for chat's (log-free) per-session state.
-    crate::session::chat::end_session(&mesh.chat, key);
+    crate::session::chat::end_session(&mesh.session.chat, key);
     // Same for the skin blob map and member set: no local member remains to
     // replay it to, so the whole per-session state can be dropped.
-    crate::session::skin::end_session(&mesh.skins, key);
+    crate::session::skin::end_session(&mesh.session.skins, key);
     // Same for request limiters, and for any hold whose slot's leave is already
     // decided — but NOT for an undecided hold: on a session that never started
     // (where a fresh undecided drop does not defer the close) that hold is
     // still the reconnect-admission token and unlock clock for a drop nobody
     // has decided yet. See `crate::session::drop_hold` module docs.
-    let decided = consensus::decided_slots(&mesh.decision_makers, key);
-    mesh.drop_holds.end_session(key, &decided);
+    let decided = consensus::decided_slots(&mesh.session.decision_makers, key);
+    mesh.session.drop_holds.end_session(key, &decided);
     // The forwarded-turn replay ring and the forward-once seen state (whose
     // entry is created lazily on the first turn forwarded — there is no
     // explicit "join" counterpart to pair the teardown with) go down on the
@@ -158,9 +158,10 @@ fn maybe_close_emptied_session_gated(
     // it records only started sessions, and a started session's reconnectable
     // departure defers this close entirely above — but tying both stores to
     // the same token keeps the rule whole rather than shape-dependent.)
-    let surviving_holds = mesh.drop_holds.pending_slots(key);
-    if !consensus::has_reconnectable_departure(&mesh.decision_makers, key, &surviving_holds) {
-        mesh.turn_ring.end_session(key);
+    let surviving_holds = mesh.session.drop_holds.pending_slots(key);
+    if !consensus::has_reconnectable_departure(&mesh.session.decision_makers, key, &surviving_holds)
+    {
+        mesh.session.turn_ring.end_session(key);
         crate::mesh::deregister_seen(&mesh.seen, key);
     }
     // A session no descriptor ever named has no coordinator lifecycle, so the
@@ -184,10 +185,10 @@ fn maybe_close_emptied_session_gated(
     // teardown's announce racing this close can never be classified away
     // and then deleted: it either refuses the discard or lands in a fresh,
     // retained journal.
-    if consensus::maker_exists(&mesh.decision_makers, key) {
-        mesh.provisional.clear(key);
-    } else if mesh.provisional_turns.discard_if_empty(key) {
-        mesh.provisional.clear(key);
-        mesh.gates.discard(key);
+    if consensus::maker_exists(&mesh.session.decision_makers, key) {
+        mesh.session.provisional.clear(key);
+    } else if mesh.session.provisional_turns.discard_if_empty(key) {
+        mesh.session.provisional.clear(key);
+        mesh.session.gates.discard(key);
     }
 }

@@ -442,19 +442,19 @@ fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey, id: u64) {
 /// One session's per-link driver state: its routing key (tenant-correct), its own
 /// flush deadline (independent per session — one game's flush cadence doesn't reset
 /// another's), and the RAII guard that deregisters its mesh forward channel.
-pub(super) struct SessionState {
+pub(super) struct JoinedSession {
     pub(super) key: SessionKey,
     pub(super) flush_deadline: tokio::time::Instant,
-    /// Deregisters this session's mesh forward channel when the `SessionState` is
+    /// Deregisters this session's mesh forward channel when the `JoinedSession` is
     /// dropped — on a `Leave`, a normal wind-down, or the driver task being
     /// cancelled. Never read; its `Drop` is the point.
     pub(super) _registration: MeshLinkRegistration,
 }
 
 /// An RAII guard tying a session's mesh forward-channel registration to the
-/// lifetime of its [`SessionState`]. Dropping it deregisters the channel, so the
+/// lifetime of its [`JoinedSession`]. Dropping it deregisters the channel, so the
 /// registration is torn down on *every* exit from [`run_mesh_link`]: a `Leave`
-/// removes the `SessionState`; a normal wind-down or a **cancelled** driver task (a
+/// removes the `JoinedSession`; a normal wind-down or a **cancelled** driver task (a
 /// dialer retargeting or removing this peer drops the whole driver future) drops the
 /// `joined` map. Without it, task cancellation would skip the cleanup and leave a
 /// dead forward channel in `mesh.links` for a session this link no longer serves —

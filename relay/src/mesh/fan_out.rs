@@ -16,7 +16,7 @@ use crate::key::SessionKey;
 use crate::routing;
 
 use super::frames::*;
-use super::links::{MeshControlTx, MeshForwardTx, SessionState};
+use super::links::{JoinedSession, MeshControlTx, MeshForwardTx};
 use super::{MeshLinks, mesh_session_key};
 
 /// Delivers a locally originated `payload` to every peer-relay mesh link serving
@@ -152,7 +152,7 @@ pub(crate) fn fan_out_delivery_cursors(
 pub(super) fn apply_ack_cursors(
     link: &mut rally_point_transport::MeshLink,
     frame: &MeshControlFrame,
-    joined: &HashMap<SessionId, SessionState>,
+    joined: &HashMap<SessionId, JoinedSession>,
 ) {
     if frame.session == 0 {
         return;
@@ -194,7 +194,7 @@ pub(super) fn apply_ack_cursors(
 pub(super) fn fold_oversize_into_link(
     link: &mut rally_point_transport::MeshLink,
     frame: &MeshControlFrame,
-    joined: &HashMap<SessionId, SessionState>,
+    joined: &HashMap<SessionId, JoinedSession>,
 ) -> bool {
     let Some(mesh_control_frame::Kind::OversizeTurn(payload)) = &frame.kind else {
         return true;
@@ -244,7 +244,7 @@ pub(super) fn fold_oversize_into_link(
 pub(super) fn reconcile_ack_cursors(
     link: &rally_point_transport::MeshLink,
     ack_cursors_sent: &mut HashMap<(SessionId, SlotId), u64>,
-    state: &SessionState,
+    state: &JoinedSession,
 ) -> Option<MeshControlFrame> {
     let session_id = state.key.session;
     let advanced: Vec<(SlotId, u64)> = link

@@ -26,9 +26,11 @@ fn a_peer_relays_local_fan_out_frames_deliver_locally_and_never_echo() {
     // One local member per registry a dispatch can fan to (slot 5), plus the
     // routing slot a connectivity change reaches.
     let mut lobby_member =
-        crate::session::lobby::register_member(&mesh_state.lobby, &key, SlotId(5));
-    let mut chat_member = crate::session::chat::register_member(&mesh_state.chat, &key, SlotId(5));
-    let mut skin_member = crate::session::skin::register_member(&mesh_state.skins, &key, SlotId(5));
+        crate::session::lobby::register_member(&mesh_state.session.lobby, &key, SlotId(5));
+    let mut chat_member =
+        crate::session::chat::register_member(&mesh_state.session.chat, &key, SlotId(5));
+    let mut skin_member =
+        crate::session::skin::register_member(&mesh_state.session.skins, &key, SlotId(5));
     let (mut guard, mut inbox) =
         routing::register(&sessions, &key, SlotId(5), 1).expect("slot 5 registers");
     guard.disarm();
@@ -84,7 +86,8 @@ fn a_peer_relays_local_fan_out_frames_deliver_locally_and_never_echo() {
         .expect("the local member received the skin blob");
     assert_eq!(delivered.slot, 0);
     assert_eq!(delivered.payload.as_ref(), &[0xDE, 0xAD]);
-    let mut late = crate::session::skin::register_member(&mesh_state.skins, &key, SlotId(6));
+    let mut late =
+        crate::session::skin::register_member(&mesh_state.session.skins, &key, SlotId(6));
     let replayed = late
         .try_recv()
         .expect("a member joining afterwards replays the stored blob");
@@ -114,7 +117,7 @@ fn a_peer_relays_local_fan_out_frames_deliver_locally_and_never_echo() {
 fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
     let sessions: routing::Sessions = Arc::default();
     let mesh_state = test_mesh_state();
-    let makers = Arc::clone(&mesh_state.decision_makers);
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
     let _ = crate::consensus::activate_connection_epoch(&makers, &key, SlotId(0), 22);
@@ -155,7 +158,7 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
     };
     dispatch_mesh_control(stale_departure, RelayId(9), &joined, &sessions, &mesh_state);
     assert!(!crate::consensus::slot_departed(&makers, &key, SlotId(0),));
-    assert!(!mesh_state.drop_holds.is_pending(&key, SlotId(0)));
+    assert!(!mesh_state.session.drop_holds.is_pending(&key, SlotId(0)));
 
     let current_down = MeshControlFrame {
         session: key.session.0,

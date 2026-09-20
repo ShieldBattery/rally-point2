@@ -177,17 +177,17 @@ pub(crate) fn abandon_refused_admission(
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
 ) {
-    let _ = mesh.gates.discard_if(key, || {
+    let _ = mesh.session.gates.discard_if(key, || {
         if sessions.lock().contains_key(key) {
             return false;
         }
-        if consensus::maker_exists(&mesh.decision_makers, key) {
+        if consensus::maker_exists(&mesh.session.decision_makers, key) {
             return false;
         }
-        if !mesh.provisional_turns.discard_if_empty(key) {
+        if !mesh.session.provisional_turns.discard_if_empty(key) {
             return false;
         }
-        mesh.provisional.clear(key);
+        mesh.session.provisional.clear(key);
         true
     });
 }

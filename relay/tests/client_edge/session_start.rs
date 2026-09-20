@@ -18,8 +18,8 @@ async fn a_late_slot_receives_session_start_on_register() {
 
     // A one-slot expected set: slot 0 alone starts the session. A later slot then
     // registers after start and must be re-pushed the directive on register.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
@@ -72,8 +72,8 @@ async fn fires_session_start_with_the_computed_depth_once_every_expected_slot_co
     let tenant = make_default_tenant();
     let session = SessionId(91);
 
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
+    let mesh = rally_point_relay::mesh::MeshState::default();
+    let makers = mesh.session.decision_makers.clone();
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,

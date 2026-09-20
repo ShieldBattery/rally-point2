@@ -161,15 +161,15 @@ async fn live_and_replay_sends_report_when_they_carry_redundancy() {
     );
 }
 
-/// A minimal `SessionState` for `reconcile_ack_cursors`'s `joined` map --
+/// A minimal `JoinedSession` for `reconcile_ack_cursors`'s `joined` map --
 /// a real `MeshLinkRegistration` (needed so its `Drop` doesn't panic) but
 /// otherwise inert: nothing in this test drains the registry it points at.
-fn bare_session_state(key: SessionKey) -> SessionState {
+fn bare_session_state(key: SessionKey) -> JoinedSession {
     let links = new_mesh_links();
     let (fwd, _fwd_rx) = mpsc::channel(8);
     let (ctl, _ctl_rx) = mpsc::unbounded_channel();
     let registration = register_mesh_link(&links, key.clone(), fwd, ctl, Arc::new(Notify::new()));
-    SessionState {
+    JoinedSession {
         key,
         flush_deadline: tokio::time::Instant::now(),
         _registration: registration,

@@ -26,7 +26,7 @@ pub(in crate::routing) fn end_slot_link(
     connection_epoch: u64,
     leave_announced: bool,
 ) {
-    mesh.decision_makers.flight_recorder().record(
+    mesh.session.decision_makers.flight_recorder().record(
         key,
         crate::observability::flight_recorder::FlightEvent::SlotDisconnected { slot: slot.0 },
     );
@@ -35,14 +35,14 @@ pub(in crate::routing) fn end_slot_link(
     // (and re-register its lobby member) until this deregister frees the roster
     // slot — doing the lobby deregister first keeps a fresh connection's
     // `register_member` from being clobbered by this one's cleanup.
-    crate::session::lobby::deregister_member(&mesh.lobby, key, slot);
+    crate::session::lobby::deregister_member(&mesh.session.lobby, key, slot);
     // Same rationale for chat: deregister before the roster frees the slot, so
     // a reconnect can't clobber this connection's cleanup.
-    crate::session::chat::deregister_member(&mesh.chat, key, slot);
+    crate::session::chat::deregister_member(&mesh.session.chat, key, slot);
     // Same for skins: deregister the member before the roster frees the slot. The
     // session's blob map is left intact (like the lobby log), so a remaining or
     // reconnecting member still replays it.
-    crate::session::skin::deregister_member(&mesh.skins, key, slot);
+    crate::session::skin::deregister_member(&mesh.session.skins, key, slot);
     let session_emptied = deregister(sessions, key, slot);
     let retired_connection =
         crate::mesh::unpublish_conditions(&mesh.conditions, key, slot, Some(connection_epoch));
@@ -71,13 +71,13 @@ pub(in crate::routing) fn end_slot_link(
         // swept state, recreating a drop hold and a departure record nothing
         // will ever clean up. The roster and per-member cleanup above still
         // ran; a retired session has no one left to inform.
-        let announced = mesh.gates.with_ingress(key, || {
+        let announced = mesh.session.gates.with_ingress(key, || {
             announce_departure(
-                &mesh.drop_holds,
-                &mesh.decision_makers,
+                &mesh.session.drop_holds,
+                &mesh.session.decision_makers,
                 sessions,
                 &mesh.links,
-                &mesh.provisional_turns,
+                &mesh.session.provisional_turns,
                 key,
                 slot,
                 LEAVE_REASON_DROPPED,
@@ -121,7 +121,7 @@ pub(in crate::routing) fn end_slot_link(
             .is_some_and(|slots| slots.contains_key(&slot));
         if !reoccupied {
             let _ = consensus::remove_slot_for_epoch(
-                &mesh.decision_makers,
+                &mesh.session.decision_makers,
                 key,
                 slot,
                 Some(connection_epoch),

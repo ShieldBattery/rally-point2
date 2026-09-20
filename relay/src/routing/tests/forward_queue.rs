@@ -292,10 +292,15 @@ async fn mesh_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
         commands: vec![0x05].into(),
         ..payload()
     };
-    let mut mesh_state = crate::mesh::new_mesh_state();
-    mesh_state.seen = seen.clone();
-    mesh_state.decision_makers = makers.clone();
-    mesh_state.turn_ring = turn_ring.clone();
+    let mesh_state = crate::mesh::MeshState {
+        seen: seen.clone(),
+        session: SessionState {
+            decision_makers: makers.clone(),
+            turn_ring: turn_ring.clone(),
+            ..SessionState::default()
+        },
+        ..crate::mesh::MeshState::default()
+    };
     crate::mesh::deliver_mesh_turn(
         &sessions,
         &mesh_state,

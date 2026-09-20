@@ -30,7 +30,7 @@ pub(super) fn activate_slot(
     // coordinator already ended. Under the gate, either the sweep waits for
     // this block or this block observes the retirement and the link is torn
     // down instead of serving.
-    let activated = mesh_for_teardown.gates.with_ingress(key, || {
+    let activated = mesh_for_teardown.session.gates.with_ingress(key, || {
         // A slot link is serving this session (again): any session-closed report an
         // earlier emptying latched no longer describes this relay, so the next
         // emptying must report anew. See `consensus::claim_close_report`.
@@ -230,6 +230,7 @@ pub(super) fn apply_resume_anchor(
         // is seen by at least one of the two reads.
         for seq in ctx
             .mesh_for_teardown
+            .session
             .provisional_turns
             .held_turn_seqs(&ctx.key, ctx.slot)
         {

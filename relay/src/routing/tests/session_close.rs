@@ -12,37 +12,37 @@ use super::*;
 #[test]
 fn a_refused_admission_leaves_no_scaffolding() {
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state();
-    mesh.provisional_turns.arm();
+    let mesh = crate::mesh::MeshState::default();
+    mesh.session.provisional_turns.arm();
     let k = key();
 
     // The refusal path's residue: the register attempt touched the gate,
     // the reservation created the empty journal entry.
-    let _ = mesh.gates.with_ingress(&k, || ());
-    assert!(mesh.provisional_turns.reserve(&k));
+    let _ = mesh.session.gates.with_ingress(&k, || ());
+    assert!(mesh.session.provisional_turns.reserve(&k));
     abandon_refused_admission(&sessions, &mesh, &k);
     assert_eq!(
-        mesh.gates.tracked(),
+        mesh.session.gates.tracked(),
         0,
         "the refused session's gate is gone"
     );
     assert!(
-        mesh.provisional_turns.discard_if_empty(&k),
+        mesh.session.provisional_turns.discard_if_empty(&k),
         "the empty reservation is gone too (an absent journal reads empty)",
     );
 
     // A retired gate is a tombstone: kept.
-    mesh.gates.retire(&k);
+    mesh.session.gates.retire(&k);
     abandon_refused_admission(&sessions, &mesh, &k);
-    assert_eq!(mesh.gates.tracked(), 1, "the tombstone stands");
-    mesh.gates.reopen(&k);
+    assert_eq!(mesh.session.gates.tracked(), 1, "the tombstone stands");
+    mesh.session.gates.reopen(&k);
 
     // An occupied roster owns the session's state: kept.
     let (_reg, _inbox) = register(&sessions, &k, SlotId(0), 1).expect("registers");
-    assert!(mesh.provisional_turns.reserve(&k));
+    assert!(mesh.session.provisional_turns.reserve(&k));
     abandon_refused_admission(&sessions, &mesh, &k);
     assert_eq!(
-        mesh.gates.tracked(),
+        mesh.session.gates.tracked(),
         1,
         "a live occupant's gate (and journal state) is untouched",
     );
@@ -57,25 +57,26 @@ fn a_refused_admission_leaves_no_scaffolding() {
 #[tokio::test]
 async fn an_emptied_close_keeps_an_undrained_journal() {
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state();
-    mesh.provisional_turns.arm();
+    let mesh = crate::mesh::MeshState::default();
+    mesh.session.provisional_turns.arm();
     let k = key();
     let _i1 = registered(&sessions, &k, SlotId(1));
     // Admission marks the undescribed session for the provisional sweep.
     assert!(
-        mesh.provisional
-            .mark_if_undescribed(&mesh.decision_makers, &k)
+        mesh.session
+            .provisional
+            .mark_if_undescribed(&mesh.session.decision_makers, &k)
     );
 
     // The clean-leave intent path: journal the departure, then the full
     // link teardown with the leave already announced.
-    let announced = mesh.gates.with_ingress(&k, || {
+    let announced = mesh.session.gates.with_ingress(&k, || {
         announce_departure(
-            &mesh.drop_holds,
-            &mesh.decision_makers,
+            &mesh.session.drop_holds,
+            &mesh.session.decision_makers,
             &sessions,
             &mesh.links,
-            &mesh.provisional_turns,
+            &mesh.session.provisional_turns,
             &k,
             SlotId(1),
             LEAVE_REASON_LEFT,
@@ -87,15 +88,15 @@ async fn an_emptied_close_keeps_an_undrained_journal() {
     end_slot_link(&sessions, &mesh, &k, SlotId(1), 3, true);
 
     assert!(
-        mesh.provisional_turns.has_undrained(&k),
+        mesh.session.provisional_turns.has_undrained(&k),
         "the emptied close keeps the journaled departure for the descriptor",
     );
     assert!(
-        mesh.provisional_turns.slot_sealed(&k, SlotId(1)),
+        mesh.session.provisional_turns.slot_sealed(&k, SlotId(1)),
         "the clean leave's admission seal survives the emptied close",
     );
     assert!(
-        mesh.provisional.is_marked(&k),
+        mesh.session.provisional.is_marked(&k),
         "the sweep mark is retained WITH the journal — clearing it while \
          keeping the journal would leave the retained state immortal if \
          no descriptor ever comes",
@@ -108,11 +109,11 @@ async fn slot_teardown_records_flight_events_and_the_close_flushes() {
     // its disconnect and the drop hold; the session-emptying teardown records
     // the close and flushes the recording (a logged discard — no sink here).
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state();
+    let mesh = crate::mesh::MeshState::default();
     let k = key();
     let _i0 = registered(&sessions, &k, SlotId(0));
     let _i1 = registered(&sessions, &k, SlotId(1));
-    let flight = mesh.decision_makers.flight_recorder().clone();
+    let flight = mesh.session.decision_makers.flight_recorder().clone();
 
     // Slot 1's link dies without a clean leave; slot 0 remains, so the
     // session stays open and the recording keeps accumulating.
@@ -157,7 +158,7 @@ fn session_emptying_teardown_drops_the_seen_registry_entry() {
     // registry the same teardown clears, leaking one `MeshSeen` per
     // session for the process lifetime.
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state();
+    let mesh = crate::mesh::MeshState::default();
     let k = key();
     let _i0 = registered(&sessions, &k, SlotId(0));
 
@@ -188,13 +189,28 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
 
     let k = key();
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state_with_timings(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+    let mesh = crate::mesh::MeshState::new(SessionState::with_tunables(Tunables {
+        drop_unlock: UNREACHABLE_UNLOCK,
+        abandon_timeout: UNREACHABLE_UNLOCK,
+        ..Tunables::default()
+    }));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    mesh.decision_makers.set_notice_notifier(tx);
-    seed_maker(&mesh.decision_makers, &k, Authority::SelfRelay, &[0], &[]);
-    consensus::mark_session_started(&mesh.decision_makers, &k);
-    consensus::observe_frame(&mesh.decision_makers, &k, SlotId(0), GameFrameCount(50));
-    crate::session::presence::set_order(&mesh.presence, &k, vec![Candidate::SelfRelay]);
+    mesh.session.decision_makers.set_notice_notifier(tx);
+    seed_maker(
+        &mesh.session.decision_makers,
+        &k,
+        Authority::SelfRelay,
+        &[0],
+        &[],
+    );
+    consensus::mark_session_started(&mesh.session.decision_makers, &k);
+    consensus::observe_frame(
+        &mesh.session.decision_makers,
+        &k,
+        SlotId(0),
+        GameFrameCount(50),
+    );
+    crate::session::presence::set_order(&mesh.session.presence, &k, vec![Candidate::SelfRelay]);
 
     let _i0 = registered(&sessions, &k, SlotId(0));
     // The serve path reports own presence right after registering; without a
@@ -208,7 +224,7 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
     end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
 
     assert!(
-        mesh.drop_holds.is_pending(&k, SlotId(0)),
+        mesh.session.drop_holds.is_pending(&k, SlotId(0)),
         "the drop marked a hold",
     );
     assert!(
@@ -233,7 +249,7 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
         "the decided departure ran the close",
     );
     assert!(
-        !mesh.drop_holds.is_pending(&k, SlotId(0)),
+        !mesh.session.drop_holds.is_pending(&k, SlotId(0)),
         "the decided hold was released and swept",
     );
     let mut saw_closed = false;
@@ -252,11 +268,21 @@ async fn a_clean_leave_does_not_defer_the_emptied_session_close() {
 
     let k = key();
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state_with_timings(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+    let mesh = crate::mesh::MeshState::new(SessionState::with_tunables(Tunables {
+        drop_unlock: UNREACHABLE_UNLOCK,
+        abandon_timeout: UNREACHABLE_UNLOCK,
+        ..Tunables::default()
+    }));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    mesh.decision_makers.set_notice_notifier(tx);
-    seed_maker(&mesh.decision_makers, &k, Authority::SelfRelay, &[0], &[]);
-    consensus::mark_session_started(&mesh.decision_makers, &k);
+    mesh.session.decision_makers.set_notice_notifier(tx);
+    seed_maker(
+        &mesh.session.decision_makers,
+        &k,
+        Authority::SelfRelay,
+        &[0],
+        &[],
+    );
+    consensus::mark_session_started(&mesh.session.decision_makers, &k);
 
     let _i0 = registered(&sessions, &k, SlotId(0));
     crate::mesh::mark_seen(&mesh.seen, &k, SlotId(0), 0);
@@ -267,8 +293,8 @@ async fn a_clean_leave_does_not_defer_the_emptied_session_close() {
     // clean leave released any hold, and only a *held* departure promises a
     // reconnect, so the emptying still closes.
     hold_or_decide_leave(
-        &mesh.drop_holds,
-        &mesh.decision_makers,
+        &mesh.session.drop_holds,
+        &mesh.session.decision_makers,
         &sessions,
         &mesh.links,
         &k,
@@ -301,11 +327,21 @@ async fn a_never_started_emptying_retains_receipts_while_the_hold_survives() {
 
     let k = key();
     let sessions: Sessions = Arc::default();
-    let mesh = crate::mesh::new_mesh_state_with_timings(UNREACHABLE_UNLOCK, UNREACHABLE_UNLOCK);
+    let mesh = crate::mesh::MeshState::new(SessionState::with_tunables(Tunables {
+        drop_unlock: UNREACHABLE_UNLOCK,
+        abandon_timeout: UNREACHABLE_UNLOCK,
+        ..Tunables::default()
+    }));
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    mesh.decision_makers.set_notice_notifier(tx);
+    mesh.session.decision_makers.set_notice_notifier(tx);
     // Descriptor-backed (a maker exists, homing slot 0) but never started.
-    seed_maker(&mesh.decision_makers, &k, Authority::SelfRelay, &[0], &[]);
+    seed_maker(
+        &mesh.session.decision_makers,
+        &k,
+        Authority::SelfRelay,
+        &[0],
+        &[],
+    );
 
     let _i0 = registered(&sessions, &k, SlotId(0));
     // A pre-start turn passed the forward gate: seq 1 was received and
@@ -317,7 +353,7 @@ async fn a_never_started_emptying_retains_receipts_while_the_hold_survives() {
     end_slot_link(&sessions, &mesh, &k, SlotId(0), 0, false);
 
     assert!(
-        mesh.drop_holds.is_pending(&k, SlotId(0)),
+        mesh.session.drop_holds.is_pending(&k, SlotId(0)),
         "the drop marked a hold — the reconnect-admission token",
     );
     let mut saw_closed = false;

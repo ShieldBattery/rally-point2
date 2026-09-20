@@ -11,7 +11,7 @@ use crate::key::SessionKey;
 use crate::routing;
 
 use super::conditions::{ConditionsRegistry, snapshot_conditions};
-use super::links::{MESH_STREAM_WRITE_TIMEOUT, SessionState};
+use super::links::{JoinedSession, MESH_STREAM_WRITE_TIMEOUT};
 use super::seen::{Seen, SeenRegistries, mark_seen};
 use super::{MeshState, fan_out_to_mesh, mesh_session_key};
 
@@ -51,18 +51,19 @@ pub fn forward_client_turn(
     // the journal's one-shot resolved mark makes the pair atomic against the
     // descriptor's single drain: a deposit that loses that race is refused
     // and re-runs here against the maker that now provably exists.
-    let payload = if mesh.provisional_turns.armed() {
+    let payload = if mesh.session.provisional_turns.armed() {
         use crate::session::provisional_turns::{HoldOutcome, PennedIngress};
         enum Funnel {
             Proceed(Payload),
             Held,
             Overflow,
         }
-        let Some(verdict) = mesh.gates.with_ingress(key, || {
-            if crate::consensus::maker_exists(&mesh.decision_makers, key) {
+        let Some(verdict) = mesh.session.gates.with_ingress(key, || {
+            if crate::consensus::maker_exists(&mesh.session.decision_makers, key) {
                 return Funnel::Proceed(payload);
             }
             match mesh
+                .session
                 .provisional_turns
                 .hold(key, PennedIngress::Turn(slot, payload))
             {
@@ -120,7 +121,7 @@ pub fn forward_client_turn(
     // NOT fenced ([`deliver_mesh_turn`]): a peer home forwarded them before
     // the decision reached it, and local survivors may still need them to
     // reach a clean leave's exact count.
-    if crate::consensus::slot_leave_decided(&mesh.decision_makers, key, slot) {
+    if crate::consensus::slot_leave_decided(&mesh.session.decision_makers, key, slot) {
         tracing::debug!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
@@ -129,12 +130,12 @@ pub fn forward_client_turn(
         );
         return;
     }
-    let delivered = mesh.gates.with_ingress(key, || {
+    let delivered = mesh.session.gates.with_ingress(key, || {
         deliver_turn_to_locals(
             sessions,
             &mesh.seen,
-            &mesh.decision_makers,
-            &mesh.turn_ring,
+            &mesh.session.decision_makers,
+            &mesh.session.turn_ring,
             key,
             slot,
             payload,
@@ -163,12 +164,12 @@ pub(crate) fn deliver_mesh_turn(
     // retirement sweep — a retired session's mesh turns are dropped here.
     // Recursive-read, so the mesh-control dispatch arm that funnels an
     // oversize turn through this path re-enters its own session's gate.
-    let _ = mesh.gates.with_ingress(key, || {
+    let _ = mesh.session.gates.with_ingress(key, || {
         deliver_turn_to_locals(
             sessions,
             &mesh.seen,
-            &mesh.decision_makers,
-            &mesh.turn_ring,
+            &mesh.session.decision_makers,
+            &mesh.session.turn_ring,
             key,
             slot,
             payload,
@@ -322,7 +323,7 @@ pub(super) fn deliver_turn_to_locals(
 /// has no way to do.
 pub(super) fn resume_replay_for_frame(
     frame: &MeshControlFrame,
-    joined: &HashMap<SessionId, SessionState>,
+    joined: &HashMap<SessionId, JoinedSession>,
     mesh: &MeshState,
 ) -> Option<(SessionKey, Vec<Payload>)> {
     let Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) = &frame.kind else {
@@ -338,7 +339,10 @@ pub(super) fn resume_replay_for_frame(
                 .map(|s| (SlotId(s), c.next_seq))
         })
         .collect();
-    let payloads = mesh.turn_ring.replay_local(&key, &cursors, resume.resuming);
+    let payloads = mesh
+        .session
+        .turn_ring
+        .replay_local(&key, &cursors, resume.resuming);
     (!payloads.is_empty()).then_some((key, payloads))
 }
 

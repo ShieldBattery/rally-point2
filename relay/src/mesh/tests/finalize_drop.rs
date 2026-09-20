@@ -15,7 +15,7 @@ fn the_home_answers_finalize_drop_with_the_sealed_count() {
         PeerDrop::Untouched,
     );
     crate::consensus::record_departure(
-        &fixture.mesh.decision_makers,
+        &fixture.mesh.session.decision_makers,
         &fixture.key,
         SUBJECT,
         crate::consensus::DepartureStamps {
@@ -59,13 +59,13 @@ fn the_home_answers_finalize_drop_with_the_sealed_count() {
 fn the_authority_decides_on_a_finalized_result() {
     let fixture = finalize_fixture(crate::consensus::Authority::SelfRelay, &[0], PeerDrop::Held);
     crate::consensus::observe_frame(
-        &fixture.mesh.decision_makers,
+        &fixture.mesh.session.decision_makers,
         &fixture.key,
         SlotId(0),
         rally_point_proto::ids::GameFrameCount(40),
     );
     crate::consensus::observe_frame(
-        &fixture.mesh.decision_makers,
+        &fixture.mesh.session.decision_makers,
         &fixture.key,
         SUBJECT,
         rally_point_proto::ids::GameFrameCount(50),
@@ -81,7 +81,11 @@ fn the_authority_decides_on_a_finalized_result() {
     assert_eq!(leave.final_turn_count, Some(5));
     assert!(leave.finalized);
     assert!(
-        !fixture.mesh.drop_holds.is_pending(&fixture.key, SUBJECT),
+        !fixture
+            .mesh
+            .session
+            .drop_holds
+            .is_pending(&fixture.key, SUBJECT),
         "the hold was claimed by the decide",
     );
 }
@@ -100,7 +104,7 @@ fn the_authority_ignores_a_stale_generation_finalize_result() {
         PeerDrop::Recorded(Some(7)),
     );
     crate::consensus::observe_frame(
-        &fixture.mesh.decision_makers,
+        &fixture.mesh.session.decision_makers,
         &fixture.key,
         SlotId(0),
         rally_point_proto::ids::GameFrameCount(40),
@@ -113,7 +117,11 @@ fn the_authority_ignores_a_stale_generation_finalize_result() {
         "a stale-generation result decides nothing",
     );
     assert!(
-        fixture.mesh.drop_holds.is_pending(&fixture.key, SUBJECT),
+        fixture
+            .mesh
+            .session
+            .drop_holds
+            .is_pending(&fixture.key, SUBJECT),
         "the hold survives a stale-generation result",
     );
 
@@ -122,7 +130,13 @@ fn the_authority_ignores_a_stale_generation_finalize_result() {
         .try_recv_leave()
         .expect("the matching generation's result decides");
     assert_eq!(leave.final_turn_count, Some(5));
-    assert!(!fixture.mesh.drop_holds.is_pending(&fixture.key, SUBJECT));
+    assert!(
+        !fixture
+            .mesh
+            .session
+            .drop_holds
+            .is_pending(&fixture.key, SUBJECT)
+    );
 }
 
 /// A FINALIZED result whose sealed count the authority's own forwarded
@@ -139,7 +153,7 @@ fn the_authority_refuses_a_finalized_count_its_own_prefix_exceeds() {
         PeerDrop::Recorded(None),
     );
     crate::consensus::observe_frame(
-        &fixture.mesh.decision_makers,
+        &fixture.mesh.session.decision_makers,
         &fixture.key,
         SlotId(0),
         rally_point_proto::ids::GameFrameCount(40),
@@ -157,7 +171,11 @@ fn the_authority_refuses_a_finalized_count_its_own_prefix_exceeds() {
         "a count the local prefix exceeds decides nothing",
     );
     assert!(
-        fixture.mesh.drop_holds.is_pending(&fixture.key, SUBJECT),
+        fixture
+            .mesh
+            .session
+            .drop_holds
+            .is_pending(&fixture.key, SUBJECT),
         "the hold survives the stale count",
     );
 
@@ -188,12 +206,16 @@ fn a_pre_frame_finalized_result_keeps_the_hold_for_a_retry() {
         "no leave commits without a framed basis",
     );
     assert!(
-        fixture.mesh.drop_holds.is_pending(&fixture.key, SUBJECT),
+        fixture
+            .mesh
+            .session
+            .drop_holds
+            .is_pending(&fixture.key, SUBJECT),
         "the hold is kept for a later retry",
     );
 
     crate::consensus::observe_frame(
-        &fixture.mesh.decision_makers,
+        &fixture.mesh.session.decision_makers,
         &fixture.key,
         SlotId(0),
         rally_point_proto::ids::GameFrameCount(40),
@@ -203,7 +225,13 @@ fn a_pre_frame_finalized_result_keeps_the_hold_for_a_retry() {
         .try_recv_leave()
         .expect("the re-sent result completes once a frame exists");
     assert_eq!(leave.final_turn_count, Some(5));
-    assert!(!fixture.mesh.drop_holds.is_pending(&fixture.key, SUBJECT));
+    assert!(
+        !fixture
+            .mesh
+            .session
+            .drop_holds
+            .is_pending(&fixture.key, SUBJECT)
+    );
 }
 
 /// The home's FINALIZED answer for the subject slot: sealed at `count`, under

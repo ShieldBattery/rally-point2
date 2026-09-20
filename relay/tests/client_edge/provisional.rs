@@ -7,6 +7,8 @@ use std::time::Duration;
 use crate::helpers::*;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
+use rally_point_relay::mesh::MeshState;
+use rally_point_relay::session::{SessionState, Tunables};
 use rally_point_transport::noq;
 
 /// A session admitted by a client dial with no applied descriptor is
@@ -30,12 +32,15 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
     };
 
     let window = Duration::from_millis(150);
-    let mesh = rally_point_relay::mesh::new_mesh_state_with_provisional_window(window);
-    let provisional: ProvisionalSessions = mesh.provisional.clone();
-    let decision_makers = mesh.decision_makers.clone();
+    let mesh = MeshState::new(SessionState::with_tunables(Tunables {
+        provisional_window: window,
+        ..Tunables::default()
+    }));
+    let provisional: ProvisionalSessions = mesh.session.provisional.clone();
+    let decision_makers = mesh.session.decision_makers.clone();
     // Armed exactly as production coordinator wiring arms it, so the reap
     // exercises the journal paths a coordinator-managed relay runs.
-    mesh.provisional_turns.arm();
+    mesh.session.provisional_turns.arm();
     let relay = start_relay_with_mesh(registry_for_one(&tenant), mesh);
 
     // Armed from the start (standing in for an established control
@@ -119,19 +124,26 @@ async fn a_descriptor_arriving_inside_the_window_saves_the_session_from_the_swee
     };
 
     let window = Duration::from_millis(150);
-    let mesh = rally_point_relay::mesh::new_mesh_state_with_provisional_window(window);
-    let provisional: ProvisionalSessions = mesh.provisional.clone();
-    let decision_makers = mesh.decision_makers.clone();
+    let mesh = MeshState::new(SessionState::with_tunables(Tunables {
+        provisional_window: window,
+        ..Tunables::default()
+    }));
+    let provisional: ProvisionalSessions = mesh.session.provisional.clone();
+    let decision_makers = mesh.session.decision_makers.clone();
     // Armed exactly as production coordinator wiring arms it, so the reap
     // exercises the journal paths a coordinator-managed relay runs.
-    mesh.provisional_turns.arm();
+    mesh.session.provisional_turns.arm();
     // Points at the same decision-maker registry and provisional map the
     // relay serves this session with, so `apply_descriptor` here is
     // indistinguishable from one the coordinator subscriber would have
     // applied -- this test drives the real clearing path, not a hand call
     // into `ProvisionalSessions` directly.
-    let control = MeshControl::new(RelayId(1), mesh.decision_makers.clone(), Arc::default())
-        .with_provisional(provisional.clone());
+    let control = MeshControl::new(
+        RelayId(1),
+        mesh.session.decision_makers.clone(),
+        Arc::default(),
+    )
+    .with_provisional(provisional.clone());
 
     let relay = start_relay_with_mesh(registry_for_one(&tenant), mesh);
 
