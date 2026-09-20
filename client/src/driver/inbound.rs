@@ -27,10 +27,8 @@ use super::{ChatOut, DriverError};
 ///
 /// A turn whose slot id is past `u8` range names no real slot; a truncating cast
 /// would alias it onto `slot % 256` and corrupt another player's turn stream, so
-/// it is dropped (defensive — the wire values are validated upstream). A turn
-/// below its slot's next-needed seq has already been handed to the game: a
-/// resume replays turns the relay cannot know arrived, and re-buffering one
-/// would deliver it twice.
+/// it is dropped (defensive — the wire values are validated upstream). The
+/// reorder buffer decides what to do with everything past that.
 pub(super) fn ingest_fresh_turns(
     fresh: Vec<Payload>,
     reorder: &mut SlotReorder,
