@@ -138,13 +138,8 @@
 //! sidecar because the mesh RTT is a property of the relay-pair, not of any
 //! individual client's link.
 //!
-//! **N-relay gap.** The single `mesh_rtt_us` parameter models the authority's
-//! direct link to one peer. For N>2 relays, a turn between two *remote* slots on
-//! different peer relays traverses their direct peer1<->peer2 link, whose RTT
-//! the authority does not observe. A robust extension would distribute
-//! relay-pair RTT observations explicitly. Until then, this simplification is
-//! exact for two relays and approximate for remote-to-remote pairs in a larger
-//! full mesh.
+//! That single mesh hop is exact for two relays and an approximation in a
+//! larger full mesh; `SlotState::mesh_rtt_us` spells out why.
 //!
 //! # Jitter awareness
 //!

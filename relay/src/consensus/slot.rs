@@ -12,6 +12,14 @@ pub(in crate::consensus) struct SlotState {
     pub(in crate::consensus) rtt_window: RttWindow,
     /// The one-way mesh hop RTT (us) from the authority to this slot's home
     /// relay. `0` for local slots; the relay-pair RTT for remote slots.
+    ///
+    /// One hop is all this models. With more than two relays, a turn between
+    /// two slots homed on *different* peer relays travels those peers' direct
+    /// link, whose RTT the authority never observes — sizing such a pair uses
+    /// the authority's own hop instead. That makes the value exact for two
+    /// relays and an approximation for remote-to-remote pairs in a larger full
+    /// mesh; closing the gap means distributing relay-pair RTT observations
+    /// across the mesh, which nothing does today.
     pub(in crate::consensus) mesh_rtt_us: u32,
     /// The newest `game_frame_count` observed on this slot's validated turns.
     /// Monotonic per slot; `None` until the slot's first framed turn (lobby

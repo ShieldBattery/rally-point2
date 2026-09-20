@@ -89,15 +89,20 @@ fn mesh_session_key(key: &SessionKey) -> MeshSessionKey {
     MeshSessionKey::new(key.session, key.tenant.as_ref())
 }
 
-/// The three mesh-related registries a relay thread needs: the live mesh links
-/// (fan-out to peer relays), the session-level forward-once gate,
-/// and the per-client conditions the mesh attaches to outgoing datagrams.
+/// Every shared registry a relay's per-session tasks carry, in one bundle.
 ///
-/// These are always created together, passed together, and used together, so
-/// bundling them keeps the `serve` and `run_slot_link` signatures within the
-/// argument-count the codebase holds elsewhere — no `#[allow(clippy::too_many_arguments)]`
-/// needed. Clone the struct cheaply (each field is an `Arc`) to hand a copy to a
-/// spawned task.
+/// Only the first few members are mesh concerns proper — the live peer-relay
+/// links, the session-level forward-once gate, the link conditions the mesh
+/// attaches to outgoing datagrams, and the peer-generation map behind them.
+/// The rest (decision makers, presence, lobby, chat, skins, drop holds, turn
+/// ring, provisional admission and its turn pen, the session gates, the load
+/// fence) are session concerns that live here only because they share the
+/// mesh registries' per-session lifecycle and are threaded through the same
+/// two tasks — `run_slot_link` and `run_mesh_link` — which would otherwise
+/// each take a dozen more arguments. Each field's own doc says what it holds.
+///
+/// Clone the struct cheaply (each field is an `Arc` or a handle around one) to
+/// hand a copy to a spawned task.
 #[derive(Clone)]
 pub struct MeshState {
     /// Channels to peer-relay mesh-link tasks, keyed by session.

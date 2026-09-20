@@ -42,8 +42,12 @@ impl Drop for SlotRegistration {
 /// the slot on drop plus the inbox its link task drains — or `None` if the slot is
 /// already connected.
 ///
-/// Refusing a duplicate keeps two connections from claiming one slot; a real
-/// reconnect/takeover path is a later concern.
+/// Refusing a duplicate keeps two connections from claiming one slot: a
+/// reconnecting client registers only once the previous link's task has exited
+/// and dropped its guard. Carrying the slot across that gap is not this
+/// function's job — the drop hold keeps the departure undecided, reconnect
+/// admission reopens it, and the resume cursors replay the turns missed in
+/// between.
 ///
 /// `connection_epoch` is the dialing connection's lifecycle epoch, recorded on the
 /// entry so a reader can tell this registration apart from the one a reconnect

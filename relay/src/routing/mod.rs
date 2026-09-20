@@ -287,6 +287,7 @@ impl SlotCloseReason {
     }
 }
 
+/// The largest oversize turn a client may send, counted in command bytes.
 ///
 /// A turn too big for a datagram rides the reliable control stream
 /// ([`ControlInbound::OversizeTurn`](rally_point_transport::control::ControlInbound::OversizeTurn)) and is then fanned out to the other slots'
