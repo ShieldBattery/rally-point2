@@ -70,14 +70,12 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
     // A framed turn was observed at frame 1, then a 150ms RTT sample -> target
     // 4 turns, raised from the min of 0, so the pending directive names buffer

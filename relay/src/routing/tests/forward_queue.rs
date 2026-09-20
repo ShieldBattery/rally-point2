@@ -233,14 +233,7 @@ async fn mesh_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
     let _ = consensus::sync_maker(
         &makers,
         &k,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::Peer),
     );
 
     // A local client to fan out to.

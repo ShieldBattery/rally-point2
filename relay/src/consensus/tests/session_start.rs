@@ -12,14 +12,10 @@ fn session_start_fires_once_when_live_slots_cover_expected() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        expected,
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            expected_slots: expected,
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
     );
 
     // No directive until the last expected slot completes the set.
@@ -51,14 +47,7 @@ fn empty_expected_slots_never_fires_session_start() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(1, 6), Authority::SelfRelay),
     );
     assert!(!note_slot_present(&registry, &k, SlotId(0)));
     assert!(!note_slot_present(&registry, &k, SlotId(1)));
@@ -76,14 +65,10 @@ fn a_non_authority_accumulates_presence_and_fires_on_promotion() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::Peer,
-        HashSet::new(),
-        expected,
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            expected_slots: expected,
+            ..MakerSync::new(bounds(1, 6), Authority::Peer)
+        },
     );
 
     // Both expected slots register, but a peer relay never fires.
@@ -109,14 +94,10 @@ fn a_departure_uncovers_a_not_yet_started_session() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        expected,
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            expected_slots: expected,
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
     );
     assert!(!note_slot_present(&registry, &k, SlotId(0)));
     // Slot 0 departs, retiring it from the live-slot set.
@@ -143,14 +124,10 @@ fn mark_session_started_latches_without_firing() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::Peer,
-        HashSet::new(),
-        expected,
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            expected_slots: expected,
+            ..MakerSync::new(bounds(1, 6), Authority::Peer)
+        },
     );
     assert!(!session_started(&registry, &k));
     mark_session_started(&registry, &k);
@@ -172,14 +149,10 @@ fn a_peer_shared_start_report_is_recorded_without_a_coordinator_notice() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::Peer,
-        HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..MakerSync::new(bounds(1, 6), Authority::Peer)
+        },
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);

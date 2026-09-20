@@ -11,14 +11,10 @@ fn fence_fixture() -> (Sessions, Arc<crate::consensus::DecisionMakers>) {
     let _ = crate::consensus::sync_maker(
         &decision_makers,
         &key(7),
-        BufferBounds { min: 1, max: 6 },
-        crate::consensus::Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync::new(
+            BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+        ),
     );
     (sessions, decision_makers)
 }

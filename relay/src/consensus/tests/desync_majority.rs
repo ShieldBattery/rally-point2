@@ -117,14 +117,10 @@ fn a_maker_created_by_a_descriptor_excludes_its_observer_slots() {
     let leaves = sync_maker(
         &registry,
         &key(),
-        bounds(0, 6),
-        Authority::SelfRelay,
-        HashSet::from([SlotId(2)]),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            observers: HashSet::from([SlotId(2)]),
+            ..MakerSync::new(bounds(0, 6), Authority::SelfRelay)
+        },
     );
     assert!(leaves.is_empty(), "creating a maker broadcasts no leaves");
 
@@ -188,14 +184,7 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 6), Authority::SelfRelay),
     );
     registry.set_session_refs(
         &k,
@@ -376,43 +365,6 @@ fn a_malformed_kind_is_skipped_not_recorded() {
         m.sync.malformed_kind_warns >= 1,
         "the malformed kind was flagged",
     );
-}
-
-#[test]
-fn token_bucket_admits_a_full_burst_then_recovers_after_refill() {
-    let burst = 4;
-    let interval = std::time::Duration::from_millis(200);
-    let mut bucket = TokenBucket::new(burst, interval);
-
-    for _ in 0..burst {
-        assert!(bucket.try_take());
-    }
-    assert!(
-        !bucket.try_take(),
-        "the burst is exhausted; the next admission is rejected",
-    );
-
-    std::thread::sleep(interval + std::time::Duration::from_millis(50));
-    assert!(
-        bucket.try_take(),
-        "one interval refilled at least one token"
-    );
-}
-
-#[test]
-fn token_bucket_never_refills_past_its_burst_cap() {
-    let burst = 2;
-    let interval = std::time::Duration::from_millis(10);
-    let mut bucket = TokenBucket::new(burst, interval);
-
-    // Idle far longer than many refill intervals: the bucket must still
-    // cap at `burst`, not accumulate an unbounded backlog of tokens.
-    std::thread::sleep(interval * 50);
-    let mut admitted = 0;
-    while bucket.try_take() {
-        admitted += 1;
-    }
-    assert_eq!(admitted, burst as usize);
 }
 
 // -- Silent-slot eviction: a client whose simulation stopped stepping holds

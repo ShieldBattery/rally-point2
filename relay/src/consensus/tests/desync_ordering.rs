@@ -504,18 +504,7 @@ fn ordering_failures_record_once_per_origin_without_a_desync_notice() {
     for authority in [Authority::SelfRelay, Authority::Peer] {
         let registry = new_decision_makers();
         let k = key();
-        let _ = sync_maker(
-            &registry,
-            &k,
-            bounds(0, 6),
-            authority,
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            None,
-            false,
-        );
+        let _ = sync_maker(&registry, &k, MakerSync::new(bounds(0, 6), authority));
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         registry.set_notice_notifier(tx);
         observe_sync(

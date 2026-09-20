@@ -295,23 +295,18 @@ mod tests {
 
     #[test]
     fn mark_if_undescribed_refuses_once_a_maker_exists() {
-        use crate::consensus::sync_maker;
+        use crate::consensus::{MakerSync, sync_maker};
         use rally_point_proto::control::BufferBounds;
-        use std::collections::HashSet;
 
         let provisional = ProvisionalSessions::new(Duration::from_secs(10));
         let makers = crate::consensus::new_decision_makers();
         let _ = sync_maker(
             &makers,
             &key(1),
-            BufferBounds::new(0, 20).unwrap(),
-            crate::consensus::Authority::SelfRelay,
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            None,
-            false,
+            MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            ),
         );
 
         assert!(
@@ -447,9 +442,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_described_session_is_spared_when_its_maker_appears_before_the_reap() {
-        use crate::consensus::sync_maker;
+        use crate::consensus::{MakerSync, sync_maker};
         use rally_point_proto::control::BufferBounds;
-        use std::collections::HashSet;
 
         // The race the maker-check closes: a session marked provisional, then named
         // by a descriptor (its decision-maker created) with the mark not yet
@@ -472,14 +466,10 @@ mod tests {
         let _ = sync_maker(
             &makers,
             &key(1),
-            BufferBounds::new(0, 20).unwrap(),
-            crate::consensus::Authority::SelfRelay,
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            HashSet::new(),
-            None,
-            false,
+            MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            ),
         );
         assert!(
             provisional.is_marked(&key(1)),

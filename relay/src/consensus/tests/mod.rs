@@ -262,14 +262,11 @@ fn finalized_drop_registry(k: &SessionKey, homed: &[u8]) -> DecisionMakers {
     let _ = sync_maker(
         &registry,
         k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        homed.iter().map(|&s| SlotId(s)).collect(),
-        HashSet::new(),
-        None,
-        true,
+        MakerSync {
+            homed_slots: homed.iter().map(|&s| SlotId(s)).collect(),
+            finalized_drops: true,
+            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+        },
     );
     observe_frame(&registry, k, SlotId(0), GameFrameCount(40));
     observe_frame(&registry, k, SlotId(1), GameFrameCount(50));

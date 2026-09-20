@@ -42,14 +42,10 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
     let _ = crate::consensus::sync_maker(
         &decision_makers,
         &key(7),
-        rally_point_proto::control::BufferBounds { min: 1, max: 6 },
-        crate::consensus::Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync::new(
+            rally_point_proto::control::BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+        ),
     );
     crate::consensus::record_slot_connected(
         &decision_makers,
@@ -144,14 +140,10 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
     let _ = crate::consensus::sync_maker(
         &decision_makers,
         &key(7),
-        BufferBounds { min: 1, max: 6 },
-        crate::consensus::Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync::new(
+            BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+        ),
     );
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
@@ -239,14 +231,10 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
     let _ = crate::consensus::sync_maker(
         &decision_makers,
         &key(7),
-        rally_point_proto::control::BufferBounds { min: 1, max: 6 },
-        crate::consensus::Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync::new(
+            rally_point_proto::control::BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+        ),
     );
     for slot in [2u8, 3] {
         crate::consensus::record_slot_connected(
@@ -330,14 +318,10 @@ fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
     let _ = crate::consensus::sync_maker(
         &decision_makers,
         &key(7),
-        BufferBounds { min: 1, max: 6 },
-        crate::consensus::Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync::new(
+            BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+        ),
     );
     let (_registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");

@@ -44,14 +44,12 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -135,14 +133,13 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0)].into_iter().collect(),
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
     presence::set_order(&mesh.presence, &key, vec![Candidate::SelfRelay]);
 
@@ -281,14 +278,13 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
     presence::set_order(&presence_registry, &key, vec![Candidate::SelfRelay]);
 

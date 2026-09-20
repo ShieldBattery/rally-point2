@@ -14,14 +14,7 @@ fn record_result_fires_one_notice_per_slot() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -65,14 +58,7 @@ fn record_result_stamps_session_refs_into_the_notice() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -113,14 +99,7 @@ fn record_result_rejects_an_empty_payload() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -142,14 +121,7 @@ fn record_result_rejects_an_oversize_payload() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -180,14 +152,7 @@ fn record_departure_rejects_an_oversize_mesh_folded_result() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -232,14 +197,7 @@ fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -286,14 +244,7 @@ fn a_departure_without_a_reported_result_embeds_none() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -319,14 +270,7 @@ fn an_embedded_result_folds_first_non_none_wins() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::Peer),
     );
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
 

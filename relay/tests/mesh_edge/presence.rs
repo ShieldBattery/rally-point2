@@ -42,26 +42,20 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     let _ = consensus::sync_maker(
         &relay_a.mesh.decision_makers,
         &key,
-        bounds,
-        Authority::Peer,
-        std::collections::HashSet::new(),
-        expected.clone(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: expected.clone(),
+            homed_slots: [SlotId(0)].into_iter().collect(),
+            ..consensus::MakerSync::new(bounds, Authority::Peer)
+        },
     );
     let _ = consensus::sync_maker(
         &relay_b.mesh.decision_makers,
         &key,
-        bounds,
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        expected,
-        [SlotId(1)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: expected,
+            homed_slots: [SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(bounds, Authority::SelfRelay)
+        },
     );
 
     // Both clients connect before either side joins the mesh session. Their live

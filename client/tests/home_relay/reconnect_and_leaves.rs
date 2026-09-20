@@ -19,8 +19,6 @@ use super::helpers::{
 
 #[tokio::test]
 async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once() {
-    use std::collections::HashSet;
-
     use rally_point_client::{LinkDriver, Reconnect};
     use rally_point_proto::control::BufferBounds;
     use rally_point_relay::consensus::{self, Authority};
@@ -46,14 +44,10 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -144,8 +138,6 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
 
 #[tokio::test]
 async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
-    use std::collections::HashSet;
-
     use rally_point_client::LinkDriver;
     use rally_point_proto::control::BufferBounds;
     use rally_point_relay::consensus::{self, Authority};
@@ -173,14 +165,10 @@ async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);

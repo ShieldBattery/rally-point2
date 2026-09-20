@@ -18,14 +18,12 @@ fn reconcile_leaves_on_join_re_announces_known_state() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
     );
     // The authority decided one slot's leave (caches a directive and records a
     // departure), and separately recorded a bare departure for another slot.
@@ -79,14 +77,12 @@ fn join_reconcile_re_shares_this_relay_s_own_started_slots() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
     );
     crate::consensus::record_slot_started(&makers, &key, SlotId(2));
     crate::consensus::record_slot_started(&makers, &key, SlotId(0));

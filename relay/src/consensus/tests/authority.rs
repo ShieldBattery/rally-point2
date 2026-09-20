@@ -12,14 +12,7 @@ fn sync_maker_reconciles_bounds_and_authority_on_a_repush() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 5),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 5), Authority::SelfRelay),
     );
     {
         let makers = registry.lock();
@@ -33,14 +26,7 @@ fn sync_maker_reconciles_bounds_and_authority_on_a_repush() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 99),
-        Authority::Peer,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 99), Authority::Peer),
     );
     let makers = registry.lock();
     let maker = makers.get(&k).unwrap();
@@ -67,14 +53,7 @@ fn sync_maker_promotion_skips_a_held_departure() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::Peer),
     );
     consensus_observe_and_hold(&registry, &k);
 
@@ -85,14 +64,10 @@ fn sync_maker_promotion_skips_a_held_departure() {
     let leaves = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        held_slots,
-        None,
-        false,
+        MakerSync {
+            held_slots,
+            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+        },
     );
     assert!(
         leaves.is_empty(),
@@ -115,14 +90,7 @@ fn losing_authority_drops_the_pending_directive_but_keeps_history() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     {
         let mut makers = registry.lock();
@@ -134,14 +102,7 @@ fn losing_authority_drops_the_pending_directive_but_keeps_history() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::Peer),
     );
     assert_eq!(
         active_directive(&registry, &k),
@@ -163,14 +124,7 @@ fn deregister_maker_removes_session() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 5),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 5), Authority::SelfRelay),
     );
     assert!(registry.lock().contains_key(&k));
     deregister_maker(&registry, &k);

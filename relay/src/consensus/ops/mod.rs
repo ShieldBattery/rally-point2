@@ -16,7 +16,7 @@ mod start;
 mod sync_coverage;
 
 pub use authority::{
-    FrameRegression, is_authority, observe_delivery, observe_frame, observe_sync,
+    FrameRegression, MakerSync, is_authority, observe_delivery, observe_frame, observe_sync,
     observe_sync_with_generation, observe_turn_frame, session_e2e, set_authority, slot_frame,
     sync_maker,
 };

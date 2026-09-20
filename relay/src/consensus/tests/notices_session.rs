@@ -85,14 +85,7 @@ fn session_closed_with_a_maker_still_seals() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     registry.flight_recorder().record(
         &k,
@@ -128,14 +121,7 @@ fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
 
     registry.set_session_refs(
@@ -162,14 +148,7 @@ fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
     assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());

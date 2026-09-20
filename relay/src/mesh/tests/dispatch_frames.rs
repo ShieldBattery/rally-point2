@@ -24,14 +24,12 @@ fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
 
     // A peer mesh link that must NOT hear an echo of the received turn.
@@ -166,14 +164,12 @@ fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
         let _ = crate::consensus::sync_maker(
             &makers,
             &key,
-            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-            crate::consensus::Authority::Peer,
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            None,
-            false,
+            crate::consensus::MakerSync {
+                ..crate::consensus::MakerSync::new(
+                    rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                    crate::consensus::Authority::Peer,
+                )
+            },
         );
     };
     serve();
@@ -258,14 +254,12 @@ fn a_decided_slots_client_turn_is_fenced_at_its_home_only() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
     let (_reg, mut survivor) =
         routing::register(&sessions, &key, SlotId(1), 1).expect("survivor registers");

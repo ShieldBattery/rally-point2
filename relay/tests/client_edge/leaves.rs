@@ -123,14 +123,12 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -222,14 +220,12 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -292,14 +288,12 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);

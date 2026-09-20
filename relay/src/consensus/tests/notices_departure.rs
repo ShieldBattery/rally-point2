@@ -12,14 +12,7 @@ fn decide_leave_fires_one_departure_notice_on_the_authority() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -56,14 +49,7 @@ fn observe_leave_fires_one_departure_notice_on_first_insert() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::Peer),
     );
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry.set_notice_notifier(tx);
@@ -108,14 +94,7 @@ fn a_standalone_relay_decides_leaves_without_a_notifier() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(10));
     assert!(decide_leave(&registry, &k, SlotId(1), DROPPED).is_some());
@@ -143,14 +122,7 @@ fn promotion_re_derivation_fires_exactly_one_departure_notice() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::Peer),
     );
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
     record_departure(
@@ -199,14 +171,7 @@ fn promotion_does_not_refire_an_already_cached_directive() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
     observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
@@ -237,14 +202,7 @@ fn decide_leave_stamps_session_refs_into_the_notice() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
 
     registry.set_session_refs(
@@ -271,14 +229,7 @@ fn observe_leave_stamps_session_refs_into_the_notice() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::Peer),
     );
 
     registry.set_session_refs(
@@ -316,14 +267,7 @@ fn promotion_re_derivation_stamps_session_refs_into_the_notice() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::Peer),
     );
     registry.set_session_refs(
         &k,
@@ -361,14 +305,7 @@ fn a_notice_carries_no_refs_when_none_were_ever_recorded() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        std::collections::HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
 
     observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));

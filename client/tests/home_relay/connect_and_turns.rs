@@ -260,8 +260,6 @@ async fn wildcard_relay_accepts_ipv4_and_ipv6_clients() {
 /// surface the DLL reads to seed the game's turn buffer before frame 0.
 #[tokio::test]
 async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_channel() {
-    use std::collections::HashSet;
-
     use rally_point_client::LinkDriver;
     use rally_point_proto::control::BufferBounds;
     use rally_point_relay::consensus::{self, Authority};
@@ -284,14 +282,10 @@ async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_chann
     let _ = consensus::sync_maker(
         &mesh.decision_makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::set_session_shape(&mesh.decision_makers, &key, Some(400), false);
 

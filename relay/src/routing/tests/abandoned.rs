@@ -20,14 +20,11 @@ fn peer_zero_closes_a_never_started_session_on_a_relay_with_no_local_slots() {
     let _ = consensus::sync_maker(
         &mesh.decision_makers,
         &k,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            homed_slots: [SlotId(0)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     assert!(
         !consensus::session_started(&mesh.decision_makers, &k),

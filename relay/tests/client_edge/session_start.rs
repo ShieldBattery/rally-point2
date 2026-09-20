@@ -28,14 +28,13 @@ async fn fires_session_start_when_every_expected_slot_connects() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -99,14 +98,13 @@ async fn a_late_slot_receives_session_start_on_register() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0)].into_iter().collect(),
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
@@ -163,14 +161,13 @@ async fn session_start_carries_the_computed_initial_buffer_depth() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                Authority::SelfRelay,
+            )
+        },
     );
     consensus::set_session_shape(&makers, &key, Some(400), false);
 

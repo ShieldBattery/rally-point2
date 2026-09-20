@@ -87,14 +87,12 @@ fn a_mesh_slot_started_marks_the_slot_without_notifying_or_echoing() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
     let (notice_tx, mut notice_rx) = mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
@@ -280,14 +278,7 @@ fn mesh_turn_delivers_locally_and_never_reenters_the_mesh() {
     let _ = consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::Peer),
     );
     let (_registration, mut local) =
         routing::register(&sessions, &key, SlotId(1), 1).expect("local slot registers");

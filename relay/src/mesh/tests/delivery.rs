@@ -37,14 +37,10 @@ fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
     let _ = consensus::sync_maker(
         &decision_makers,
         &key,
-        BufferBounds::new(1, 6).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0), SlotId(1)].into(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into(),
+            ..consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::mark_session_started(&decision_makers, &key);
 
@@ -101,14 +97,7 @@ fn region_label_relay(
     let _ = consensus::sync_maker(
         &decision_makers,
         &key,
-        BufferBounds::new(1, 6).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay),
     );
     let labels = vec![
         RegionLabel {
@@ -259,14 +248,7 @@ fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
     let _ = consensus::sync_maker(
         &decision_makers,
         &key,
-        BufferBounds::new(1, 6).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay),
     );
 
     // Slot 0's very first turn (seq 0, sync ordinal 0), delivered twice at
@@ -369,14 +351,7 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
     let _ = consensus::sync_maker(
         &decision_makers,
         &key,
-        BufferBounds::new(1, 6).unwrap(),
-        Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::Peer),
     );
 
     // The survivor's turns each arrive twice: the home peer's direct copy,

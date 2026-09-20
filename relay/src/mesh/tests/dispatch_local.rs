@@ -201,14 +201,12 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
     let _ = crate::consensus::activate_connection_epoch(&makers, &key, SlotId(0), 22);
 

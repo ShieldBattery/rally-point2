@@ -55,8 +55,6 @@ impl rally_point_client::RehomeProvider for FixedTarget {
 
 #[tokio::test]
 async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
-    use std::collections::HashSet;
-
     use rally_point_client::{LinkDriver, Reconnect};
     use rally_point_proto::control::BufferBounds;
     use rally_point_relay::consensus::{self, Authority};
@@ -82,14 +80,10 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     let _ = consensus::sync_maker(
         &mesh_a.decision_makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     let (addr_a, ca_a, endpoint_a) = start_relay_killable(registry_for(&[&tenant]), mesh_a);
 
@@ -99,14 +93,10 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     let _ = consensus::sync_maker(
         &mesh_b.decision_makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::mark_session_started(&mesh_b.decision_makers, &key);
     let (addr_b, ca_b, _endpoint_b) = start_relay_killable(registry_for(&[&tenant]), mesh_b);
@@ -209,8 +199,6 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
 
 #[tokio::test]
 async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
-    use std::collections::HashSet;
-
     use rally_point_proto::control::BufferBounds;
     use rally_point_relay::consensus::{self, Authority};
     use rally_point_relay::routing::SessionKey;
@@ -243,14 +231,10 @@ async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
     let _ = consensus::sync_maker(
         &mesh.decision_makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::mark_session_started(&mesh.decision_makers, &key);
 

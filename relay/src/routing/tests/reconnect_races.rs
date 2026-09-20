@@ -64,14 +64,7 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
     let _ = consensus::sync_maker(
         &mesh.decision_makers,
         &k,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::Peer),
     );
     let replacement = SlotConditions {
         slot: 0,
@@ -133,14 +126,10 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     let _ = consensus::sync_maker(
         &makers,
         &k,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
     consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));

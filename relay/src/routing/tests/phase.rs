@@ -20,14 +20,12 @@ fn phase_corrections_fan_to_the_corrected_slot_and_survive_for_repush() {
     let _ = consensus::sync_maker(
         &makers,
         &k,
-        BufferBounds::new(1, 6).unwrap(),
-        crate::consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            ..consensus::MakerSync::new(
+                BufferBounds::new(1, 6).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
     );
     let (_reg0, mut inbox0) = register(&sessions, &k, SlotId(0), 1).unwrap();
     let (_reg1, mut inbox1) = register(&sessions, &k, SlotId(1), 1).unwrap();

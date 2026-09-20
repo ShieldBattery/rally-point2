@@ -14,14 +14,10 @@ fn retained_load_state_outlives_the_links_it_was_recorded_from() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        expected,
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            expected_slots: expected,
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
     );
 
     record_slot_connected(&registry, &k, SlotId(2), false);
@@ -87,14 +83,10 @@ fn a_peer_adopting_the_start_directive_stands_in_its_own_start_instant() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::Peer,
-        HashSet::new(),
-        expected,
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            expected_slots: expected,
+            ..MakerSync::new(bounds(1, 6), Authority::Peer)
+        },
     );
     let before = now_ms();
     adopt_session_start(&registry, &k, Some(4));

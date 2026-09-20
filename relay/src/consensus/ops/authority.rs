@@ -4,21 +4,94 @@
 
 use super::*;
 
+/// Everything a descriptor push (or a reconcile) tells a session's
+/// decision-maker. Built with [`MakerSync::new`] plus struct-update syntax for
+/// whatever else the caller has to say, or with
+/// [`from_descriptor`](Self::from_descriptor) straight off a coordinator push.
+#[derive(Debug, Clone)]
+pub struct MakerSync<'a> {
+    /// The latency-buffer bounds the maker clamps every decision to. They
+    /// follow the descriptor rather than staying frozen at whatever the first
+    /// push said.
+    pub bounds: BufferBounds,
+    /// Who decides the buffer for this session, as of this push. Re-injected
+    /// on every push and every presence change: a frozen verdict could leave a
+    /// session with two authorities or none.
+    pub authority: Authority,
+    /// The descriptor's observer-slot set, applied as part of maker
+    /// creation/sync rather than through a separately-ordered call: a maker
+    /// created by this sync starts with the set (so its observer slots are
+    /// excluded from the desync comparator from the first turn — a
+    /// single-relay session that only ever receives one push therefore never
+    /// loses them), and an existing maker has its set replaced to follow a
+    /// changed descriptor.
+    pub observers: HashSet<SlotId>,
+    /// The slots the session waits on before it may start. Seeded and replaced
+    /// exactly like `observers`.
+    pub expected_slots: HashSet<SlotId>,
+    /// The slots this relay is home for. Seeded and replaced exactly like
+    /// `observers` — see [`DecisionMaker::set_homed_slots`].
+    pub homed_slots: HashSet<SlotId>,
+    /// This relay's current set of undecided drop holds, read by the caller
+    /// from the drop-hold registry (see [`DecisionMaker::sync`]). Only
+    /// meaningful on the reconcile path: a fresh maker has nothing recorded
+    /// yet to hold back.
+    pub held_slots: HashSet<SlotId>,
+    /// `Some` exactly when the descriptor is a rehome (resumed) one, carrying
+    /// the coordinator-known departed slots to seed.
+    pub resumed_departed: Option<&'a [DepartedSlot]>,
+    /// The descriptor's immutable per-session flag enabling the home-side
+    /// drop-finalization handshake. Latched at maker creation; a re-push that
+    /// disagrees is ignored with a warning — every count-acceptance rule keys
+    /// on the flag, so a session must never change its mind mid-game.
+    pub finalized_drops: bool,
+}
+
+impl<'a> MakerSync<'a> {
+    /// A sync carrying only what a maker cannot exist without: every slot set
+    /// empty, nothing to seed, finalized drops off.
+    pub fn new(bounds: BufferBounds, authority: Authority) -> Self {
+        Self {
+            bounds,
+            authority,
+            observers: HashSet::new(),
+            expected_slots: HashSet::new(),
+            homed_slots: HashSet::new(),
+            held_slots: HashSet::new(),
+            resumed_departed: None,
+            finalized_drops: false,
+        }
+    }
+
+    /// What a coordinator descriptor push says: every slot set read off
+    /// `descriptor`, departed seeds present exactly when it is a resumed
+    /// (re-home) descriptor, and `held_slots` the drop holds the caller read
+    /// from the registry the descriptor cannot see.
+    pub fn from_descriptor(
+        descriptor: &'a SessionDescriptor,
+        authority: Authority,
+        held_slots: HashSet<SlotId>,
+    ) -> Self {
+        Self {
+            bounds: descriptor.bounds,
+            authority,
+            observers: descriptor.observer_slots.iter().copied().collect(),
+            expected_slots: descriptor.expected_slots.iter().copied().collect(),
+            homed_slots: descriptor.homed_slots.iter().copied().collect(),
+            held_slots,
+            resumed_departed: descriptor
+                .resumed
+                .then_some(descriptor.departed_slots.as_slice()),
+            finalized_drops: descriptor.finalized_drops,
+        }
+    }
+}
+
 /// Creates a decision-maker for `key`, or reconciles an existing one with the
-/// coordinator's current `bounds` and the freshly computed `authority`. Called
-/// on every descriptor push: the relay set serving a session changes as
-/// players join and leave, and the authority verdict (and bounds) must follow
-/// the descriptor rather than stay frozen at whatever the first push said --
-/// a frozen verdict could leave a session with two authorities or none.
+/// bounds and authority verdict `sync` carries. Called on every descriptor
+/// push: the relay set serving a session changes as players join and leave,
+/// and the authority verdict (and bounds) must follow the descriptor.
 /// Condition history survives a re-push (see [`DecisionMaker::sync`]).
-///
-/// `observers` is the descriptor's observer-slot set, applied as part of maker
-/// creation/sync rather than through a separately-ordered call: a maker created
-/// by this descriptor starts with that set (so its observer slots are excluded
-/// from the desync comparator from the first turn — a single-relay session that
-/// only ever receives one push therefore never loses them), and an existing
-/// maker has its set replaced to follow a changed descriptor. `homed_slots` is
-/// applied the same way — see [`DecisionMaker::set_homed_slots`].
 ///
 /// A promotion can *freshly derive* a leave for a departure no relay ever
 /// cached before (the directive never escaped the dead authority) -- that is
@@ -27,21 +100,15 @@ use super::*;
 /// a verbatim re-broadcast of an already-cached directive fires nothing (the
 /// relay that cached it first already reported it).
 ///
-/// `held_slots` is this relay's current set of undecided drop holds, read by
-/// the caller from the drop-hold registry (see [`DecisionMaker::sync`]) --
-/// only meaningful on the reconcile path (a fresh maker has nothing recorded
-/// yet to hold back).
-///
-/// `resumed_departed` is `Some` exactly when the descriptor is a rehome
-/// (resumed) one, carrying the coordinator-known departed slots. They are
-/// seeded — and the maker's started and resumed latches set — *inside* the
-/// registry lock that creates or reconciles the maker, never as follow-up
-/// calls: the moment this function returns, other tasks can reach the maker
-/// (a provisionally admitted client's clean-leave intent, say), and a maker
-/// momentarily visible without its resumed latch would stamp an exact final
-/// turn count that the rehomed session's split forwarding history cannot
-/// support. Seeding runs before the authority `sync`, so a promotion in the
-/// same push re-broadcasts the seeded leaves like any other decided ones.
+/// A resumed sync's departed slots are seeded — and the maker's started and
+/// resumed latches set — *inside* the registry lock that creates or reconciles
+/// the maker, never as follow-up calls: the moment this function returns,
+/// other tasks can reach the maker (a provisionally admitted client's
+/// clean-leave intent, say), and a maker momentarily visible without its
+/// resumed latch would stamp an exact final turn count that the rehomed
+/// session's split forwarding history cannot support. Seeding runs before the
+/// authority `sync`, so a promotion in the same push re-broadcasts the seeded
+/// leaves like any other decided ones.
 ///
 /// The returned batch is everything the caller must (re)broadcast: the
 /// promotion re-broadcast, plus any directive newly decided by this push's
@@ -49,25 +116,23 @@ use super::*;
 /// reconciliation at registration and would otherwise never hear a seeded
 /// departure, stalling forever on the departed slot's turns. Deduplicated by
 /// slot (receivers dedup again regardless).
-/// `finalized_drops` is the descriptor's immutable per-session flag enabling
-/// the home-side drop-finalization handshake. Latched at maker creation; a
-/// re-push that disagrees is ignored with a warning — every count-acceptance
-/// rule keys on the flag, so a session must never change its mind mid-game.
 #[must_use]
-#[allow(clippy::too_many_arguments)]
 pub fn sync_maker(
     registry: &DecisionMakers,
     key: &SessionKey,
-    bounds: BufferBounds,
-    authority: Authority,
-    observers: HashSet<SlotId>,
-    expected_slots: HashSet<SlotId>,
-    homed_slots: HashSet<SlotId>,
-    held_slots: HashSet<SlotId>,
-    resumed_departed: Option<&[DepartedSlot]>,
-    finalized_drops: bool,
+    sync: MakerSync<'_>,
 ) -> Vec<LeaveDirective> {
     use std::collections::hash_map::Entry;
+    let MakerSync {
+        bounds,
+        authority,
+        observers,
+        expected_slots,
+        homed_slots,
+        held_slots,
+        resumed_departed,
+        finalized_drops,
+    } = sync;
     let seed = |maker: &mut DecisionMaker| -> Vec<LeaveDirective> {
         let Some(departed) = resumed_departed else {
             return Vec::new();

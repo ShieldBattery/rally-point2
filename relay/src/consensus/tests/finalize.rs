@@ -229,14 +229,12 @@ fn finalize_refuses_a_home_gained_by_a_rehome() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        Some(&departed),
-        true,
+        MakerSync {
+            homed_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            resumed_departed: Some(&departed),
+            finalized_drops: true,
+            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+        },
     );
     let framed = DepartureStamps {
         last_frame: Some(GameFrameCount(40)),
@@ -270,14 +268,12 @@ fn finalize_refuses_every_home_of_a_resumed_created_maker() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        [SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        Some(&departed),
-        true,
+        MakerSync {
+            homed_slots: [SlotId(1)].into_iter().collect(),
+            resumed_departed: Some(&departed),
+            finalized_drops: true,
+            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+        },
     );
     record_departure(
         &registry,
@@ -343,14 +339,11 @@ fn finalize_refuses_a_pre_frame_drop_without_sealing() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        [SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        None,
-        true,
+        MakerSync {
+            homed_slots: [SlotId(1)].into_iter().collect(),
+            finalized_drops: true,
+            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+        },
     );
     record_departure(
         &registry,

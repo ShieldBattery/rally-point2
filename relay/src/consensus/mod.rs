@@ -250,8 +250,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
     BufferBounds, DepartedSlot, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot,
-    GAME_SYNC_SAFE_BUFFER_MAX, ResultEcho, ResultNotice, SessionStartedNotice, SlotConnectedNotice,
-    SlotStartedNotice, TenantId,
+    GAME_SYNC_SAFE_BUFFER_MAX, ResultEcho, ResultNotice, SessionDescriptor, SessionStartedNotice,
+    SlotConnectedNotice, SlotStartedNotice, TenantId,
 };
 use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
@@ -274,7 +274,7 @@ use sync::*;
 pub use law::ControlLaw;
 pub use maker::{DecisionMaker, DepartureStamps, RecordedDeparture, SilentSlot};
 pub use ops::{
-    FinalizeOutcome, FrameRegression, SILENCE_CHECK_INTERVAL, activate_connection_epoch,
+    FinalizeOutcome, FrameRegression, MakerSync, SILENCE_CHECK_INTERVAL, activate_connection_epoch,
     active_directive, adopt_session_start, claim_close_report, claim_close_report_with_maker,
     commanded_phase_delay, connection_epoch_matches, decide_abandoned_departures, decide_leave,
     decided_slots, departure_epoch, deregister_maker, finalize_drop, finalized_drops_enabled,
@@ -301,7 +301,6 @@ pub use sync::SyncDivergence;
 
 pub(crate) use ops::{admit_reconnect, mark_connection_down, record_departure_for_epoch_outcome};
 pub(crate) use slot::{ConnectionActivation, DepartureRecordOutcome, ReconnectAdmission};
-pub(crate) use sync::{RateLimitedCounter, TokenBucket};
 
 /// How long a relay withholds the session's relay → region labels from its
 /// clients, measured on the relay's own clock from the moment it latched the
@@ -379,10 +378,11 @@ pub struct BufferSize(pub u32);
 ///
 /// The relays sit in a fixed priority order; the highest still serving live
 /// players is the decision-maker. Handoff -- when the authority relay drops
-/// out and authority falls to the next relay -- needs the coordinator-assigned
-/// priority order and a presence signal, both of which land with the mesh
-/// wiring + coordinator (Phase 3). Until then, authority is an injected input
-/// so the decision core runs unchanged once peer conditions flow in.
+/// out and authority falls to the next relay -- runs off the
+/// coordinator-assigned priority order and the presence the relays track among
+/// themselves. Both reach this core as an *injected input*: `MeshControl`
+/// computes the verdict and re-injects it, so the decision core stays pure and
+/// unaware of where either half came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Authority {
     /// This relay is the decision-maker. The relay decides from its own

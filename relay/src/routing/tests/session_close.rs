@@ -195,14 +195,10 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
     let _ = consensus::sync_maker(
         &mesh.decision_makers,
         &k,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::mark_session_started(&mesh.decision_makers, &k);
     consensus::observe_frame(&mesh.decision_makers, &k, SlotId(0), GameFrameCount(50));
@@ -272,14 +268,10 @@ async fn a_clean_leave_does_not_defer_the_emptied_session_close() {
     let _ = consensus::sync_maker(
         &mesh.decision_makers,
         &k,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::mark_session_started(&mesh.decision_makers, &k);
 
@@ -335,14 +327,10 @@ async fn a_never_started_emptying_retains_receipts_while_the_hold_survives() {
     let _ = consensus::sync_maker(
         &mesh.decision_makers,
         &k,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
 
     let (mut g0, _i0) = register(&sessions, &k, SlotId(0), 1).expect("slot 0 registers");

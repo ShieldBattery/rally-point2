@@ -23,14 +23,12 @@ async fn a_mesh_request_drop_at_the_authority_decides_the_leave_and_never_echoes
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
     );
     // The target slot dropped: a frame basis for its leave, a recorded departure,
     // and a hold this relay marked. `test_mesh_state` uses a zero unlock floor,
@@ -107,14 +105,12 @@ async fn a_mesh_request_drop_at_a_non_authority_does_nothing() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
     crate::consensus::observe_frame(&makers, &key, SlotId(0), GameFrameCount(50));
     crate::consensus::record_departure(

@@ -21,14 +21,8 @@ fn slot_homed_admits_every_slot_when_the_homed_set_is_empty() {
     let _ = sync_maker(
         &registry,
         &key(),
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(), // empty homed_slots: unenforced
-        HashSet::new(),
-        None,
-        false,
+        // No homed slots named at all: the unenforced case.
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     assert!(slot_homed(&registry, &key(), SlotId(0)));
     assert!(slot_homed(&registry, &key(), SlotId(7)));
@@ -43,14 +37,10 @@ fn slot_homed_refuses_a_slot_absent_from_a_non_empty_homed_set() {
     let _ = sync_maker(
         &registry,
         &key(),
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        [SlotId(0), SlotId(2)].into_iter().collect(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            homed_slots: [SlotId(0), SlotId(2)].into_iter().collect(),
+            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+        },
     );
     assert!(
         slot_homed(&registry, &key(), SlotId(0)),
@@ -78,14 +68,10 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            homed_slots: [SlotId(0)].into_iter().collect(),
+            ..MakerSync::new(bounds(0, 20), Authority::Peer)
+        },
     );
     let held_both: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
 
@@ -147,14 +133,7 @@ fn a_reconnectable_departure_counts_every_held_slot_when_the_homed_set_is_empty(
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::Peer,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::Peer),
     );
     let held: HashSet<SlotId> = [SlotId(3)].into_iter().collect();
     assert!(!has_reconnectable_departure(&registry, &k, &held));
@@ -211,14 +190,7 @@ fn claim_close_report_latches_once_until_reopened() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(0, 20), Authority::SelfRelay),
     );
     assert!(claim_close_report(&registry, &k), "the first claim wins");
     assert!(
@@ -241,14 +213,10 @@ fn slot_homed_follows_a_later_descriptors_reassignment() {
     let _ = sync_maker(
         &registry,
         &key(),
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            homed_slots: [SlotId(0)].into_iter().collect(),
+            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+        },
     );
     assert!(slot_homed(&registry, &key(), SlotId(0)));
     assert!(!slot_homed(&registry, &key(), SlotId(1)));
@@ -258,14 +226,10 @@ fn slot_homed_follows_a_later_descriptors_reassignment() {
     let _ = sync_maker(
         &registry,
         &key(),
-        bounds(0, 20),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        [SlotId(1)].into_iter().collect(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync {
+            homed_slots: [SlotId(1)].into_iter().collect(),
+            ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
+        },
     );
     assert!(
         !slot_homed(&registry, &key(), SlotId(0)),

@@ -135,16 +135,7 @@ impl MeshControl {
         let leaves = consensus::sync_maker(
             &self.decision_makers,
             &key,
-            descriptor.bounds,
-            authority,
-            descriptor.observer_slots.iter().copied().collect(),
-            descriptor.expected_slots.iter().copied().collect(),
-            descriptor.homed_slots.iter().copied().collect(),
-            held_slots,
-            descriptor
-                .resumed
-                .then_some(descriptor.departed_slots.as_slice()),
-            descriptor.finalized_drops,
+            consensus::MakerSync::from_descriptor(descriptor, authority, held_slots),
         );
         // A descriptor now names this session, so any provisional-admission
         // mark it carried is moot -- the bounded-admission sweep would

@@ -448,14 +448,12 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
     let _ = consensus::sync_maker(
         &relay_a.mesh.decision_makers,
         &key,
-        BufferBounds::new(1, 6).unwrap(),
-        consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            ..consensus::MakerSync::new(
+                BufferBounds::new(1, 6).unwrap(),
+                consensus::Authority::SelfRelay,
+            )
+        },
     );
     consensus::mark_session_started(&relay_a.mesh.decision_makers, &key);
 

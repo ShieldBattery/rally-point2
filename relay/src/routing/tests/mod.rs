@@ -93,14 +93,11 @@ pub(super) fn finalized_drop_harness(
     let _ = consensus::sync_maker(
         &makers,
         key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        homed.iter().map(|&s| SlotId(s)).collect(),
-        std::collections::HashSet::new(),
-        None,
-        true,
+        consensus::MakerSync {
+            homed_slots: homed.iter().map(|&s| SlotId(s)).collect(),
+            finalized_drops: true,
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::observe_frame(
         &makers,
@@ -137,14 +134,7 @@ pub(super) fn drop_hold_harness(
     let _ = consensus::sync_maker(
         &makers,
         key,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay),
     );
     // Both slots have framed history: the survivor pins a session frame and the
     // departing slot gives the leave its apply-frame basis.
@@ -215,14 +205,10 @@ pub(super) fn abandoned_harness() -> (
     let _ = consensus::sync_maker(
         &makers,
         &k,
-        BufferBounds::new(0, 20).unwrap(),
-        Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        [SlotId(0), SlotId(1)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
     );
     consensus::mark_session_started(&makers, &k);
     consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));

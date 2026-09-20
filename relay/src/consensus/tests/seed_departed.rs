@@ -122,14 +122,10 @@ fn a_resumed_sync_installs_the_latch_and_returns_the_seeds() {
     let leaves = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        Some(&departed),
-        false,
+        MakerSync {
+            resumed_departed: Some(&departed),
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
     );
     assert!(
         leaves
@@ -152,14 +148,10 @@ fn a_resumed_sync_installs_the_latch_and_returns_the_seeds() {
     let replayed = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        Some(&departed),
-        false,
+        MakerSync {
+            resumed_departed: Some(&departed),
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
     );
     assert!(
         replayed.iter().all(|l| l.slot != 2),
@@ -178,14 +170,7 @@ fn a_resumed_repush_seeds_into_an_existing_maker() {
     let _ = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        None,
-        false,
+        MakerSync::new(bounds(1, 6), Authority::SelfRelay),
     );
     assert!(!registry.lock().get(&k).unwrap().resumed);
 
@@ -198,14 +183,10 @@ fn a_resumed_repush_seeds_into_an_existing_maker() {
     let leaves = sync_maker(
         &registry,
         &k,
-        bounds(1, 6),
-        Authority::SelfRelay,
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        HashSet::new(),
-        Some(&departed),
-        false,
+        MakerSync {
+            resumed_departed: Some(&departed),
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
     );
     assert!(
         leaves

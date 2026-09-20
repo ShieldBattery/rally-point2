@@ -19,14 +19,14 @@ fn the_home_answers_finalize_drop_with_the_sealed_count() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        [SlotId(1)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        None,
-        true,
+        crate::consensus::MakerSync {
+            homed_slots: [SlotId(1)].into_iter().collect(),
+            finalized_drops: true,
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
     crate::consensus::record_departure(
         &makers,
@@ -102,14 +102,14 @@ fn the_authority_decides_on_a_finalized_result() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        None,
-        true,
+        crate::consensus::MakerSync {
+            homed_slots: [SlotId(0)].into_iter().collect(),
+            finalized_drops: true,
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
     );
     crate::consensus::observe_frame(
         &makers,
@@ -200,14 +200,14 @@ fn the_authority_ignores_a_stale_generation_finalize_result() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        None,
-        true,
+        crate::consensus::MakerSync {
+            homed_slots: [SlotId(0)].into_iter().collect(),
+            finalized_drops: true,
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
     );
     crate::consensus::observe_frame(
         &makers,
@@ -311,14 +311,14 @@ fn the_authority_refuses_a_finalized_count_its_own_prefix_exceeds() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        None,
-        true,
+        crate::consensus::MakerSync {
+            homed_slots: [SlotId(0)].into_iter().collect(),
+            finalized_drops: true,
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
     );
     crate::consensus::observe_frame(
         &makers,
@@ -410,14 +410,14 @@ fn a_pre_frame_finalized_result_keeps_the_hold_for_a_retry() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::SelfRelay,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        [SlotId(0)].into_iter().collect(),
-        std::collections::HashSet::new(),
-        None,
-        true,
+        crate::consensus::MakerSync {
+            homed_slots: [SlotId(0)].into_iter().collect(),
+            finalized_drops: true,
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
     );
     let (_reg, mut survivor) =
         routing::register(&sessions, &key, SlotId(0), 1).expect("survivor registers");

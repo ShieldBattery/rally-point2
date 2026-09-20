@@ -29,14 +29,12 @@ async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepte
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
 
     // A local survivor (slot 5) that must hear an accepted leave and must
@@ -177,14 +175,12 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
     crate::consensus::record_departure(
         &makers,
@@ -251,14 +247,12 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
     let _ = crate::consensus::sync_maker(
         &makers,
         &key,
-        rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-        crate::consensus::Authority::Peer,
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        None,
-        false,
+        crate::consensus::MakerSync {
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
     );
     assert!(crate::consensus::activate_connection_epoch(
         &makers,
@@ -329,14 +323,12 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
         let _ = crate::consensus::sync_maker(
             &makers,
             &key,
-            rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-            crate::consensus::Authority::Peer,
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            std::collections::HashSet::new(),
-            None,
-            false,
+            crate::consensus::MakerSync {
+                ..crate::consensus::MakerSync::new(
+                    rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                    crate::consensus::Authority::Peer,
+                )
+            },
         );
         assert!(crate::consensus::activate_connection_epoch(
             &makers,
