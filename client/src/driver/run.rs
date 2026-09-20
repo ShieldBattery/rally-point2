@@ -56,7 +56,7 @@ impl LinkDriver {
     /// *itself* — keeping every game channel alive — instead of ending.
     ///
     /// Across a drop the driver: emits its own slot's connectivity as `false` then
-    /// `true` on [`connectivity`](TurnChannels::connectivity) (so the game learns of
+    /// `true` on [`connectivity`](super::TurnChannels::connectivity) (so the game learns of
     /// its own disconnect/reconnect from an explicit signal, not from the channels
     /// closing); re-dials with capped exponential backoff, presenting per-slot
     /// resume cursors so the relay replays the turns missed during the outage; and

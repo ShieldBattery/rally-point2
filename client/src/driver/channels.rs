@@ -28,13 +28,13 @@ pub struct ChatOut {
     pub text: String,
 }
 
-/// The game thread's end of the turn channels to a running [`LinkDriver`].
+/// The game thread's end of the turn channels to a running [`LinkDriver`](super::LinkDriver).
 ///
 /// The game pushes the turns it produces to [`outbound`](Self::outbound) and
 /// drains the peers' turns the relay forwards from [`inbound`](Self::inbound).
 /// Dropping `outbound`, or dropping `inbound`, stops the driver cleanly. Letting
 /// `inbound` fill without draining it does not — the game has stalled, and the
-/// driver surfaces that as [`DriverError::GameStalled`] rather than parking on it.
+/// driver surfaces that as [`DriverError::GameStalled`](super::DriverError::GameStalled) rather than parking on it.
 pub struct TurnChannels {
     /// Turns the game produces, to be sent to the relay. The driver assigns each
     /// payload's transport `seq` and the relay rebinds its `slot` to the authorized
@@ -104,7 +104,7 @@ pub struct TurnChannels {
     /// that to the relay. Unlike [`lobby_out`](Self::lobby_out), this stays live
     /// for the whole game, not just pre-game setup. A send failure is
     /// best-effort: the driver logs it and continues rather than surfacing a
-    /// [`DriverError`], since a lost chat line is not correctness-critical.
+    /// [`DriverError`](super::DriverError), since a lost chat line is not correctness-critical.
     pub chat_out: mpsc::Sender<ChatOut>,
     /// Chat messages other members authored, as the relay fanned them down the
     /// reliable control stream, each tagged with its authoring slot. There is no
@@ -118,7 +118,7 @@ pub struct TurnChannels {
     /// turn — and the relay stamps the authoring slot, so the caller leaves that
     /// to the relay and just hands over the opaque bytes. Like
     /// [`chat_out`](Self::chat_out) a send failure is best-effort: the driver logs
-    /// it and continues rather than surfacing a [`DriverError`], since a skin is
+    /// it and continues rather than surfacing a [`DriverError`](super::DriverError), since a skin is
     /// cosmetic and non-synced — a lost blob costs only a wrong cosmetic.
     pub skin_out: mpsc::Sender<Vec<u8>>,
     /// Cosmetic-skin blobs other members authored, as the relay fanned them down
@@ -171,7 +171,7 @@ pub struct TurnChannels {
     /// - **Peer slots** — the relay pushes these down the control stream as it does
     ///   the other directives.
     /// - **This client's own slot** — when the driver runs with reconnection
-    ///   ([`run_reconnecting`](LinkDriver::run_reconnecting)) it emits
+    ///   ([`run_reconnecting`](super::LinkDriver::run_reconnecting)) it emits
     ///   `(own_slot, false)` the moment its own link drops and `(own_slot, true)`
     ///   once it has re-established one, so the game learns of *its own*
     ///   disconnect/reconnect from an explicit signal rather than from these

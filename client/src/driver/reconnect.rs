@@ -89,8 +89,8 @@ pub trait RehomeProvider: Send + Sync {
     fn rehome(&self, dead_relay_id: u64) -> RehomeFuture<'_>;
 }
 
-/// What a [`LinkDriver`] needs to re-dial its home relay itself, so
-/// [`run_reconnecting`](LinkDriver::run_reconnecting) can resume a dropped session
+/// What a [`LinkDriver`](super::LinkDriver) needs to re-dial its home relay itself, so
+/// [`run_reconnecting`](super::LinkDriver::run_reconnecting) can resume a dropped session
 /// without tearing the game seam down.
 pub struct Reconnect {
     /// The endpoint to re-dial from — the one that made the initial connection, its
@@ -140,7 +140,7 @@ pub(super) struct ReconnectTarget {
     pub(super) relay_id: u64,
 }
 
-/// The reconnect machinery [`run_reconnecting`](LinkDriver::run_reconnecting) owns
+/// The reconnect machinery [`run_reconnecting`](super::LinkDriver::run_reconnecting) owns
 /// across a session's life: the current (mutable) re-dial target plus the fixed
 /// credentials, re-home hook, and escalation timing. Bundled so `reconnect_link`
 /// takes it as one argument.
