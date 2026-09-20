@@ -218,7 +218,7 @@ fn reconnect_restores_frame_history_and_immediate_redrop_keeps_apply_basis() {
         Some(11),
     ));
 
-    let transition = maker.resolve_reconnect(SlotId(0), Some(22), true);
+    let transition = maker.resolve_reconnect_with(SlotId(0), Some(22), true, || {});
     assert_eq!(
         transition.admission,
         ReconnectAdmission::Admitted { reinstated: true }

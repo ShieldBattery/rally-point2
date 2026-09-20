@@ -516,7 +516,7 @@ fn a_silence_evicted_slot_is_refused_readmission_without_taking_the_hold() {
     maker.mark_silence_evicted(SlotId(1));
     drop_slot(&mut maker, 1);
 
-    let transition = maker.resolve_reconnect(SlotId(1), Some(2), true);
+    let transition = maker.resolve_reconnect_with(SlotId(1), Some(2), true, || {});
     assert_eq!(transition.admission, ReconnectAdmission::Rejected);
     assert!(
         !transition.consume_hold,

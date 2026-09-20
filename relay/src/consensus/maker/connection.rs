@@ -277,16 +277,10 @@ impl DecisionMaker {
     /// section. If an undecided departure has a matching drop hold, its complete
     /// slot state is restored and the new generation is activated without a gap
     /// in which the old generation can record another departure.
-    #[cfg(test)]
-    pub(in crate::consensus) fn resolve_reconnect(
-        &mut self,
-        slot: SlotId,
-        observed: Option<u64>,
-        hold_pending: bool,
-    ) -> ReconnectTransition {
-        self.resolve_reconnect_with(slot, observed, hold_pending, || {})
-    }
-
+    ///
+    /// `after_reinstate` runs inside that same critical section, immediately
+    /// after a reinstatement, so whatever the caller owes the restored slot
+    /// cannot be interleaved with another departure for it.
     pub(in crate::consensus) fn resolve_reconnect_with(
         &mut self,
         slot: SlotId,

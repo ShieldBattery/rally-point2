@@ -83,7 +83,7 @@ fn final_leave_is_terminal_across_true_and_departure_orderings() {
         if true_before_leave {
             assert_eq!(
                 maker
-                    .resolve_reconnect(SlotId(0), Some(22), false)
+                    .resolve_reconnect_with(SlotId(0), Some(22), false, || {})
                     .admission,
                 ReconnectAdmission::Admitted { reinstated: false }
             );
@@ -95,7 +95,7 @@ fn final_leave_is_terminal_across_true_and_departure_orderings() {
         if !true_before_leave {
             assert_eq!(
                 maker
-                    .resolve_reconnect(SlotId(0), Some(22), false)
+                    .resolve_reconnect_with(SlotId(0), Some(22), false, || {})
                     .admission,
                 ReconnectAdmission::Rejected,
                 "Leave(E1) must make a later true(E2) terminal"
