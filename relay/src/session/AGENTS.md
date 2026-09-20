@@ -13,8 +13,10 @@ module's teardown).
   phases — `remove_slot` (one slot's link ended), `close_emptied` (the last
   local slot went) and `retire` (the descriptor was retired) — so a new store
   is added to the bundle and to its sweep in one place, not at three call
-  sites. `retire` does not sweep the side channels — read its doc before
-  assuming that is on purpose.
+  sites. `retire` is terminal and sweeps everything, side channels included:
+  a session retired with members still connected never reaches
+  `close_emptied` (its gate refuses the later teardowns), so nothing else
+  would.
 - `presence.rs` — own + peer live-player counts and the buffer-authority
   verdict (first still-live relay in the coordinator's priority order).
 - `lobby.rs` — pre-game `LobbyCommand` fan-out **plus an ordered replay log**
