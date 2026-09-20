@@ -422,16 +422,7 @@ fn spawn_provision_loop<P: Provisioner + 'static>(
     pair_rtts: pair_rtts::PairRttStore,
     provisioner: P,
 ) {
-    let registry = setup.registry().clone();
-    let provision_loop = ProvisionLoop::new(
-        config,
-        registry,
-        setup,
-        ledger,
-        warm,
-        pair_rtts,
-        provisioner,
-    );
+    let provision_loop = ProvisionLoop::new(config, setup, ledger, warm, pair_rtts, provisioner);
     tokio::spawn(provision_loop.run());
 }
 

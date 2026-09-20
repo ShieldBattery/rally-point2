@@ -136,7 +136,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
             }
         };
         for relay in bound {
-            if registry::is_enrolled(&self.registry, relay.relay_id) {
+            if registry::is_enrolled(self.setup.registry(), relay.relay_id) {
                 continue;
             }
             let Some(arn) = relay.task_arn else {
@@ -228,7 +228,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
         self.setup.descriptors().forget(relay_id);
         self.setup.reaps().forget(relay_id);
         self.setup.attest().forget(relay_id);
-        crate::registry::forget_boot_id(self.setup.registry(), relay_id);
+        registry::forget_boot_id(self.setup.registry(), relay_id);
         Ok(())
     }
 }

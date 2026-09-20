@@ -13,6 +13,7 @@ use rally_point_proto::token::ExpiresAt;
 
 use super::*;
 use crate::provision::ProvisionError;
+use crate::registry::RelayRegistry;
 use crate::session::create_session;
 use crate::test_support::{hello, region, request, tenant_store, two_players};
 
@@ -201,7 +202,6 @@ impl Harness {
         };
         let provision = ProvisionLoop::new(
             config,
-            setup.registry().clone(),
             setup.clone(),
             ledger.clone(),
             warm.clone(),

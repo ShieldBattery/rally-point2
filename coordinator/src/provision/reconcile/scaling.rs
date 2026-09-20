@@ -264,12 +264,12 @@ impl<P: Provisioner> ProvisionLoop<P> {
     pub(super) async fn try_drain_one(&mut self, relay_id: RelayId, generation: u64) -> bool {
         let proceed = {
             let _assignment = self.setup.lock_assignment();
-            if !registry::mark_draining(&self.registry, relay_id, generation) {
+            if !registry::mark_draining(self.setup.registry(), relay_id, generation) {
                 // The relay reconnected or left between selection and the mark.
                 false
             } else if self.setup.session_count_for_relay(relay_id) != 0 {
                 // A session landed in the placement race: spare the relay.
-                registry::clear_draining(&self.registry, relay_id, generation);
+                registry::clear_draining(self.setup.registry(), relay_id, generation);
                 false
             } else {
                 true

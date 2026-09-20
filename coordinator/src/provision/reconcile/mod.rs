@@ -49,7 +49,7 @@ use rally_point_proto::time::unix_secs_fail_closed;
 use super::{LaunchSpec, Provisioner, TaskId, TaskState, WarmTargets};
 use crate::ledger::RelayLedger;
 use crate::pair_rtts::PairRttStore;
-use crate::registry::{self, EnrolledRelay, RelayRegistry};
+use crate::registry::{self, EnrolledRelay};
 use crate::session::SessionSetup;
 
 /// Static configuration for a [`ProvisionLoop`].
@@ -182,7 +182,6 @@ enum CoveragePhase {
 /// substrate it was built with; it never names a concrete one.
 pub struct ProvisionLoop<P> {
     config: ProvisionConfig,
-    registry: RelayRegistry,
     setup: SessionSetup,
     ledger: Arc<RelayLedger>,
     warm: WarmTargets,
@@ -209,7 +208,6 @@ impl<P: Provisioner> ProvisionLoop<P> {
     /// Builds a loop over the given coordinator handles and provisioner.
     pub fn new(
         config: ProvisionConfig,
-        registry: RelayRegistry,
         setup: SessionSetup,
         ledger: Arc<RelayLedger>,
         warm: WarmTargets,
@@ -218,7 +216,6 @@ impl<P: Provisioner> ProvisionLoop<P> {
     ) -> Self {
         Self {
             config,
-            registry,
             setup,
             ledger,
             warm,
@@ -260,7 +257,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
     /// One reconcile pass at `now` (Unix seconds). Public so a test — or the e2e —
     /// can drive ticks deterministically rather than sleeping through real time.
     pub async fn tick(&mut self, now: u64) {
-        let enrolled = registry::enrolled_relays(&self.registry);
+        let enrolled = registry::enrolled_relays(self.setup.registry());
         self.refresh_idle(&enrolled, now);
 
         // The pairs that currently hold a value, snapshotted once so each region's

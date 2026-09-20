@@ -132,7 +132,6 @@ async fn provisioning_lifecycle_launches_enrolls_drains_and_re_mints_a_fresh_id(
             launch_deadline: Duration::from_secs(300),
             idle_grace: Duration::from_secs(2),
         },
-        reg.clone(),
         setup,
         ledger.clone(),
         warm.clone(),
