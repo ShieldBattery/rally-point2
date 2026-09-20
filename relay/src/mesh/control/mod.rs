@@ -61,11 +61,9 @@ use rally_point_proto::control::RelayPeer;
 use rally_point_proto::ids::RelayId;
 use tokio::sync::{mpsc, watch};
 
-use crate::consensus;
 use crate::key::SessionKey;
 use crate::mesh::{MeshCommand, MeshState};
 use crate::routing::Sessions;
-use crate::session::presence;
 
 /// Drives the mesh links' `Join`/`Leave` commands from coordinator session
 /// descriptors. Clone it cheaply (the state is behind one `Arc`) to hand a copy
@@ -217,39 +215,7 @@ impl MeshControl {
     /// session has a maker but no mesh peers to reconcile, so gating its teardown
     /// on the mesh state below would leak it.
     pub fn end_session(&self, key: &SessionKey) {
-        // Close the session's ingress gate first, before any state is
-        // destroyed. The write acquisition drains every in-flight ingress
-        // critical section (mesh dispatch, the turn funnel, an admission), so
-        // their mutations land wholly before the sweeps below; every ingress
-        // that starts afterward observes the retirement and refuses. Without
-        // this boundary a buffered mesh frame — still passing its link
-        // driver's joined check until the queued Leave drains — would find no
-        // maker, read a `SlotDeparted` as an undecided drop, and recreate a
-        // drop hold (or report a second close, or re-create a flight
-        // recording) for a session that no longer exists.
-        self.mesh.session.gates.retire(key);
-        consensus::deregister_maker(&self.mesh.session.decision_makers, key);
-        presence::forget(&self.mesh.session.presence, key);
-        // Discard any turns still penned for the session — with the maker
-        // gone and the gate retired, no descriptor will ever drain them. The
-        // replay ring and forward-once seen state fall with them: the
-        // session-emptied close retains both while an undecided hold still
-        // promises a reconnect (their receipts seed that resume's receive
-        // window), and retirement is the terminal boundary that ends the
-        // promise — with the descriptor gone there is no admission path left,
-        // so nothing else would ever sweep a retained pair whose reconnect
-        // never came. Idempotent when the emptied close already removed them.
-        self.mesh.session.provisional_turns.discard(key);
-        self.mesh.session.turn_ring.end_session(key);
-        crate::mesh::deregister_seen(&self.mesh.seen, key);
-        // Retirement is terminal for the session's drop bookkeeping: with the
-        // descriptor gone there is no admission path left for a held slot's
-        // reconnect and no decide path for its leave, so any armed abandon
-        // timer and every remaining hold would otherwise leak forever — the
-        // timer's expiry stands down on the forgotten presence (never deciding
-        // or releasing), and nothing else ever sweeps the entries.
-        self.mesh.session.drop_holds.cancel_abandon(key);
-        self.mesh.session.drop_holds.end_session_terminal(key);
+        self.mesh.session.retire(key, &self.mesh.seen);
         {
             let mut inner = self.inner.lock();
             if let Some(peers) = inner.desired.remove(key) {

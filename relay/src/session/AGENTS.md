@@ -6,11 +6,14 @@ teardown).
 
 ## File map
 
-- `state.rs` — `SessionState`, the bundle of every store below plus the
+- `state/` — `SessionState`, the bundle of every store below plus the
   decision-makers and the load fence, and `Tunables`, the windows and ceilings
   it is built with (`Default` = production). The per-session tasks carry one
-  bundle rather than a dozen registries, and a new store is added here and to
-  its teardown phase in one place.
+  bundle rather than a dozen registries. It also owns the three teardown
+  phases — `remove_slot` (one slot's link ended), `close_emptied` (the last
+  local slot went) and `retire` (the descriptor was retired) — so a new store
+  is added to the bundle and to its sweep in one place, not at three call
+  sites. `retire` deliberately does not sweep the side channels; see its doc.
 - `presence.rs` — own + peer live-player counts and the buffer-authority
   verdict (first still-live relay in the coordinator's priority order).
 - `lobby.rs` — pre-game `LobbyCommand` fan-out **plus an ordered replay log**

@@ -12,6 +12,9 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::{SessionId, SlotId};
 
+use crate::consensus;
+use crate::session::presence;
+
 const TENANT: &str = "sb-test";
 
 fn key(session: u64) -> SessionKey {

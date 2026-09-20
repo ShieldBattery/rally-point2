@@ -30,19 +30,7 @@ pub(in crate::routing) fn end_slot_link(
         key,
         crate::observability::flight_recorder::FlightEvent::SlotDisconnected { slot: slot.0 },
     );
-    // Drop this member's lobby-push channel before the roster deregister below.
-    // The roster refuses a duplicate slot, so a reconnecting slot cannot register
-    // (and re-register its lobby member) until this deregister frees the roster
-    // slot — doing the lobby deregister first keeps a fresh connection's
-    // `register_member` from being clobbered by this one's cleanup.
-    crate::session::lobby::deregister_member(&mesh.session.lobby, key, slot);
-    // Same rationale for chat: deregister before the roster frees the slot, so
-    // a reconnect can't clobber this connection's cleanup.
-    crate::session::chat::deregister_member(&mesh.session.chat, key, slot);
-    // Same for skins: deregister the member before the roster frees the slot. The
-    // session's blob map is left intact (like the lobby log), so a remaining or
-    // reconnecting member still replays it.
-    crate::session::skin::deregister_member(&mesh.session.skins, key, slot);
+    mesh.session.remove_slot(key, slot);
     let session_emptied = deregister(sessions, key, slot);
     let retired_connection =
         crate::mesh::unpublish_conditions(&mesh.conditions, key, slot, Some(connection_epoch));
