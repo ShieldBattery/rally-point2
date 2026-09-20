@@ -35,19 +35,19 @@ fn buckets_are_independent_per_session_and_tenant() {
     // another's session of the same id.
     let limiter = RehomeLimiter::new(1, Duration::from_secs(5));
     let t0 = Instant::now();
-    assert!(limiter.check_at(&tid(), SessionId(1), t0));
-    assert!(!limiter.check_at(&tid(), SessionId(1), t0));
-    assert!(limiter.check_at(&tid(), SessionId(2), t0));
-    assert!(limiter.check_at(&TenantId("sb-other".to_owned()), SessionId(1), t0));
+    assert!(limiter.check_at(&(tid(), SessionId(1)), t0));
+    assert!(!limiter.check_at(&(tid(), SessionId(1)), t0));
+    assert!(limiter.check_at(&(tid(), SessionId(2)), t0));
+    assert!(limiter.check_at(&(TenantId("sb-other".to_owned()), SessionId(1)), t0));
 }
 
 #[test]
 fn forget_drops_a_sessions_buckets() {
     let limiter = RehomeLimiter::new(1, Duration::from_secs(5));
     let t0 = Instant::now();
-    assert!(limiter.check_at(&tid(), SessionId(1), t0));
-    assert!(!limiter.check_at(&tid(), SessionId(1), t0));
+    assert!(limiter.check_at(&(tid(), SessionId(1)), t0));
+    assert!(!limiter.check_at(&(tid(), SessionId(1)), t0));
     // After forgetting, the session starts fresh with a full burst.
     limiter.forget(&tid(), SessionId(1));
-    assert!(limiter.check_at(&tid(), SessionId(1), t0));
+    assert!(limiter.check_at(&(tid(), SessionId(1)), t0));
 }

@@ -255,13 +255,12 @@ async fn a_tenant_reading_past_its_rate_limit_gets_a_429_with_a_retry_after() {
     // open on each, so the limit is the tenant's rather than the session's: a
     // caller cannot buy a fresh burst by naming a different session.
     let state = state_with_relay_and_tenant();
-    let state =
-        CoordinatorState {
-            setup: state.setup.clone().with_load_state_limiter(
-                crate::rehome::LoadStateLimiter::new(1, Duration::from_secs(60)),
-            ),
-            ..state
-        };
+    let state = CoordinatorState {
+        setup: state.setup.clone().with_load_state_limiter(
+            crate::endpoint_limits::LoadStateLimiter::new(1, Duration::from_secs(60)),
+        ),
+        ..state
+    };
     let app = router(state);
 
     let body =

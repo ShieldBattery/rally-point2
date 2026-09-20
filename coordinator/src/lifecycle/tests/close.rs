@@ -89,7 +89,7 @@ async fn closing_a_session_retires_membership_and_limiter_bucket() {
     // A full close must retire the session's relay membership and drop its
     // rate-limit bucket, so a straggler cannot re-home (and thus resurrect) a
     // dead session and the bucket map stays bounded.
-    use crate::rehome::REHOME_BURST;
+    use crate::endpoint_limits::REHOME_BURST;
     use crate::session::{self, RehomeOutcome};
 
     let (setup, s) = setup_with_relay_and_session();
@@ -109,10 +109,10 @@ async fn closing_a_session_retires_membership_and_limiter_bucket() {
         "membership is recorded before close",
     );
     for _ in 0..REHOME_BURST {
-        assert!(setup.rehome_limiter().check(&tid(), s));
+        assert!(setup.rehome_limiter().check(&(tid(), s)));
     }
     assert!(
-        !setup.rehome_limiter().check(&tid(), s),
+        !setup.rehome_limiter().check(&(tid(), s)),
         "the bucket is exhausted before close",
     );
 
@@ -131,7 +131,7 @@ async fn closing_a_session_retires_membership_and_limiter_bucket() {
         "a closed session refuses re-home even while a relay is live",
     );
     assert!(
-        setup.rehome_limiter().check(&tid(), s),
+        setup.rehome_limiter().check(&(tid(), s)),
         "close dropped the limiter bucket, so a fresh burst is available",
     );
 }

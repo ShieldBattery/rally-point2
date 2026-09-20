@@ -334,7 +334,11 @@ pub(super) async fn rehome_session(
     // Every non-recorded ask — a first-time survivor, a false-alarm `stay`, or an
     // unknown/garbage session — is rate-limited per authenticated (tenant, session).
     // A refused request is a 429 the caller backs off and re-asks after.
-    if !state.setup.rehome_limiter().check(&tenant, session) {
+    if !state
+        .setup
+        .rehome_limiter()
+        .check(&(tenant.clone(), session))
+    {
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 

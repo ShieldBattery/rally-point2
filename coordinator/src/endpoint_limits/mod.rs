@@ -1,5 +1,5 @@
-//! Rate limiting for the coordinator-mediated re-home endpoint and the load-state
-//! read.
+//! Rate limiting for the tenant-authenticated endpoints that need it: the
+//! coordinator-mediated re-home and the load-state read.
 //!
 //! Both are tenant-authenticated (the tenant's app server signs each request; game
 //! clients never call the coordinator directly) and both are cheap to re-ask, so
@@ -24,6 +24,7 @@
 //! burst — harmless for limits that exist to bound abuse, not to enforce
 //! correctness.
 
+use std::hash::Hash;
 use std::time::{Duration, Instant};
 
 use rally_point_proto::control::TenantId;
@@ -41,13 +42,14 @@ pub const REHOME_BURST: u32 = 3;
 /// that.
 pub const REHOME_REFILL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Hard cap on the number of live re-home buckets. The time-window idle eviction
-/// alone only bounds the map by `O(rate x window)`, so an authenticated caller
-/// spraying unique garbage session ids at high rate could hold many thousands of
-/// buckets between eviction sweeps. This cap bounds the map by cardinality
-/// regardless of rate. A few thousand comfortably covers every session a real
-/// coordinator re-homes at once while keeping the worst-case memory footprint small.
-pub const REHOME_BUCKET_CAP: usize = 4096;
+/// Hard cap on the number of live buckets one endpoint's limiter holds. The
+/// time-window idle eviction alone only bounds the map by `O(rate x window)`, so
+/// an authenticated caller spraying unique garbage keys at high rate could hold
+/// many thousands of buckets between eviction sweeps. This cap bounds the map by
+/// cardinality regardless of rate. A few thousand comfortably covers every
+/// session a real coordinator re-homes at once — and every tenant it serves —
+/// while keeping the worst-case memory footprint small.
+pub const ENDPOINT_BUCKET_CAP: usize = 4096;
 
 /// Burst capacity for the load-state read: how many reads one tenant may make
 /// back-to-back before it must wait. Ten covers a tenant whose load deadlines expire
@@ -61,17 +63,61 @@ pub const LOAD_STATE_BURST: u32 = 10;
 /// after an incomplete answer can sustain without the fleet feeling it.
 pub const LOAD_STATE_REFILL_INTERVAL: Duration = Duration::from_millis(2000);
 
-/// Hard cap on the number of live load-state buckets. Keyed per tenant, so this is
-/// bounded by enrolled tenants rather than by anything a caller supplies; the cap is
-/// a backstop, not a working limit.
-pub const LOAD_STATE_BUCKET_CAP: usize = 4096;
-
-/// The per-session re-home rate limiter, shared across every request handler. Clone
-/// it cheaply to hand a copy to the router state.
-#[derive(Clone)]
-pub struct RehomeLimiter {
-    buckets: KeyedTokenBuckets<(TenantId, SessionId)>,
+/// One endpoint's rate limit, keyed on `K` — whatever the request authenticated
+/// as, so one caller's misbehaviour never starves another's. Clone it cheaply to
+/// hand a copy to the router state.
+///
+/// The endpoints differ only in that key and in the burst/refill they are sized
+/// with; the mechanics are [`KeyedTokenBuckets`]'. The refill interval is kept
+/// alongside so a refusal can tell the caller how long to wait.
+pub struct EndpointLimiter<K> {
+    buckets: KeyedTokenBuckets<K>,
+    refill_interval: Duration,
 }
+
+impl<K> Clone for EndpointLimiter<K> {
+    fn clone(&self) -> Self {
+        Self {
+            buckets: self.buckets.clone(),
+            refill_interval: self.refill_interval,
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone> EndpointLimiter<K> {
+    /// Builds a limiter with the given burst and refill interval, using the
+    /// production bucket cap ([`ENDPOINT_BUCKET_CAP`]). Production sizes come from
+    /// [`Default`]; tests inject their own so they need not wait real seconds.
+    pub fn new(burst: u32, refill_interval: Duration) -> Self {
+        Self {
+            buckets: KeyedTokenBuckets::new(burst, refill_interval, ENDPOINT_BUCKET_CAP),
+            refill_interval,
+        }
+    }
+
+    /// Whether a request under `key` is admitted now, consuming a token if so.
+    pub fn check(&self, key: &K) -> bool {
+        self.check_at(key, Instant::now())
+    }
+
+    /// [`check`](Self::check) against an explicit clock, so a test can advance time
+    /// deterministically rather than sleeping.
+    pub fn check_at(&self, key: &K, now: Instant) -> bool {
+        self.buckets.check_at(key, now)
+    }
+
+    /// How long a refused caller should wait before retrying: one refill interval,
+    /// rounded up to whole seconds because `Retry-After` counts in seconds and
+    /// rounding down would invite an immediately-refused retry.
+    pub fn retry_after_secs(&self) -> u64 {
+        self.refill_interval.as_secs().max(1)
+    }
+}
+
+/// The per-session re-home rate limiter, keyed per `(tenant, session)`: an app
+/// server may legitimately re-ask every few seconds while a session's home relay
+/// is unreachable, and one session's re-asking must never starve another's.
+pub type RehomeLimiter = EndpointLimiter<(TenantId, SessionId)>;
 
 impl Default for RehomeLimiter {
     fn default() -> Self {
@@ -80,28 +126,6 @@ impl Default for RehomeLimiter {
 }
 
 impl RehomeLimiter {
-    /// Builds a limiter with the given burst and refill interval, using the
-    /// production bucket cap ([`REHOME_BUCKET_CAP`]). Production uses
-    /// [`REHOME_BURST`]/[`REHOME_REFILL_INTERVAL`] (via [`Default`]); tests inject
-    /// their own so they need not wait real seconds.
-    pub fn new(burst: u32, refill_interval: Duration) -> Self {
-        Self {
-            buckets: KeyedTokenBuckets::new(burst, refill_interval, REHOME_BUCKET_CAP),
-        }
-    }
-
-    /// Whether a re-home request for `(tenant, session)` is admitted now,
-    /// consuming a token if so.
-    pub fn check(&self, tenant: &TenantId, session: SessionId) -> bool {
-        self.check_at(tenant, session, Instant::now())
-    }
-
-    /// [`check`](Self::check) against an explicit clock, so a test can advance time
-    /// deterministically rather than sleeping.
-    pub fn check_at(&self, tenant: &TenantId, session: SessionId, now: Instant) -> bool {
-        self.buckets.check_at(&(tenant.clone(), session), now)
-    }
-
     /// Drops every bucket for `session` — called when the session closes, so the
     /// map stays bounded by the coordinator's live re-homing sessions.
     pub fn forget(&self, tenant: &TenantId, session: SessionId) {
@@ -110,49 +134,14 @@ impl RehomeLimiter {
     }
 }
 
-/// The per-tenant load-state read rate limiter, shared across every request
-/// handler. Clone it cheaply to hand a copy to the router state.
-#[derive(Clone)]
-pub struct LoadStateLimiter {
-    buckets: KeyedTokenBuckets<TenantId>,
-    refill_interval: Duration,
-}
+/// The load-state read rate limiter, keyed per **tenant** because the cost it
+/// bounds is fleet-wide rather than per-session. Clone it cheaply to hand a copy
+/// to the router state.
+pub type LoadStateLimiter = EndpointLimiter<TenantId>;
 
 impl Default for LoadStateLimiter {
     fn default() -> Self {
         Self::new(LOAD_STATE_BURST, LOAD_STATE_REFILL_INTERVAL)
-    }
-}
-
-impl LoadStateLimiter {
-    /// Builds a limiter with the given burst and refill interval, using the
-    /// production bucket cap ([`LOAD_STATE_BUCKET_CAP`]). Production uses
-    /// [`LOAD_STATE_BURST`]/[`LOAD_STATE_REFILL_INTERVAL`] (via [`Default`]); tests
-    /// inject their own so they need not wait real seconds.
-    pub fn new(burst: u32, refill_interval: Duration) -> Self {
-        Self {
-            buckets: KeyedTokenBuckets::new(burst, refill_interval, LOAD_STATE_BUCKET_CAP),
-            refill_interval,
-        }
-    }
-
-    /// Whether a load-state read for `tenant` is admitted now, consuming a token if
-    /// so. A refused read is answered `429` with a `Retry-After`.
-    pub fn check(&self, tenant: &TenantId) -> bool {
-        self.check_at(tenant, Instant::now())
-    }
-
-    /// [`check`](Self::check) against an explicit clock, so a test can advance time
-    /// deterministically rather than sleeping.
-    pub fn check_at(&self, tenant: &TenantId, now: Instant) -> bool {
-        self.buckets.check_at(tenant, now)
-    }
-
-    /// How long a refused caller should wait before re-reading: one refill
-    /// interval, rounded up to whole seconds because `Retry-After` counts in
-    /// seconds and rounding down would invite an immediately-refused retry.
-    pub fn retry_after_secs(&self) -> u64 {
-        self.refill_interval.as_secs().max(1)
     }
 }
 

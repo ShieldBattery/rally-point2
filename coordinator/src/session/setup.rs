@@ -14,9 +14,9 @@ use rally_point_proto::ids::{RelayId, SessionId};
 
 use crate::attest::LoadStateAttest;
 use crate::descriptors::{RelayDescriptors, RelayReaps};
+use crate::endpoint_limits::{LoadStateLimiter, RehomeLimiter};
 use crate::presence::PresenceStore;
 use crate::registry::RelayRegistry;
-use crate::rehome::{LoadStateLimiter, RehomeLimiter};
 use crate::tenant::TenantStore;
 
 use super::create::first_session_id;
