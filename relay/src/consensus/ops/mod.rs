@@ -7,7 +7,6 @@
 
 use super::*;
 
-mod buffer;
 mod departure;
 mod homing;
 mod leave;
@@ -16,10 +15,6 @@ mod session_start;
 mod silence;
 mod sync_coverage;
 
-pub use buffer::{
-    active_directive, ingest_local_condition, ingest_local_conditions, ingest_remote_conditions,
-    observe_directive, set_own_relay_id,
-};
 pub use departure::{
     FinalizeOutcome, activate_connection_epoch, claim_close_report, connection_epoch_matches,
     decide_abandoned_departures, departure_epoch, finalize_drop, maker_exists, record_departure,

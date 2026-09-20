@@ -149,7 +149,10 @@ impl MeshControl {
         // tie-break (see `BufferDirective.authority_relay_id`). Idempotent;
         // run on every descriptor push, not just creation, since `sync_maker`
         // itself re-syncs an existing maker the same way.
-        consensus::set_own_relay_id(&self.mesh.session.decision_makers, &key, self.our_id);
+        self.mesh
+            .session
+            .decision_makers
+            .set_own_relay_id(&key, self.our_id);
         // Feed the descriptor-derived inputs to the initial-depth computation: the
         // tenant's latency hint, and whether this is a single-relay session (no
         // mesh peers) — the latter decides both the fully-observed rule and the

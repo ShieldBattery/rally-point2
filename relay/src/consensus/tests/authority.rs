@@ -80,11 +80,11 @@ fn losing_authority_drops_the_pending_directive_but_keeps_history() {
         let maker = makers.get_mut(&k).unwrap();
         ingest_at(maker, &conditions(0, 150_000, 0, 100), 1).expect("a raise fires");
     }
-    assert!(active_directive(&registry, &k).is_some());
+    assert!(registry.active_directive(&k).is_some());
 
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::Peer);
     assert_eq!(
-        active_directive(&registry, &k),
+        registry.active_directive(&k),
         None,
         "a demoted relay stops stamping",
     );

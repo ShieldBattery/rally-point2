@@ -294,8 +294,7 @@ impl LinkDriver {
                             mesh_rtt.get_or_refresh(link.connection(), tokio::time::Instant::now());
                         // Any decision it fires is logged by the helper and
                         // broadcast later, at fan-out.
-                        let _ = crate::consensus::ingest_remote_conditions(
-                            decision_makers,
+                        let _ = decision_makers.ingest_remote_conditions(
                             &key,
                             peer_conditions,
                             mesh_rtt_us,

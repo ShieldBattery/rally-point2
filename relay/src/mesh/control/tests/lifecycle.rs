@@ -257,15 +257,17 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
         control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6), SelfRelay
 
         makers.observe_frame(&key(1), SlotId(0), GameFrameCount(1));
-        let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)
+        let decision = makers
+            .ingest_local_conditions(&key(1), &conditions)
             .expect("a raise fires on the first high-RTT sample");
         assert_eq!(
             decision.buffer.0, 4,
             "150ms -> 4 turns, within bounds (1, 6)"
         );
 
-        let directive =
-            consensus::active_directive(&makers, &key(1)).expect("a directive is queued");
+        let directive = makers
+            .active_directive(&key(1))
+            .expect("a directive is queued");
         assert_eq!(directive.buffer_turns, 4);
         assert_eq!(directive.apply_at_frame, decision.applied_frame.0);
     }
@@ -295,7 +297,8 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
         DeliveryHome::Peer(RelayId(9)),
     );
 
-    let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)
+    let decision = makers
+        .ingest_local_conditions(&key(1), &conditions)
         .expect("a raise fires on the first high-RTT sample");
     assert_eq!(
         decision.buffer.0,
@@ -322,8 +325,9 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
         0,
         DeliveryHome::Peer(RelayId(9)),
     );
-    let decision =
-        consensus::ingest_local_conditions(&makers, &key(1), &conditions).expect("a raise fires");
+    let decision = makers
+        .ingest_local_conditions(&key(1), &conditions)
+        .expect("a raise fires");
     assert_eq!(
         decision.buffer.0, 6,
         "the cushion never escapes the session's BufferBounds",

@@ -64,7 +64,10 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
         connection_epoch: Some(22),
     };
     crate::mesh::activate_conditions(&mesh.conditions, &k, SlotId(0), replacement);
-    let _ = consensus::ingest_local_condition(&mesh.session.decision_makers, &k, &replacement);
+    let _ = mesh
+        .session
+        .decision_makers
+        .ingest_local_condition(&k, &replacement);
     mesh.session
         .decision_makers
         .observe_frame(&k, SlotId(0), GameFrameCount(40));

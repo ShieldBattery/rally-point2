@@ -253,7 +253,7 @@ pub(super) fn deliver_turn_to_locals(
         &payload.commands,
         payload.sync_generation,
     );
-    match crate::consensus::active_directive(decision_makers, key) {
+    match decision_makers.active_directive(key) {
         Some(directive) => payload.buffer_directive = Some(directive),
         // Preserving an upstream stamp also records its seq and buffer: an
         // authority's locally originated turns carry its directive directly to
@@ -263,7 +263,7 @@ pub(super) fn deliver_turn_to_locals(
         // instead of restarting below it.
         None => {
             if let Some(incoming) = &payload.buffer_directive {
-                crate::consensus::observe_directive(decision_makers, key, incoming);
+                decision_makers.observe_directive(key, incoming);
             }
         }
     }

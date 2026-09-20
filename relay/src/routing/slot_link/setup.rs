@@ -50,7 +50,7 @@ pub(super) fn activate_slot(
         // seeds the mesh sidecar for this slot.
         let handshake_sample = sample_slot_conditions(link, slot, connection_epoch).conditions;
         crate::mesh::activate_conditions(&mesh.conditions, key, slot, handshake_sample);
-        let _ = consensus::ingest_local_condition(decision_makers, key, &handshake_sample);
+        let _ = decision_makers.ingest_local_condition(key, &handshake_sample);
 
         // Tell the coordinator this slot's client is here, so the tenant can name
         // who actually arrived instead of inferring it from a load deadline. Fired

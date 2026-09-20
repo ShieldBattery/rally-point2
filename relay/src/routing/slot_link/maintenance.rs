@@ -42,7 +42,9 @@ pub(super) fn resample_pre_start(link: &Link, ctx: &mut SlotLinkCtx) {
     } else {
         let sample = sample_slot_conditions(link, ctx.slot, ctx.connection_epoch).conditions;
         if crate::mesh::publish_conditions(&ctx.conditions, &ctx.key, ctx.slot, sample) {
-            let _ = consensus::ingest_local_condition(&ctx.decision_makers, &ctx.key, &sample);
+            let _ = ctx
+                .decision_makers
+                .ingest_local_condition(&ctx.key, &sample);
         }
         ctx.pre_start_deadline = Instant::now() + PRE_START_SAMPLE_INTERVAL;
     }

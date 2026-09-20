@@ -330,21 +330,21 @@ async fn mesh_turn_preserves_an_upstream_stamp_on_a_non_authority_relay() {
             &std::collections::HashSet::new(),
         );
     }
-    consensus::ingest_local_conditions(
-        &makers,
-        &k,
-        &rally_point_proto::messages::LinkConditions {
-            slots: vec![rally_point_proto::messages::SlotConditions {
-                slot: 0,
-                rtt_us: 150_000,
-                lost_packets: 0,
-                sent_packets: 100,
-                connection_epoch: None,
-            }],
-        },
-    )
-    .expect("promoted, its first decision fires");
-    let own = consensus::active_directive(&makers, &k).expect("a directive is queued");
+    makers
+        .ingest_local_conditions(
+            &k,
+            &rally_point_proto::messages::LinkConditions {
+                slots: vec![rally_point_proto::messages::SlotConditions {
+                    slot: 0,
+                    rtt_us: 150_000,
+                    lost_packets: 0,
+                    sent_packets: 100,
+                    connection_epoch: None,
+                }],
+            },
+        )
+        .expect("promoted, its first decision fires");
+    let own = makers.active_directive(&k).expect("a directive is queued");
     assert!(
         own.decision_seq > stamp.decision_seq,
         "a promoted relay continues the session's numbering",

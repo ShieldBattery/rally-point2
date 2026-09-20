@@ -320,7 +320,7 @@ fn an_over_ceiling_peer_directive_is_forwarded_verbatim_and_recorded_once() {
         decision_seq: 5,
         authority_relay_id: Some(2),
     };
-    observe_directive(&registry, &k, &over_ceiling);
+    registry.observe_directive(&k, &over_ceiling);
     assert_eq!(
         registry.lock().get(&k).unwrap().buffer(),
         BufferSize(GAME_SYNC_SAFE_BUFFER_MAX + 3),
@@ -329,9 +329,8 @@ fn an_over_ceiling_peer_directive_is_forwarded_verbatim_and_recorded_once() {
 
     // The same decision re-stamped on every forwarded turn records nothing
     // further, and a directive back under the ceiling records nothing at all.
-    observe_directive(&registry, &k, &over_ceiling);
-    observe_directive(
-        &registry,
+    registry.observe_directive(&k, &over_ceiling);
+    registry.observe_directive(
         &k,
         &BufferDirective {
             buffer_turns: GAME_SYNC_SAFE_BUFFER_MAX,
@@ -340,8 +339,7 @@ fn an_over_ceiling_peer_directive_is_forwarded_verbatim_and_recorded_once() {
         },
     );
     // A second over-ceiling *decision* is its own exposure, so its own event.
-    observe_directive(
-        &registry,
+    registry.observe_directive(
         &k,
         &BufferDirective {
             decision_seq: 7,

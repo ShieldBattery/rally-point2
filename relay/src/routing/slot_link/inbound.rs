@@ -57,7 +57,9 @@ pub(super) async fn handle_received(
         // off validated turns below — never off raw packet claims —
         // and is broadcast later at fan-out.
         if sample_is_current {
-            let _ = consensus::ingest_local_condition(&ctx.decision_makers, &ctx.key, &sample);
+            let _ = ctx
+                .decision_makers
+                .ingest_local_condition(&ctx.key, &sample);
         }
     }
     // A packet that first-delivers exactly one turn times the

@@ -50,7 +50,6 @@ async fn fans_a_validated_turn_to_the_other_slot() {
 async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
     use rally_point_proto::ids::GameFrameCount;
     use rally_point_proto::messages::{LinkConditions, SlotConditions};
-    use rally_point_relay::consensus;
     use rally_point_relay::key::SessionKey;
 
     let tenant = make_default_tenant();
@@ -81,7 +80,8 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
             connection_epoch: None,
         }],
     };
-    let decision = consensus::ingest_local_conditions(&makers, &key, &seed)
+    let decision = makers
+        .ingest_local_conditions(&key, &seed)
         .expect("the seeded high-RTT sample raises the buffer");
 
     let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
