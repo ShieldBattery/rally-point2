@@ -3,8 +3,6 @@
 //! sending a packet, pushing delivered-through cursors, and the unacked-window
 //! cap check.
 
-use std::collections::VecDeque;
-
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::Payload;
 use rally_point_transport::beacon::BeaconWriter;
@@ -15,7 +13,7 @@ use tokio::time::Instant;
 use crate::leave_announcer::LeaveAnnouncer;
 
 use super::reorder::SlotReorder;
-use super::state::retain_sent;
+use super::retention::RetentionRing;
 use super::{DriverError, DriverTiming, UNACKED_WINDOW_CAP};
 
 /// The outcome of one turn's wire handoff: sent (keep looping), or the session
@@ -38,8 +36,7 @@ pub(super) async fn send_game_turn(
     control_send: &mut noq::SendStream,
     announcer: &LeaveAnnouncer,
     next_outbound_seq: &mut u64,
-    retention: &mut VecDeque<Payload>,
-    retention_bytes: &mut usize,
+    retention: &mut RetentionRing,
     own_slot: SlotId,
     flush_deadline: &mut Instant,
     acks_owed: &mut bool,
@@ -58,7 +55,7 @@ pub(super) async fn send_game_turn(
     *next_outbound_seq += 1;
     // Retain a copy for a possible re-home re-injection before the turn is
     // handed to the link (which moves it).
-    retain_sent(retention, retention_bytes, &payload);
+    retention.push(&payload);
     let fits = match link.payload_fits(&payload) {
         Ok(fits) => fits,
         Err(error) => return OutboundSend::EndSession(Err(DriverError::from(error))),

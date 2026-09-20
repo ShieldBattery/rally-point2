@@ -1,6 +1,6 @@
-//! The state a session runs on: the reconnect/retention tuning constants, the
-//! driver's half of the game seam, the per-session state that must survive a
-//! reconnect, the connectivity-epoch fence, and the retention ring's bookkeeping.
+//! The state a session runs on: the reconnect tuning constants, the driver's
+//! half of the game seam, the per-session state that must survive a reconnect,
+//! and the connectivity-epoch fence.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
 
 use super::reorder::SlotReorder;
+use super::retention::RetentionRing;
 
 use super::{
     CHAT_CHANNEL_CAPACITY, ChatOut, DriverTiming, GAME_STARTED_CHANNEL_CAPACITY,
@@ -40,20 +41,6 @@ pub(super) const RECONNECT_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 /// turns — so this is a safety bound, not a tuned depth; past it the oldest buffered
 /// turn is dropped (with a warning) rather than let the buffer grow without bound.
 pub(super) const OUTAGE_OUTBOUND_BUFFER_CAP: usize = 256;
-
-/// How many of this client's own recently-sent turns the retention ring keeps for
-/// re-injection after a re-home. Independent of ack retirement — a turn the old
-/// relay acked is dropped from the unacked window but kept here — so the ring can
-/// re-carry it to a replacement relay whose turn ring is empty. A few times the
-/// deepest realistic latency buffer; the byte cap ([`RETENTION_BYTE_CAP`]) bounds it
-/// too, so an oversize turn can't blow the memory budget.
-pub(super) const RETENTION_TURN_CAP: usize = 512;
-
-/// The byte ceiling on the retention ring, enforced alongside
-/// [`RETENTION_TURN_CAP`] so a run of large turns can't grow it past this even
-/// under the turn cap. 256 KiB comfortably holds 512 ordinary (tens-of-bytes)
-/// turns and still bounds a pathological run of near-MTU ones.
-pub(super) const RETENTION_BYTE_CAP: usize = 256 * 1024;
 
 /// How long a run of failed same-relay re-dials must persist before the driver
 /// escalates to coordinator-mediated failover (asking the [`RehomeProvider`] where
@@ -262,13 +249,9 @@ pub(super) struct LoopState {
     pub(super) game_started: bool,
     /// A ring of this client's own recently-sent turns, retained for re-injection
     /// after a **re-home** so a replacement relay's empty turn ring still fans them
-    /// out to peers. Bounded by [`RETENTION_TURN_CAP`] and [`RETENTION_BYTE_CAP`],
-    /// drop-oldest — independent of ack retirement (a turn the old relay acked is
+    /// out to peers — independent of ack retirement (a turn the old relay acked is
     /// dropped from the unacked window but stays here). Persisted across reconnects.
-    pub(super) retention: VecDeque<Payload>,
-    /// The running encoded-byte total of [`retention`](Self::retention), so the
-    /// byte cap is enforced without re-summing the ring on every push.
-    pub(super) retention_bytes: usize,
+    pub(super) retention: RetentionRing,
     /// Retained turns a resume deferred to the fresh connection's reliable
     /// control stream: turns too large to ride any datagram, staged here
     /// because re-injecting them into the unacked window would strand them
@@ -321,8 +304,7 @@ impl LoopState {
             outbound_buffer: VecDeque::new(),
             game_started_announced: false,
             game_started: false,
-            retention: VecDeque::new(),
-            retention_bytes: 0,
+            retention: RetentionRing::default(),
             pending_control_redivert: Vec::new(),
             connectivity_states: ConnectivityEpochStates::default(),
             terminal_connectivity_slots: HashSet::new(),
@@ -394,35 +376,4 @@ pub(super) fn admit_connectivity_epoch(
         }
         (None, None) => true,
     }
-}
-
-/// Records one of this client's own sent turns into the retention ring, evicting
-/// the oldest turns until both the turn-count and byte caps hold. Called for every
-/// turn the driver sends for its own slot (datagram or diverted), so a re-home can
-/// re-inject them onto a replacement relay whose turn ring is empty.
-pub(super) fn retain_sent(
-    retention: &mut VecDeque<Payload>,
-    retention_bytes: &mut usize,
-    payload: &Payload,
-) {
-    retention.push_back(payload.clone());
-    *retention_bytes += retained_size(payload);
-    while retention.len() > RETENTION_TURN_CAP
-        || (*retention_bytes > RETENTION_BYTE_CAP && retention.len() > 1)
-    {
-        if let Some(dropped) = retention.pop_front() {
-            *retention_bytes = retention_bytes.saturating_sub(retained_size(&dropped));
-        } else {
-            break;
-        }
-    }
-}
-
-/// The size a retained turn counts against [`RETENTION_BYTE_CAP`]: its command
-/// bytes (the variable bulk) plus a fixed allowance for the small fixed fields.
-/// An estimate, not the exact encoded length — the byte cap is a memory safety
-/// bound, so an approximation that avoids pulling a prost dependency into the lib
-/// is enough.
-pub(super) fn retained_size(payload: &Payload) -> usize {
-    payload.commands.len() + 32
 }

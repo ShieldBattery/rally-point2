@@ -1,7 +1,8 @@
-//! Re-delivering this client's own retained turns after a resume: which turns
-//! a re-home re-injects into the unacked window, which are too large for any
-//! datagram and must ride the fresh control stream instead, and the own-slot
-//! receive-window anchors a resume declares so nothing it re-sends is refused.
+//! The ring of this client's own recently-sent turns, and re-delivering them
+//! after a resume: which turns a re-home re-injects into the unacked window,
+//! which are too large for any datagram and must ride the fresh control stream
+//! instead, and the own-slot receive-window anchors a resume declares so
+//! nothing it re-sends is refused.
 
 use std::collections::VecDeque;
 
@@ -11,6 +12,101 @@ use rally_point_transport::control::{ControlSendError, send_control_turn};
 use rally_point_transport::{Link, noq};
 
 use super::state::LoopState;
+
+/// How many of this client's own recently-sent turns the retention ring keeps for
+/// re-injection after a re-home. Independent of ack retirement — a turn the old
+/// relay acked is dropped from the unacked window but kept here — so the ring can
+/// re-carry it to a replacement relay whose turn ring is empty. A few times the
+/// deepest realistic latency buffer; the byte cap ([`RETENTION_BYTE_CAP`]) bounds it
+/// too, so an oversize turn can't blow the memory budget.
+const RETENTION_TURN_CAP: usize = 512;
+
+/// The byte ceiling on the retention ring, enforced alongside
+/// [`RETENTION_TURN_CAP`] so a run of large turns can't grow it past this even
+/// under the turn cap. 256 KiB comfortably holds 512 ordinary (tens-of-bytes)
+/// turns and still bounds a pathological run of near-MTU ones.
+const RETENTION_BYTE_CAP: usize = 256 * 1024;
+
+/// A drop-oldest ring of this client's own recently-sent turns, bounded by both
+/// [`RETENTION_TURN_CAP`] and [`RETENTION_BYTE_CAP`]. Every turn the driver
+/// sends for its own slot goes in (datagram or diverted), so a re-home can
+/// re-inject them onto a replacement relay whose turn ring is empty.
+///
+/// The running byte total is the ring's own business — it exists only so the
+/// byte cap is enforced without re-summing the ring on every push — which is
+/// why nothing outside carries it.
+#[derive(Default)]
+pub(super) struct RetentionRing {
+    turns: VecDeque<Payload>,
+    bytes: usize,
+}
+
+impl RetentionRing {
+    /// Records one sent turn, evicting the oldest turns until both caps hold.
+    /// The last remaining entry is never evicted on the byte cap alone: a lone
+    /// turn larger than the whole budget is still the only copy of a turn some
+    /// peer may be stalled on.
+    pub(super) fn push(&mut self, payload: &Payload) {
+        self.turns.push_back(payload.clone());
+        self.bytes += retained_size(payload);
+        while self.turns.len() > RETENTION_TURN_CAP
+            || (self.bytes > RETENTION_BYTE_CAP && self.turns.len() > 1)
+        {
+            let Some(dropped) = self.turns.pop_front() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(retained_size(&dropped));
+        }
+    }
+
+    /// The retained turns, oldest first — what a resume walks to decide which
+    /// go back into the unacked window and which must ride the control stream.
+    pub(super) fn iter(&self) -> impl Iterator<Item = &Payload> {
+        self.turns.iter()
+    }
+
+    /// The seq of the oldest retained turn: the front a re-home's own-slot
+    /// anchor descends from, or `None` when nothing is retained.
+    pub(super) fn front_seq(&self) -> Option<u64> {
+        self.turns.front().map(|turn| turn.seq)
+    }
+
+    /// The oldest retained turn a same-relay resume will restage onto the fresh
+    /// control stream — the entries too large to ride any datagram (see
+    /// [`redivert_oversize_retention_on_same_relay_resume`], which stages
+    /// exactly these). Judged against the transport's static floor: the live
+    /// admission equals it on every connection the session can hold
+    /// (under-floor peers are refused at establishment), and the dead link this
+    /// is computed beside no longer has a live budget to ask.
+    pub(super) fn oldest_oversize_seq(&self) -> Option<u64> {
+        self.turns
+            .iter()
+            .filter(|turn| !rally_point_transport::ack_manager::fits_guaranteed_datagram(turn))
+            .map(|turn| turn.seq)
+            .min()
+    }
+
+    /// How many turns are retained.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.turns.len()
+    }
+
+    /// What the ring counts against its byte cap.
+    #[cfg(test)]
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// The size a retained turn counts against [`RETENTION_BYTE_CAP`]: its command
+/// bytes (the variable bulk) plus a fixed allowance for the small fixed fields.
+/// An estimate, not the exact encoded length — the byte cap is a memory safety
+/// bound, so an approximation that avoids pulling a prost dependency into the lib
+/// is enough.
+fn retained_size(payload: &Payload) -> usize {
+    payload.commands.len() + 32
+}
 
 /// Re-carries the retained turns onto a freshly re-homed link so the replacement
 /// relay's empty turn ring re-delivers them to peers (each deduping by origin
@@ -122,21 +218,6 @@ pub(super) fn same_relay_resume_cursors(
     let mut cursors = peer_cursors.to_vec();
     cursors.push((own_slot, anchor));
     cursors
-}
-
-/// The oldest retained turn a same-relay resume will restage onto the fresh
-/// control stream — the retention entries too large for any datagram (see
-/// [`redivert_oversize_retention_on_same_relay_resume`], which stages exactly
-/// these). Judged against the transport's static floor: the live admission
-/// equals it on every connection the session can hold (under-floor peers are
-/// refused at establishment), and the dead link this is computed beside no
-/// longer has a live budget to ask.
-pub(super) fn oldest_restaged_oversize(retention: &VecDeque<Payload>) -> Option<u64> {
-    retention
-        .iter()
-        .filter(|turn| !rally_point_transport::ack_manager::fits_guaranteed_datagram(turn))
-        .map(|turn| turn.seq)
-        .min()
 }
 
 /// Stages one turn for reliable-control delivery unless an identical

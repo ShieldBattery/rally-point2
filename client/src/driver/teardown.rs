@@ -14,6 +14,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::leave_announcer::LeaveAnnouncer;
 
+use super::retention::RetentionRing;
 use super::send::{OutboundSend, send_game_turn, send_packet};
 use super::{DriverError, DriverTiming};
 
@@ -34,8 +35,7 @@ pub(super) async fn drain_and_settle(
     control_send: &mut noq::SendStream,
     announcer: &mut LeaveAnnouncer,
     next_outbound_seq: &mut u64,
-    retention: &mut VecDeque<Payload>,
-    retention_bytes: &mut usize,
+    retention: &mut RetentionRing,
     own_slot: SlotId,
     flush_deadline: &mut Instant,
     acks_owed: &mut bool,
@@ -54,7 +54,6 @@ pub(super) async fn drain_and_settle(
             announcer,
             next_outbound_seq,
             retention,
-            retention_bytes,
             own_slot,
             flush_deadline,
             acks_owed,
@@ -74,7 +73,6 @@ pub(super) async fn drain_and_settle(
             announcer,
             next_outbound_seq,
             retention,
-            retention_bytes,
             own_slot,
             flush_deadline,
             acks_owed,

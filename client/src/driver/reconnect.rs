@@ -18,8 +18,8 @@ use crate::identity::Identity;
 use super::DriverError;
 use super::backoff::{Backoff, EscalationWait, WaitOutcome, await_rehome, wait_backoff};
 use super::retention::{
-    oldest_restaged_oversize, redivert_oversize_retention_on_same_relay_resume,
-    rehome_own_slot_anchor, reinject_retention, same_relay_resume_cursors,
+    redivert_oversize_retention_on_same_relay_resume, rehome_own_slot_anchor, reinject_retention,
+    same_relay_resume_cursors,
 };
 use super::state::{
     GameSeam, LoopState, OUTAGE_OUTBOUND_BUFFER_CAP, RECONNECT_DIAL_TIMEOUT,
@@ -259,7 +259,7 @@ pub(super) async fn reconnect_link(
         let same_relay_cursors = same_relay_resume_cursors(
             &cursors,
             link.oldest_replayable_seq(own_slot),
-            oldest_restaged_oversize(&state.retention),
+            state.retention.oldest_oversize_seq(),
             own_slot,
             state.next_outbound_seq,
         );
@@ -389,7 +389,7 @@ pub(super) async fn reconnect_link(
                                     if let Some(anchor) = rehome_own_slot_anchor(
                                         link,
                                         own_slot,
-                                        state.retention.front().map(|turn| turn.seq),
+                                        state.retention.front_seq(),
                                     ) {
                                         rehome_cursors.push((own_slot, anchor));
                                     }

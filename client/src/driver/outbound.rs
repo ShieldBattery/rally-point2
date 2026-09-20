@@ -20,6 +20,7 @@ use tokio::time::Instant;
 use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
 
+use super::retention::RetentionRing;
 use super::send::{OutboundSend, send_game_turn};
 use super::session::ArmFlow;
 use super::{ChatOut, DriverError, DriverTiming, HELD_TURN_CAP};
@@ -35,8 +36,7 @@ pub(super) async fn on_outgoing_turn(
     control_send: &mut noq::SendStream,
     announcer: &mut LeaveAnnouncer,
     next_outbound_seq: &mut u64,
-    retention: &mut VecDeque<Payload>,
-    retention_bytes: &mut usize,
+    retention: &mut RetentionRing,
     own_slot: SlotId,
     flush_deadline: &mut Instant,
     acks_owed: &mut bool,
@@ -66,7 +66,6 @@ pub(super) async fn on_outgoing_turn(
                     announcer,
                     next_outbound_seq,
                     retention,
-                    retention_bytes,
                     own_slot,
                     flush_deadline,
                     acks_owed,
@@ -110,7 +109,6 @@ pub(super) async fn on_outgoing_turn(
                         announcer,
                         next_outbound_seq,
                         retention,
-                        retention_bytes,
                         own_slot,
                         flush_deadline,
                         acks_owed,
@@ -145,8 +143,7 @@ pub(super) async fn on_held_due(
     control_send: &mut noq::SendStream,
     announcer: &mut LeaveAnnouncer,
     next_outbound_seq: &mut u64,
-    retention: &mut VecDeque<Payload>,
-    retention_bytes: &mut usize,
+    retention: &mut RetentionRing,
     own_slot: SlotId,
     flush_deadline: &mut Instant,
     acks_owed: &mut bool,
@@ -165,7 +162,6 @@ pub(super) async fn on_held_due(
             announcer,
             next_outbound_seq,
             retention,
-            retention_bytes,
             own_slot,
             flush_deadline,
             acks_owed,

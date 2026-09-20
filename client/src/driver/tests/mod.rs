@@ -6,7 +6,7 @@
 //! The topic modules below inherit all of it, plus the driver's own private
 //! items, through their `use super::*;`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use rally_point_proto::beacon;

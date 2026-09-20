@@ -1,8 +1,64 @@
-//! The retention ring across a resume: which turns are re-injected into the
-//! unacked window, which are restaged onto the control stream, and the
-//! own-slot anchors a same-relay resume and a re-home each declare.
+//! The retention ring: what it evicts under its two caps, and how it is read
+//! across a resume — which turns are re-injected into the unacked window,
+//! which are restaged onto the control stream, and the own-slot anchors a
+//! same-relay resume and a re-home each declare.
 
 use super::*;
+
+/// A turn whose command bytes alone are `bytes` long.
+fn sized_turn(seq: u64, bytes: usize) -> Payload {
+    turn(seq, &vec![0x42; bytes])
+}
+
+#[test]
+fn the_turn_cap_evicts_oldest_first() {
+    let mut ring = RetentionRing::default();
+    // One past the cap, so exactly the oldest turn is evicted.
+    for seq in 0..=512 {
+        ring.push(&sized_turn(seq, 1));
+    }
+    assert_eq!(ring.len(), 512, "the ring holds at most its turn cap");
+    assert_eq!(
+        ring.front_seq(),
+        Some(1),
+        "the oldest turn is the one that went",
+    );
+}
+
+#[test]
+fn the_byte_cap_evicts_before_the_turn_cap_is_reached() {
+    // A run of large turns must not grow the ring past the byte budget even
+    // while the turn count is nowhere near its cap.
+    let mut ring = RetentionRing::default();
+    for seq in 0..64 {
+        ring.push(&sized_turn(seq, 32 * 1024));
+    }
+    assert!(
+        ring.len() < 64,
+        "the byte cap evicted before the turn cap could",
+    );
+    assert!(
+        ring.bytes() <= 256 * 1024,
+        "the ring settles inside its byte budget, got {}",
+        ring.bytes(),
+    );
+    assert_eq!(
+        ring.front_seq().map(|seq| seq + ring.len() as u64),
+        Some(64),
+        "what survives is the newest contiguous run",
+    );
+}
+
+#[test]
+fn a_lone_over_budget_turn_is_never_evicted() {
+    // A turn larger than the whole byte budget is still the only copy of a
+    // turn a peer may be stalled on: keeping it over budget beats dropping it.
+    let mut ring = RetentionRing::default();
+    ring.push(&sized_turn(7, 512 * 1024));
+    assert_eq!(ring.len(), 1);
+    assert_eq!(ring.front_seq(), Some(7));
+    assert!(ring.bytes() > 256 * 1024);
+}
 
 #[tokio::test]
 async fn rehome_anchor_extends_below_the_front_only_through_contiguous_unacked() {
@@ -43,8 +99,8 @@ async fn reinject_retention_defers_oversize_turns_to_the_control_stream() {
     let (mut link_a, link_b, _ea, _eb) = connected_links().await;
     let mut state = LoopState::new(Arc::new(AtomicBool::new(false)), TEST_TIMING);
 
-    state.retention.push_back(turn(0, &[0x01]));
-    state.retention.push_back(turn(1, &vec![0x42; 4096]));
+    state.retention.push(&turn(0, &[0x01]));
+    state.retention.push(&turn(1, &vec![0x42; 4096]));
 
     reinject_retention(&mut link_a, &mut state);
 
@@ -97,8 +153,8 @@ async fn same_relay_resume_redivers_only_the_oversize_retained_turns() {
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
     let mut state = LoopState::new(Arc::new(AtomicBool::new(false)), TEST_TIMING);
 
-    state.retention.push_back(turn(0, &[0x01])); // datagram-sized
-    state.retention.push_back(turn(1, &vec![0x42; 4096])); // oversize
+    state.retention.push(&turn(0, &[0x01])); // datagram-sized
+    state.retention.push(&turn(1, &vec![0x42; 4096])); // oversize
 
     redivert_oversize_retention_on_same_relay_resume(&link_a, &mut state);
 
@@ -144,7 +200,7 @@ async fn a_driver_that_sent_an_oversize_turn_retains_it_for_a_resume() {
         1,
         "the oversize turn was retained when it was first sent",
     );
-    assert_eq!(state.retention[0].commands.len(), 4096);
+    assert_eq!(state.retention.iter().next().unwrap().commands.len(), 4096,);
 }
 
 #[tokio::test]
@@ -225,7 +281,7 @@ async fn same_relay_resume_anchors_at_the_oldest_in_flight_seq_for_a_nonzero_slo
     let cursors = same_relay_resume_cursors(
         &[],
         link.oldest_replayable_seq(own_slot),
-        oldest_restaged_oversize(&state.retention),
+        state.retention.oldest_oversize_seq(),
         own_slot,
         state.next_outbound_seq,
     );
@@ -252,11 +308,11 @@ fn same_relay_cursor_anchors_below_a_restaged_oversize_turn() {
     // falling through to next_outbound_seq would base the relay's window
     // above it, and the control-stream restage would be discarded as a
     // duplicate — a permanent hole for every peer.
-    let mut retention: VecDeque<Payload> = VecDeque::new();
-    retention.push_back(turn(0, &vec![0x42; 4096])); // oversize, lost
-    retention.push_back(turn(1, &[0x01])); // datagram-sized, acked
+    let mut retention = RetentionRing::default();
+    retention.push(&turn(0, &vec![0x42; 4096])); // oversize, lost
+    retention.push(&turn(1, &[0x01])); // datagram-sized, acked
 
-    let oversize = oldest_restaged_oversize(&retention);
+    let oversize = retention.oldest_oversize_seq();
     assert_eq!(
         oversize,
         Some(0),

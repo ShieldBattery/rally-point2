@@ -13,8 +13,9 @@
 - `reorder.rs` — `SlotReorder`: the per-slot ordered-release buffer and the delivery
   cursor a resume is read back from.
 - `state.rs` — `GameSeam` (and the one place both halves of the seam's channels are wired),
-  `LoopState`, the connectivity-epoch fence, retention bookkeeping.
-- `reconnect.rs` / `retention.rs` — re-dial + escalation; what a resume re-sends and how it anchors.
+  `LoopState`, the connectivity-epoch fence.
+- `reconnect.rs` / `retention.rs` — re-dial + escalation; `RetentionRing` and what a
+  resume re-sends off it, and how it anchors.
 - `backoff.rs` — non-blocking game pushes, the waits that keep servicing the seam, jittered backoff.
 - `teardown.rs` — the post-loop drain and the two delivery fences.
 
