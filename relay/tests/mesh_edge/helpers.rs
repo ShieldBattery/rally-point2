@@ -6,81 +6,16 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rally_point_proto::ids::{RelayId, SessionId, SlotId};
+use rally_point_proto::ids::RelayId;
 use rally_point_proto::mesh::{MESH_PRESENCE_LEN, MeshPresence};
-use rally_point_proto::token::SignedToken;
-use rally_point_relay::auth::Registry;
 use rally_point_relay::mesh;
 use rally_point_relay::routing::{SessionKey, Sessions};
-use rally_point_relay::server;
-use rally_point_transport::quic::{client_config, mesh_client_config, server_config};
-use rally_point_transport::rustls::pki_types::CertificateDer;
+use rally_point_transport::quic::{mesh_client_config, server_config};
 use rally_point_transport::{MeshLink, noq, rustls};
 
 use tokio::sync::mpsc;
 
-pub use crate::common::{
-    AnyError, KID, Keypair, TENANT, Tenant, keypair, mint_token, self_signed, turn,
-    wait_for_connectivity,
-};
-
-/// The one tenant these tests trust, named by the suite's fixed key id.
-pub fn make_tenant() -> Tenant {
-    crate::common::make_tenant(KID, TENANT)
-}
-
-/// A registry trusting `tenant` alone.
-pub fn registry_for(tenant: &Tenant) -> Registry {
-    crate::common::registry_for(&[tenant])
-}
-
-/// Runs the client side of the handshake as a fresh dial, presenting no resume
-/// cursors (an empty, zero-count frame) so the relay replays nothing.
-pub async fn handshake(
-    connection: &noq::Connection,
-    token: &SignedToken,
-    signing_key: &Keypair,
-) -> Result<(), AnyError> {
-    crate::common::handshake(connection, token, signing_key, &[]).await
-}
-
-/// A relay with its client edge, shared mesh state, and a mesh-accept channel.
-pub struct Relay {
-    pub addr: SocketAddr,
-    pub ca: CertificateDer<'static>,
-    pub sessions: Sessions,
-    pub mesh: mesh::MeshState,
-    pub mesh_rx: mpsc::Receiver<noq::Connection>,
-}
-
-impl Relay {
-    pub fn start(tenant: &Tenant) -> Self {
-        let (chain, key, ca) = self_signed();
-        let cfg = server_config(chain, key).unwrap();
-        let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-        let endpoint = noq::Endpoint::server(cfg, bind).unwrap();
-        let addr = endpoint.local_addr().unwrap();
-        let sessions: Sessions = Arc::default();
-        let mesh = mesh::new_mesh_state();
-        let (mesh_tx, mesh_rx) = mpsc::channel(8);
-
-        tokio::spawn(server::serve(
-            endpoint,
-            Arc::new(registry_for(tenant)),
-            Arc::clone(&sessions),
-            mesh.clone(),
-            Some(mesh_tx),
-        ));
-
-        Self {
-            addr,
-            ca,
-            sessions,
-            mesh,
-            mesh_rx,
-        }
-    }
-}
+pub use crate::common::*;
 
 /// Spawns a mesh-link driver on `link` and returns the command sender the test
 /// uses to join and leave sessions. A thin wrapper over `run_mesh_link` so the
@@ -243,28 +178,6 @@ pub async fn connection_with_peer_datagram_limit(
     (client_conn, client, server)
 }
 
-/// Connects a client to `relay` for `slot`, runs the authorization handshake,
-/// and returns the live connection plus the client endpoint (kept alive by the
-/// caller so the connection is not torn down when the endpoint drops).
-pub async fn connect_client(
-    relay: &Relay,
-    tenant: &Tenant,
-    session: SessionId,
-    slot: SlotId,
-) -> Result<(noq::Connection, noq::Endpoint), AnyError> {
-    let client_key = keypair();
-    let token = mint_token(tenant, session, slot, client_key.public);
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay.ca.clone()).unwrap();
-    let client_cfg = client_config(roots).unwrap();
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = noq::Endpoint::client(bind).unwrap();
-    endpoint.set_default_client_config(client_cfg);
-    let connection = endpoint.connect(relay.addr, "localhost")?.await?;
-    handshake(&connection, &token, &client_key).await?;
-    Ok((connection, endpoint))
-}
-
 /// Opens a client's reliable control-stream halves: the send half it writes its
 /// own lobby commands on, and the reader that surfaces the frames the relay
 /// pushes down (lobby commands from the other members). Mirrors what a real
@@ -286,30 +199,11 @@ pub async fn open_lobby_streams(
 pub async fn next_lobby(
     rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
 ) -> (u32, Vec<u8>) {
-    match next_non_connectivity(rx).await {
+    match recv_meaningful(rx).await {
         rally_point_transport::control::ControlInbound::Lobby(command) => {
             (command.slot, command.payload.to_vec())
         }
         other => panic!("expected a lobby command, got {other:?}"),
-    }
-}
-
-/// Reads the next control frame that isn't a `SlotConnectivity` change, skipping
-/// the informational connectivity frames the relay fans on every register and
-/// disconnect. Panics on timeout or a closed stream. The mesh tests read the
-/// substantive frame their setup produced past those.
-pub async fn next_non_connectivity(
-    rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
-) -> rally_point_transport::control::ControlInbound {
-    use rally_point_transport::control::ControlInbound;
-    loop {
-        let inbound = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("a control frame arrived within 2s")
-            .expect("control reader ended early");
-        if !matches!(inbound, ControlInbound::Connectivity(_)) {
-            return inbound;
-        }
     }
 }
 
@@ -329,7 +223,7 @@ pub async fn next_mesh_presence(stream: &mut noq::RecvStream) -> MeshPresence {
 pub async fn next_chat(
     rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
 ) -> (u32, u32, u32, String) {
-    match next_non_connectivity(rx).await {
+    match recv_meaningful(rx).await {
         rally_point_transport::control::ControlInbound::Chat(chat) => {
             (chat.slot, chat.target_kind, chat.target_slot, chat.text)
         }
@@ -343,7 +237,7 @@ pub async fn next_chat(
 pub async fn next_skin(
     rx: &mut mpsc::Receiver<rally_point_transport::control::ControlInbound>,
 ) -> (u32, Vec<u8>) {
-    match next_non_connectivity(rx).await {
+    match recv_meaningful(rx).await {
         rally_point_transport::control::ControlInbound::Skin(skin) => {
             (skin.slot, skin.payload.to_vec())
         }
@@ -376,11 +270,8 @@ pub async fn mesh_two_relays(
         .unwrap()
         .await
         .unwrap();
-    let conn_b = relay_b
-        .mesh_rx
-        .recv()
-        .await
-        .expect("B dispatched mesh conn");
+    let mut mesh_accept = relay_b.mesh_accept_rx();
+    let conn_b = mesh_accept.recv().await.expect("B dispatched mesh conn");
 
     let cmds_a = spawn_mesh_link(
         MeshLink::new(conn_a),

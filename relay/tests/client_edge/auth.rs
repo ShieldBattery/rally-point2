@@ -9,32 +9,59 @@ use std::time::Duration;
 use crate::helpers::*;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::Payload;
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ConnectionChallenge,
 };
-use rally_point_relay::server;
+use rally_point_relay::server::{self, SLOT_TAKEN_CLOSE};
 use rally_point_transport::noq;
 use rally_point_transport::quic::server_config;
 
+/// What a refused authorization looks like on the wire, for both ways the
+/// credentials can be wrong: the relay never writes the acknowledgement byte and
+/// the connection ends. Which decision refused it — the challenge proof or the
+/// key that signed the token — is decided in `auth`; what only a real relay
+/// shows is that either refusal reaches the client as a dead handshake rather
+/// than a connection left hanging half-authorized.
 #[tokio::test]
-async fn rejects_a_bad_connection_binding_proof() {
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+async fn a_handshake_with_a_bad_proof_or_an_unknown_tenant_key_is_refused() {
+    let tenant = make_default_tenant();
+    let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
     let endpoint = client_endpoint(&ca);
+    // A tenant whose signing key the relay's registry has never seen.
+    let impostor = make_tenant("impostor-key", "impostor");
 
-    // A valid token, but the challenge is answered with a key that isn't the one
-    // the token commits to.
-    let client_key = keypair();
-    let wrong_key = keypair();
-    let token = mint_token(&tenant, SessionId(1), SlotId(0), client_key.public);
-    let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    for (case, token_signer, answer_with_the_committed_key) in [
+        (
+            "a proof signed by a key the token does not commit to",
+            &tenant,
+            false,
+        ),
+        (
+            "a token signed by an unregistered tenant key",
+            &impostor,
+            true,
+        ),
+    ] {
+        let client_key = keypair();
+        let token = mint_token(token_signer, SessionId(1), SlotId(0), client_key.public);
+        let answer = if answer_with_the_committed_key {
+            client_key
+        } else {
+            keypair()
+        };
+        let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
 
-    assert!(
-        handshake(&connection, &token, &wrong_key, &[])
-            .await
-            .is_err()
-    );
+        assert!(
+            handshake(&connection, &token, &answer, &[]).await.is_err(),
+            "{case} is never acknowledged",
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), connection.closed())
+                .await
+                .is_ok(),
+            "{case} ends the connection rather than leaving it half-authorized",
+        );
+    }
 }
 
 #[tokio::test]
@@ -44,8 +71,8 @@ async fn rejects_a_challenge_proof_bound_to_another_connection() {
     // right challenge with the right key, but bound to a second connection's
     // channel — exactly what a forwarding relay would hold — so the relay, checking
     // against this connection's binding, must reject it.
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let tenant = make_default_tenant();
+    let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
     let endpoint = client_endpoint(&ca);
     let client_key = keypair();
 
@@ -80,28 +107,9 @@ async fn rejects_a_challenge_proof_bound_to_another_connection() {
 }
 
 #[tokio::test]
-async fn rejects_a_token_from_an_unknown_tenant_key() {
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
-    let endpoint = client_endpoint(&ca);
-
-    // The token is signed by a tenant key the relay's registry has never seen.
-    let impostor = make_tenant("impostor-key", "impostor");
-    let client_key = keypair();
-    let token = mint_token(&impostor, SessionId(1), SlotId(0), client_key.public);
-    let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
-
-    assert!(
-        handshake(&connection, &token, &client_key, &[])
-            .await
-            .is_err()
-    );
-}
-
-#[tokio::test]
 async fn rejects_a_second_client_on_the_same_slot() {
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let tenant = make_default_tenant();
+    let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
     let endpoint = client_endpoint(&ca);
     let session = SessionId(5);
 
@@ -117,8 +125,17 @@ async fn rejects_a_second_client_on_the_same_slot() {
     assert!(
         handshake(&connection, &token, &client_key, &[])
             .await
-            .is_err()
+            .is_err(),
+        "a double-connect is never acknowledged",
     );
+    match connection.closed().await {
+        noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
+            u32::try_from(u64::from(app.error_code)).unwrap(),
+            SLOT_TAKEN_CLOSE,
+            "the second client is refused with the slot-taken close code,              distinct from the departed slot's terminal one",
+        ),
+        other => panic!("expected the slot-taken application close, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -126,7 +143,7 @@ async fn isolates_identical_session_ids_across_tenants() {
     // Two tenants the relay trusts, each with its own signing key.
     let tenant_a = make_tenant("tenant-a-key", "tenant-a");
     let tenant_b = make_tenant("tenant-b-key", "tenant-b");
-    let (addr, ca) = start_relay(registry_for(&[&tenant_a, &tenant_b]));
+    let TestRelay { addr, ca, .. } = start_relay(registry_for(&[&tenant_a, &tenant_b]));
     let endpoint = client_endpoint(&ca);
 
     // The same numeric session id is live for both tenants at once. Session ids are
@@ -142,13 +159,7 @@ async fn isolates_identical_session_ids_across_tenants() {
     let mut b1 = connect_slot(&endpoint, addr, &tenant_b, session, SlotId(1)).await;
 
     // Tenant A, slot 0, submits a build.
-    a0.send(Some(Payload {
-        seq: 0,
-        slot: 0,
-        commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-        ..Default::default()
-    }))
-    .unwrap();
+    a0.send(Some(build_turn(0, 0, None))).unwrap();
 
     // It reaches tenant A's other slot.
     let mut delivered = Vec::new();
@@ -167,7 +178,7 @@ async fn isolates_identical_session_ids_across_tenants() {
 
 #[tokio::test]
 async fn refuses_connections_beyond_the_handshake_limit() {
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
 
     // A relay that allows only one authorization handshake in flight at a time.
     let (chain, key, ca) = self_signed();
@@ -177,7 +188,7 @@ async fn refuses_connections_beyond_the_handshake_limit() {
     let addr = relay.local_addr().unwrap();
     tokio::spawn(server::serve_with_max_pending(
         relay,
-        Arc::new(registry_for(&[&tenant])),
+        Arc::new(registry_for_one(&tenant)),
         std::sync::Arc::default(),
         rally_point_relay::mesh::new_mesh_state(),
         None,
@@ -200,12 +211,12 @@ async fn refuses_connections_beyond_the_handshake_limit() {
 
 #[tokio::test]
 async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
-    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::consensus;
     use rally_point_relay::routing::SessionKey;
     use rally_point_relay::server::SLOT_DEPARTED_CLOSE;
     use rally_point_transport::control::send_control_leave_intent;
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(301);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -215,19 +226,9 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     // Authority over {0, 1} so the session starts and a decided leave is real.
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).expecting([0, 1]).apply();
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let _slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
@@ -237,16 +238,11 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     // reject to fire). Authored by slot 1 itself — fan-out excludes the source, so
     // slot 1 never receives its own turn back and `expect_closed` below sees only
     // the eventual close, not a stray pending datagram.
-    slot1
-        .send(Some(Payload {
-            seq: 0,
-            slot: 1,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    slot1.send(Some(build_turn(1, 0, Some(10)))).unwrap();
+    wait_until("the relay never observed the leaver's turn", || {
+        consensus::slot_frame(&makers, &key, SlotId(1)).is_some()
+    })
+    .await;
 
     // Slot 1 leaves cleanly: a clean leave is decided immediately, no hold, so the
     // slot's departure is final. The relay closes slot 1's link as confirmation.
@@ -284,10 +280,10 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
 async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
     use rally_point_relay::server::PROVISIONAL_CAPACITY_CLOSE;
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let mesh = rally_point_relay::mesh::new_mesh_state_with_journal_ceiling(1);
     mesh.provisional_turns.arm();
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     // The first session takes the only journal slot and serves normally; a
@@ -315,7 +311,6 @@ async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
 
 #[tokio::test]
 async fn a_slot_not_homed_on_this_relay_is_refused() {
-    use rally_point_relay::consensus::{self, Authority};
     use rally_point_relay::routing::SessionKey;
     use rally_point_relay::server::SLOT_NOT_HOMED_CLOSE;
 
@@ -328,7 +323,7 @@ async fn a_slot_not_homed_on_this_relay_is_refused() {
     // is refused before the handshake ever completes, while a slot present in
     // it (or a set left empty, the legacy/dev default) is admitted exactly as
     // before this check existed.
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(302);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -339,19 +334,9 @@ async fn a_slot_not_homed_on_this_relay_is_refused() {
     // multi-relay session where slot 1 is homed elsewhere.
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            homed_slots: [SlotId(0)].into_iter().collect(),
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).homed([0]).apply();
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     // Slot 0 is homed here: admitted normally.

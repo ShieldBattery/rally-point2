@@ -25,47 +25,37 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     use rally_point_relay::consensus::{self, Authority};
     use rally_point_transport::control::ControlInbound;
 
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let session = SessionId(41);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
-    let relay_a = Relay::start(&tenant);
-    let relay_b = Relay::start(&tenant);
-    let expected: std::collections::HashSet<_> = [SlotId(0), SlotId(1)].into_iter().collect();
-    let bounds = rally_point_proto::control::BufferBounds::new(0, 20).unwrap();
+    let relay_a = Relay::start(&tenant, 1);
+    let relay_b = Relay::start(&tenant, 2);
 
     // Relay B is the authority. That choice is load-bearing for the regression:
     // A joins first, so B must recover A's early slot announcement after B's own
     // later Join rather than starting from the announcement B sends to A.
-    let _ = consensus::sync_maker(
-        &relay_a.mesh.decision_makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: expected.clone(),
-            homed_slots: [SlotId(0)].into_iter().collect(),
-            ..consensus::MakerSync::new(bounds, Authority::Peer)
-        },
-    );
-    let _ = consensus::sync_maker(
-        &relay_b.mesh.decision_makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: expected,
-            homed_slots: [SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(bounds, Authority::SelfRelay)
-        },
-    );
+    seed_authority(&relay_a.mesh.decision_makers, &key)
+        .expecting([0, 1])
+        .homed([0])
+        .authority(Authority::Peer)
+        .apply();
+    seed_authority(&relay_b.mesh.decision_makers, &key)
+        .expecting([0, 1])
+        .homed([1])
+        .apply();
 
     // Both clients connect before either side joins the mesh session. Their live
     // SlotPresent frames therefore have no registered mesh channel to use; Join
     // reconciliation is the only way those already-live slots cross the link.
-    let (client_a, _client_ep_a) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
-    let (client_b, _client_ep_b) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
-    let (_send_a, mut control_a) = open_lobby_streams(&client_a).await;
-    let (_send_b, mut control_b) = open_lobby_streams(&client_b).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    let client_a = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let client_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    let (_send_a, mut control_a) = open_lobby_streams(client_a.connection()).await;
+    let (_send_b, mut control_b) = open_lobby_streams(client_b.connection()).await;
+    wait_for_slots(&relay_a.sessions, &key, 1).await;
+    wait_for_slots(&relay_b.sessions, &key, 1).await;
     assert!(!consensus::session_started(
         &relay_b.mesh.decision_makers,
         &key
@@ -78,7 +68,11 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     // A's replay happens while B is still unjoined and is intentionally
     // discarded. Prove that this one-sided state alone cannot start B.
     commands_a.send(mesh::MeshCommand::Join(key.clone()))?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    // A's replay is on the wire by now; give B long enough to have acted on it
+    // if it were going to. A negative claim needs some window, but a short one:
+    // B is one loopback hop away.
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!consensus::session_started(
         &relay_b.mesh.decision_makers,
         &key
@@ -89,11 +83,11 @@ async fn asymmetric_mesh_joins_converge_slot_presence_and_start_the_session() ->
     // roster. The authority starts both local and peer clients exactly once.
     commands_b.send(mesh::MeshCommand::Join(key.clone()))?;
     assert!(matches!(
-        next_non_connectivity(&mut control_b).await,
+        recv_meaningful(&mut control_b).await,
         ControlInbound::SessionStart(_)
     ));
     assert!(matches!(
-        next_non_connectivity(&mut control_a).await,
+        recv_meaningful(&mut control_a).await,
         ControlInbound::SessionStart(_)
     ));
     assert!(consensus::session_started(

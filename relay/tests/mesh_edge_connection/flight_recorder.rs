@@ -17,7 +17,7 @@ async fn the_flight_recorder_captures_a_client_lifecycle_and_flushes_on_close()
 -> Result<(), AnyError> {
     use rally_point_relay::observability::flight_recorder::{FileSink, FlightBlob, FlightEvent};
 
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let session = SessionId(1);
     let relay = Relay::start(&tenant, 1);
     let key = SessionKey {
@@ -25,15 +25,24 @@ async fn the_flight_recorder_captures_a_client_lifecycle_and_flushes_on_close()
         session,
     };
     let flight = relay.mesh.decision_makers.flight_recorder().clone();
-    let dir = std::env::temp_dir().join(format!("rp2-flight-e2e-{}", std::process::id()));
+    // A directory of this run's own: process-scoped alone would collide with a
+    // rerun inside the same test process.
+    let dir = std::env::temp_dir().join(format!(
+        "rp2-flight-e2e-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
     let _ = std::fs::remove_dir_all(&dir);
     flight.set_sink(std::sync::Arc::new(FileSink::new(dir.clone())));
 
     // Two clients connect; slot 0 sends a couple of turns and slot 1 receives
     // them — the receive is what proves the relay validated and delivered both
     // before the disconnect below (dropping earlier could race the datagrams).
-    let mut client_a = connect_client(relay.addr, &relay.ca, &tenant, session, SlotId(0)).await?;
-    let mut client_b = connect_client(relay.addr, &relay.ca, &tenant, session, SlotId(1)).await?;
+    let mut client_a = connect_client(&relay, &tenant, session, SlotId(0)).await?;
+    let mut client_b = connect_client(&relay, &tenant, session, SlotId(1)).await?;
     client_a.send(Some(turn(0, 0)))?;
     client_a.send(Some(turn(0, 1)))?;
     let mut received = 0;

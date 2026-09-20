@@ -21,8 +21,8 @@ use rally_point_transport::{Link, noq};
 /// replay ring records nothing, and only the forward gate can seed.
 #[tokio::test]
 async fn a_cursor_zero_resume_seeds_the_acked_hole_from_the_forward_gate() {
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let tenant = make_default_tenant();
+    let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
     let endpoint = client_endpoint(&ca);
     let session = SessionId(322);
 
@@ -32,14 +32,7 @@ async fn a_cursor_zero_resume_seeds_the_acked_hole_from_the_forward_gate() {
     // way to the relay). Waiting for the fan-out to slot 0 proves the relay
     // recorded seq 1 in its forward gate before the connection drops.
     let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
-    slot1
-        .send(Some(Payload {
-            seq: 1,
-            slot: 0,
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
+    slot1.send(Some(build_turn(0, 1, None))).unwrap();
     let mut delivered = Vec::new();
     while delivered.is_empty() {
         delivered = slot0.recv().await.unwrap().fresh;
@@ -112,8 +105,8 @@ async fn a_cursor_zero_resume_seeds_the_acked_hole_from_the_forward_gate() {
 async fn a_resume_anchored_below_a_lost_oversize_turn_forwards_its_control_retry() {
     use rally_point_transport::control::{ControlInbound, send_control_turn, spawn_control_reader};
 
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let tenant = make_default_tenant();
+    let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
     let endpoint = client_endpoint(&ca);
     let session = SessionId(323);
 
@@ -122,14 +115,7 @@ async fn a_resume_anchored_below_a_lost_oversize_turn_forwards_its_control_retry
 
     // Datagram seq 1 reaches the relay; oversize seq 0 never does.
     let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
-    slot1
-        .send(Some(Payload {
-            seq: 1,
-            slot: 0,
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
+    slot1.send(Some(build_turn(0, 1, None))).unwrap();
     let mut delivered = Vec::new();
     while delivered.is_empty() {
         delivered = slot0.recv().await.unwrap().fresh;
@@ -195,10 +181,9 @@ async fn a_resume_anchored_below_a_lost_oversize_turn_forwards_its_control_retry
 /// acked hole at 1 from receipts that outlived the emptied-session teardown.
 #[tokio::test]
 async fn a_held_reconnect_after_a_never_started_close_seeds_from_retained_receipts() {
-    use rally_point_relay::consensus::{self, Authority};
     use rally_point_relay::routing::SessionKey;
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(324);
 
     // Descriptor-backed but never started: the maker exists, and the expected
@@ -208,31 +193,17 @@ async fn a_held_reconnect_after_a_never_started_close_seeds_from_retained_receip
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
-    let _ = consensus::sync_maker(
-        &mesh.decision_makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    seed_authority(&mesh.decision_makers, &key)
+        .expecting([0, 1])
+        .apply();
+    let relay = start_relay_with_mesh(registry_for_one(&tenant), mesh);
+    let (addr, ca) = (relay.addr, relay.ca.clone());
     let endpoint = client_endpoint(&ca);
 
     // Seq 1 reaches the relay (seq 0 is lost). Waiting for the ack — the
     // unacked window emptying — proves the relay received and recorded it.
     let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
-    slot1
-        .send(Some(Payload {
-            seq: 1,
-            slot: 0,
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
+    slot1.send(Some(build_turn(0, 1, None))).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while slot1.payloads_in_flight() > 0 {
             let _ = slot1.recv().await;
@@ -242,11 +213,16 @@ async fn a_held_reconnect_after_a_never_started_close_seeds_from_retained_receip
     .expect("the relay acks the received turn");
     slot1.connection().close(0u32.into(), b"dropped");
 
-    // Give the relay time to process the disconnect: the departure marks the
-    // drop hold and the never-started emptying runs its close — the teardown
-    // that must retain the receipts. (Reconnecting faster would still work,
-    // but by replacing the live seat rather than exercising the retention.)
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait out the relay's own teardown rather than guessing at it: the
+    // departure marks the drop hold and the never-started emptying clears the
+    // roster — the teardown that must retain the receipts. (Reconnecting
+    // faster would still work, but by replacing the live seat rather than
+    // exercising the retention.)
+    wait_until("the relay never ran the never-started emptying", || {
+        relay.mesh.drop_holds.is_pending(&key, SlotId(1))
+            && relay.sessions.lock().get(&key).is_none()
+    })
+    .await;
 
     let slot1b = connect_slot_resuming(
         &endpoint,
@@ -297,8 +273,8 @@ async fn a_held_reconnect_after_a_never_started_close_seeds_from_retained_receip
 /// closed, never the relay itself.
 #[tokio::test]
 async fn an_absurd_resume_anchor_is_refused_not_applied() {
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let tenant = make_default_tenant();
+    let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
     let endpoint = client_endpoint(&ca);
     let session = SessionId(321);
 

@@ -7,6 +7,7 @@ use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{GameChat, LobbyCommand, PlayerSkin};
 use rally_point_relay::routing::SessionKey;
+use rally_point_relay::session::lobby::LOBBY_RATE_BURST;
 
 use crate::helpers::*;
 
@@ -16,30 +17,34 @@ use crate::helpers::*;
 /// the mesh, driven by real relays and real client control streams.
 #[tokio::test]
 async fn lobby_commands_reach_same_relay_and_cross_relay_peers_in_order() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let session = SessionId(1);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
 
-    let relay_a = Relay::start(&tenant);
-    let mut relay_b = Relay::start(&tenant);
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
     let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
 
     // Host (slot 0) and a same-relay peer (slot 2) on A; a cross-relay peer
     // (slot 1) on B. All three are connected before any command flows, so each
     // receives its peers' commands live.
-    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
-    let (peer_a, _ep2) = connect_client(&relay_a, &tenant, session, SlotId(2)).await?;
-    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    let host = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let peer_a = connect_client(&relay_a, &tenant, session, SlotId(2)).await?;
+    let peer_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
 
-    let (mut host_send, mut host_rx) = open_lobby_streams(&host).await;
-    let (_peer_a_send, mut peer_a_rx) = open_lobby_streams(&peer_a).await;
-    let (mut peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
+    let (mut host_send, mut host_rx) = open_lobby_streams(host.connection()).await;
+    let (_peer_a_send, mut peer_a_rx) = open_lobby_streams(peer_a.connection()).await;
+    let (mut peer_b_send, mut peer_b_rx) = open_lobby_streams(peer_b.connection()).await;
 
-    // Let the mesh drivers open their sessions and every slot link register.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // Every slot link has to be registered and both mesh drivers joined before
+    // the first command, or it fans out to whoever happens to be ready.
+    wait_for_slots(&relay_a.sessions, &key, 2).await;
+    wait_for_slots(&relay_b.sessions, &key, 1).await;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    wait_for_mesh_link(&relay_b.mesh, &key).await;
 
     // The host authors three setup commands (the wire slot is ignored — the relay
     // stamps the authenticated slot 0).
@@ -85,25 +90,33 @@ async fn lobby_commands_reach_same_relay_and_cross_relay_peers_in_order() -> Res
 /// receives the whole sequence, in order — the per-session replay log catches it
 /// up. Covers both a same-relay late dial (replayed from A's log) and a
 /// cross-relay one (replayed from B's log, fed by the mesh).
+///
+/// A live peer on B receives the sequence first: that is both the proof it
+/// crossed the mesh and the synchronization the late dials need, since a relay
+/// logs a command before it fans it out.
 #[tokio::test]
 async fn a_late_dialing_peer_replays_the_full_lobby_sequence() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let session = SessionId(1);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
 
-    let relay_a = Relay::start(&tenant);
-    let mut relay_b = Relay::start(&tenant);
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
     let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
 
-    // Only the host is connected. It sends its setup commands before any peer
-    // exists — the relay logs them (and fans copies across the mesh, which relay
-    // B logs too).
-    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
-    let (mut host_send, _host_rx) = open_lobby_streams(&host).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The host on A and one live peer on B. No other member exists yet.
+    let host = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let live_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    let (mut host_send, _host_rx) = open_lobby_streams(host.connection()).await;
+    let (_live_b_send, mut live_b_rx) = open_lobby_streams(live_b.connection()).await;
+    wait_for_slots(&relay_a.sessions, &key, 1).await;
+    wait_for_slots(&relay_b.sessions, &key, 1).await;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    wait_for_mesh_link(&relay_b.mesh, &key).await;
+
     for byte in [0x01u8, 0x02, 0x03] {
         rally_point_transport::control::send_control_lobby(
             &mut host_send,
@@ -114,22 +127,25 @@ async fn a_late_dialing_peer_replays_the_full_lobby_sequence() -> Result<(), Any
         )
         .await?;
     }
-    // Give the commands time to reach and append to both relays' logs.
-    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    // The live peer on B has them all: both relays' logs are therefore complete.
+    for byte in [0x01u8, 0x02, 0x03] {
+        assert_eq!(next_lobby(&mut live_b_rx).await, (0, vec![byte]));
+    }
 
     // A same-relay peer dials late: it replays A's log in order.
-    let (peer_a, _ep2) = connect_client(&relay_a, &tenant, session, SlotId(2)).await?;
-    let (_peer_a_send, mut peer_a_rx) = open_lobby_streams(&peer_a).await;
-    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x01]));
-    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x02]));
-    assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![0x03]));
+    let peer_a = connect_client(&relay_a, &tenant, session, SlotId(2)).await?;
+    let (_peer_a_send, mut peer_a_rx) = open_lobby_streams(peer_a.connection()).await;
+    for byte in [0x01u8, 0x02, 0x03] {
+        assert_eq!(next_lobby(&mut peer_a_rx).await, (0, vec![byte]));
+    }
 
     // A cross-relay peer dials late: it replays B's log (fed by the mesh) in order.
-    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
-    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
-    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x01]));
-    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x02]));
-    assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![0x03]));
+    let peer_b = connect_client(&relay_b, &tenant, session, SlotId(3)).await?;
+    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(peer_b.connection()).await;
+    for byte in [0x01u8, 0x02, 0x03] {
+        assert_eq!(next_lobby(&mut peer_b_rx).await, (0, vec![byte]));
+    }
 
     Ok(())
 }
@@ -139,37 +155,33 @@ async fn a_late_dialing_peer_replays_the_full_lobby_sequence() -> Result<(), Any
 /// remainder never reaches the mesh control channel at all (not merely
 /// delayed) — and a departure that follows right on the spam's heels still
 /// reaches that peer promptly, proving the refused burst left nothing queued
-/// ahead of it to back up behind. Mirrors
-/// `lobby_commands_reach_same_relay_and_cross_relay_peers_in_order`'s
-/// cross-relay setup.
+/// ahead of it to back up behind.
 #[tokio::test]
 async fn lobby_spam_past_the_rate_cap_never_reaches_the_mesh_and_a_departure_still_gets_through()
 -> Result<(), AnyError> {
-    // Mirrors the private `lobby::LOBBY_RATE_BURST` (see the sibling flood
-    // tests' own comments on this pattern, e.g. mesh.rs's
-    // `routing::FORWARD_CAPACITY` mirror).
-    const LOBBY_RATE_BURST: usize = 32;
-
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let session = SessionId(3);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
 
-    let relay_a = Relay::start(&tenant);
-    let mut relay_b = Relay::start(&tenant);
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
     let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
 
     // The spammer (slot 0) is on A; the observing peer (slot 1) is on B, so
     // the mesh control channel is genuinely exercised, not just local fan-out.
-    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
-    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    let host = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let peer_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
 
-    let (mut host_send, _host_rx) = open_lobby_streams(&host).await;
-    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
+    let (mut host_send, _host_rx) = open_lobby_streams(host.connection()).await;
+    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(peer_b.connection()).await;
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_for_slots(&relay_a.sessions, &key, 1).await;
+    wait_for_slots(&relay_b.sessions, &key, 1).await;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    wait_for_mesh_link(&relay_b.mesh, &key).await;
 
     // Fire well past the burst, back to back with no pacing -- exactly the
     // shape a flooding or buggy client produces.
@@ -209,43 +221,48 @@ async fn lobby_spam_past_the_rate_cap_never_reaches_the_mesh_and_a_departure_sti
     // burst had queued anything ahead of this on the shared mesh control
     // channel, the departure would be stuck behind it; it arrives promptly
     // instead.
-    host.close(0u32.into(), b"done");
+    host.connection().close(0u32.into(), b"done");
     wait_for_connectivity(&mut peer_b_rx, SlotId(0), false).await;
 
     Ok(())
 }
 
-/// A game-chat message a member authors on relay A reaches a cross-relay peer on
-/// relay B, in order, stamped with the author's slot and with its scope fields
-/// (`target_kind`/`target_slot`) preserved verbatim across the mesh hop — the
-/// relay never interprets them. The full mid-game chat fan-out path across the
-/// mesh, driven by real relays and real client control streams, mirroring the
-/// lobby-command cross-relay test.
+/// The two mid-game broadcasts that ride the same cross-relay control path: a
+/// game-chat message and a cosmetic-skin blob a member authors on relay A both
+/// reach a cross-relay peer on relay B, stamped with the author's authoritative
+/// slot. Chat's scope fields (`target_kind`/`target_slot`) cross verbatim — the
+/// relay never interprets them. Skins, unlike chat, are also stored in relay B's
+/// per-session map, so a client that dials into B *after* the blob arrived still
+/// replays it on register.
 #[tokio::test]
-async fn game_chat_reaches_a_cross_relay_peer_through_the_mesh() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+async fn chat_and_skin_reach_a_cross_relay_peer_and_the_skin_replays_to_a_late_joiner()
+-> Result<(), AnyError> {
+    let tenant = make_default_tenant();
     let session = SessionId(2);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
 
-    let relay_a = Relay::start(&tenant);
-    let mut relay_b = Relay::start(&tenant);
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
     let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
 
     // The sender (slot 0) is on A; the receiver (slot 1) is on B.
-    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
-    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    let host = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let peer_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
 
-    let (mut host_send, _host_rx) = open_lobby_streams(&host).await;
-    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
+    let (mut host_send, _host_rx) = open_lobby_streams(host.connection()).await;
+    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(peer_b.connection()).await;
 
-    // Let the mesh drivers open their sessions and both slot links register.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    wait_for_slots(&relay_a.sessions, &key, 1).await;
+    wait_for_slots(&relay_b.sessions, &key, 1).await;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    wait_for_mesh_link(&relay_b.mesh, &key).await;
 
     // The host authors a scoped chat message (the wire slot is ignored — the
-    // relay stamps the authenticated slot 0).
+    // relay stamps the authenticated slot 0). The cross-relay peer receives it
+    // with its scope fields intact.
     rally_point_transport::control::send_control_chat(
         &mut host_send,
         GameChat {
@@ -256,49 +273,14 @@ async fn game_chat_reaches_a_cross_relay_peer_through_the_mesh() -> Result<(), A
         },
     )
     .await?;
-
-    // The cross-relay peer receives it across the mesh, stamped with the host's
-    // authoritative slot, its scope fields intact.
     assert_eq!(
         next_chat(&mut peer_b_rx).await,
         (0, 1, 4, "flanking from the north".to_owned()),
     );
 
-    Ok(())
-}
-
-/// A cosmetic-skin blob a member broadcasts on relay A reaches a cross-relay peer
-/// on relay B, stamped with the author's slot — and, unlike chat, is stored in
-/// relay B's per-session map, so a client that dials into B *after* the blob
-/// arrived still replays it on register. The full skin fan-out-plus-replay path
-/// across the mesh, mirroring the game-chat cross-relay test with the store its
-/// latest-per-slot map adds.
-#[tokio::test]
-async fn player_skin_reaches_a_cross_relay_peer_and_replays_to_a_late_joiner()
--> Result<(), AnyError> {
-    let tenant = make_tenant();
-    let session = SessionId(3);
-    let key = SessionKey {
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-    };
-
-    let relay_a = Relay::start(&tenant);
-    let mut relay_b = Relay::start(&tenant);
-    let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
-
-    // The sender (slot 0) is on A; the first receiver (slot 1) is on B.
-    let (host, _ep0) = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
-    let (peer_b, _ep1) = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
-
-    let (mut host_send, _host_rx) = open_lobby_streams(&host).await;
-    let (_peer_b_send, mut peer_b_rx) = open_lobby_streams(&peer_b).await;
-
-    // Let the mesh drivers open their sessions and both slot links register.
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    // The host broadcasts its blob (the wire slot is ignored — the relay stamps
-    // the authenticated slot 0).
+    // Then its skin blob, sent only once the chat has landed: the two ride
+    // different per-session registries across the mesh, so nothing orders one
+    // against the other at the receiving end.
     rally_point_transport::control::send_control_skin(
         &mut host_send,
         PlayerSkin {
@@ -307,8 +289,6 @@ async fn player_skin_reaches_a_cross_relay_peer_and_replays_to_a_late_joiner()
         },
     )
     .await?;
-
-    // The cross-relay peer receives it, stamped with the host's authoritative slot.
     assert_eq!(
         next_skin(&mut peer_b_rx).await,
         (0, vec![0xCA, 0xFE, 0xBA, 0xBE]),
@@ -316,9 +296,9 @@ async fn player_skin_reaches_a_cross_relay_peer_and_replays_to_a_late_joiner()
 
     // A client dialing into relay B after the blob already crossed the mesh still
     // gets it — proof relay B stored the mesh-received blob in its own map and
-    // replays it on register.
-    let (late_b, _ep2) = connect_client(&relay_b, &tenant, session, SlotId(2)).await?;
-    let (_late_send, mut late_rx) = open_lobby_streams(&late_b).await;
+    // replays it on register. (Chat has no such store: it is ephemeral.)
+    let late_b = connect_client(&relay_b, &tenant, session, SlotId(2)).await?;
+    let (_late_send, mut late_rx) = open_lobby_streams(late_b.connection()).await;
     assert_eq!(
         next_skin(&mut late_rx).await,
         (0, vec![0xCA, 0xFE, 0xBA, 0xBE])

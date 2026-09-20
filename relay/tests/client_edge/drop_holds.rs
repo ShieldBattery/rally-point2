@@ -6,7 +6,6 @@ use std::time::Duration;
 use crate::helpers::*;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::Payload;
 
 /// `end_slot_link`'s session-emptied teardown must not sweep away a hold its
 /// own disconnect just marked: the sweep may only discard *decided* holds, not
@@ -25,10 +24,10 @@ use rally_point_proto::messages::Payload;
 /// reinstated, not refused.
 #[tokio::test]
 async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the_real_gate() {
-    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::consensus;
     use rally_point_relay::routing::SessionKey;
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(310);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -41,18 +40,9 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
     let drop_holds = mesh.drop_holds.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).apply();
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
@@ -65,9 +55,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
     // recorded and the hold marked. Polled on the shared registries (cloned before
     // the relay took ownership of `mesh`) since there is no local peer to observe
     // this through a control frame.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     wait_until(
-        deadline,
         "the relay never recorded the disconnected slot's departure and hold",
         || {
             consensus::slot_departed(&makers, &key, SlotId(0))
@@ -106,14 +94,14 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
 /// when the client later leaves cleanly.
 #[tokio::test]
 async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_state() {
-    use rally_point_relay::consensus::{self, Authority, RelayNotice};
+    use rally_point_relay::consensus::{self, RelayNotice};
     use rally_point_relay::routing::SessionKey;
     use rally_point_relay::session::presence::{self, Candidate};
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
     };
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(312);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -130,25 +118,14 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     let lobby = mesh.lobby.clone();
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0)].into_iter().collect(),
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).expecting([0]).apply();
     presence::set_order(&mesh.presence, &key, vec![Candidate::SelfRelay]);
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    wait_until(deadline, "the session never started", || {
+    wait_until("the session never started", || {
         consensus::session_started(&makers, &key)
     })
     .await;
@@ -156,15 +133,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     // A framed turn gives the session a frame basis (a clean leave's decide
     // schedules against it), and a lobby command goes into the replay log the
     // reconnect below must still find.
-    slot0
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
+    slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
     // A peer-authored lobby command into the replay log (a member's own
     // commands are skipped on its replay, so the survivable content must be
     // authored by another slot — here injected as a mesh delivery would be).
@@ -176,14 +145,15 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
             payload: vec![0xAB, 0xCD].into(),
         },
     );
-    // Let the relay validate the turn before the blip.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The blip must come after the relay has validated that turn.
+    wait_until("the relay never observed the slot's turn", || {
+        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+    })
+    .await;
 
     // The blip: a real disconnect of the relay's only local slot.
     drop(slot0);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     wait_until(
-        deadline,
         "the relay never recorded the disconnected slot's departure and hold",
         || {
             consensus::slot_departed(&makers, &key, SlotId(0))
@@ -251,14 +221,14 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
 #[tokio::test]
 async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_still_honor_a_request()
  {
-    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::consensus;
     use rally_point_relay::routing::SessionKey;
     use rally_point_relay::session::presence::{self, Candidate};
     use rally_point_transport::control::{
         ControlInbound, send_control_request_drop, spawn_control_reader,
     };
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(311);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -275,20 +245,10 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     let makers = mesh.decision_makers.clone();
     let presence_registry = mesh.presence.clone();
     let drop_holds = mesh.drop_holds.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).expecting([0, 1]).apply();
     presence::set_order(&presence_registry, &key, vec![Candidate::SelfRelay]);
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
@@ -297,25 +257,13 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     // Both slots produce a framed turn so their own departure records carry a last
     // frame -- a basis their eventual leave (however it's decided) can schedule
     // against.
-    slot0
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
-    slot1
-        .send(Some(Payload {
-            seq: 0,
-            slot: 1,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
+    slot1.send(Some(build_turn(1, 0, Some(10)))).unwrap();
+    wait_until("the relay never observed both slots' turns", || {
+        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+            && consensus::slot_frame(&makers, &key, SlotId(1)).is_some()
+    })
+    .await;
 
     // The shared uplink blip: both slots' links die. Slot 1 first (session stays
     // non-empty, ordinary disconnect path), then slot 0 -- whose disconnect empties
@@ -323,14 +271,12 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     drop(slot1);
     drop(slot0);
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     wait_until(
-        deadline,
         "the relay never marked holds for both disconnected slots",
         || drop_holds.is_pending(&key, SlotId(0)) && drop_holds.is_pending(&key, SlotId(1)),
     )
     .await;
-    wait_until(deadline, "the abandoned-session timer never armed", || {
+    wait_until("the abandoned-session timer never armed", || {
         drop_holds.abandon_armed(&key)
     })
     .await;
@@ -342,7 +288,6 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     // The reconnect must have cancelled the timer -- verify directly, and then
     // outlast the original window with nothing decided.
     wait_until(
-        tokio::time::Instant::now() + Duration::from_secs(2),
         "the reconnect never cancelled the abandoned-session timer",
         || !drop_holds.abandon_armed(&key),
     )

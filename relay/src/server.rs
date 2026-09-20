@@ -24,7 +24,7 @@ use crate::routing::{self, SessionKey, Sessions};
 
 /// QUIC application close code for a connection whose authorized slot is already
 /// connected by another client.
-const SLOT_TAKEN_CLOSE: u32 = 0x02;
+pub const SLOT_TAKEN_CLOSE: u32 = 0x02;
 
 /// QUIC application close code for a re-register the relay refuses because the
 /// slot's leave was already decided — a survivor's drop request was honored, or it

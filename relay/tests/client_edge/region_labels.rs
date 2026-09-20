@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::helpers::*;
-use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 
@@ -27,7 +26,7 @@ async fn region_labels_reach_clients_only_after_the_release_delay() {
     use rally_point_relay::mesh::control::MeshControl;
     use rally_point_transport::control::{ControlInbound, spawn_control_reader};
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(410);
 
     let release_delay = Duration::from_millis(400);
@@ -49,24 +48,12 @@ async fn region_labels_reach_clients_only_after_the_release_delay() {
     // release delay is measured from -- fires when both clients have connected,
     // exactly as it does in production.
     control.apply_descriptor(&SessionDescriptor {
-        finalized_drops: false,
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-        peers: vec![],
-        bounds: rally_point_proto::control::BufferBounds::new(1, 6).unwrap(),
-        authority_order: vec![],
-        external_id: None,
-        slot_refs: vec![],
-        observer_slots: vec![],
         expected_slots: vec![SlotId(0), SlotId(1)],
-        homed_slots: vec![],
-        resumed: false,
-        departed_slots: vec![],
-        latency_estimate_ms: None,
         relay_regions: labels,
+        ..descriptor(TENANT, session)
     });
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
     let slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;

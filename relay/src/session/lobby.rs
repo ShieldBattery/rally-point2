@@ -80,7 +80,7 @@ const LOBBY_LOG_MAX_BYTES: usize = 256 * 1024;
 /// fast). 32 covers that whole burst from a single slot with a little room to
 /// spare, while still bounding a flooding client to a small, cheap admission
 /// check per command.
-const LOBBY_RATE_BURST: u32 = 32;
+pub const LOBBY_RATE_BURST: u32 = 32;
 
 /// The lobby rate cap's refill rate: one additional token every this long, up
 /// to [`LOBBY_RATE_BURST`]. Ordinary post-setup lobby traffic is a member's own

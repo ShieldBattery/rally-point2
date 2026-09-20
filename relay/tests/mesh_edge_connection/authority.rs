@@ -4,16 +4,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rally_point_proto::control::{BufferBounds, RelayPeer, SessionDescriptor, TenantId};
+use rally_point_proto::control::{RelayPeer, SessionDescriptor, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_relay::mesh::control;
-use rally_point_relay::mesh::edge;
 use rally_point_relay::routing::SessionKey;
-use rally_point_transport::rustls;
 
 use crate::helpers::*;
-use tokio::sync::mpsc;
 
 /// Buffer authority hands off to the next relay in the coordinator-assigned
 /// order when the deciding relay's players all leave — driven end to end over
@@ -27,7 +24,7 @@ use tokio::sync::mpsc;
 /// flush cadence.
 #[tokio::test]
 async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let session = SessionId(1);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -38,7 +35,7 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
     // relay's decision-maker and presence registries, as the binary wires it —
     // the descriptor's order must land where the turn-path reports do.
     let relay_a = Relay::start(&tenant, 1);
-    let relay_b = Relay::start(&tenant, 2);
+    let mut relay_b = Relay::start(&tenant, 2);
     let control_a = control::MeshControl::new(
         RelayId(1),
         relay_a.mesh.decision_makers.clone(),
@@ -50,62 +47,19 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         relay_b.mesh.presence.clone(),
     );
 
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        empty_fleet_peers(),
-        false,
-    ));
-    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay_b.ca.clone()).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    tokio::spawn(edge::run_mesh_dial(
-        edge::MeshDial {
-            our_id: RelayId(1),
-            peer_id: RelayId(2),
-            peer_addrs: vec![relay_b.addr],
-            server_name: "localhost".to_owned(),
-            roots,
-            cert_chain: dial_chain,
-            key: dial_key,
-        },
-        Arc::clone(&relay_a.sessions),
-        relay_a.mesh.clone(),
-        links_a_tx,
-    ));
+    let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
+    let mut links_a = dial_a_to_b(&relay_a, &relay_b);
 
-    let (peer_a, generation_a, cmds_a) = links_a_rx
-        .recv()
-        .await
-        .ok_or("dial side did not produce a link")?;
+    let (peer_a, generation_a, cmds_a) = next_link(&mut links_a, "A's link to B").await?;
     let _ = control_a.register_link(peer_a, generation_a, cmds_a);
-    let (peer_b, generation_b, cmds_b) = links_b_rx
-        .recv()
-        .await
-        .ok_or("accept side did not produce a link")?;
+    let (peer_b, generation_b, cmds_b) = next_link(&mut links_b, "B's link to A").await?;
     let _ = control_b.register_link(peer_b, generation_b, cmds_b);
 
     // The coordinator ranked A first (the session's home relay).
     let descriptor_for = |peers: Vec<RelayPeer>| SessionDescriptor {
-        finalized_drops: false,
-        tenant: TenantId(TENANT.to_owned()),
-        session,
         peers,
-        bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![RelayId(1), RelayId(2)],
-        external_id: None,
-        slot_refs: vec![],
-        observer_slots: vec![],
-        expected_slots: vec![],
-        homed_slots: vec![],
-        resumed: false,
-        departed_slots: vec![],
-        latency_estimate_ms: None,
-        relay_regions: Vec::new(),
+        ..descriptor(TENANT, session)
     };
     control_a.apply_descriptor(&descriptor_for(vec![RelayPeer {
         relay_id: RelayId(2),
@@ -121,10 +75,8 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
     }]));
 
     // A player on each relay. A's client is the one whose departure hands off.
-    let mut client_a =
-        connect_client(relay_a.addr, &relay_a.ca, &tenant, session, SlotId(0)).await?;
-    let mut client_b =
-        connect_client(relay_b.addr, &relay_b.ca, &tenant, session, SlotId(1)).await?;
+    let mut client_a = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let mut client_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
 
     let a_is_authority = || {
         relay_a
@@ -182,7 +134,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
 -> Result<(), AnyError> {
     use rally_point_relay::consensus;
 
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let session = SessionId(1);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -193,7 +145,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     // accepts A's dial. Each Join source shares its relay's REAL registries, so
     // the makers the descriptors create are the ones the link tasks feed.
     let relay_a = Relay::start(&tenant, 1);
-    let relay_b = Relay::start(&tenant, 2);
+    let mut relay_b = Relay::start(&tenant, 2);
     let control_a = control::MeshControl::new(
         RelayId(1),
         Arc::clone(&relay_a.mesh.decision_makers),
@@ -207,56 +159,19 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     )
     .with_broadcast(Arc::clone(&relay_b.sessions), relay_b.mesh.links.clone());
 
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        empty_fleet_peers(),
-        false,
-    ));
-    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay_b.ca.clone()).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    tokio::spawn(edge::run_mesh_dial(
-        edge::MeshDial {
-            our_id: RelayId(1),
-            peer_id: RelayId(2),
-            peer_addrs: vec![relay_b.addr],
-            server_name: "localhost".to_owned(),
-            roots,
-            cert_chain: dial_chain,
-            key: dial_key,
-        },
-        Arc::clone(&relay_a.sessions),
-        relay_a.mesh.clone(),
-        links_a_tx,
-    ));
-    let (peer_a, generation_a, cmds_a) = links_a_rx.recv().await.ok_or("no dial-side link")?;
+    let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
+    let mut links_a = dial_a_to_b(&relay_a, &relay_b);
+    let (peer_a, generation_a, cmds_a) = next_link(&mut links_a, "A's link to B").await?;
     let _ = control_a.register_link(peer_a, generation_a, cmds_a);
-    let (peer_b, generation_b, cmds_b) = links_b_rx.recv().await.ok_or("no accept-side link")?;
+    let (peer_b, generation_b, cmds_b) = next_link(&mut links_b, "B's link to A").await?;
     let _ = control_b.register_link(peer_b, generation_b, cmds_b);
 
     // The coordinator's descriptors: each relay names the other as its peer,
     // with A ranked first (the authority).
     let delivery_descriptor = |peers: Vec<RelayPeer>| SessionDescriptor {
-        finalized_drops: false,
-        tenant: TenantId(TENANT.to_owned()),
-        session,
         peers,
-        bounds: BufferBounds::new(1, 6).unwrap(),
         authority_order: vec![RelayId(1), RelayId(2)],
-        external_id: None,
-        slot_refs: vec![],
-        observer_slots: vec![],
-        expected_slots: vec![],
-        homed_slots: vec![],
-        resumed: false,
-        departed_slots: vec![],
-        latency_estimate_ms: None,
-        relay_regions: Vec::new(),
+        ..descriptor(TENANT, session)
     };
     control_a.apply_descriptor(&delivery_descriptor(vec![RelayPeer {
         relay_id: RelayId(2),
@@ -282,11 +197,10 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
         game_frame_count: Some(seq as u32 + 1),
         ..Default::default()
     };
-    let mut client_a =
-        connect_client(relay_a.addr, &relay_a.ca, &tenant, session, SlotId(0)).await?;
-    let mut client_b =
-        connect_client(relay_b.addr, &relay_b.ca, &tenant, session, SlotId(1)).await?;
-    tokio::time::sleep(Duration::from_millis(50)).await; // let the mesh join settle
+    let mut client_a = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let mut client_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    wait_for_mesh_link(&relay_b.mesh, &key).await;
 
     // Slot 0 sends turns 0..=5; the destination receives them across the mesh.
     for seq in 0..=5u64 {

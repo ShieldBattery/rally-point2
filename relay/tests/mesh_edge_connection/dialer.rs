@@ -28,20 +28,12 @@ use tokio::sync::{mpsc, watch};
 /// still desired, the dialer redials.
 #[tokio::test]
 async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
 
     // A (id 1) dials; B (id 2) accepts via the production accept drain.
     let relay_a = Relay::start(&tenant, 1);
-    let relay_b = Relay::start(&tenant, 2);
-    let (links_b_tx, _links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        empty_fleet_peers(),
-        false,
-    ));
+    let mut relay_b = Relay::start(&tenant, 2);
+    let _links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
 
     // A's on-demand dialer, fed desired peers over a watch. Its configured
     // fallback roots are EMPTY: trust must come entirely from the pinned cert
@@ -73,20 +65,14 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
         relay_addrs: vec![],
     }])?;
     let (peer1, _generation1, cmds1) =
-        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-            .await
-            .map_err(|_| "the dialer did not establish a link to the desired peer")?
-            .ok_or("A's links channel closed")?;
+        next_link(&mut links_a_rx, "the link to the desired peer").await?;
     assert_eq!(peer1, RelayId(2), "the dialed link reaches B");
 
     // The link winds down (its command sender is dropped). B is still desired, so
     // the dialer re-establishes the link.
     drop(cmds1);
     let (peer2, _generation2, _cmds2) =
-        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-            .await
-            .map_err(|_| "the dialer did not re-establish the link after it ended")?
-            .ok_or("A's links channel closed")?;
+        next_link(&mut links_a_rx, "the re-established link").await?;
     assert_eq!(peer2, RelayId(2), "the re-established link reaches B");
 
     drop(relay_a);
@@ -99,7 +85,7 @@ async fn dialer_establishes_and_reestablishes_a_desired_peer_link() -> Result<()
 /// and the pair would never mesh.
 #[tokio::test]
 async fn dialer_retargets_a_link_when_a_peer_moves_to_a_new_address() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
 
     // Peer id 2 exists first at relay B's address, then at relay C's (same id, new
     // address — a restart).
@@ -112,19 +98,12 @@ async fn dialer_retargets_a_link_when_a_peer_moves_to_a_new_address() -> Result<
     // the peer synchronizes on the dialer having applied the first address.
     peers_tx.send(vec![peer_at(2, relay_b.addr)])?;
     let (peer1, _generation1, _cmds1) =
-        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-            .await
-            .map_err(|_| "the dialer did not dial the peer at its first address")?
-            .ok_or("A's links channel closed")?;
+        next_link(&mut links_a_rx, "the link to the peer's first address").await?;
     assert_eq!(peer1, RelayId(2));
 
     // Peer 2 moves to C's address: the dialer retargets and a fresh link forms.
     peers_tx.send(vec![peer_at(2, relay_c.addr)])?;
-    let (peer2, _generation2, _cmds2) =
-        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-            .await
-            .map_err(|_| "the dialer did not retarget to the peer's new address")?
-            .ok_or("A's links channel closed")?;
+    let (peer2, _generation2, _cmds2) = next_link(&mut links_a_rx, "the retargeted link").await?;
     assert_eq!(peer2, RelayId(2));
 
     drop(relay_a);
@@ -138,7 +117,7 @@ async fn dialer_retargets_a_link_when_a_peer_moves_to_a_new_address() -> Result<
 /// the pair would never mesh once the peer became reachable.
 #[tokio::test]
 async fn dialer_retargets_away_from_an_unreachable_address() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let relay_a = Relay::start(&tenant, 1);
     let relay_b = Relay::start(&tenant, 2);
 
@@ -154,10 +133,10 @@ async fn dialer_retargets_away_from_an_unreachable_address() -> Result<(), AnyEr
     let (peers_tx, mut links_a_rx) = dialer_for_a(&relay_a, &[&relay_b.ca]);
 
     // Peer 2 first at the unreachable address: the dialer spawns a supervisor that
-    // fails to connect and keeps retrying. Give it a moment to reach that state, and
-    // confirm no link forms.
+    // fails to connect and keeps retrying. A connect to a dead loopback port is
+    // refused at once, so a short window is enough to confirm no link forms.
     peers_tx.send(vec![peer_at(2, dead_addr)])?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(
         links_a_rx.try_recv().is_err(),
         "no link forms to an unreachable address",
@@ -166,11 +145,11 @@ async fn dialer_retargets_away_from_an_unreachable_address() -> Result<(), AnyEr
     // Peer 2 reappears at B's live address: the stuck supervisor must be cancelled
     // and a fresh dial started, or the dedup keeps it stuck on the dead address.
     peers_tx.send(vec![peer_at(2, relay_b.addr)])?;
-    let (peer, _generation, _cmds) =
-        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-            .await
-            .map_err(|_| "the dialer stayed stuck on the dead address after the peer moved")?
-            .ok_or("A's links channel closed")?;
+    let (peer, _generation, _cmds) = next_link(
+        &mut links_a_rx,
+        "the link after the peer moved off the dead address",
+    )
+    .await?;
     assert_eq!(peer, RelayId(2));
 
     drop(relay_a);
@@ -183,7 +162,7 @@ async fn dialer_retargets_away_from_an_unreachable_address() -> Result<(), AnyEr
 /// forever — session ids are never reused, so nothing later reclaims it.
 #[tokio::test]
 async fn removing_a_serving_peer_cleans_up_its_mesh_forwarding_state() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let relay_a = Relay::start(&tenant, 1);
     let relay_b = Relay::start(&tenant, 2);
     let (peers_tx, mut links_a_rx) = dialer_for_a(&relay_a, &[&relay_b.ca]);
@@ -191,28 +170,22 @@ async fn removing_a_serving_peer_cleans_up_its_mesh_forwarding_state() -> Result
     // Dial B, then join a session on the established link (standing in for a
     // descriptor-driven Join); the join registers a mesh forward channel.
     peers_tx.send(vec![peer_at(2, relay_b.addr)])?;
-    let (_peer, _generation, cmds) =
-        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-            .await
-            .map_err(|_| "the dialer did not establish the link")?
-            .ok_or("A's links channel closed")?;
+    let (_peer, _generation, cmds) = next_link(&mut links_a_rx, "the dialed link").await?;
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session: SessionId(1),
     };
     cmds.send(mesh::MeshCommand::Join(key.clone()))?;
-    assert!(
-        wait_until(|| relay_a.mesh.links.lock().contains_key(&key)).await,
-        "the join should register a mesh forward channel",
-    );
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
 
     // The peer is removed from the desired set: the dialer aborts the link driver.
     // The forward-channel registration must still be torn down despite the abort.
     peers_tx.send(vec![])?;
-    assert!(
-        wait_until(|| !relay_a.mesh.links.lock().contains_key(&key)).await,
-        "the aborted link's mesh forwarding state was not cleaned up",
-    );
+    wait_until(
+        "the aborted link's mesh forwarding state was never cleaned up",
+        || !relay_a.mesh.links.lock().contains_key(&key),
+    )
+    .await;
 
     drop(relay_a);
     Ok(())
@@ -224,57 +197,28 @@ async fn removing_a_serving_peer_cleans_up_its_mesh_forwarding_state() -> Result
 /// delay spent.
 #[tokio::test]
 async fn a_mesh_dial_falls_back_to_the_next_advertised_candidate() -> Result<(), AnyError> {
-    let tenant = make_tenant();
+    let tenant = make_default_tenant();
     let relay_a = Relay::start(&tenant, 1);
-    let relay_b = Relay::start(&tenant, 2);
+    let mut relay_b = Relay::start(&tenant, 2);
 
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        empty_fleet_peers(),
-        false,
-    ));
-
-    let (links_a_tx, mut links_a_rx) = mpsc::channel::<LinkHandle>(8);
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay_b.ca.clone()).unwrap();
+    let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
     let unreachable: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let dial = edge::MeshDial {
-        our_id: RelayId(1),
-        peer_id: RelayId(2),
-        // The peer advertises an unusable candidate first; the walk must fall
-        // through to the reachable one.
-        peer_addrs: vec![unreachable, relay_b.addr],
-        server_name: "localhost".to_owned(),
-        roots,
-        cert_chain: dial_chain,
-        key: dial_key,
-    };
-    tokio::spawn(edge::run_mesh_dial(
-        dial,
-        Arc::clone(&relay_a.sessions),
-        relay_a.mesh.clone(),
-        links_a_tx,
-    ));
+    let mut links_a = spawn_dial(
+        &relay_a,
+        edge::MeshDial {
+            // The peer advertises an unusable candidate first; the walk must
+            // fall through to the reachable one.
+            peer_addrs: vec![unreachable, relay_b.addr],
+            ..dial_to(&relay_b, 1, 2)
+        },
+    );
 
-    // The link establishes on the second candidate — well within one attempt
-    // (the 2s bound is far under the supervisor's redial delay would allow for
-    // a second attempt to even begin mattering here).
-    let (peer_a, _generation_a, _cmds_a) =
-        tokio::time::timeout(Duration::from_secs(2), links_a_rx.recv())
-            .await
-            .map_err(|_| "the dial did not fall back to the reachable candidate")?
-            .ok_or("A's links channel closed")?;
+    // The link establishes on the second candidate — well within one attempt,
+    // far sooner than a second attempt could even begin to matter.
+    let (peer_a, _generation_a, _cmds_a) = next_link(&mut links_a, "the fallback link").await?;
     assert_eq!(peer_a, RelayId(2));
     let (peer_b, _generation_b, _cmds_b) =
-        tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
-            .await
-            .map_err(|_| "the acceptor did not surface the link")?
-            .ok_or("B's links channel closed")?;
+        next_link(&mut links_b, "the acceptor's side of it").await?;
     assert_eq!(peer_b, RelayId(1));
 
     drop(relay_a);

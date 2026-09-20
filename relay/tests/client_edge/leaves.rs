@@ -1,17 +1,13 @@
-//! Departures: a coordinator reap, a plain disconnect, and the leave-intent path
-//! that decides a departure once and closes the sender.
+//! Departures: a coordinator reap and the leave-intent path that decides a
+//! departure once, closes the sender, and cuts the slot's serving.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::helpers::*;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
-use rally_point_relay::server;
-use rally_point_transport::noq;
-use rally_point_transport::quic::server_config;
+use rally_point_relay::consensus::LEAVE_REASON_LEFT;
 
 /// A coordinator reap (`routing::close_slots`, the same signal a holdout reap
 /// fires) actually closes the client's QUIC connection promptly, not just the
@@ -20,95 +16,42 @@ use rally_point_transport::quic::server_config;
 /// `connection.close()` (despite its own comment saying it would) — the
 /// beacon and control-stream reader tasks it spawned each held their own
 /// `connection.clone()`, so the connection lingered until QUIC's own idle
-/// timeout instead of freeing promptly. This test builds its own minimal
-/// relay directly (rather than through `start_relay`/`start_relay_with_mesh`,
-/// which don't expose the `Sessions` handle `close_slots` needs) so it can
-/// reach the same signal a real coordinator reap would send.
+/// timeout instead of freeing promptly.
 #[tokio::test]
 async fn a_coordinator_reap_closes_the_connection_so_the_client_observes_it_end() {
     use rally_point_relay::routing::{self, SessionKey};
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(12);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
         session,
     };
 
-    let (chain, key_der, ca) = self_signed();
-    let server_cfg = server_config(chain, key_der).unwrap();
-    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
-    let endpoint = noq::Endpoint::server(server_cfg, bind).unwrap();
-    let addr = endpoint.local_addr().unwrap();
-    let sessions = routing::Sessions::default();
-    tokio::spawn(server::serve(
-        endpoint,
-        Arc::new(registry_for(&[&tenant])),
-        Arc::clone(&sessions),
-        rally_point_relay::mesh::new_mesh_state(),
-        None,
-    ));
-    let endpoint = client_endpoint(&ca);
+    let relay = start_relay(registry_for_one(&tenant));
+    let endpoint = client_endpoint(&relay.ca);
 
-    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let slot0 = connect_slot(&endpoint, relay.addr, &tenant, session, SlotId(0)).await;
     let client_connection = slot0.connection().clone();
-    // Let the relay finish registering the slot before reaping it.
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The reap acts on the roster, so the slot has to be in it first.
+    wait_for_slots(&relay.sessions, &key, 1).await;
 
-    routing::close_slots(&sessions, &key, &[SlotId(0)]);
+    routing::close_slots(&relay.sessions, &key, &[SlotId(0)]);
 
-    match tokio::time::timeout(Duration::from_secs(5), client_connection.closed()).await {
-        Ok(_reason) => {}
-        Err(_) => panic!("the client never observed the connection end after a coordinator reap"),
-    }
-}
-
-#[tokio::test]
-async fn frees_the_slot_when_a_client_disconnects() {
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
-    let endpoint = client_endpoint(&ca);
-    let session = SessionId(11);
-
-    // A client authorizes for slot 0, then drops its connection.
-    {
-        let _slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
-    }
-
-    // The slot must not stay occupied: a fresh client reclaims it. Allow a few
-    // attempts for the relay to observe the departure and deregister the slot.
-    let mut reclaimed = false;
-    for _ in 0..20 {
-        let client_key = keypair();
-        let token = mint_token(&tenant, session, SlotId(0), client_key.public);
-        let connection = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
-        if handshake(&connection, &token, &client_key, &[])
-            .await
-            .is_ok()
-        {
-            reclaimed = true;
-            break;
-        }
-    }
-    assert!(
-        reclaimed,
-        "slot stayed occupied after the client disconnected"
-    );
+    tokio::time::timeout(Duration::from_secs(5), client_connection.closed())
+        .await
+        .expect("the client never observed the connection end after a coordinator reap");
 }
 
 #[tokio::test]
 async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
-    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::consensus;
     use rally_point_relay::routing::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
     };
 
-    // The native SC:R `pending_leave_reason` a voluntary quit writes -- see
-    // `relay::routing::LEAVE_REASON_LEFT`.
-    const LEAVE_REASON_LEFT: u32 = 3;
-
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(200);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -120,18 +63,9 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
     // one on its own outside a real coordinator-driven deployment.
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).apply();
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
@@ -142,17 +76,12 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
 
     // A framed turn from slot 0 gives `decide_leave` a basis to schedule
     // against -- without any observed frame (pure lobby) it would hold.
-    slot0
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
-    // Give the relay a moment to observe the frame before the intent lands.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
+    // The intent must land on a relay that has already observed that frame.
+    wait_until("the relay never observed the leaver's turn", || {
+        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+    })
+    .await;
 
     // Slot 0 announces its own clean departure on the control stream it opens
     // (mirroring the real client driver, which never reuses the relay's
@@ -197,18 +126,18 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
 
 #[tokio::test]
 async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
+    use rally_point_relay::consensus;
     // The same task that decides the leave from the intent also runs the
     // post-loop Trigger-A cleanup on its way out (deregister, decide_leave,
     // remove_slot, presence). This proves that follow-through doesn't produce
     // a *second* directive for the same slot: the survivor sees exactly one
     // leave push, not two.
-    use rally_point_relay::consensus::{self, Authority};
     use rally_point_relay::routing::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
     };
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(201);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -217,34 +146,20 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
 
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).apply();
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
     let slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
     let mut ctrl1 = spawn_control_reader(slot1.connection().clone());
 
-    slot0
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
+    wait_until("the relay never observed the leaver's turn", || {
+        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+    })
+    .await;
 
     let (mut leave_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
     send_control_leave_intent(&mut leave_send).await.unwrap();
@@ -272,11 +187,10 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
     // can still reach a survivor. Sending only once the relay has confirmed
     // the intent by closing the link (rather than racing the intent and a
     // turn on the wire) is what makes this deterministic to test.
-    use rally_point_relay::consensus::{self, Authority};
     use rally_point_relay::routing::SessionKey;
     use rally_point_transport::control::send_control_leave_intent;
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(202);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -285,32 +199,15 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
 
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).apply();
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
     let mut slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
 
-    slot0
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
+    slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
     // Drain that first turn at slot 1 so it can't be mistaken for the later,
     // forbidden one.
     let mut delivered = Vec::new();

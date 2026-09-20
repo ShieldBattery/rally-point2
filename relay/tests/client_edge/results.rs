@@ -7,25 +7,22 @@ use std::time::Duration;
 use crate::helpers::*;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_proto::messages::Payload;
 
 #[tokio::test]
 async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_alone() {
+    use rally_point_relay::consensus;
     // A client writes its result report then its leave intent on the one control
     // stream it opens. The relay processes that stream in order, so it fires the
     // result notice (stamped with the reporting slot, payload, and frames) before
     // the departure notice, and the surviving second client still gets the synced
     // leave and keeps its link.
-    use rally_point_relay::consensus::{self, Authority, RelayNotice};
+    use rally_point_relay::consensus::{LEAVE_REASON_LEFT, RelayNotice};
     use rally_point_relay::routing::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_game_result, send_control_leave_intent, spawn_control_reader,
     };
 
-    // The native SC:R `pending_leave_reason` a voluntary quit writes.
-    const LEAVE_REASON_LEFT: u32 = 3;
-
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(203);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -34,21 +31,12 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
 
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).apply();
     // Watch the notices the relay would send up its coordinator connection.
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
@@ -57,16 +45,11 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
 
     // A framed turn from slot 0 gives the result its frame stamps and gives
     // `decide_leave` a basis to schedule against.
-    slot0
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
+    wait_until("the relay never observed the reporter's turn", || {
+        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+    })
+    .await;
 
     // Slot 0 writes its result report then its leave intent on the one control
     // stream it opens — the ordering the relay must preserve on the wire.
@@ -120,151 +103,87 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
     );
 }
 
+/// Both malformed result reports the relay must refuse to record, and the
+/// property that only a live link shows: it survives them, so a real report on
+/// the same control stream still lands afterwards.
+///
+/// The rows are the two shapes a report can be ill-formed in. An oversize
+/// payload is past the 4096-byte cap but well inside the 64 KiB control-frame
+/// cap, so it reaches the relay's own size check rather than the framing guard.
+/// A zero-length payload is the wire sentinel `SlotDeparted` uses for "no
+/// result reported", never a genuine report: recording one would make a real
+/// empty result indistinguishable from no result once the slot departs.
 #[tokio::test]
-async fn an_oversize_result_report_is_dropped_without_closing_the_link() {
-    // A result payload past the size cap is an ill-formed report: the relay drops
-    // it (no notice) but keeps the link — a within-cap report that follows on the
-    // same stream is still accepted, proving the stream wasn't torn down.
-    use rally_point_relay::consensus::{self, Authority, RelayNotice};
+async fn a_malformed_result_report_is_dropped_without_closing_the_link() {
+    use rally_point_relay::consensus::{self, RelayNotice};
     use rally_point_relay::routing::SessionKey;
     use rally_point_transport::control::send_control_game_result;
 
-    let tenant = make_tenant(KID, TENANT);
-    let session = SessionId(204);
-    let key = SessionKey {
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-    };
-
+    let tenant = make_default_tenant();
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
     let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(notice_tx);
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
-    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    // Each row's client and its control stream stay alive for the rest of the
+    // test: dropping the stream resets it, which the relay reads as a lost
+    // control stream and closes the link over — emptying that session and
+    // firing a close notice into the next row's negative window.
+    let mut connected = Vec::new();
 
-    // A payload past the 4096-byte cap, well within the 64 KiB control-frame cap
-    // (so it reaches the relay's own size check rather than the framing guard).
-    let (mut ctrl0_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
-    send_control_game_result(&mut ctrl0_send, vec![0x7u8; 5000].into())
-        .await
-        .unwrap();
+    // A session of its own per row, so the good report each row ends with
+    // cannot stand in for the next row's dropped one.
+    for (case, session, malformed) in [
+        (
+            "an oversize result payload",
+            SessionId(204),
+            vec![0x7u8; 5000],
+        ),
+        ("an empty result payload", SessionId(205), Vec::new()),
+    ] {
+        let key = SessionKey {
+            tenant: TenantId(TENANT.to_owned()),
+            session,
+        };
+        seed_authority(&makers, &key).apply();
 
-    // No result notice fires for the oversize report.
-    assert_no_event_notice(
-        &mut notice_rx,
-        Duration::from_millis(400),
-        "an oversize result payload must fire no notice",
-    )
-    .await;
+        let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+        let (mut ctrl0_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
+        send_control_game_result(&mut ctrl0_send, malformed.into())
+            .await
+            .unwrap();
 
-    // The link is still up: a within-cap report on the same stream is accepted
-    // and fires its notice — the first record for the slot, since the oversize
-    // one was dropped rather than recorded.
-    send_control_game_result(&mut ctrl0_send, vec![0x1u8, 0x2, 0x3].into())
-        .await
-        .unwrap();
-    let notice = recv_event_notice(&mut notice_rx).await;
-    let RelayNotice::Result(result) = notice else {
-        panic!("expected a result notice, got {notice:?}");
-    };
-    assert_eq!(result.slot, SlotId(0));
-    assert_eq!(result.payload, vec![0x1, 0x2, 0x3]);
+        assert_no_event_notice(
+            &mut notice_rx,
+            Duration::from_millis(400),
+            &format!("{case} must fire no notice"),
+        )
+        .await;
+        assert!(
+            consensus::result_for(&makers, &key, SlotId(0)).is_none(),
+            "{case} must never be retained",
+        );
 
-    // And the relay never closed the connection over the oversize report.
-    assert!(
-        slot0.connection().close_reason().is_none(),
-        "an oversize result must not close the link",
-    );
-}
+        // The link is still up: a within-cap report on the same stream is
+        // accepted and fires its notice — the first record for the slot, since
+        // the malformed one was dropped rather than recorded.
+        send_control_game_result(&mut ctrl0_send, vec![0x1u8, 0x2, 0x3].into())
+            .await
+            .unwrap();
+        let notice = recv_event_notice(&mut notice_rx).await;
+        let RelayNotice::Result(result) = notice else {
+            panic!("expected a result notice after {case}, got {notice:?}");
+        };
+        assert_eq!(result.slot, SlotId(0));
+        assert_eq!(result.payload, vec![0x1, 0x2, 0x3]);
 
-#[tokio::test]
-async fn an_empty_result_report_is_dropped_without_closing_the_link() {
-    // A zero-length result payload is the wire sentinel `SlotDeparted` uses for
-    // "no result reported" (see wire.proto), never a genuine report, so the relay
-    // must never record one: doing so would make a real empty result
-    // indistinguishable from no result once the slot departs. The relay drops it
-    // (no notice) but keeps the link, exactly like an oversize report.
-    use rally_point_relay::consensus::{self, Authority, RelayNotice};
-    use rally_point_relay::routing::SessionKey;
-    use rally_point_transport::control::send_control_game_result;
-
-    let tenant = make_tenant(KID, TENANT);
-    let session = SessionId(205);
-    let key = SessionKey {
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-    };
-
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
-    let (notice_tx, mut notice_rx) = tokio::sync::mpsc::unbounded_channel();
-    makers.set_notice_notifier(notice_tx);
-
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
-    let endpoint = client_endpoint(&ca);
-
-    let slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
-
-    let (mut ctrl0_send, _unused_recv) = slot0.connection().open_bi().await.unwrap();
-    send_control_game_result(&mut ctrl0_send, Vec::new().into())
-        .await
-        .unwrap();
-
-    // No result notice fires for the empty report.
-    assert_no_event_notice(
-        &mut notice_rx,
-        Duration::from_millis(400),
-        "an empty result payload must fire no notice",
-    )
-    .await;
-    assert!(
-        consensus::result_for(&makers, &key, SlotId(0)).is_none(),
-        "an empty result payload must never be retained",
-    );
-
-    // The link is still up: a real report on the same stream is still accepted
-    // and fires its notice — the first record for the slot, since the empty one
-    // was dropped rather than recorded.
-    send_control_game_result(&mut ctrl0_send, vec![0x1u8, 0x2, 0x3].into())
-        .await
-        .unwrap();
-    let notice = tokio::time::timeout(Duration::from_secs(5), notice_rx.recv())
-        .await
-        .expect("the real result never fired a notice — the link was torn down")
-        .expect("the notice channel closed early");
-    let RelayNotice::Result(result) = notice else {
-        panic!("expected a result notice, got {notice:?}");
-    };
-    assert_eq!(result.slot, SlotId(0));
-    assert_eq!(result.payload, vec![0x1, 0x2, 0x3]);
-
-    // And the relay never closed the connection over the empty report.
-    assert!(
-        slot0.connection().close_reason().is_none(),
-        "an empty result must not close the link",
-    );
+        assert!(
+            slot0.connection().close_reason().is_none(),
+            "{case} must not close the link",
+        );
+        connected.push((slot0, ctrl0_send));
+    }
 }

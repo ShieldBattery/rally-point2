@@ -1,14 +1,17 @@
 //! What the mesh acceptor refuses: an incompatible hello, a missing or
-//! unenrolled client certificate, a fingerprint that does not match the fleet
-//! map — and what an empty fleet map admits instead.
+//! unenrolled client certificate, and a fingerprint that does not match the
+//! fleet map.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rally_point_proto::control::MeshPeerIdentity;
 use rally_point_proto::ids::RelayId;
+use rally_point_proto::version::{
+    MESH_CLOSE_CERT_MISMATCH, MESH_CLOSE_NO_CLIENT_CERT, MESH_CLOSE_UNKNOWN_PEER,
+};
 use rally_point_relay::coordinator::client::FleetMeshPeers;
-use rally_point_relay::mesh::edge;
 use rally_point_transport::{noq, rustls};
 
 use crate::helpers::*;
@@ -23,18 +26,9 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
     use rally_point_proto::mesh::MeshHello;
     use rally_point_proto::version::{MESH_CLOSE_PROTOCOL_MISMATCH, ProtocolVersion};
 
-    let tenant = make_tenant();
-    let relay_b = Relay::start(&tenant, 2);
-
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        empty_fleet_peers(),
-        false,
-    ));
+    let tenant = make_default_tenant();
+    let mut relay_b = Relay::start(&tenant, 2);
+    let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
 
     // A stand-in dialer speaking only v1 (below MIN_SUPPORTED): connect on the
     // mesh ALPN and announce the incompatible version in the hello.
@@ -54,26 +48,8 @@ async fn acceptor_refuses_an_incompatible_mesh_hello() -> Result<(), AnyError> {
     let hello = MeshHello::new(RelayId(1), incompatible);
     hello_stream.write_all(&hello.encode()).await?;
 
-    // The acceptor refuses with the protocol-mismatch application close...
-    let reason = connection.closed().await;
-    match reason {
-        noq::ConnectionError::ApplicationClosed(close) => {
-            assert_eq!(
-                close.error_code,
-                noq::VarInt::from_u32(MESH_CLOSE_PROTOCOL_MISMATCH),
-                "the close carries the protocol-mismatch code",
-            );
-        }
-        other => panic!("expected an application close refusing the version, got {other:?}"),
-    }
-
-    // ...and no link ever surfaces for the refused peer.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), links_b_rx.recv())
-            .await
-            .is_err(),
-        "a refused peer must not surface on the links channel",
-    );
+    expect_mesh_close(&connection, MESH_CLOSE_PROTOCOL_MISMATCH).await;
+    expect_no_link(&mut links_b).await;
     Ok(())
 }
 
@@ -103,8 +79,7 @@ async fn dial_and_send_hello(
 
 /// Asserts `connection` was application-closed with `expected_code`.
 async fn expect_mesh_close(connection: &noq::Connection, expected_code: u32) {
-    let reason = connection.closed().await;
-    match reason {
+    match connection.closed().await {
         noq::ConnectionError::ApplicationClosed(close) => {
             assert_eq!(
                 close.error_code,
@@ -117,12 +92,24 @@ async fn expect_mesh_close(connection: &noq::Connection, expected_code: u32) {
     }
 }
 
+/// Asserts a refused peer never surfaces on the acceptor's links channel. The
+/// refusal has already been observed as a close by the time this runs, so a
+/// short window is enough to catch a link that was spawned anyway.
+async fn expect_no_link(links: &mut mpsc::Receiver<LinkHandle>) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), links.recv())
+            .await
+            .is_err(),
+        "a refused peer must not surface on the links channel",
+    );
+}
+
 /// Builds a mesh-ALPN client config that presents **no** TLS client
 /// certificate — what a peer relay predating this leg would still do, and the
-/// exact shape [`MESH_CLOSE_NO_CLIENT_CERT`](rally_point_proto::version::MESH_CLOSE_NO_CLIENT_CERT)
-/// exists to refuse once enforcement is active. `mesh_client_config` cannot
-/// express this any more (it always presents a certificate), so this builds the
-/// TLS config by hand, mirroring `quic.rs`'s own stale-ALPN tests.
+/// exact shape [`MESH_CLOSE_NO_CLIENT_CERT`] exists to refuse once enforcement
+/// is active. `mesh_client_config` cannot express this any more (it always
+/// presents a certificate), so this builds the TLS config by hand, mirroring
+/// `quic.rs`'s own stale-ALPN tests.
 fn mesh_client_config_without_a_certificate(roots: rustls::RootCertStore) -> noq::ClientConfig {
     let mut tls = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -137,61 +124,6 @@ fn mesh_client_config_without_a_certificate(roots: rustls::RootCertStore) -> noq
     noq::ClientConfig::new(Arc::new(client))
 }
 
-/// With no coordinator ever having pushed a fleet-peer set (the dev/loopback
-/// `--mesh-peer` posture), peer-identity enforcement stays off: a dialer
-/// presenting a real certificate and a valid hello establishes a link exactly
-/// as before this leg, with no fingerprint check at all.
-#[tokio::test]
-async fn an_empty_fleet_map_admits_any_peer_certificate() -> Result<(), AnyError> {
-    // A full production dial (not the bare hello-only helper the refusal tests
-    // below use): the acceptor's `accept_bi` for the mesh control stream is
-    // bounded by the hello timeout, so reaching an established link needs the
-    // dialer to actually open and establish that stream too, exactly as
-    // `run_mesh_dial` does.
-    let tenant = make_tenant();
-    let relay_a = Relay::start(&tenant, 1);
-    let relay_b = Relay::start(&tenant, 2);
-
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        empty_fleet_peers(),
-        false,
-    ));
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay_b.ca.clone()).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let (links_a_tx, _links_a_rx) = mpsc::channel::<LinkHandle>(8);
-    let dial = edge::MeshDial {
-        our_id: RelayId(1),
-        peer_id: RelayId(2),
-        peer_addrs: vec![relay_b.addr],
-        server_name: "localhost".to_owned(),
-        roots,
-        cert_chain: dial_chain,
-        key: dial_key,
-    };
-    tokio::spawn(edge::run_mesh_dial(
-        dial,
-        Arc::clone(&relay_a.sessions),
-        relay_a.mesh.clone(),
-        links_a_tx,
-    ));
-
-    let (peer_id, _generation, _cmds) =
-        tokio::time::timeout(Duration::from_secs(2), links_b_rx.recv())
-            .await
-            .map_err(|_| "the link should establish with enforcement off")?
-            .ok_or("accept side did not produce a link")?;
-    assert_eq!(peer_id, RelayId(1));
-    drop(relay_a);
-    Ok(())
-}
-
 /// `--require-mesh-peer-auth` fails closed even before the coordinator's first
 /// push: every dial is refused while the fleet map is still empty, with the
 /// same code an unrecognized claimed id draws (an empty map trivially has no
@@ -199,18 +131,9 @@ async fn an_empty_fleet_map_admits_any_peer_certificate() -> Result<(), AnyError
 #[tokio::test]
 async fn require_peer_auth_refuses_every_dial_while_the_fleet_map_is_empty() -> Result<(), AnyError>
 {
-    let tenant = make_tenant();
-    let relay_b = Relay::start(&tenant, 2);
-
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        empty_fleet_peers(),
-        true, // --require-mesh-peer-auth
-    ));
+    let tenant = make_default_tenant();
+    let mut relay_b = Relay::start(&tenant, 2);
+    let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), true);
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(relay_b.ca.clone()).unwrap();
@@ -218,155 +141,96 @@ async fn require_peer_auth_refuses_every_dial_while_the_fleet_map_is_empty() -> 
     let cfg = rally_point_transport::quic::mesh_client_config(roots, dial_chain, dial_key)?;
     let connection = dial_and_send_hello(relay_b.addr, cfg, RelayId(1)).await?;
 
-    expect_mesh_close(
-        &connection,
-        rally_point_proto::version::MESH_CLOSE_UNKNOWN_PEER,
-    )
-    .await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), links_b_rx.recv())
-            .await
-            .is_err(),
-        "a refused peer must not surface on the links channel",
-    );
+    expect_mesh_close(&connection, MESH_CLOSE_UNKNOWN_PEER).await;
+    expect_no_link(&mut links_b).await;
     Ok(())
 }
 
-/// A peer that completes the TLS handshake without presenting a client
-/// certificate is refused once enforcement is active (a non-empty fleet map) —
-/// there is nothing to pin against it.
+/// Every way a peer can fail the fleet-map pin, each with its own close code —
+/// the codes are the diagnosis, so collapsing them would hide exactly what the
+/// design wants an operator to be able to read off a refused dial.
+///
+/// The rows are: a peer that completes the TLS handshake without presenting a
+/// client certificate at all (there is nothing to pin against it, and this
+/// fires before the map is even consulted for a specific id); a peer presenting
+/// a real certificate but claiming a relay id the coordinator never enrolled;
+/// and a peer whose claimed id *is* enrolled but whose certificate fingerprint
+/// is not the one recorded for it — the pin catching an impostor, or a cert
+/// that rotated without a fresh coordinator push.
+///
+/// One relay and one accept loop serve all three: the fleet map is re-stored
+/// between rows, which also keeps the suite's hold on the process-wide accept
+/// permits to a minimum.
 #[tokio::test]
-async fn acceptor_refuses_a_peer_presenting_no_client_certificate() -> Result<(), AnyError> {
-    let tenant = make_tenant();
-    let relay_b = Relay::start(&tenant, 2);
-
-    // Enforcement is active: seed one (unrelated) fleet entry so the map is
-    // non-empty. Which entry doesn't matter — this refusal fires before the
-    // fleet map is even consulted for a specific id.
+async fn the_acceptor_refuses_a_peer_that_fails_the_fleet_pin() -> Result<(), AnyError> {
+    let tenant = make_default_tenant();
+    let mut relay_b = Relay::start(&tenant, 2);
     let fleet = FleetMeshPeers::new();
-    fleet.store(vec![rally_point_proto::control::MeshPeerIdentity {
-        relay_id: RelayId(99),
-        cert_sha256: [0xAA; 32],
-    }]);
+    let mut links_b = accept_on(&mut relay_b, fleet.reader(), false);
 
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        fleet.reader(),
-        false,
-    ));
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay_b.ca.clone()).unwrap();
-    let cfg = mesh_client_config_without_a_certificate(roots);
-    let connection = dial_and_send_hello(relay_b.addr, cfg, RelayId(1)).await?;
-
-    expect_mesh_close(
-        &connection,
-        rally_point_proto::version::MESH_CLOSE_NO_CLIENT_CERT,
-    )
-    .await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), links_b_rx.recv())
-            .await
-            .is_err(),
-        "a refused peer must not surface on the links channel",
-    );
-    Ok(())
-}
-
-/// A peer presenting a real certificate but claiming a relay id the fleet map
-/// does not name is refused — the coordinator never enrolled that id.
-#[tokio::test]
-async fn acceptor_refuses_a_peer_claiming_an_unenrolled_relay_id() -> Result<(), AnyError> {
-    let tenant = make_tenant();
-    let relay_b = Relay::start(&tenant, 2);
-
-    // The fleet only knows relay 9; the dialer below claims relay 42.
-    let fleet = FleetMeshPeers::new();
-    fleet.store(vec![rally_point_proto::control::MeshPeerIdentity {
-        relay_id: RelayId(9),
-        cert_sha256: [0xAA; 32],
-    }]);
-
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        fleet.reader(),
-        false,
-    ));
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay_b.ca.clone()).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let cfg = rally_point_transport::quic::mesh_client_config(roots, dial_chain, dial_key)?;
-    let connection = dial_and_send_hello(relay_b.addr, cfg, RelayId(42)).await?;
-
-    expect_mesh_close(
-        &connection,
-        rally_point_proto::version::MESH_CLOSE_UNKNOWN_PEER,
-    )
-    .await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), links_b_rx.recv())
-            .await
-            .is_err(),
-        "a refused peer must not surface on the links channel",
-    );
-    Ok(())
-}
-
-/// A peer whose claimed relay id is enrolled, but whose presented certificate's
-/// fingerprint does not match what the coordinator recorded for that id, is
-/// refused — the fleet-set pin caught an impostor (or a cert that rotated
-/// without a fresh coordinator push).
-#[tokio::test]
-async fn acceptor_refuses_a_peer_whose_certificate_fingerprint_does_not_match()
--> Result<(), AnyError> {
-    let tenant = make_tenant();
-    let relay_b = Relay::start(&tenant, 2);
-
-    // The fleet records relay 1 under a fingerprint that is NOT the dialer's
-    // actual certificate below — a decoy cert's fingerprint.
+    // A certificate the dialer below will never present: the fingerprint the
+    // fleet map records for the mismatch row.
     let (_decoy_chain, _decoy_key, decoy_ca) = self_signed();
-    let fleet = FleetMeshPeers::new();
-    fleet.store(vec![rally_point_proto::control::MeshPeerIdentity {
-        relay_id: RelayId(1),
-        cert_sha256: rally_point_transport::quic::cert_fingerprint(decoy_ca.as_ref()),
-    }]);
+    let decoy_fingerprint = rally_point_transport::quic::cert_fingerprint(decoy_ca.as_ref());
 
-    let (links_b_tx, mut links_b_rx) = mpsc::channel::<LinkHandle>(8);
-    tokio::spawn(edge::run_mesh_accept(
-        relay_b.mesh_accept_rx,
-        Arc::clone(&relay_b.sessions),
-        relay_b.mesh.clone(),
-        links_b_tx,
-        fleet.reader(),
-        false,
-    ));
+    for (case, enrolled, presents_a_certificate, claimed_id, expected_close) in [
+        (
+            "a peer presenting no client certificate",
+            // Enforcement is active (a non-empty map); which entry it holds
+            // does not matter, this refusal fires first.
+            vec![MeshPeerIdentity {
+                relay_id: RelayId(99),
+                cert_sha256: [0xAA; 32],
+            }],
+            false,
+            RelayId(1),
+            MESH_CLOSE_NO_CLIENT_CERT,
+        ),
+        (
+            "a peer claiming an unenrolled relay id",
+            vec![MeshPeerIdentity {
+                relay_id: RelayId(9),
+                cert_sha256: [0xAA; 32],
+            }],
+            true,
+            RelayId(42),
+            MESH_CLOSE_UNKNOWN_PEER,
+        ),
+        (
+            "a peer whose certificate fingerprint does not match",
+            vec![MeshPeerIdentity {
+                relay_id: RelayId(1),
+                cert_sha256: decoy_fingerprint,
+            }],
+            true,
+            RelayId(1),
+            MESH_CLOSE_CERT_MISMATCH,
+        ),
+    ] {
+        fleet.store(enrolled);
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(relay_b.ca.clone()).unwrap();
-    let (dial_chain, dial_key, _) = self_signed();
-    let cfg = rally_point_transport::quic::mesh_client_config(roots, dial_chain, dial_key)?;
-    let connection = dial_and_send_hello(relay_b.addr, cfg, RelayId(1)).await?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(relay_b.ca.clone()).unwrap();
+        let cfg = if presents_a_certificate {
+            let (dial_chain, dial_key, _) = self_signed();
+            rally_point_transport::quic::mesh_client_config(roots, dial_chain, dial_key)?
+        } else {
+            mesh_client_config_without_a_certificate(roots)
+        };
 
-    expect_mesh_close(
-        &connection,
-        rally_point_proto::version::MESH_CLOSE_CERT_MISMATCH,
-    )
-    .await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(300), links_b_rx.recv())
-            .await
-            .is_err(),
-        "a refused peer must not surface on the links channel",
-    );
+        let connection = dial_and_send_hello(relay_b.addr, cfg, claimed_id).await?;
+        match tokio::time::timeout(Duration::from_secs(5), connection.closed()).await {
+            Ok(noq::ConnectionError::ApplicationClosed(close)) => assert_eq!(
+                close.error_code,
+                noq::VarInt::from_u32(expected_close),
+                "{case} must draw its own close code (reason: {:?})",
+                close.reason,
+            ),
+            other => {
+                panic!("expected {case} to be refused with an application close, got {other:?}")
+            }
+        }
+        expect_no_link(&mut links_b).await;
+    }
     Ok(())
 }

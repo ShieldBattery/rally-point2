@@ -104,7 +104,7 @@ pub(crate) use lifecycle::{
 /// effectively a dead client. A real capacity/backpressure model is future work,
 /// so this is deliberately generous rather than tuned. Shared by the client-edge
 /// slot link and the mesh-link task (same turn-magnitude, same drain cadence).
-pub(crate) const FORWARD_CAPACITY: usize = 1024;
+pub const FORWARD_CAPACITY: usize = 1024;
 
 /// The aggregate resident-byte ceiling on one slot's forward queue, a second
 /// bound sitting alongside the payload-*count* bound [`FORWARD_CAPACITY`].
@@ -143,7 +143,7 @@ const INVALID_TURN_CLOSE: u32 = 0x01;
 /// QUIC application close code for a connection the relay disconnects because its
 /// link fell hopelessly behind (its forward queue filled), isolating it so it can't
 /// back-pressure healthy peers.
-const ISOLATED_CLOSE: u32 = 0x04;
+pub const ISOLATED_CLOSE: u32 = 0x04;
 
 /// How often a link flushes a maintenance packet when the forward stream is not
 /// already re-carrying unacked turns.
@@ -179,7 +179,7 @@ const PRE_START_SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 /// same action it takes for a stuck forward queue) rather than let seqs race ahead
 /// until the client's receive window rejects them. Sat below the client's receive
 /// window (4096) so it trips before a hard reject.
-const UNACKED_WINDOW_CAP: usize = 1024;
+pub const UNACKED_WINDOW_CAP: usize = 1024;
 
 /// A sane ceiling on a client-supplied resume-cursor anchor -- the same-relay
 /// resume dial's own-slot cursor read off `resume_cursors` before it ever
@@ -237,7 +237,7 @@ const LEAVE_PROCESSED_CLOSE: u32 = 0x05;
 /// diagnosable in logs, though the client's driver treats it exactly like a
 /// plain transport error (only [`crate::server::SLOT_DEPARTED_CLOSE`] gets
 /// special client-side handling).
-const CONTROL_STREAM_LOST_CLOSE: u32 = 0x07;
+pub const CONTROL_STREAM_LOST_CLOSE: u32 = 0x07;
 
 /// QUIC application close code for a connection refused because its presented
 /// resume-cursor anchor exceeds [`MAX_SANE_RESUME_ANCHOR`]. Distinct from

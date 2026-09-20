@@ -11,36 +11,52 @@ use std::time::Duration;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_relay::auth::Registry;
+use rally_point_relay::routing::Sessions;
 use rally_point_relay::server;
 use rally_point_transport::quic::server_config;
 use rally_point_transport::rustls::pki_types::CertificateDer;
 use rally_point_transport::{Link, noq};
 
-/// Binds an ephemeral relay endpoint serving `registry`, returning its address
-/// and the CA a client trusts to reach it.
-pub fn start_relay(registry: Registry) -> (SocketAddr, CertificateDer<'static>) {
+/// A relay serving the client edge, with the state a test drives it through:
+/// the address and CA a client needs, the roster a coordinator reap or a
+/// provisional sweep acts on, and the mesh registries the turn path reads.
+pub struct TestRelay {
+    pub addr: SocketAddr,
+    pub ca: CertificateDer<'static>,
+    pub sessions: Sessions,
+    pub mesh: rally_point_relay::mesh::MeshState,
+}
+
+/// Binds an ephemeral relay endpoint serving `registry`.
+pub fn start_relay(registry: Registry) -> TestRelay {
     start_relay_with_mesh(registry, rally_point_relay::mesh::new_mesh_state())
 }
 
-/// [`start_relay`] with a caller-supplied [`MeshState`], so a test can hold its
+/// [`start_relay`] with a caller-supplied mesh state, so a test can hold its
 /// decision-maker registry (to seed a pending buffer change) or its mesh links.
 pub fn start_relay_with_mesh(
     registry: Registry,
     mesh: rally_point_relay::mesh::MeshState,
-) -> (SocketAddr, CertificateDer<'static>) {
+) -> TestRelay {
     let (chain, key, ca) = self_signed();
     let server_cfg = server_config(chain, key).unwrap();
     let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
     let endpoint = noq::Endpoint::server(server_cfg, bind).unwrap();
     let addr = endpoint.local_addr().unwrap();
+    let sessions: Sessions = Arc::default();
     tokio::spawn(server::serve(
         endpoint,
         Arc::new(registry),
-        std::sync::Arc::default(),
-        mesh,
+        Arc::clone(&sessions),
+        mesh.clone(),
         None,
     ));
-    (addr, ca)
+    TestRelay {
+        addr,
+        ca,
+        sessions,
+        mesh,
+    }
 }
 
 /// Connects a client for `slot`, completes the handshake as a fresh dial (no resume
@@ -73,26 +89,6 @@ pub async fn connect_slot_resuming(
         .await
         .unwrap();
     Link::new(connection)
-}
-
-/// Reads the next control frame that carries real meaning, skipping the
-/// informational `SlotConnectivity` frames the relay now fans on every register
-/// and disconnect. Panics on timeout or a closed stream. Tests asserting on a
-/// leave or session-start frame use this so a connectivity frame that legitimately
-/// precedes it does not fail the match.
-pub async fn recv_meaningful(
-    reader: &mut tokio::sync::mpsc::Receiver<rally_point_transport::control::ControlInbound>,
-) -> rally_point_transport::control::ControlInbound {
-    use rally_point_transport::control::ControlInbound;
-    loop {
-        let frame = tokio::time::timeout(Duration::from_secs(5), reader.recv())
-            .await
-            .expect("a control frame arrives before the timeout")
-            .expect("the control stream stays open");
-        if !matches!(frame, ControlInbound::Connectivity(_)) {
-            return frame;
-        }
-    }
 }
 
 /// Reads the next coordinator notice that reports a game *event*, skipping the
@@ -172,24 +168,4 @@ pub async fn collect_oversize_turns(
         }
     }
     turns
-}
-
-/// Polls `condition` until it's true or `deadline` passes, sleeping briefly between
-/// checks. Panics with `what` on timeout. Used to observe async server-side
-/// teardown (a disconnect's `end_slot_link` running) that has no local peer to
-/// signal it via a control frame.
-pub async fn wait_until(
-    deadline: tokio::time::Instant,
-    what: &str,
-    mut condition: impl FnMut() -> bool,
-) {
-    loop {
-        if condition() {
-            return;
-        }
-        if tokio::time::Instant::now() > deadline {
-            panic!("{what}");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }

@@ -110,8 +110,11 @@ async fn a_relay_with_no_coordinator_does_not_self_reap() {
         .spawn()
         .expect("the relay binary launches");
 
-    // Well past the threshold, the relay is still running.
-    let exited = wait_for_exit(&mut child, Duration::from_secs(6)).await;
+    // Well past the threshold, the relay is still running. The window has to
+    // clear the binary's own 5s idle-exit poll interval by a wide margin: a
+    // relay that wrongly armed the self-exit would fire on its first or second
+    // poll, and a window only just past one of those could pass by luck.
+    let exited = wait_for_exit(&mut child, Duration::from_secs(9)).await;
     let still_running = exited.is_none();
     // Clean up regardless of the outcome (a no-op if it already exited).
     let _ = child.kill();

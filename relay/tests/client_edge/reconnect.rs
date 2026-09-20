@@ -10,11 +10,10 @@ use rally_point_proto::messages::Payload;
 
 #[tokio::test]
 async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_missed_turns() {
-    use rally_point_relay::consensus::{self, Authority};
     use rally_point_relay::routing::SessionKey;
     use rally_point_transport::control::{ControlInbound, spawn_control_reader};
 
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(300);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -23,24 +22,16 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
 
     // Seed this relay as the authority over an expected {0, 1} set: the session then
     // starts (turns are ring-buffered only once started). A dropped slot is never
-    // auto-decided regardless of the unlock floor, so the floor here matters only to
-    // bound how long the test waits before asserting no leave ever fired.
-    let unlock = Duration::from_millis(1000);
+    // auto-decided regardless of the unlock floor, so a short floor proves the same
+    // thing a long one would — it only bounds how long the test must outlast before
+    // asserting no leave ever fired.
+    let unlock = Duration::from_millis(150);
     let mesh = rally_point_relay::mesh::new_mesh_state_with_drop_unlock(unlock);
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    let ring = mesh.turn_ring.clone();
+    seed_authority(&makers, &key).expecting([0, 1]).apply();
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
@@ -49,15 +40,7 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
 
     // Both connected, so the session started. Slot 0's first framed turn reaches
     // slot 1 live and gives the session a frame basis.
-    slot0
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
+    slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
     let mut got = Vec::new();
     while got.is_empty() {
         got = slot1.recv().await.unwrap().fresh;
@@ -82,9 +65,14 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
             }))
             .unwrap();
     }
-    // Let the relay validate and record the two turns before the reconnect reads the
-    // ring.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The reconnect below replays from the ring, so wait until all three of this
+    // session's turns are recorded in it rather than guessing how long
+    // validation takes.
+    wait_until(
+        "the relay never recorded the missed turns in the replay ring",
+        || ring.totals().turns >= 3,
+    )
+    .await;
 
     // Slot 1 re-dials while its drop is still held, resuming from slot 0 seq 1 (it
     // already has seq 0). The relay accepts it (the hold is still pending), releases
@@ -113,7 +101,7 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
     // The hold was released and the slot reinstated: even well past the unlock floor
     // (past which a drop would only ever be honored on request, never automatically),
     // slot 0 never receives a synced leave for slot 1 (it only hears slot 1 reconnect).
-    let deadline = tokio::time::Instant::now() + unlock + Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + unlock + Duration::from_millis(250);
     loop {
         match tokio::time::timeout_at(deadline, ctrl0.recv()).await {
             Ok(Some(ControlInbound::Leave(leave))) => {
@@ -136,17 +124,13 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
 /// directive itself.
 #[tokio::test]
 async fn a_reconnecting_client_is_replayed_a_leave_decided_while_it_was_gone() {
-    use rally_point_relay::consensus::{self, Authority};
+    use rally_point_relay::consensus::LEAVE_REASON_LEFT;
     use rally_point_relay::routing::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
     };
 
-    // The native SC:R `pending_leave_reason` a voluntary quit writes -- see
-    // `relay::routing::LEAVE_REASON_LEFT`.
-    const LEAVE_REASON_LEFT: u32 = 3;
-
-    let tenant = make_tenant(KID, TENANT);
+    let tenant = make_default_tenant();
     let session = SessionId(310);
     let key = SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -157,19 +141,9 @@ async fn a_reconnecting_client_is_replayed_a_leave_decided_while_it_was_gone() {
     // leave-intent is decided here rather than merely recorded.
     let mesh = rally_point_relay::mesh::new_mesh_state();
     let makers = mesh.decision_makers.clone();
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(
-                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
-                Authority::SelfRelay,
-            )
-        },
-    );
+    seed_authority(&makers, &key).expecting([0, 1]).apply();
 
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    let TestRelay { addr, ca, .. } = start_relay_with_mesh(registry_for_one(&tenant), mesh);
     let endpoint = client_endpoint(&ca);
 
     let mut slot0 = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
@@ -178,15 +152,7 @@ async fn a_reconnecting_client_is_replayed_a_leave_decided_while_it_was_gone() {
 
     // A framed turn from slot 0 reaches slot 1 live: the session has started
     // and `decide_leave` has a frame basis to schedule against.
-    slot0
-        .send(Some(Payload {
-            seq: 0,
-            slot: 0,
-            game_frame_count: Some(10),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
+    slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
     let mut got = Vec::new();
     while got.is_empty() {
         got = slot1.recv().await.unwrap().fresh;
@@ -276,8 +242,8 @@ async fn a_resumed_turn_past_the_window_on_a_nonzero_slot_is_forwarded_not_close
     // dedup and the anchor on the authorized slot, so the turn is accepted and fanned
     // out. (Presenting a high own-slot resume cursor reproduces the anchored,
     // past-window state without pushing 4096 real turns through the loopback first.)
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
+    let tenant = make_default_tenant();
+    let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
     let endpoint = client_endpoint(&ca);
     let session = SessionId(320);
 
@@ -304,15 +270,7 @@ async fn a_resumed_turn_past_the_window_on_a_nonzero_slot_is_forwarded_not_close
     // Slot 1 re-sends its resumed turn, stamping wire slot 0 exactly as the DLL does,
     // at a seq far past the from-zero window. Keyed on the wire slot this trips
     // PayloadOutOfWindow and closes the link — the regression.
-    slot1
-        .send(Some(Payload {
-            seq: 8000,
-            slot: 0,
-            game_frame_count: Some(9000),
-            commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
-            ..Default::default()
-        }))
-        .unwrap();
+    slot1.send(Some(build_turn(0, 8000, Some(9000)))).unwrap();
 
     // The turn is forwarded to slot 0, bound to the authorized slot 1.
     let mut delivered = Vec::new();
