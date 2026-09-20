@@ -51,10 +51,8 @@ pub use silence::{
 };
 pub use sync_coverage::sync_coverage;
 
-#[cfg(test)]
-pub(in crate::consensus) use departure::admit_reconnect_with;
 pub(in crate::consensus) use leave::record_leave_event;
 
 pub(crate) use departure::{
-    admit_reconnect, mark_connection_down, record_departure_for_epoch_outcome,
+    mark_connection_down, record_departure_for_epoch_outcome, resolve_reconnect,
 };

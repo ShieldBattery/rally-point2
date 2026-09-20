@@ -430,13 +430,10 @@ fn dispatch_mesh_control_frame(
             // hold may already have been decided, or a final leave may have
             // arrived first, and fanning out true would resurrect that slot.
             if change.connected {
-                if crate::consensus::admit_reconnect(
-                    &mesh.session.decision_makers,
-                    &mesh.session.drop_holds,
-                    &key,
-                    slot,
-                    change.connection_epoch,
-                ) == crate::consensus::ReconnectAdmission::Rejected
+                if mesh
+                    .session
+                    .admit_reconnect(&key, slot, change.connection_epoch)
+                    == crate::consensus::ReconnectAdmission::Rejected
                 {
                     return;
                 }

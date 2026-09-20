@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
 
-use crate::consensus::DecisionMakers;
+use crate::consensus::{DecisionMakers, ReconnectAdmission};
 use crate::coordinator::load_fence::LoadStateFence;
 use crate::key::SessionKey;
 use crate::session::drop_hold::DropHolds;
@@ -155,6 +155,52 @@ impl SessionState {
             ),
             load_fence: LoadStateFence::new(),
         }
+    }
+}
+
+/// The operations that span two of these stores, which is what makes them this
+/// bundle's rather than either store's.
+impl SessionState {
+    /// Atomically resolves a reliable connection-up event against both the drop
+    /// hold and the decision-maker's departure/generation state.
+    ///
+    /// The hold map stays locked while the maker is acquired, and
+    /// reinstatement plus activation happen under that single maker lock. Thus
+    /// an old departure can linearize only wholly before this operation (and be
+    /// claimed here) or wholly after the new epoch is active (and be rejected
+    /// as stale). The lock order is holds → decision-makers, everywhere.
+    pub(crate) fn admit_reconnect(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        epoch: Option<u64>,
+    ) -> ReconnectAdmission {
+        self.admit_reconnect_with(key, slot, epoch, || {})
+    }
+
+    /// [`admit_reconnect`](Self::admit_reconnect) with a hook that runs inside
+    /// the maker lock, right after a departure is reinstated — the seam a test
+    /// needs to park a thread mid-transition and prove a stale teardown cannot
+    /// interleave.
+    pub(crate) fn admit_reconnect_with(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        epoch: Option<u64>,
+        after_reinstate: impl FnOnce(),
+    ) -> ReconnectAdmission {
+        self.drop_holds
+            .resolve_reconnect(key, slot, |hold_pending| {
+                let transition = crate::consensus::resolve_reconnect(
+                    &self.decision_makers,
+                    key,
+                    slot,
+                    epoch,
+                    hold_pending,
+                    after_reinstate,
+                );
+                (transition.admission, transition.consume_hold)
+            })
     }
 }
 

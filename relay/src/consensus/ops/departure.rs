@@ -90,40 +90,37 @@ pub fn activate_connection_epoch(
         .is_some_and(|maker| maker.activate_connection_epoch(slot, epoch, now))
 }
 
-/// Atomically resolves a reliable connection-up event against both the drop
-/// hold and the decision-maker's departure/generation state. The hold map stays
-/// locked while the maker is acquired, and reinstatement plus activation happen
-/// under that single maker lock. Thus an old departure can linearize only wholly
-/// before this operation (and be claimed here) or wholly after the new epoch is
-/// active (and be rejected as stale).
-pub(crate) fn admit_reconnect(
+/// Resolves a reliable connection-up event against the decision-maker's
+/// departure and generation state, under one acquisition of the maker lock:
+/// whether the dial is admitted, and whether it claimed the caller's pending
+/// drop hold. `hold_pending` is whether a hold for the slot is currently
+/// installed, read by the caller under the hold map's own lock.
+///
+/// The reinstatement and the new generation's activation both happen inside
+/// that one maker lock, so an old departure can linearize only wholly before
+/// this call (and be claimed here) or wholly after the new epoch is active
+/// (and be rejected as stale). The caller's hold map must stay locked across
+/// this call for the pairing to be atomic — see
+/// [`crate::session::state::SessionState::admit_reconnect`], which owns both
+/// registries and is the only production caller.
+///
+/// A missing maker admits without reinstating: there is no local consensus
+/// state the dial could conflict with.
+pub(crate) fn resolve_reconnect(
     registry: &DecisionMakers,
-    drop_holds: &crate::session::drop_hold::DropHolds,
     key: &SessionKey,
     slot: SlotId,
     epoch: Option<u64>,
-) -> ReconnectAdmission {
-    admit_reconnect_with(registry, drop_holds, key, slot, epoch, || {})
-}
-
-pub(in crate::consensus) fn admit_reconnect_with(
-    registry: &DecisionMakers,
-    drop_holds: &crate::session::drop_hold::DropHolds,
-    key: &SessionKey,
-    slot: SlotId,
-    epoch: Option<u64>,
+    hold_pending: bool,
     after_reinstate: impl FnOnce(),
-) -> ReconnectAdmission {
-    drop_holds.resolve_reconnect(key, slot, |hold_pending| {
-        let transition = registry.lock().get_mut(key).map_or(
-            ReconnectTransition {
-                admission: ReconnectAdmission::Admitted { reinstated: false },
-                consume_hold: hold_pending,
-            },
-            |maker| maker.resolve_reconnect_with(slot, epoch, hold_pending, after_reinstate),
-        );
-        (transition.admission, transition.consume_hold)
-    })
+) -> ReconnectTransition {
+    registry.lock().get_mut(key).map_or(
+        ReconnectTransition {
+            admission: ReconnectAdmission::Admitted { reinstated: false },
+            consume_hold: hold_pending,
+        },
+        |maker| maker.resolve_reconnect_with(slot, epoch, hold_pending, after_reinstate),
+    )
 }
 
 /// Commits a reliable level=false frame. A duplicate Down(E) is idempotent;

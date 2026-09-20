@@ -627,10 +627,13 @@ pub(crate) enum ReconnectAdmission {
     Rejected,
 }
 
+/// What one reliable connection-up event resolved to against the maker: the
+/// admission to answer the dial with, and whether a pending drop hold was
+/// claimed by it and must now be removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::consensus) struct ReconnectTransition {
-    pub(in crate::consensus) admission: ReconnectAdmission,
-    pub(in crate::consensus) consume_hold: bool,
+pub(crate) struct ReconnectTransition {
+    pub(crate) admission: ReconnectAdmission,
+    pub(crate) consume_hold: bool,
 }
 
 /// Whether an epoch-fenced departure was rejected, recorded as an undecided

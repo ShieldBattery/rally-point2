@@ -251,13 +251,13 @@ fn reconnect_restores_frame_history_and_immediate_redrop_keeps_apply_basis() {
 
 #[test]
 fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
-    let makers = Arc::new(new_decision_makers());
+    // Both registries come from one `SessionState`, which owns the pairing:
+    // the admission below locks the holds and the makers together.
+    let state = reconnect_state();
+    let makers = Arc::clone(&state.decision_makers);
+    let holds = state.drop_holds.clone();
     let session = key();
     makers.lock().insert(session.clone(), peer_maker());
-    let holds = crate::session::drop_hold::DropHolds::new(
-        std::time::Duration::ZERO,
-        std::time::Duration::from_secs(1),
-    );
     assert!(activate_connection_epoch(&makers, &session, SlotId(0), 11));
 
     // The old departure linearizes first: reconnect observes and claims the
@@ -274,7 +274,7 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
         (recorded, recorded)
     }));
     assert_eq!(
-        admit_reconnect(&makers, &holds, &session, SlotId(0), Some(22)),
+        state.admit_reconnect(&session, SlotId(0), Some(22)),
         ReconnectAdmission::Admitted { reinstated: true }
     );
     assert!(!holds.is_pending(&session, SlotId(0)));
@@ -283,7 +283,7 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
     // The reconnect linearizes first: a later E1 record is stale and cannot
     // install either a departure or an orphan hold against live E3.
     assert_eq!(
-        admit_reconnect(&makers, &holds, &session, SlotId(0), Some(33)),
+        state.admit_reconnect(&session, SlotId(0), Some(33)),
         ReconnectAdmission::Admitted { reinstated: false }
     );
     assert!(!holds.record_and_maybe_hold(&session, SlotId(0), || {
@@ -309,7 +309,9 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
 
 #[test]
 fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
-    let makers = Arc::new(new_decision_makers());
+    let state = reconnect_state();
+    let makers = Arc::clone(&state.decision_makers);
+    let holds = state.drop_holds.clone();
     let session = key();
     let mut maker = peer_maker();
     assert!(maker.activate_connection_epoch(SlotId(0), 11, Instant::now()));
@@ -320,29 +322,17 @@ fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
         Some(11)
     ));
     makers.lock().insert(session.clone(), maker);
-    let holds = crate::session::drop_hold::DropHolds::new(
-        std::time::Duration::ZERO,
-        std::time::Duration::from_secs(1),
-    );
     holds.hold(session.clone(), SlotId(0));
 
     let (inside_tx, inside_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
-    let reconnect_makers = Arc::clone(&makers);
-    let reconnect_holds = holds.clone();
+    let reconnect_state = state.clone();
     let reconnect_key = session.clone();
     let reconnect = std::thread::spawn(move || {
-        admit_reconnect_with(
-            &reconnect_makers,
-            &reconnect_holds,
-            &reconnect_key,
-            SlotId(0),
-            Some(22),
-            || {
-                inside_tx.send(()).unwrap();
-                resume_rx.recv().unwrap();
-            },
-        )
+        reconnect_state.admit_reconnect_with(&reconnect_key, SlotId(0), Some(22), || {
+            inside_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+        })
     });
     inside_rx
         .recv()
@@ -383,4 +373,15 @@ fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
         SlotId(0),
         Some(22)
     ));
+}
+
+/// The bundle both reconnect-ordering tests drive: an immediate drop unlock
+/// (nothing here waits one out) and an abandon window long enough never to
+/// fire mid-test.
+fn reconnect_state() -> crate::session::SessionState {
+    crate::session::SessionState::with_tunables(crate::session::Tunables {
+        drop_unlock: Duration::ZERO,
+        abandon_timeout: Duration::from_secs(1),
+        ..crate::session::Tunables::default()
+    })
 }

@@ -476,13 +476,9 @@ async fn serve_connection(
         if !journal_seal_still_clear(&mesh.session, &key, authorized.slot) {
             return consensus::ReconnectAdmission::Rejected;
         }
-        let verdict = consensus::admit_reconnect(
-            &mesh.session.decision_makers,
-            &mesh.session.drop_holds,
-            &key,
-            authorized.slot,
-            Some(connection_epoch),
-        );
+        let verdict = mesh
+            .session
+            .admit_reconnect(&key, authorized.slot, Some(connection_epoch));
         // Bound the admit-first race this connection just rode (the home-relay
         // gate above, admitted because no descriptor names this session yet):
         // if the coordinator's descriptor push never arrives, the

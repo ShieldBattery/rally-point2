@@ -300,10 +300,10 @@ pub use registry::{
 };
 pub use sync::SyncDivergence;
 
-#[cfg(test)]
-pub(in crate::consensus) use ops::admit_reconnect_with;
-pub(crate) use ops::{admit_reconnect, mark_connection_down, record_departure_for_epoch_outcome};
-pub(crate) use slot::{ConnectionActivation, DepartureRecordOutcome, ReconnectAdmission};
+pub(crate) use ops::{mark_connection_down, record_departure_for_epoch_outcome, resolve_reconnect};
+pub(crate) use slot::{
+    ConnectionActivation, DepartureRecordOutcome, ReconnectAdmission, ReconnectTransition,
+};
 
 /// How long a relay withholds the session's relay → region labels from its
 /// clients, measured on the relay's own clock from the moment it latched the
