@@ -2,6 +2,8 @@
 //! the relay-pair RTT cache, the maintenance schedule, redundancy-aware flush
 //! deferral, and the ack-cursor and oversize-turn folds.
 
+use rally_point_transport::test_util::self_signed;
+
 use super::*;
 
 #[test]
@@ -177,20 +179,6 @@ async fn live_and_replay_sends_report_when_they_carry_redundancy() {
         Some(true),
         "a replay batch propagates the redundancy carried by its later send",
     );
-}
-
-fn self_signed() -> (
-    Vec<rally_point_transport::rustls::pki_types::CertificateDer<'static>>,
-    rally_point_transport::rustls::pki_types::PrivateKeyDer<'static>,
-    rally_point_transport::rustls::pki_types::CertificateDer<'static>,
-) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    let cert_der = cert.cert.der().clone();
-    let key = rally_point_transport::rustls::pki_types::PrivateKeyDer::try_from(
-        cert.signing_key.serialize_der(),
-    )
-    .unwrap();
-    (vec![cert_der.clone()], key, cert_der)
 }
 
 /// A loopback mesh-link QUIC connection, wrapped as a [`MeshLink`]. Only one

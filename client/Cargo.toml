@@ -30,6 +30,10 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+# The shared loopback fixtures (self-signed cert, a connected QUIC pair) the
+# driver's tests bring a link up with. Dev-only: the feature pulls rcgen in, and
+# the 32-bit game build must never see it.
+rally-point-transport = { workspace = true, features = ["test-util"] }
 # The C–S–C loopback test drives real clients against a real relay.
 rally-point-relay = { workspace = true }
 # Self-signed relay cert for the loopback test (dev-only; uses ring, not aws-lc-rs).

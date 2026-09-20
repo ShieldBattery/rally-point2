@@ -64,6 +64,9 @@ zstd = { workspace = true }
 # already dev-depends on this crate — which cargo permits, since dev-dependencies do
 # not feed the library build graph.
 rally-point-coordinator = { path = "../coordinator" }
+# The shared loopback/cert fixtures the tests bring a QUIC pair up with, so the
+# helpers live once in the transport crate instead of once per test module.
+rally-point-transport = { workspace = true, features = ["test-util"] }
 # Serves that in-process coordinator's HTTP router in the test.
 axum = { workspace = true }
 criterion = { workspace = true }

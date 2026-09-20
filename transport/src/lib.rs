@@ -60,6 +60,9 @@ pub mod mesh_control_stream;
 #[cfg(test)]
 mod recarry_sim;
 
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_util;
+
 /// Re-exports of the QUIC stack and its TLS layer, so a consumer pins exactly
 /// the versions this crate was built against rather than declaring its own.
 pub use {noq, rustls};

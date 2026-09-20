@@ -22,7 +22,7 @@ use rally_point_proto::token::{
 };
 use rally_point_relay::auth::{HANDSHAKE_OK, Registry};
 use rally_point_transport::quic::client_config;
-use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rally_point_transport::rustls::pki_types::CertificateDer;
 use rally_point_transport::{noq, rustls};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -98,17 +98,9 @@ pub fn mint_token(
 }
 
 /// A self-signed cert + key for the relay, plus the cert alone to seed a client's
-/// trust roots.
-pub fn self_signed() -> (
-    Vec<CertificateDer<'static>>,
-    PrivateKeyDer<'static>,
-    CertificateDer<'static>,
-) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    let cert_der = cert.cert.der().clone();
-    let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-    (vec![cert_der.clone()], key, cert_der)
-}
+/// trust roots. Re-exported from the transport crate's shared fixtures so every
+/// suite still reaches it as `common::self_signed`.
+pub use rally_point_transport::test_util::self_signed;
 
 /// A client endpoint trusting `ca`. One endpoint can dial the relay for several
 /// slots; the caller keeps it alive for as long as its connections are needed.

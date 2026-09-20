@@ -33,6 +33,13 @@ ring = { workspace = true }
 tokio = { workspace = true }
 # Structured logging in the beacon read loop (malformed-frame diagnostics).
 tracing = { workspace = true }
+# Self-signed certs for the `test-util` loopback fixtures dependents' tests use.
+rcgen = { workspace = true, optional = true }
+
+[features]
+# Exposes `test_util` (self-signed certs + loopback QUIC pairs) to dependents'
+# tests. Never enabled by a production build.
+test-util = ["dep:rcgen"]
 
 [dev-dependencies]
 # Self-signed certs for the loopback QUIC tests.

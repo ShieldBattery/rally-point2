@@ -5,7 +5,7 @@
 use std::net::Ipv4Addr;
 
 use rally_point_transport::quic::server_config;
-use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rally_point_transport::test_util::self_signed;
 use tokio::sync::mpsc;
 
 use crate::mesh;
@@ -13,17 +13,6 @@ use crate::routing::Sessions;
 
 use super::accept::{MESH_ACCEPT_CONCURRENCY, MESH_ACCEPT_PERMITS};
 use super::*;
-
-fn self_signed() -> (
-    Vec<CertificateDer<'static>>,
-    PrivateKeyDer<'static>,
-    CertificateDer<'static>,
-) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    let cert_der = cert.cert.der().clone();
-    let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-    (vec![cert_der.clone()], key, cert_der)
-}
 
 /// A loopback QUIC connection negotiated on `MESH_ALPN`, mirroring the
 /// integration tests' own helper -- only the accept side is returned
