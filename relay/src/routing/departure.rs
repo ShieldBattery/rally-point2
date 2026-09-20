@@ -62,19 +62,16 @@ use crate::consensus::LEAVE_REASON_DROPPED;
 /// drain-time reclaim check stands a stale journaled drop down if the slot
 /// reconnected meanwhile). Callers run this under the session's ingress gate,
 /// so a racing retirement cannot have the deposit recreate journal state.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn announce_departure(
-    drop_holds: &crate::session::drop_hold::DropHolds,
-    decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
-    mesh_links: &crate::mesh::MeshLinks,
-    provisional_turns: &crate::session::provisional_turns::ProvisionalTurnPen,
+    mesh: &crate::mesh::MeshState,
     key: &SessionKey,
     slot: SlotId,
     reason: u32,
     final_turn_count: Option<u64>,
     connection_epoch: Option<u64>,
 ) -> bool {
+    let provisional_turns = &mesh.session.provisional_turns;
     if provisional_turns.armed() {
         use crate::session::provisional_turns::{HoldOutcome, PennedIngress};
         match provisional_turns.hold(
@@ -112,10 +109,8 @@ pub(crate) fn announce_departure(
         }
     }
     announce_departure_recorded(
-        drop_holds,
-        decision_makers,
         sessions,
-        mesh_links,
+        mesh,
         key,
         slot,
         reason,
@@ -128,18 +123,17 @@ pub(crate) fn announce_departure(
 /// broadcasts against the session's current state. Called directly by the
 /// journal drain (whose deposits must not re-enter the journal) and by the
 /// wrapper above once the journal is resolved.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn announce_departure_recorded(
-    drop_holds: &crate::session::drop_hold::DropHolds,
-    decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
-    mesh_links: &crate::mesh::MeshLinks,
+    mesh: &crate::mesh::MeshState,
     key: &SessionKey,
     slot: SlotId,
     reason: u32,
     final_turn_count: Option<u64>,
     connection_epoch: Option<u64>,
 ) -> bool {
+    let drop_holds = &mesh.session.drop_holds;
+    let decision_makers = &mesh.session.decision_makers;
     let roster_guard = (reason == LEAVE_REASON_DROPPED).then(|| sessions.lock());
     if let Some(roster) = &roster_guard
         && roster
@@ -201,7 +195,7 @@ pub(crate) fn announce_departure_recorded(
     if outcome != consensus::DepartureRecordOutcome::Pending {
         return false;
     }
-    crate::mesh::fan_out_slot_departed(mesh_links, key, slot, &stamps, reason, connection_epoch);
+    crate::mesh::fan_out_slot_departed(&mesh.links, key, slot, &stamps, reason, connection_epoch);
     // Turn the recorded departure into the synced leave — but a *drop* is only
     // marked as an undecided hold, never decided here: survivors are removed on a
     // disconnect only when a human's `RequestDrop` is honored past the unlock
@@ -213,7 +207,7 @@ pub(crate) fn announce_departure_recorded(
         drop_holds,
         decision_makers,
         sessions,
-        mesh_links,
+        &mesh.links,
         key,
         slot,
         reason,

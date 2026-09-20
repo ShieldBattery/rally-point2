@@ -320,11 +320,8 @@ fn a_pre_descriptor_clean_leave_is_journaled_and_drained_with_its_count() {
     }
     let announced = mesh_state.session.gates.with_ingress(&key(1), || {
         crate::routing::announce_departure(
-            &mesh_state.session.drop_holds,
-            &makers,
             &sessions,
-            &mesh_state.links,
-            &mesh_state.session.provisional_turns,
+            &mesh_state,
             &key(1),
             SlotId(1),
             consensus::LEAVE_REASON_LEFT,
@@ -395,11 +392,8 @@ fn a_journaled_leave_with_no_local_survivors_still_drains_and_decides() {
     );
     let announced = mesh_state.session.gates.with_ingress(&key(1), || {
         crate::routing::announce_departure(
-            &mesh_state.session.drop_holds,
-            &makers,
             &sessions,
-            &mesh_state.links,
-            &mesh_state.session.provisional_turns,
+            &mesh_state,
             &key(1),
             SlotId(1),
             consensus::LEAVE_REASON_LEFT,

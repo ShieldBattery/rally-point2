@@ -282,10 +282,8 @@ impl MeshControl {
                                     .then(|| mesh::forwarded_count(&self.mesh.seen, &key, slot))
                                     .flatten();
                                 let _ = routing::announce_departure_recorded(
-                                    &self.mesh.session.drop_holds,
-                                    &self.mesh.session.decision_makers,
                                     &self.sessions,
-                                    &self.mesh.links,
+                                    &self.mesh,
                                     &key,
                                     slot,
                                     reason,

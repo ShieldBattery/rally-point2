@@ -72,11 +72,8 @@ async fn an_emptied_close_keeps_an_undrained_journal() {
     // link teardown with the leave already announced.
     let announced = mesh.session.gates.with_ingress(&k, || {
         announce_departure(
-            &mesh.session.drop_holds,
-            &mesh.session.decision_makers,
             &sessions,
-            &mesh.links,
-            &mesh.session.provisional_turns,
+            &mesh,
             &k,
             SlotId(1),
             LEAVE_REASON_LEFT,

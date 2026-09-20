@@ -159,16 +159,7 @@ pub(crate) fn honor_drop_request(
                         "honoring manual drop request via local finalization",
                     );
                     if let consensus::FinalizeOutcome::Finalized { final_turn_count } = outcome {
-                        complete_finalized_drop(
-                            drop_holds,
-                            decision_makers,
-                            sessions,
-                            mesh_links,
-                            seen,
-                            key,
-                            target,
-                            final_turn_count,
-                        );
+                        complete_finalized_drop(sessions, mesh, key, target, final_turn_count);
                     } else if outcome == consensus::FinalizeOutcome::RejectedNoCursor {
                         decision_makers.flight_recorder().record(
                             key,
@@ -258,17 +249,17 @@ pub(crate) fn honor_drop_request(
 /// ([`honor_drop_request`]) and the mesh `FinalizeDropResult` arm. A lost
 /// hold-claim race stands down exactly like the legacy honor path — the slot
 /// may be live again on a relay whose rejection is still in flight.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn complete_finalized_drop(
-    drop_holds: &crate::session::drop_hold::DropHolds,
-    decision_makers: &Arc<crate::consensus::DecisionMakers>,
     sessions: &Sessions,
-    mesh_links: &crate::mesh::MeshLinks,
-    seen: &crate::mesh::SeenRegistries,
+    mesh: &crate::mesh::MeshState,
     key: &SessionKey,
     target: SlotId,
     final_turn_count: u64,
 ) {
+    let drop_holds = &mesh.session.drop_holds;
+    let decision_makers = &mesh.session.decision_makers;
+    let mesh_links = &mesh.links;
+    let seen = &mesh.seen;
     // Local staleness proof, checked before anything is stamped: if this
     // relay's own gap-free forwarded prefix for the slot already extends
     // PAST the sealed count, turns beyond the count entered the mesh after

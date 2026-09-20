@@ -26,11 +26,8 @@ async fn a_disconnect_announcement_stands_down_when_the_slot_has_already_reconne
     // The disconnect's teardown -- unaware the seat was already reclaimed --
     // reaches its announcement.
     announce_departure(
-        &holds,
-        &h.makers,
         &h.sessions,
-        &h.mesh_links,
-        &crate::session::provisional_turns::ProvisionalTurnPen::default(),
+        &h.mesh(&holds),
         &k,
         SlotId(1),
         LEAVE_REASON_DROPPED,
@@ -143,11 +140,8 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     // then report the changed roster — the end-of-link path, in order.
     deregister(&sessions, &k, SlotId(0));
     announce_departure(
-        &holds,
-        &makers,
         &sessions,
-        &mesh_links,
-        &crate::session::provisional_turns::ProvisionalTurnPen::default(),
+        &mesh_with(&holds, &makers, &mesh_links, &presence),
         &k,
         SlotId(0),
         LEAVE_REASON_DROPPED,
@@ -161,11 +155,8 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     );
     deregister(&sessions, &k, SlotId(1));
     announce_departure(
-        &holds,
-        &makers,
         &sessions,
-        &mesh_links,
-        &crate::session::provisional_turns::ProvisionalTurnPen::default(),
+        &mesh_with(&holds, &makers, &mesh_links, &presence),
         &k,
         SlotId(1),
         LEAVE_REASON_DROPPED,

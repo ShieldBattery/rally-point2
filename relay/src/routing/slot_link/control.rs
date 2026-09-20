@@ -352,11 +352,8 @@ fn handle_leave_intent(link: &mut Link, ctx: &mut SlotLinkCtx) -> ControlFlow<()
         .gates
         .with_ingress(&ctx.key, || {
             announce_departure(
-                &ctx.drop_holds,
-                &ctx.decision_makers,
                 &ctx.sessions,
-                &ctx.mesh_links,
-                &ctx.mesh_for_teardown.session.provisional_turns,
+                &ctx.mesh_for_teardown,
                 &ctx.key,
                 ctx.slot,
                 LEAVE_REASON_LEFT,

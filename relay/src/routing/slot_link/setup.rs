@@ -9,19 +9,16 @@ use super::inbound::sample_slot_conditions;
 /// Runs the activation prologue for a freshly registered slot, reporting whether
 /// it landed (a session retired mid-activation refuses it and the link is torn
 /// down instead of serving).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn activate_slot(
     link: &Link,
     sessions: &Sessions,
-    mesh_for_teardown: &crate::mesh::MeshState,
-    mesh_links: &crate::mesh::MeshLinks,
-    conditions: &crate::mesh::ConditionsRegistry,
-    decision_makers: &Arc<crate::consensus::DecisionMakers>,
+    mesh: &crate::mesh::MeshState,
     key: &SessionKey,
     slot: SlotId,
     connection_epoch: u64,
     resumed_dial: bool,
 ) -> bool {
+    let decision_makers = &mesh.session.decision_makers;
     // The activation prologue runs as ONE ingress critical section: the
     // admission gate (`server.rs`) necessarily released across the
     // handshake-ack await before this task started, so a retirement can land
@@ -30,7 +27,7 @@ pub(super) fn activate_slot(
     // coordinator already ended. Under the gate, either the sweep waits for
     // this block or this block observes the retirement and the link is torn
     // down instead of serving.
-    let activated = mesh_for_teardown.session.gates.with_ingress(key, || {
+    let activated = mesh.session.gates.with_ingress(key, || {
         // A slot link is serving this session (again): any session-closed report an
         // earlier emptying latched no longer describes this relay, so the next
         // emptying must report anew. See `consensus::claim_close_report`.
@@ -42,7 +39,7 @@ pub(super) fn activate_slot(
         // roster already includes this slot (registration preceded this task), so
         // report it and re-derive. The peers learn the new count from the mesh
         // drivers' presence reconcile, off the same roster.
-        report_own_presence(sessions, mesh_for_teardown, key);
+        report_own_presence(sessions, mesh, key);
 
         // Feed an immediate conditions sample from the completed QUIC handshake into
         // the session's decision-maker BEFORE announcing presence, so when this slot
@@ -52,7 +49,7 @@ pub(super) fn activate_slot(
         // consensus coordinate — so this only accumulates state. Publishing it also
         // seeds the mesh sidecar for this slot.
         let handshake_sample = sample_slot_conditions(link, slot, connection_epoch).conditions;
-        crate::mesh::activate_conditions(conditions, key, slot, handshake_sample);
+        crate::mesh::activate_conditions(&mesh.conditions, key, slot, handshake_sample);
         let _ = consensus::ingest_local_condition(decision_makers, key, &handshake_sample);
 
         // Tell the coordinator this slot's client is here, so the tenant can name
@@ -69,7 +66,7 @@ pub(super) fn activate_slot(
         // late or reconnecting slot), the directive is re-pushed straight to it. The
         // roster already includes this slot (registration preceded this task), so
         // `fan_out_session_start` reaches it too.
-        announce_slot_present(sessions, decision_makers, mesh_links, key, slot);
+        announce_slot_present(sessions, decision_makers, &mesh.links, key, slot);
 
         // Announce this slot's link as connected to every slot in the session (local
         // and across the mesh), so survivors' connectivity displays reflect it. A
@@ -79,7 +76,7 @@ pub(super) fn activate_slot(
         // and leave paths.
         broadcast_connectivity(
             sessions,
-            mesh_links,
+            &mesh.links,
             key,
             slot,
             true,

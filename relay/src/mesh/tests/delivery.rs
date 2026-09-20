@@ -30,9 +30,8 @@ fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
     use rally_point_proto::control::BufferBounds;
 
     let sessions = routing::Sessions::default();
-    let seen = new_seen_registries();
-    let decision_makers = Arc::new(consensus::new_decision_makers());
-    let turn_ring = crate::session::turn_ring::TurnRing::new();
+    let mesh = MeshState::default();
+    let decision_makers = mesh.session.decision_makers.clone();
     let key = control_key();
     let _ = consensus::sync_maker(
         &decision_makers,
@@ -51,9 +50,7 @@ fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
     for seq in 0..(cap + 5) as u64 {
         deliver_turn_to_locals(
             &sessions,
-            &seen,
-            &decision_makers,
-            &turn_ring,
+            &mesh,
             &key,
             SlotId(0),
             Payload {
@@ -64,7 +61,7 @@ fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
             crate::consensus::delivery::DeliveryHome::Local,
         );
     }
-    assert_eq!(turn_ring.len(&key), cap);
+    assert_eq!(mesh.session.turn_ring.len(&key), cap);
     assert!(
         cap < crate::session::turn_ring::max_turns(crate::session::turn_ring::MAX_GAME_SLOTS),
         "the 2-slot bound is genuinely tighter than the full-game bound",
@@ -80,9 +77,7 @@ fn delivery_relay(
     region_delay: std::time::Duration,
 ) -> (
     routing::Sessions,
-    SeenRegistries,
-    Arc<crate::consensus::DecisionMakers>,
-    crate::session::turn_ring::TurnRing,
+    MeshState,
     SessionKey,
     Vec<rally_point_proto::messages::RegionLabel>,
 ) {
@@ -91,11 +86,13 @@ fn delivery_relay(
     use rally_point_proto::messages::RegionLabel;
 
     let sessions = routing::Sessions::default();
-    let seen = new_seen_registries();
-    let decision_makers = Arc::new(consensus::new_decision_makers_with_region_delay(
-        region_delay,
+    let mesh = MeshState::new(crate::session::SessionState::with_tunables(
+        crate::session::Tunables {
+            region_release_delay: region_delay,
+            ..Default::default()
+        },
     ));
-    let turn_ring = crate::session::turn_ring::TurnRing::new();
+    let decision_makers = mesh.session.decision_makers.clone();
     let key = control_key();
     let _ = consensus::sync_maker(
         &decision_makers,
@@ -117,7 +114,7 @@ fn delivery_relay(
         None,
         "a descriptor alone never releases the labels",
     );
-    (sessions, seen, decision_makers, turn_ring, key, labels)
+    (sessions, mesh, key, labels)
 }
 
 /// The region-label release gate is evaluated on the production turn path, so
@@ -142,16 +139,14 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
 
     // A relay whose release delay outlasts the test: the gate never opens.
     {
-        let (sessions, seen, decision_makers, turn_ring, key, _labels) =
-            delivery_relay(std::time::Duration::from_secs(3600));
+        let (sessions, mesh, key, _labels) = delivery_relay(std::time::Duration::from_secs(3600));
+        let decision_makers = mesh.session.decision_makers.clone();
         let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
         let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
         let deliver = |payload: Payload| {
             deliver_turn_to_locals(
                 &sessions,
-                &seen,
-                &decision_makers,
-                &turn_ring,
+                &mesh,
                 &key,
                 SlotId(0),
                 payload,
@@ -180,16 +175,14 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
 
     // A relay whose delay has elapsed by construction: the next delivered turn
     // opens the gate and every local slot gets the descriptor's map, verbatim.
-    let (sessions, seen, decision_makers, turn_ring, key, labels) =
-        delivery_relay(std::time::Duration::ZERO);
+    let (sessions, mesh, key, labels) = delivery_relay(std::time::Duration::ZERO);
+    let decision_makers = mesh.session.decision_makers.clone();
     let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
     let (_reg1, mut inbox1) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
     let deliver = |payload: Payload| {
         deliver_turn_to_locals(
             &sessions,
-            &seen,
-            &decision_makers,
-            &turn_ring,
+            &mesh,
             &key,
             SlotId(0),
             payload,
@@ -225,17 +218,15 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
 fn a_frameless_turn_drives_the_region_label_gate_like_any_other() {
     use crate::consensus;
 
-    let (sessions, seen, decision_makers, turn_ring, key, labels) =
-        delivery_relay(std::time::Duration::ZERO);
+    let (sessions, mesh, key, labels) = delivery_relay(std::time::Duration::ZERO);
+    let decision_makers = mesh.session.decision_makers.clone();
     let (_reg0, mut inbox0) = routing::register(&sessions, &key, SlotId(0), 1).unwrap();
 
     consensus::mark_session_started(&decision_makers, &key);
 
     deliver_turn_to_locals(
         &sessions,
-        &seen,
-        &decision_makers,
-        &turn_ring,
+        &mesh,
         &key,
         SlotId(0),
         Payload {
@@ -264,9 +255,8 @@ fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
     use rally_point_proto::control::BufferBounds;
 
     let sessions = routing::Sessions::default();
-    let seen = new_seen_registries();
-    let decision_makers = Arc::new(consensus::new_decision_makers());
-    let turn_ring = crate::session::turn_ring::TurnRing::new();
+    let mesh = MeshState::default();
+    let decision_makers = mesh.session.decision_makers.clone();
     let (tx, mut rx) = mpsc::unbounded_channel();
     decision_makers.set_notice_notifier(tx);
     let key = control_key();
@@ -284,9 +274,7 @@ fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
     assert!(
         deliver_turn_to_locals(
             &sessions,
-            &seen,
-            &decision_makers,
-            &turn_ring,
+            &mesh,
             &key,
             SlotId(0),
             first.clone(),
@@ -298,9 +286,7 @@ fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
     assert!(
         deliver_turn_to_locals(
             &sessions,
-            &seen,
-            &decision_makers,
-            &turn_ring,
+            &mesh,
             &key,
             SlotId(0),
             first,
@@ -318,9 +304,7 @@ fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
     // mismatch.
     deliver_turn_to_locals(
         &sessions,
-        &seen,
-        &decision_makers,
-        &turn_ring,
+        &mesh,
         &key,
         SlotId(1),
         sync_payload(0, 1, 0, value),
@@ -329,9 +313,7 @@ fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
     for ordinal in 1..12u8 {
         deliver_turn_to_locals(
             &sessions,
-            &seen,
-            &decision_makers,
-            &turn_ring,
+            &mesh,
             &key,
             SlotId(0),
             sync_payload(u64::from(ordinal), 0, ordinal, value),
@@ -339,9 +321,7 @@ fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
         );
         deliver_turn_to_locals(
             &sessions,
-            &seen,
-            &decision_makers,
-            &turn_ring,
+            &mesh,
             &key,
             SlotId(1),
             sync_payload(u64::from(ordinal), 1, ordinal, value),
@@ -369,9 +349,8 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
     use rally_point_proto::control::BufferBounds;
 
     let sessions = routing::Sessions::default();
-    let seen = new_seen_registries();
-    let decision_makers = Arc::new(consensus::new_decision_makers());
-    let turn_ring = crate::session::turn_ring::TurnRing::new();
+    let mesh = MeshState::default();
+    let decision_makers = mesh.session.decision_makers.clone();
     let key = control_key();
     let _ = consensus::sync_maker(
         &decision_makers,
@@ -394,9 +373,7 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
         assert!(
             deliver_turn_to_locals(
                 &sessions,
-                &seen,
-                &decision_makers,
-                &turn_ring,
+                &mesh,
                 &key,
                 SlotId(0),
                 payload.clone(),
@@ -408,9 +385,7 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
         assert!(
             deliver_turn_to_locals(
                 &sessions,
-                &seen,
-                &decision_makers,
-                &turn_ring,
+                &mesh,
                 &key,
                 SlotId(0),
                 payload,
@@ -435,8 +410,7 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
 
 #[test]
 fn checksum_sequence_gaps_never_hold_gameplay_delivery() {
-    let (sessions, seen, decision_makers, turn_ring, key, _) =
-        delivery_relay(std::time::Duration::from_secs(60));
+    let (sessions, mesh, key, _) = delivery_relay(std::time::Duration::from_secs(60));
     let (_registration, mut inbox) = routing::register(&sessions, &key, SlotId(1), 1).unwrap();
 
     // Sequence 1 waits on 0 in the checksum observer. Sequence 4096 then
@@ -445,9 +419,7 @@ fn checksum_sequence_gaps_never_hold_gameplay_delivery() {
         let payload = sync_payload(seq, 0, seq as u8, [1, 2, 3, 4, 5]);
         let delivered = deliver_turn_to_locals(
             &sessions,
-            &seen,
-            &decision_makers,
-            &turn_ring,
+            &mesh,
             &key,
             SlotId(0),
             payload.clone(),

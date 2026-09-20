@@ -117,16 +117,7 @@ pub(super) fn dispatch_finalize_drop_result(
     }
     match (result.outcome, result.final_turn_count) {
         (FINALIZE_OUTCOME_FINALIZED, Some(final_turn_count)) => {
-            routing::complete_finalized_drop(
-                &mesh.session.drop_holds,
-                &mesh.session.decision_makers,
-                sessions,
-                &mesh.links,
-                &mesh.seen,
-                key,
-                slot,
-                final_turn_count,
-            );
+            routing::complete_finalized_drop(sessions, mesh, key, slot, final_turn_count);
             // The decide may have been the last undecided departure
             // deferring this relay's session-emptied close.
             routing::maybe_close_emptied_session(sessions, mesh, key);

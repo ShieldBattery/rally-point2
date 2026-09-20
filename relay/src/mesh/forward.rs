@@ -12,7 +12,7 @@ use crate::routing;
 
 use super::conditions::{ConditionsRegistry, snapshot_conditions};
 use super::links::{JoinedSession, MESH_STREAM_WRITE_TIMEOUT};
-use super::seen::{Seen, SeenRegistries, mark_seen};
+use super::seen::{Seen, mark_seen};
 use super::{MeshState, fan_out_to_mesh, mesh_session_key};
 
 /// Forwards one turn received from a local client: session-level dedup,
@@ -133,9 +133,7 @@ pub fn forward_client_turn(
     let delivered = mesh.session.gates.with_ingress(key, || {
         deliver_turn_to_locals(
             sessions,
-            &mesh.seen,
-            &mesh.session.decision_makers,
-            &mesh.session.turn_ring,
+            mesh,
             key,
             slot,
             payload,
@@ -167,9 +165,7 @@ pub(crate) fn deliver_mesh_turn(
     let _ = mesh.session.gates.with_ingress(key, || {
         deliver_turn_to_locals(
             sessions,
-            &mesh.seen,
-            &mesh.session.decision_makers,
-            &mesh.session.turn_ring,
+            mesh,
             key,
             slot,
             payload,
@@ -185,21 +181,17 @@ pub(crate) fn deliver_mesh_turn(
 /// for a duplicate already delivered through another ingress instance. `home`
 /// feeds both the delivery-tracking home stamp and the replay ring's
 /// [`crate::session::turn_ring::TurnOrigin`].
-// Eight references, one over clippy's default: bundling them into a struct
-// would touch every call site (production and test) for one parameter's worth
-// of churn, the same trade `SyncTracker::record` in `consensus/mod.rs` and
-// `connect_and_stream` in `coordinator/client.rs` make.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn deliver_turn_to_locals(
     sessions: &routing::Sessions,
-    seen: &SeenRegistries,
-    decision_makers: &crate::consensus::DecisionMakers,
-    turn_ring: &crate::session::turn_ring::TurnRing,
+    mesh: &MeshState,
     key: &SessionKey,
     slot: SlotId,
     mut payload: Payload,
     home: crate::consensus::delivery::DeliveryHome,
 ) -> Option<Payload> {
+    let seen = &mesh.seen;
+    let decision_makers = &mesh.session.decision_makers;
+    let turn_ring = &mesh.session.turn_ring;
     let forwarded = mark_seen(seen, key, slot, payload.seq);
     if forwarded.seen == Seen::Duplicate {
         // Only the duplicate branch touches the recorder's maps —

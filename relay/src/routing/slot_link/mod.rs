@@ -59,7 +59,6 @@ pub(super) struct SlotLinkCtx {
     lobby: crate::session::lobby::LobbyRegistry,
     chat: crate::session::chat::ChatRegistry,
     skins: crate::session::skin::SkinRegistry,
-    drop_holds: crate::session::drop_hold::DropHolds,
     turn_ring: crate::session::turn_ring::TurnRing,
     load_fence: crate::coordinator::load_fence::LoadStateFence,
     /// The flight recorder's per-slot counter handle, fetched once so the
@@ -154,7 +153,6 @@ pub async fn run_slot_link(
                 lobby,
                 chat,
                 skins,
-                drop_holds,
                 turn_ring,
                 load_fence,
                 ..
@@ -165,9 +163,6 @@ pub async fn run_slot_link(
         &link,
         &sessions,
         &mesh_for_teardown,
-        &mesh_links,
-        &conditions,
-        &decision_makers,
         &key,
         slot,
         connection_epoch,
@@ -359,7 +354,6 @@ pub async fn run_slot_link(
         lobby,
         chat,
         skins,
-        drop_holds,
         turn_ring,
         load_fence,
         flight_counters,

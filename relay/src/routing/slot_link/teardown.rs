@@ -61,11 +61,8 @@ pub(in crate::routing) fn end_slot_link(
         // ran; a retired session has no one left to inform.
         let announced = mesh.session.gates.with_ingress(key, || {
             announce_departure(
-                &mesh.session.drop_holds,
-                &mesh.session.decision_makers,
                 sessions,
-                &mesh.links,
-                &mesh.session.provisional_turns,
+                mesh,
                 key,
                 slot,
                 LEAVE_REASON_DROPPED,
