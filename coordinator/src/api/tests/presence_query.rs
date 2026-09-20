@@ -16,7 +16,7 @@ async fn presence_query_reports_a_beating_user_in_game_and_an_unknown_one_not() 
         std::time::Instant::now(),
     );
 
-    let body = presence_body("sb-test", &["sb-user-7", "sb-user-9"]);
+    let body = presence_body(TEST_TENANT, &["sb-user-7", "sb-user-9"]);
     let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -55,7 +55,7 @@ async fn presence_query_reads_an_expired_entry_as_not_in_game() {
         stale,
     );
 
-    let body = presence_body("sb-test", &["sb-user-7"]);
+    let body = presence_body(TEST_TENANT, &["sb-user-7"]);
     let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -80,7 +80,7 @@ async fn presence_query_reads_a_cleared_connection_as_not_in_game() {
     );
     presence::clear_connection(state.setup.presence(), RelayId(1), 1);
 
-    let body = presence_body("sb-test", &["sb-user-7"]);
+    let body = presence_body(TEST_TENANT, &["sb-user-7"]);
     let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -91,33 +91,6 @@ async fn presence_query_reads_a_cleared_connection_as_not_in_game() {
 }
 
 #[tokio::test]
-async fn presence_query_rejects_unsigned_and_wrong_key_requests_alike() {
-    let state = state_with_relay_and_tenant();
-    let app = router(state);
-    let body = presence_body("sb-test", &["sb-user-7"]);
-
-    // No signature headers at all — fails closed.
-    let resp = app
-        .clone()
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/presence/query")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body.clone()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // Signed by a key that is not the tenant's enrolled request key — the
-    // same indistinguishable 401.
-    let resp = signed_post(app, "/presence/query", &body, &[0x99; 32]).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
 async fn presence_query_rejects_an_over_cap_user_list() {
     // An over-cap list is rejected rather than resolved, past the auth gate —
     // the same shape as the sessions-alive probe cap.
@@ -125,8 +98,8 @@ async fn presence_query_rejects_an_over_cap_user_list() {
     let too_many: Vec<String> = (0..=MAX_PRESENCE_USERS)
         .map(|i| format!("sb-user-{i}"))
         .collect();
-    let body =
-        serde_json::to_vec(&serde_json::json!({ "tenant": "sb-test", "users": too_many })).unwrap();
+    let body = serde_json::to_vec(&serde_json::json!({ "tenant": TEST_TENANT, "users": too_many }))
+        .unwrap();
     let resp = signed_post(router(state), "/presence/query", &body, &TEST_CLIENT_SEED).await;
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

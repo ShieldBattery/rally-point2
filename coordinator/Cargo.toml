@@ -76,6 +76,10 @@ zstd = { workspace = true }
 [dev-dependencies]
 rally-point-relay = { workspace = true }
 tower = { workspace = true }
+# `test-util` for the paused-clock tests: a test that would otherwise race a
+# wall-clock margin runs under `#[tokio::test(start_paused = true)]` and asserts
+# its timer's deadline exactly.
+tokio = { workspace = true, features = ["test-util"] }
 # A raw WebSocket client for the control-endpoint tests (e.g. a connection that
 # never sends its enroll Hello), which the relay's own client can't express.
 tokio-tungstenite = { workspace = true }

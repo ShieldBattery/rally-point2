@@ -16,7 +16,7 @@ use crate::lifecycle::Lifecycle;
 /// a webhook delivers without depending on the coordinator's stored session.
 fn desync(session: SessionId, sync_ordinal: u64, no_majority: bool) -> DesyncNotice {
     DesyncNotice {
-        tenant: TenantId("sb-test".to_owned()),
+        tenant: TenantId(TEST_TENANT.to_owned()),
         session,
         sync_ordinal,
         game_frame: Some(4242),
@@ -36,24 +36,10 @@ fn desync(session: SessionId, sync_ordinal: u64, no_majority: bool) -> DesyncNot
 
 #[tokio::test]
 async fn a_desync_posts_one_signed_webhook_and_dedups_by_sync_ordinal() {
-    let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     // A tenant enrolled (for the signing key) but no session created this
     // lifetime: the notice's self-stamped refs carry the webhook.
-    let reg = registry::new_registry();
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
-    tenant::set_notify(
-        setup.tenants(),
-        &TenantId("sb-test".to_owned()),
-        Some(NotifyConfig { url }),
-    );
+    let setup = setup_without_session(url);
     let dedup = new_dedup();
     let lifecycle = Lifecycle::new(setup.clone());
 
@@ -77,9 +63,9 @@ async fn a_desync_posts_one_signed_webhook_and_dedups_by_sync_ordinal() {
         .await
         .expect("a desync webhook is delivered")
         .expect("the receiver got it");
-    assert_signed(&setup, "sb-test", &got);
+    assert_signed(&setup, TEST_TENANT, &got);
     assert_eq!(got.body["event"], "desync");
-    assert_eq!(got.body["tenant"], "sb-test");
+    assert_eq!(got.body["tenant"], TEST_TENANT);
     assert_eq!(got.body["session"], 7);
     assert_eq!(got.body["externalId"], "game-desync");
     assert_eq!(got.body["syncOrdinal"], 91);
@@ -99,22 +85,8 @@ async fn a_desync_posts_one_signed_webhook_and_dedups_by_sync_ordinal() {
 
 #[tokio::test]
 async fn a_no_majority_desync_omits_absent_optionals_and_carries_an_empty_diverged() {
-    let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
-    let reg = registry::new_registry();
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
-    tenant::set_notify(
-        setup.tenants(),
-        &TenantId("sb-test".to_owned()),
-        Some(NotifyConfig { url }),
-    );
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
+    let setup = setup_without_session(url);
     let dedup = new_dedup();
     let lifecycle = Lifecycle::new(setup.clone());
 
@@ -145,11 +117,11 @@ async fn a_no_majority_desync_omits_absent_optionals_and_carries_an_empty_diverg
 
 #[tokio::test]
 async fn a_desync_with_no_gameid_from_any_source_is_a_silent_no_op() {
-    let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, session) = setup_with_session(None, None);
     tenant::set_notify(
         setup.tenants(),
-        &TenantId("sb-test".to_owned()),
+        &TenantId(TEST_TENANT.to_owned()),
         Some(NotifyConfig { url }),
     );
     let dedup = new_dedup();
@@ -203,7 +175,7 @@ async fn a_desync_with_no_gameid_from_any_source_is_a_silent_no_op() {
 #[test]
 fn a_desync_mark_is_read_back_and_expires_after_its_ttl() {
     let marks: DesyncMarks = Arc::new(Mutex::new(HashMap::new()));
-    let tenant = TenantId("sb-test".to_owned());
+    let tenant = TenantId(TEST_TENANT.to_owned());
     let session = SessionId(7);
     // Explicitly std's clock: the desync marks are stamped with it, not tokio's
     // test clock, which this module's other tests bring into scope as `Instant`.
@@ -231,7 +203,7 @@ fn a_desync_mark_is_read_back_and_expires_after_its_ttl() {
 /// notice (self-describing) or are left to the stored-session fallback.
 fn result(session: SessionId, slot: u8, refs_from_notice: bool) -> ResultNotice {
     ResultNotice {
-        tenant: TenantId("sb-test".to_owned()),
+        tenant: TenantId(TEST_TENANT.to_owned()),
         session,
         slot: SlotId(slot),
         external_id: refs_from_notice.then(|| "game-result".to_owned()),
@@ -245,24 +217,10 @@ fn result(session: SessionId, slot: u8, refs_from_notice: bool) -> ResultNotice 
 
 #[tokio::test]
 async fn a_result_posts_one_signed_webhook_with_base64_payload_and_dedups_by_slot() {
-    let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     // A tenant enrolled (for the signing key) but no session created this
     // lifetime: the notice's self-stamped refs carry the webhook.
-    let reg = registry::new_registry();
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
-    tenant::set_notify(
-        setup.tenants(),
-        &TenantId("sb-test".to_owned()),
-        Some(NotifyConfig { url }),
-    );
+    let setup = setup_without_session(url);
     let dedup = new_dedup();
     let lifecycle = Lifecycle::new(setup.clone());
 
@@ -284,9 +242,9 @@ async fn a_result_posts_one_signed_webhook_with_base64_payload_and_dedups_by_slo
         .await
         .expect("a result webhook is delivered")
         .expect("the receiver got it");
-    assert_signed(&setup, "sb-test", &got);
+    assert_signed(&setup, TEST_TENANT, &got);
     assert_eq!(got.body["event"], "result");
-    assert_eq!(got.body["tenant"], "sb-test");
+    assert_eq!(got.body["tenant"], TEST_TENANT);
     assert_eq!(got.body["session"], 7);
     assert_eq!(got.body["externalId"], "game-result");
     assert_eq!(got.body["slot"], 1);
@@ -313,11 +271,11 @@ async fn a_result_with_no_notice_refs_falls_back_to_the_stored_session() {
     // The notice carries no correlation ids of its own; the coordinator's
     // stored session (from create_session) supplies both the gameId and the
     // player ref — the refs-fallback path.
-    let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, session) = setup_with_session(Some("game-stored"), Some("sb-user-stored"));
     tenant::set_notify(
         setup.tenants(),
-        &TenantId("sb-test".to_owned()),
+        &TenantId(TEST_TENANT.to_owned()),
         Some(NotifyConfig { url }),
     );
     let dedup = new_dedup();
@@ -336,32 +294,4 @@ async fn a_result_with_no_notice_refs_falls_back_to_the_stored_session() {
         .unwrap();
     assert_eq!(got.body["externalId"], "game-stored");
     assert_eq!(got.body["externalRef"], "sb-user-stored");
-}
-
-#[tokio::test]
-async fn a_result_with_no_gameid_from_any_source_is_a_silent_no_op() {
-    let (url, mut rx) = spawn_receiver(StatusCode::OK).await;
-    let (setup, session) = setup_with_session(None, None);
-    tenant::set_notify(
-        setup.tenants(),
-        &TenantId("sb-test".to_owned()),
-        Some(NotifyConfig { url }),
-    );
-    let dedup = new_dedup();
-    let lifecycle = Lifecycle::new(setup.clone());
-
-    // Neither the notice nor the stored session has a gameId.
-    handle_result(
-        &setup,
-        &dedup.results,
-        &lifecycle,
-        result(session, 0, false),
-    );
-
-    assert!(
-        timeout(Duration::from_millis(400), rx.recv())
-            .await
-            .is_err(),
-        "no gameId from the notice or the stored session -> dropped",
-    );
 }

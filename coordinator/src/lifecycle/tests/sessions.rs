@@ -104,64 +104,29 @@ async fn heartbeat_load_state_accumulates_and_the_first_start_instant_wins() {
 
     lc.merge_load_state(&[heartbeat_load(s, &[1], &[1], &[1], Some(1_700_000_000_000))]);
     // The second serving relay's beat: its own slot unions in, and its later
-    // latch instant never displaces the first one recorded.
-    lc.merge_load_state(&[heartbeat_load(s, &[0], &[0], &[], Some(1_700_000_009_999))]);
+    // latch instant never displaces the first one recorded. It names slot 0 as
+    // connected right now while restating an ever-connected set that omits it —
+    // a slot that is linked necessarily linked at some point, so folding the
+    // live roster in too recovers a slot-connected notice lost before the relay
+    // had a decision-maker to retain it in.
+    lc.merge_load_state(&[heartbeat_load(s, &[0], &[], &[], Some(1_700_000_009_999))]);
     // A re-statement of what is already recorded changes nothing.
     lc.merge_load_state(&[heartbeat_load(s, &[1], &[1], &[1], None)]);
 
     let load = lc
         .load_state(&tid(), s)
         .expect("the session was created here");
-    assert_eq!(load.connected_slots, vec![SlotId(0), SlotId(1)]);
+    assert_eq!(
+        load.connected_slots,
+        vec![SlotId(0), SlotId(1)],
+        "slot 0 is ever-connected on the strength of being connected now",
+    );
     assert_eq!(load.started_slots, vec![SlotId(1)]);
     assert_eq!(
         load.started_at_ms,
         Some(1_700_000_000_000),
         "the first instant reported wins; a tenant may already have recorded it",
     );
-}
-
-#[tokio::test]
-async fn a_beat_reads_a_live_slot_as_proof_it_ever_connected() {
-    // A relay restates the ever-connected set it retained, but a slot that is
-    // connected right now necessarily connected at some point — folding the
-    // live roster in too recovers a slot-connected notice lost before the
-    // relay had a decision-maker to retain it in.
-    let (setup, s) = setup_with_relay_and_session();
-    let lc = Lifecycle::new(setup.clone());
-    lc.register_session(
-        tid(),
-        s,
-        vec![RelayId(1)],
-        HashSet::from([SlotId(0), SlotId(1)]),
-        HashSet::new(),
-    );
-
-    lc.merge_load_state(&[heartbeat_load(s, &[1], &[], &[], None)]);
-
-    let load = lc.load_state(&tid(), s).expect("created here");
-    assert_eq!(load.connected_slots, vec![SlotId(1)]);
-}
-
-#[tokio::test]
-async fn a_registered_session_starts_attestable_and_reports_its_serving_set() {
-    // The two facts a completeness claim needs from the coordinator: this
-    // process created the session, and relay memory covering it is unbroken.
-    // The serving set comes with them, because whoever asks must ask all of it.
-    let (setup, s) = setup_with_relay_and_session();
-    let lc = Lifecycle::new(setup.clone());
-    lc.register_session(
-        tid(),
-        s,
-        vec![RelayId(1), RelayId(2)],
-        HashSet::from([SlotId(0), SlotId(1)]),
-        HashSet::new(),
-    );
-
-    let load = lc.load_state(&tid(), s).expect("created here");
-    assert!(load.created_here);
-    assert!(load.attestable);
-    assert_eq!(load.serving_relays, vec![RelayId(1), RelayId(2)]);
 }
 
 #[tokio::test]

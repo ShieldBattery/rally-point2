@@ -8,60 +8,13 @@ use super::*;
 /// default, unsplit assignment) — with the tenant's notify URL wired to
 /// `url`, so a test can observe the final `sessionClosed` webhook.
 fn setup_with_two_relays_and_session(url: String) -> (SessionSetup, SessionId) {
-    use rally_point_proto::control::{PlayerHandoff, RelayHello, SessionRequest};
-    use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
-    use rally_point_proto::version::ProtocolVersion;
-
-    let reg = registry::new_registry();
-    for (id, port) in [(1u64, 14900u16), (2, 14901)] {
-        registry::enroll(
-            &reg,
-            RelayHello::new(
-                RelayId(id),
-                std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
-                ProtocolVersion::CURRENT,
-                vec![id as u8; 4],
-            ),
-        );
+    SessionFixture {
+        relays: untagged_relays(&[1, 2]),
+        players: plain_players(&[0, 1]),
+        notify_url: Some(url),
+        ..Default::default()
     }
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("k1".to_owned()),
-        tid(),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    tenant::set_notify(&tenants, &tid(), Some(NotifyConfig { url }));
-    let setup = SessionSetup::new(reg, tenants);
-    let resp = crate::session::create_session(
-        &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: vec![
-                PlayerHandoff {
-                    slot: SlotId(0),
-                    client_pubkey: ClientPublicKey([0xAA; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: None,
-                },
-                PlayerHandoff {
-                    slot: SlotId(1),
-                    client_pubkey: ClientPublicKey([0xBB; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: None,
-                },
-            ],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-    (setup, resp.session)
+    .build()
 }
 
 #[tokio::test]
@@ -74,7 +27,7 @@ async fn rehome_then_the_replacements_close_satisfies_all_relays_closed_and_reap
     // lifetime instead of being reaped here.
     use crate::session::{self, RehomeOutcome};
 
-    let (url, mut rx) = spawn_receiver(None).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, s) = setup_with_two_relays_and_session(url);
     let lc = Lifecycle::new(setup.clone());
     lc.register_session(
@@ -102,7 +55,7 @@ async fn rehome_then_the_replacements_close_satisfies_all_relays_closed_and_reap
         .await
         .expect("sessionClosed is delivered once the swapped-in relay closes")
         .unwrap();
-    assert_eq!(got.event, "sessionClosed");
+    assert_eq!(got.event(), "sessionClosed");
     assert!(
         !lc.is_alive(&tid(), s),
         "a fully-closed session is not alive"
@@ -122,7 +75,7 @@ async fn a_late_close_from_the_swapped_out_dead_relay_is_ignored() {
     // normally afterward.
     use crate::session::{self, RehomeOutcome};
 
-    let (url, mut rx) = spawn_receiver(None).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, s) = setup_with_two_relays_and_session(url);
     let lc = Lifecycle::new(setup.clone());
     lc.register_session(
@@ -158,7 +111,7 @@ async fn a_late_close_from_the_swapped_out_dead_relay_is_ignored() {
         .await
         .expect("the real serving relay's close still finishes the session")
         .unwrap();
-    assert_eq!(got.event, "sessionClosed");
+    assert_eq!(got.event(), "sessionClosed");
 }
 
 #[tokio::test]
@@ -170,79 +123,45 @@ async fn rehome_swap_composes_with_a_surviving_relay_that_was_already_serving() 
     // drained-but-still-serving survivor) in the cached set. Both must report
     // closed before the session finishes.
     use crate::session::{self, RehomeOutcome};
-    use rally_point_proto::control::{PlayerHandoff, RegionId, RelayHello, SessionRequest};
-    use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
-    use rally_point_proto::version::ProtocolVersion;
 
-    let (url, mut rx) = spawn_receiver(None).await;
-    let reg = registry::new_registry();
-    registry::enroll(
-        &reg,
-        RelayHello::new(
-            RelayId(1),
-            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-            ProtocolVersion::CURRENT,
-            vec![1u8; 4],
-        )
-        .with_region(RegionId("region-a".to_owned())),
-    );
-    let gen2 = registry::enroll(
-        &reg,
-        RelayHello::new(
-            RelayId(2),
-            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
-            ProtocolVersion::CURRENT,
-            vec![2u8; 4],
-        )
-        .with_region(RegionId("region-b".to_owned())),
-    );
-    registry::enroll(
-        &reg,
-        RelayHello::new(
-            RelayId(3),
-            std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, 14902)),
-            ProtocolVersion::CURRENT,
-            vec![3u8; 4],
-        ),
-    );
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("k1".to_owned()),
-        tid(),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    tenant::set_notify(&tenants, &tid(), Some(NotifyConfig { url }));
-    let setup = SessionSetup::new(reg, tenants);
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
+    let (setup, resp) = SessionFixture {
+        relays: vec![
+            RelaySpec {
+                id: 1,
+                region: Some("region-a"),
+            },
+            RelaySpec {
+                id: 2,
+                region: Some("region-b"),
+            },
+            RelaySpec {
+                id: 3,
+                region: None,
+            },
+        ],
+        players: vec![
+            PlayerSpec {
+                slot: 0,
+                external_ref: None,
+                region: Some("region-a"),
+            },
+            PlayerSpec {
+                slot: 1,
+                external_ref: None,
+                region: Some("region-b"),
+            },
+        ],
+        notify_url: Some(url),
+        ..Default::default()
+    }
+    .build_response();
+    let gen2 = registry::enrolled_relays(setup.registry())
+        .into_iter()
+        .find(|relay| relay.relay_id == RelayId(2))
+        .expect("relay 2 is enrolled")
+        .generation;
 
-    let resp = crate::session::create_session(
-        &setup,
-        SessionRequest {
-            tenant: tid(),
-            players: vec![
-                PlayerHandoff {
-                    slot: SlotId(0),
-                    client_pubkey: ClientPublicKey([0xAA; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: Some(RegionId("region-a".to_owned())),
-                },
-                PlayerHandoff {
-                    slot: SlotId(1),
-                    client_pubkey: ClientPublicKey([0xBB; 32]),
-                    external_ref: None,
-                    observer: false,
-                    region: Some(RegionId("region-b".to_owned())),
-                },
-            ],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
     let s = resp.session;
     let original_order = setup.serving_relays(&tid(), s);
     assert_eq!(original_order[0], resp.home_relay.relay_id);
@@ -293,7 +212,7 @@ async fn rehome_swap_composes_with_a_surviving_relay_that_was_already_serving() 
         .await
         .expect("sessionClosed fires once both the replacement and the surviving relay close")
         .unwrap();
-    assert_eq!(got.event, "sessionClosed");
+    assert_eq!(got.event(), "sessionClosed");
 }
 
 #[tokio::test]
@@ -301,7 +220,7 @@ async fn an_unassigned_close_cannot_seed_a_future_assignment() {
     // A relay id may have served this session in an earlier topology or may be
     // selected by a future re-home. A terminal notice while it is not in the
     // cached assignment must not be retained and reused later.
-    let (url, mut rx) = spawn_receiver(None).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let setup = setup_with_notify(url);
     let lc = Lifecycle::new(setup);
     let s = SessionId(1);
@@ -334,7 +253,7 @@ async fn an_unassigned_close_cannot_seed_a_future_assignment() {
         .await
         .expect("the replacement's post-swap close delivers sessionClosed")
         .unwrap();
-    assert_eq!(got.event, "sessionClosed");
+    assert_eq!(got.event(), "sessionClosed");
     assert!(
         !lc.is_alive(&tid(), s),
         "a fully-closed session is not alive"
@@ -386,7 +305,7 @@ async fn rehome_reopens_a_target_that_already_served_and_previously_closed() {
     // A resumed descriptor can give an already-serving target a newly homed
     // group. Its earlier close therefore belongs to the old assignment and
     // must not retire the resumed one immediately.
-    let (url, mut rx) = spawn_receiver(None).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let setup = setup_with_notify(url);
     let lc = Lifecycle::new(setup);
     let s = SessionId(1);
@@ -411,7 +330,7 @@ async fn rehome_reopens_a_target_that_already_served_and_previously_closed() {
         .await
         .expect("the target's post-rehome close finishes the session")
         .unwrap();
-    assert_eq!(got.event, "sessionClosed");
+    assert_eq!(got.event(), "sessionClosed");
     assert!(
         !lc.is_alive(&tid(), s),
         "a fully-closed session is not alive"
@@ -479,56 +398,5 @@ async fn on_rehome_is_a_no_op_for_a_same_id_swap() {
     assert!(
         !lc.is_alive(&tid(), s),
         "both original members closing finishes it"
-    );
-}
-
-#[tokio::test]
-async fn webhook_only_reap_retires_membership_harmlessly() {
-    // A webhook-only state (restart amnesia) has no membership to begin with, so
-    // its idle reap runs the same retirement as a no-op. It must not panic, and
-    // the session stays unavailable to re-home afterward.
-    use crate::session::{self, RehomeOutcome};
-
-    let (url, mut rx) = spawn_receiver(None).await;
-    let setup = setup_with_notify(url.clone());
-    let lc = Lifecycle::with_tunables(
-        setup.clone(),
-        LifecycleTunables {
-            webhook_grace: SHORT,
-            ..Default::default()
-        },
-    );
-    let s = SessionId(1);
-
-    lc.enqueue_webhook(
-        tid(),
-        s,
-        NotifyConfig { url },
-        Bytes::from_static(br#"{"event":"departure"}"#),
-        "departure",
-    );
-    assert!(
-        setup.serving_relays(&tid(), s).is_empty(),
-        "a webhook-only session never had membership",
-    );
-
-    // Let its queued webhook deliver, then wait for the idle reap to remove it.
-    let _ = timeout(Duration::from_secs(2), rx.recv()).await;
-    timeout(SHORT * 20, async {
-        loop {
-            if !lc.contains_state(&tid(), s) {
-                break;
-            }
-            tokio::time::sleep(SHORT / 4).await;
-        }
-    })
-    .await
-    .expect("the webhook-only state is reaped after its idle grace");
-
-    assert!(setup.serving_relays(&tid(), s).is_empty());
-    assert_eq!(
-        session::rehome(&setup, &tid(), s, RelayId(1), vec![]),
-        RehomeOutcome::Unavailable,
-        "still unavailable after the no-op membership retirement",
     );
 }

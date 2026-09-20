@@ -8,21 +8,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::*;
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::State;
 use axum::extract::ws::Message;
 use axum::http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER};
 use rally_point_proto::control::{
-    BufferBounds, DescriptorKey, PlayerHandoff, RegionId, RegionRttReport, RelayHello,
-    RelayToCoordinator, SessionDescriptor, SessionRequest, SessionResponse, TenantId,
+    BufferBounds, DescriptorKey, PlayerHandoff, RegionId, RegionRttReport, RelayToCoordinator,
+    SessionDescriptor, SessionRequest, SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
-use rally_point_proto::version::ProtocolVersion;
 use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use tower::ServiceExt;
 
-use crate::attest::LOAD_STATE_ATTEST_TIMEOUT;
 use crate::flight_store;
 use crate::lifecycle::Lifecycle;
 use crate::notify;
@@ -31,6 +27,7 @@ use crate::presence;
 use crate::regions::RegionsConfig;
 use crate::registry;
 use crate::session;
+use crate::test_support::*;
 
 use super::control::*;
 use super::control_flight::*;
@@ -57,9 +54,18 @@ mod tenant_auth;
 /// signs with it so a request verifies. Not a real secret — a test fixture.
 const TEST_CLIENT_SEED: [u8; 32] = [0x11; 32];
 
+/// A seed whose public half is enrolled for no tenant at all, so a signature
+/// from it is well-formed and still refused.
+const UNENROLLED_SEED: [u8; 32] = [0x22; 32];
+
 /// The player-token lifetime the test coordinator states mint with. A plain
 /// finite span so a minted expiry is `now + this`, observable without waiting.
 const TEST_TOKEN_LIFETIME: Duration = Duration::from_secs(3600);
+
+/// The tenant id every fixture in this area enrolls and signs as.
+fn tenant_id() -> TenantId {
+    TenantId(TEST_TENANT.to_owned())
+}
 
 /// Produces the `(x-rp2-timestamp, x-rp2-signature)` header pair a tenant
 /// sends, signing the canonical request message with `seed` at the current
@@ -103,34 +109,77 @@ async fn signed_post(
     .unwrap()
 }
 
-fn state_with_relay_and_tenant() -> CoordinatorState {
-    let reg = registry::new_registry();
-    registry::enroll(
-        &reg,
-        RelayHello::new(
-            RelayId(1),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-            ProtocolVersion::CURRENT,
-            vec![0xC1; 4],
-        ),
-    );
-    let tenants = crate::tenant::new_store();
-    crate::tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
+/// Sends a `POST` carrying no signature headers at all.
+async fn unsigned_post(
+    app: Router,
+    path: &str,
+    body: &[u8],
+) -> axum::http::Response<axum::body::Body> {
+    app.oneshot(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_vec()))
+            .unwrap(),
     )
-    .unwrap();
-    // Enroll the tenant's inbound-request verifying key so signed requests
-    // authenticate.
-    let client_pubkey = crate::tenant::client_pubkey_from_seed(&TEST_CLIENT_SEED).unwrap();
+    .await
+    .unwrap()
+}
+
+/// Sends a `POST` signed correctly by the tenant's enrolled key, but over a
+/// timestamp far outside the replay window — a captured request replayed long
+/// after the fact.
+async fn stale_signed_post(
+    app: Router,
+    path: &str,
+    body: &[u8],
+) -> axum::http::Response<axum::body::Body> {
+    let pair = Ed25519KeyPair::from_seed_unchecked(&TEST_CLIENT_SEED).unwrap();
+    let stale_ts = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - (REQUEST_TIMESTAMP_WINDOW_SECS + 60))
+        .to_string();
+    let message = build_request_message(&stale_ts, &Method::POST, path, body);
+    let sig = hex::encode(pair.sign(&message).as_ref());
+    app.oneshot(
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header(REQUEST_TIMESTAMP_HEADER, stale_ts)
+            .header(REQUEST_SIGNATURE_HEADER, sig)
+            .body(axum::body::Body::from(body.to_vec()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+/// Enrolls `seed`'s public half as `tenant`'s only inbound-request verifying
+/// key, so a request signed with it authenticates.
+fn set_request_key(setup: &SessionSetup, tenant: &str, seed: &[u8; 32]) {
+    let client_pubkey = crate::tenant::client_pubkey_from_seed(seed).unwrap();
     crate::tenant::set_client_pubkeys(
-        &tenants,
-        &TenantId("sb-test".to_owned()),
+        setup.tenants(),
+        &TenantId(tenant.to_owned()),
         vec![client_pubkey],
     );
-    let setup = crate::session::SessionSetup::new(reg, tenants);
+}
+
+/// The coordinator state the endpoint tests drive: relay 1 enrolled, the test
+/// tenant enrolled with [`TEST_CLIENT_SEED`]'s public half as its request key,
+/// and an observable token lifetime.
+fn state_with_relay_and_tenant() -> CoordinatorState {
+    state_over(SessionFixture::default().setup_only())
+}
+
+/// Wraps `setup` in the test coordinator state: an open control endpoint and a
+/// finite token lifetime, everything else at its production default.
+fn state_over(setup: SessionSetup) -> CoordinatorState {
+    set_request_key(&setup, TEST_TENANT, &TEST_CLIENT_SEED);
     CoordinatorState {
         player_token_lifetime: TEST_TOKEN_LIFETIME,
         ..CoordinatorState::new(setup, ControlAuth::Open)
@@ -156,91 +205,112 @@ fn two_players() -> Vec<PlayerHandoff> {
     ]
 }
 
-/// A stand-in tenant webhook receiver: an axum server that signals on a
-/// channel each time it receives a POST (the body is irrelevant here — the
-/// test only cares whether a webhook was signed and delivered at all).
-/// Returns the hook URL and the receive end.
-async fn spawn_webhook_receiver() -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-    let app =
-        Router::new()
-            .route(
-                "/hook",
-                post(
-                    move |State(tx): State<tokio::sync::mpsc::UnboundedSender<()>>,
-                          _body: Bytes| async move {
-                        let _ = tx.send(());
-                        StatusCode::OK
-                    },
-                ),
-            )
-            .with_state(tx);
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}/hook"), rx)
-}
-
 /// A setup with one relay (id 1) and a tenant enrolled, a notify config
 /// pointed at `url`, and a session created — so the session's serving set is
 /// exactly `[RelayId(1)]`. Returns the setup, a fresh dedup, a lifecycle over
 /// it, and the created session id.
 fn setup_with_session_and_notify(url: String) -> (SessionSetup, NoticeDedup, Lifecycle, SessionId) {
-    let reg = registry::new_registry();
-    registry::enroll(
-        &reg,
-        RelayHello::new(
-            RelayId(1),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-            ProtocolVersion::CURRENT,
-            vec![0xC1; 4],
-        ),
-    );
-    let tenants = crate::tenant::new_store();
-    crate::tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    crate::tenant::set_notify(
-        &tenants,
-        &TenantId("sb-test".to_owned()),
-        Some(crate::tenant::NotifyConfig { url }),
-    );
-    let setup = session::SessionSetup::new(reg, tenants);
-    let resp = session::create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![PlayerHandoff {
-                slot: SlotId(0),
-                client_pubkey: ClientPublicKey([0xAA; 32]),
-                external_ref: Some("sb-user-0".to_owned()),
-                observer: false,
-                region: None,
-            }],
-            external_id: Some("game-1".to_owned()),
-            latency_estimate_ms: None,
-        },
-        rally_point_proto::token::ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
+    let (setup, session) = SessionFixture {
+        players: vec![PlayerSpec {
+            slot: 0,
+            external_ref: Some("sb-user-0"),
+            region: None,
+        }],
+        external_id: Some("game-1"),
+        notify_url: Some(url),
+        ..Default::default()
+    }
+    .build();
     let lifecycle = Lifecycle::new(setup.clone());
-    (setup, notify::new_dedup(), lifecycle, resp.session)
+    (setup, notify::new_dedup(), lifecycle, session)
+}
+
+/// The inputs `note_inbound` needs with nothing staged: a registry holding
+/// relay 1 at `generation`, an empty tenant store, a fresh lifecycle and dedup,
+/// no region config, and an idle RTT store. Returned as owned values the caller
+/// keeps alive, since the ingest view borrows the last two.
+struct InboundFixture {
+    setup: SessionSetup,
+    notices: NoticeDedup,
+    lifecycle: Lifecycle,
+    generation: u64,
+    regions: RegionsConfig,
+    store: PairRttStore,
+}
+
+impl InboundFixture {
+    /// The RTT ingest view over this fixture's own region config and store.
+    fn rtt(&self) -> RegionRttIngest<'_> {
+        idle_rtt_ingest(&self.regions, &self.store)
+    }
+
+    /// Stages a descriptor for `session` in relay 1's outbox — the declarative
+    /// per-relay assignment index the heartbeat's empty-roster accounting walks,
+    /// so a session absent from it is never even considered.
+    fn stage_descriptor(&self, tenant: &TenantId, session: SessionId) {
+        self.setup.descriptors().record(
+            RelayId(1),
+            SessionDescriptor {
+                finalized_drops: false,
+                tenant: tenant.clone(),
+                session,
+                peers: vec![],
+                bounds: BufferBounds::new(1, 6).unwrap(),
+                authority_order: vec![RelayId(1)],
+                external_id: None,
+                slot_refs: vec![],
+                observer_slots: vec![],
+                expected_slots: vec![],
+                homed_slots: vec![],
+                resumed: false,
+                departed_slots: vec![],
+                latency_estimate_ms: None,
+                relay_regions: Vec::new(),
+            },
+        );
+    }
+
+    /// Runs one frame from relay 1's current connection through `note_inbound`.
+    fn note(&self, message: &Message) {
+        note_inbound_frame(
+            &self.setup,
+            &self.notices,
+            &self.lifecycle,
+            RelayId(1),
+            self.generation,
+            message,
+            &self.rtt(),
+        );
+    }
+}
+
+fn bare_inbound_fixture() -> InboundFixture {
+    let reg = registry::new_registry();
+    let generation = registry::enroll(
+        &reg,
+        (RelaySpec {
+            id: 1,
+            region: None,
+        })
+        .hello(),
+    );
+    let setup = session::SessionSetup::new(reg, crate::tenant::new_store());
+    let lifecycle = Lifecycle::new(setup.clone());
+    InboundFixture {
+        setup,
+        notices: notify::new_dedup(),
+        lifecycle,
+        generation,
+        regions: RegionsConfig::default(),
+        store: pair_rtts::new_store(),
+    }
 }
 
 /// A `Result` notice framed as an inbound control message, carrying its own
 /// correlation ids so it would sign and deliver a webhook if accepted.
 fn result_message(session: SessionId, slot: u8) -> Message {
     let notice = rally_point_proto::control::ResultNotice {
-        tenant: TenantId("sb-test".to_owned()),
+        tenant: tenant_id(),
         session,
         slot: SlotId(slot),
         external_id: Some("game-1".to_owned()),
@@ -294,40 +364,20 @@ fn note_inbound_frame(
     )
 }
 
-/// A roster entry naming slot 0 connected and no load state — the common
-/// shape for tests that only care that the session is on the beat.
-fn session_presence(
-    tenant: TenantId,
-    session: SessionId,
-) -> rally_point_proto::control::SessionPresence {
-    rally_point_proto::control::SessionPresence {
-        tenant,
-        session,
-        slots: vec![SlotId(0)],
-        ever_connected: vec![],
-        started: vec![],
-        started_at_ms: None,
-    }
-}
-
 // --- Re-home endpoint ---
 
 /// A dev client seed for a *second* tenant (`sb-other`) in the cross-tenant
-/// probe test: its public half is enrolled as that tenant's request key, so
+/// probe tests: its public half is enrolled as that tenant's request key, so
 /// `sb-other` can sign a request that authenticates as itself.
 const OTHER_CLIENT_SEED: [u8; 32] = [0x44; 32];
 
 /// Enrolls a second relay (id 2) into `state`'s registry, so a re-home whose home
-/// relay died has a live relay to move to.
-fn enroll_second_relay(state: &CoordinatorState) {
+/// relay died has a live relay to move to. `region` labels it when the test cares
+/// what the answer says about where the replacement lives.
+fn enroll_second_relay(state: &CoordinatorState, region: Option<&'static str>) {
     registry::enroll(
         state.setup.registry(),
-        RelayHello::new(
-            RelayId(2),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
-            ProtocolVersion::CURRENT,
-            vec![0xC2; 4],
-        ),
+        (RelaySpec { id: 2, region }).hello(),
     );
 }
 
@@ -337,7 +387,7 @@ fn enroll_second_relay(state: &CoordinatorState) {
 /// existence and its `(tenant, session)` ownership matter.
 fn create_rehome_session(state: &CoordinatorState) -> SessionId {
     let req = SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
+        tenant: tenant_id(),
         players: vec![PlayerHandoff {
             slot: SlotId(0),
             client_pubkey: ClientPublicKey([0xAA; 32]),
@@ -365,12 +415,7 @@ fn enroll_other_tenant(state: &CoordinatorState) {
         BufferBounds::new(1, 6).unwrap(),
     )
     .unwrap();
-    let client_pubkey = crate::tenant::client_pubkey_from_seed(&OTHER_CLIENT_SEED).unwrap();
-    crate::tenant::set_client_pubkeys(
-        state.setup.tenants(),
-        &TenantId("sb-other".to_owned()),
-        vec![client_pubkey],
-    );
+    set_request_key(&state.setup, "sb-other", &OTHER_CLIENT_SEED);
 }
 
 /// Builds the tenant-signed rehome request body `{tenant, session, dead_relay_id}`
@@ -392,7 +437,7 @@ fn create_session_with_user(state: &CoordinatorState, user: &str) -> SessionId {
     crate::session::create_session(
         &state.setup,
         SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
+            tenant: tenant_id(),
             players: vec![PlayerHandoff {
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0xAA; 32]),
@@ -413,7 +458,7 @@ fn create_session_with_user(state: &CoordinatorState, user: &str) -> SessionId {
 /// The heartbeat roster naming `session`'s slot 0 — what relay 1's beat
 /// carries while that slot's client is connected.
 fn slot0_roster(session: SessionId) -> Vec<rally_point_proto::control::SessionPresence> {
-    vec![session_presence(TenantId("sb-test".to_owned()), session)]
+    vec![presence_entry(&tenant_id(), session, &[0])]
 }
 
 /// The signed presence-query body `{tenant, users}`.

@@ -6,7 +6,7 @@ use super::*;
 
 #[tokio::test]
 async fn session_closed_fires_only_after_all_serving_relays_closed() {
-    let (url, mut rx) = spawn_receiver(None).await;
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let setup = setup_with_notify(url);
     let lc = Lifecycle::new(setup);
     let s = SessionId(1);
@@ -35,7 +35,7 @@ async fn session_closed_fires_only_after_all_serving_relays_closed() {
         .await
         .expect("sessionClosed is delivered once every relay closed")
         .unwrap();
-    assert_eq!(got.event, "sessionClosed");
+    assert_eq!(got.event(), "sessionClosed");
     assert!(
         !lc.is_alive(&tid(), s),
         "a fully-closed session is not alive"
@@ -48,7 +48,12 @@ async fn a_retrying_notice_blocks_session_closed_behind_it() {
     // after it, cannot be delivered until the departure completes — the ordering
     // guarantee the sessionClosed signal rests on.
     let gate = StdArc::new(TokioNotify::new());
-    let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
+    let (url, mut rx) = WebhookReceiver {
+        gate: Some(gate.clone()),
+        ..Default::default()
+    }
+    .spawn()
+    .await;
     let setup = setup_with_notify(url.clone());
     let lc = Lifecycle::new(setup);
     let s = SessionId(1);
@@ -77,7 +82,7 @@ async fn a_retrying_notice_blocks_session_closed_behind_it() {
         .await
         .expect("the departure request reaches the receiver")
         .unwrap();
-    assert_eq!(first.event, "departure");
+    assert_eq!(first.event(), "departure");
     assert!(
         timeout(Duration::from_millis(300), rx.recv())
             .await
@@ -91,7 +96,7 @@ async fn a_retrying_notice_blocks_session_closed_behind_it() {
         .await
         .expect("sessionClosed is delivered once the departure completes")
         .unwrap();
-    assert_eq!(next.event, "sessionClosed");
+    assert_eq!(next.event(), "sessionClosed");
 }
 
 #[tokio::test]
@@ -103,7 +108,12 @@ async fn a_full_queue_drops_the_newest_notice_but_never_the_terminal_one() {
     const CAPACITY: usize = 8;
 
     let gate = StdArc::new(TokioNotify::new());
-    let (url, mut rx) = spawn_receiver(Some(gate.clone())).await;
+    let (url, mut rx) = WebhookReceiver {
+        gate: Some(gate.clone()),
+        ..Default::default()
+    }
+    .spawn()
+    .await;
     let setup = setup_with_notify(url.clone());
     let lc = Lifecycle::with_tunables(
         setup,
@@ -136,7 +146,7 @@ async fn a_full_queue_drops_the_newest_notice_but_never_the_terminal_one() {
         .await
         .expect("the first notice reaches the receiver")
         .unwrap();
-    assert_eq!(first.event, "first");
+    assert_eq!(first.event(), "first");
 
     // Fill the queue down to its reserved boundary: CAPACITY - 1 more
     // ordinary notices exactly exhaust the buffer down to the one slot
@@ -184,7 +194,7 @@ async fn a_full_queue_drops_the_newest_notice_but_never_the_terminal_one() {
             .await
             .expect("every accepted notice is delivered")
             .unwrap();
-        events.push(received.event);
+        events.push(received.event().to_owned());
     }
     assert!(
         !events.contains(&"overflow".to_owned()),

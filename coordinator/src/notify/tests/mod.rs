@@ -1,28 +1,24 @@
-//! Shared fixtures for the notify tests: a stand-in tenant HTTP receiver, the
-//! signature-verification helper, and a session-setup builder, used by every
-//! topic file below via `use super::*;`. Split by topic: `departures`,
-//! `desync_and_results`, `dispatch_delivery`.
+//! Shared fixtures for the notify tests: the signature-verification helper and
+//! the tenant/session wiring every topic file below drives a handler with, via
+//! `use super::*;`. Split by topic: `departures`, `desync_and_results`,
+//! `dispatch_delivery`. The webhook receiver and the session builder are the
+//! crate-wide test-support ones.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::Ipv4Addr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::StatusCode;
 use axum::routing::post;
 use base64::Engine as _;
-use rally_point_proto::control::{
-    BufferBounds, DepartureKind, DivergedSlot, PlayerHandoff, RelayHello, SessionRequest, TenantId,
-};
-use rally_point_proto::ids::{RelayId, SlotId};
-use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
-use rally_point_proto::version::ProtocolVersion;
+use rally_point_proto::control::{BufferBounds, DepartureKind, DivergedSlot, TenantId};
+use rally_point_proto::ids::SlotId;
+use rally_point_proto::token::KeyId;
 use ring::signature::{ED25519, UnparsedPublicKey};
-use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant, timeout};
 
 use super::*;
-use crate::registry;
+use crate::test_support::*;
 
 /// The three load-progress bodies serialize to exactly the shapes the tenant
 /// parses: camelCase keys, the `event` discriminator naming the kind, and
@@ -106,60 +102,6 @@ fn the_load_progress_webhook_bodies_serialize_to_their_documented_shapes() {
     );
 }
 
-/// One webhook the stand-in tenant received: the two signature headers
-/// (raw strings, unvalidated — verification is the test's job) plus the
-/// exact body bytes (needed to reconstruct the signed message) and the
-/// body parsed as JSON (for the usual field assertions).
-#[derive(Clone)]
-pub(super) struct Received {
-    pub(super) timestamp: Option<String>,
-    pub(super) signature: Option<String>,
-    pub(super) raw_body: Vec<u8>,
-    pub(super) body: serde_json::Value,
-}
-
-/// A stand-in tenant receiver: an axum server that records each POST it gets
-/// (its signature headers, raw body, and parsed JSON body) onto a channel.
-/// Returns the hook URL and the receive end.
-pub(super) async fn spawn_receiver(
-    status: StatusCode,
-) -> (String, mpsc::UnboundedReceiver<Received>) {
-    let (tx, rx) = mpsc::unbounded_channel::<Received>();
-    let app = Router::new()
-        .route(
-            "/hook",
-            post(
-                move |State(tx): State<mpsc::UnboundedSender<Received>>,
-                      headers: HeaderMap,
-                      raw_body: axum::body::Bytes| async move {
-                    let header = |name: &str| {
-                        headers
-                            .get(name)
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_owned)
-                    };
-                    let body = serde_json::from_slice(&raw_body).unwrap();
-                    let _ = tx.send(Received {
-                        timestamp: header(TIMESTAMP_HEADER),
-                        signature: header(SIGNATURE_HEADER),
-                        raw_body: raw_body.to_vec(),
-                        body,
-                    });
-                    status
-                },
-            ),
-        )
-        .with_state(tx);
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}/hook"), rx)
-}
-
 /// Asserts a received webhook is properly signed: the timestamp header
 /// parses as a decimal unix-epoch-milliseconds value that is current-ish
 /// (within a generous minute of "now" — a loose sanity check, not the
@@ -205,50 +147,34 @@ pub(super) fn assert_signed(setup: &SessionSetup, tenant: &str, received: &Recei
         .expect("the signature verifies against the tenant's enrolled public key");
 }
 
-/// A session-setup with one relay and a tenant enrolled, plus a created
-/// session carrying the given correlation ids. Returns the setup and session.
+/// A setup with one relay and the test tenant enrolled, plus a created session
+/// carrying the given correlation ids. Returns the setup and session.
 pub(super) fn setup_with_session(
-    external_id: Option<&str>,
-    slot0_ref: Option<&str>,
+    external_id: Option<&'static str>,
+    slot0_ref: Option<&'static str>,
 ) -> (SessionSetup, SessionId) {
-    let reg = registry::new_registry();
-    registry::enroll(
-        &reg,
-        RelayHello::new(
-            RelayId(1),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-            ProtocolVersion::CURRENT,
-            vec![0xC1; 4],
-        ),
-    );
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = SessionSetup::new(reg, tenants);
-    let resp = session::create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId("sb-test".to_owned()),
-            players: vec![PlayerHandoff {
-                slot: SlotId(0),
-                client_pubkey: ClientPublicKey([0xAA; 32]),
-                external_ref: slot0_ref.map(str::to_owned),
-                observer: false,
-                region: None,
-            }],
-            external_id: external_id.map(str::to_owned),
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-    (setup, resp.session)
+    SessionFixture {
+        players: vec![PlayerSpec {
+            slot: 0,
+            external_ref: slot0_ref,
+            region: None,
+        }],
+        external_id,
+        ..Default::default()
+    }
+    .build()
+}
+
+/// A tenant enrolled for its signing key with **no** session created this
+/// lifetime — the post-restart shape, where a notice must carry its own
+/// correlation ids to deliver at all. `url` is the tenant's webhook.
+pub(super) fn setup_without_session(url: String) -> SessionSetup {
+    SessionFixture {
+        relays: vec![],
+        notify_url: Some(url),
+        ..Default::default()
+    }
+    .setup_only()
 }
 
 mod departures;

@@ -457,13 +457,21 @@ pub(super) fn index_descriptors(
 /// registry entry open: its stalled send trips this bound instead. Returns whether
 /// the connection should keep running: `false` on a stall past `liveness_timeout`
 /// or a socket error, which ends it. `what` names the frame for the log line.
-async fn writer_send(
-    write_half: &mut ControlWrite,
+///
+/// Generic over the sink so the bound can be asserted against a send that never
+/// completes, which a real socket cannot be made to do on demand; every caller
+/// passes the connection's own [`ControlWrite`].
+pub(super) async fn writer_send<S>(
+    write_half: &mut S,
     message: Message,
     relay_id: RelayId,
     liveness_timeout: Duration,
     what: &str,
-) -> bool {
+) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
     let started = tokio::time::Instant::now();
     let outcome = tokio::time::timeout(liveness_timeout, write_half.send(message)).await;
     crate::metrics::observe_control_send(started.elapsed().as_millis() as u64);

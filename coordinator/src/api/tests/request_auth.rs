@@ -45,35 +45,27 @@ fn the_request_signature_message_matches_the_cross_impl_vector() {
 }
 
 #[test]
-fn control_auth_secret_accepts_the_matching_bearer() {
-    let mut headers = HeaderMap::new();
-    headers.insert(AUTHORIZATION, "Bearer s3cret".parse().unwrap());
-    assert!(control_auth_ok(
-        &headers,
-        &ControlAuth::Secret("s3cret".to_owned())
-    ));
-}
-
-#[test]
-fn control_auth_secret_rejects_a_wrong_or_missing_bearer() {
+fn control_auth_admits_only_a_matching_bearer_and_open_admits_any_request() {
+    let bearer = |value: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, value.parse().unwrap());
+        headers
+    };
     let secret = ControlAuth::Secret("s3cret".to_owned());
 
-    // Wrong secret.
-    let mut headers = HeaderMap::new();
-    headers.insert(AUTHORIZATION, "Bearer nope".parse().unwrap());
-    assert!(!control_auth_ok(&headers, &secret));
+    for (label, headers, admitted) in [
+        ("the matching bearer", bearer("Bearer s3cret"), true),
+        ("a wrong secret", bearer("Bearer nope"), false),
+        ("no Authorization header at all", HeaderMap::new(), false),
+        ("a non-Bearer scheme", bearer("Basic s3cret"), false),
+    ] {
+        assert_eq!(
+            control_auth_ok(&headers, &secret),
+            admitted,
+            "under a configured secret, {label} decides admission wrongly",
+        );
+    }
 
-    // Missing header entirely.
-    assert!(!control_auth_ok(&HeaderMap::new(), &secret));
-
-    // Present but not a Bearer scheme.
-    let mut basic = HeaderMap::new();
-    basic.insert(AUTHORIZATION, "Basic s3cret".parse().unwrap());
-    assert!(!control_auth_ok(&basic, &secret));
-}
-
-#[test]
-fn control_auth_open_accepts_any_request() {
     // Open is the explicit dev/loopback posture: any request (even without a
     // header) is accepted. It is never the default — the binary only builds
     // it under an explicit insecure opt-in.
@@ -81,24 +73,19 @@ fn control_auth_open_accepts_any_request() {
 }
 
 #[test]
-fn resolve_control_auth_with_a_secret_requires_it() {
-    let auth = resolve_control_auth(Some("s3cret".to_owned()), false).unwrap();
-    assert!(matches!(auth, ControlAuth::Secret(s) if s == "s3cret"));
-    // A secret takes precedence even if insecure is also (redundantly) set.
-    let auth = resolve_control_auth(Some("s3cret".to_owned()), true).unwrap();
-    assert!(matches!(auth, ControlAuth::Secret(_)));
-}
+fn resolve_control_auth_requires_a_secret_or_an_explicit_open_opt_in() {
+    // A secret always wins, and takes precedence even when insecure is also
+    // (redundantly) set.
+    for allow_insecure in [false, true] {
+        let auth = resolve_control_auth(Some("s3cret".to_owned()), allow_insecure).unwrap();
+        assert!(matches!(auth, ControlAuth::Secret(s) if s == "s3cret"));
+    }
 
-#[test]
-fn resolve_control_auth_allows_open_only_with_the_explicit_opt_in() {
+    // With no secret, only the explicit opt-in yields an open endpoint.
     assert!(matches!(
         resolve_control_auth(None, true).unwrap(),
         ControlAuth::Open
     ));
-}
-
-#[test]
-fn resolve_control_auth_fails_closed_without_a_secret_or_opt_in() {
     // The no-ship default: no secret and no explicit insecure flag is a hard
     // error, not a silently open endpoint.
     assert!(resolve_control_auth(None, false).is_err());

@@ -90,60 +90,46 @@ async fn a_body_that_never_finishes_times_out_the_whole_attempt_not_just_the_hea
 // -- Response body cap --
 
 #[tokio::test]
-async fn a_response_body_past_the_cap_counts_as_a_failed_attempt() {
-    let app = Router::new().route(
-        "/hook",
-        post(|| async { vec![0u8; MAX_RESPONSE_BODY_BYTES + 4096] }),
-    );
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
+async fn the_response_body_cap_fails_an_attempt_only_past_it() {
+    // The boundary pair on one call: a body exactly at the cap is not itself
+    // over it and still delivers, while anything past it fails the attempt
+    // rather than being buffered to completion.
+    for (label, body_bytes, expected) in [
+        (
+            "a body exactly at the cap",
+            MAX_RESPONSE_BODY_BYTES,
+            Ok(200u16),
+        ),
+        (
+            "a body past the cap",
+            MAX_RESPONSE_BODY_BYTES + 4096,
+            Err(AttemptError::BodyTooLarge),
+        ),
+    ] {
+        let app = Router::new().route("/hook", post(move || async move { vec![0u8; body_bytes] }));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
-    let request = hyper::Request::builder()
-        .method(hyper::Method::POST)
-        .uri(format!("http://{addr}/hook"))
-        .body(Full::new(Bytes::new()))
-        .unwrap();
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/hook"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
 
-    // A generous timeout so only the body cap, not the attempt timeout,
-    // can be what trips here.
-    let outcome = send_attempt(request, Duration::from_secs(5)).await;
-    assert!(
-        matches!(outcome, Err(AttemptError::BodyTooLarge)),
-        "a response body past the cap must fail the attempt, not buffer to completion; got {outcome:?}",
-    );
-}
-
-#[tokio::test]
-async fn a_response_body_at_or_under_the_cap_still_delivers() {
-    let app = Router::new().route(
-        "/hook",
-        post(|| async { vec![0u8; MAX_RESPONSE_BODY_BYTES] }),
-    );
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let request = hyper::Request::builder()
-        .method(hyper::Method::POST)
-        .uri(format!("http://{addr}/hook"))
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-
-    let outcome = send_attempt(request, Duration::from_secs(5)).await;
-    assert_eq!(
-        outcome.ok(),
-        Some(200),
-        "a body exactly at the cap is not itself over it",
-    );
+        // A generous timeout so only the body cap, not the attempt timeout,
+        // can be what trips here.
+        let outcome = send_attempt(request, Duration::from_secs(5)).await;
+        match (expected, &outcome) {
+            (Ok(status), Ok(got)) => assert_eq!(*got, status, "{label} delivers"),
+            (Err(AttemptError::BodyTooLarge), Err(AttemptError::BodyTooLarge)) => {}
+            _ => panic!("{label}: unexpected outcome {outcome:?}"),
+        }
+    }
 }
 
 // -- Dispatch concurrency --
@@ -156,15 +142,25 @@ async fn the_dispatch_semaphore_bounds_concurrent_in_flight_attempts() {
     // (i.e. actually in flight, not just queued), and the high-water mark
     // across the whole test -- the number the semaphore is responsible
     // for capping.
+    // `served` counts the requests that actually reached the handler: without
+    // it, a run in which nothing ever left the coordinator would report a
+    // high-water mark of zero and pass.
     let current = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
-    let (current_h, max_h) = (Arc::clone(&current), Arc::clone(&max_seen));
+    let served = Arc::new(AtomicUsize::new(0));
+    let (current_h, max_h, served_h) = (
+        Arc::clone(&current),
+        Arc::clone(&max_seen),
+        Arc::clone(&served),
+    );
     let app = Router::new().route(
         "/hook",
         post(move || {
             let current = Arc::clone(&current_h);
             let max_seen = Arc::clone(&max_h);
+            let served = Arc::clone(&served_h);
             async move {
+                served.fetch_add(1, Ordering::SeqCst);
                 let now = current.fetch_add(1, Ordering::SeqCst) + 1;
                 max_seen.fetch_max(now, Ordering::SeqCst);
                 // Held open long enough that every spawned dispatch below
@@ -214,7 +210,20 @@ async fn the_dispatch_semaphore_bounds_concurrent_in_flight_attempts() {
         handle.await.unwrap();
     }
 
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        overshoot,
+        "every dispatch actually reached the endpoint, so the high-water mark \
+         below describes real in-flight work rather than requests that never \
+         left the coordinator",
+    );
     let max_seen = max_seen.load(Ordering::SeqCst);
+    assert!(
+        max_seen > 1,
+        "dispatches run concurrently under the cap rather than serializing — \
+         a run in which they all queued up behind each other would satisfy the \
+         cap below for the wrong reason: only {max_seen} was ever in flight",
+    );
     assert!(
         max_seen <= MAX_CONCURRENT_DISPATCHES,
         "the semaphore must cap concurrent in-flight dispatches at \

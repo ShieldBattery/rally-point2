@@ -15,10 +15,7 @@ async fn get_regions(app: Router) -> serde_json::Value {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    serde_json::from_slice(&body).unwrap()
+    body_json(resp).await
 }
 
 #[tokio::test]
@@ -46,17 +43,12 @@ async fn regions_endpoint_returns_the_configured_list() {
         json.get("backbone_rtts").is_none(),
         "an empty pair table omits the backbone_rtts field entirely",
     );
-}
 
-#[tokio::test]
-async fn regions_endpoint_is_empty_without_config() {
-    // No config = an empty list, not an error — the region-blind posture.
+    // No config at all is an empty list, not an error — the region-blind
+    // posture, served in the same bare `{"regions": [...]}` shape.
     let json = get_regions(router(state_with_relay_and_tenant())).await;
     assert_eq!(json["regions"].as_array().unwrap().len(), 0);
-    assert!(
-        json.get("backbone_rtts").is_none(),
-        "with no measurements the response is the bare {{\"regions\": [...]}} shape",
-    );
+    assert!(json.get("backbone_rtts").is_none());
 }
 
 #[tokio::test]
@@ -123,31 +115,7 @@ async fn regions_endpoint_serves_recorded_backbone_rtts() {
 /// the warm endpoint holds demand and a cold-region create returns `202`; the
 /// dormant case still answers the warm endpoint but holds nothing.
 fn provisioning_state(region_ids: &[&str], provisioning: bool) -> CoordinatorState {
-    let reg = registry::new_registry();
-    registry::enroll(
-        &reg,
-        RelayHello::new(
-            RelayId(1),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-            ProtocolVersion::CURRENT,
-            vec![0xC1; 4],
-        ),
-    );
-    let tenants = crate::tenant::new_store();
-    crate::tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let client_pubkey = crate::tenant::client_pubkey_from_seed(&TEST_CLIENT_SEED).unwrap();
-    crate::tenant::set_client_pubkeys(
-        &tenants,
-        &TenantId("sb-test".to_owned()),
-        vec![client_pubkey],
-    );
-    let mut setup = crate::session::SessionSetup::new(reg, tenants);
+    let mut setup = SessionFixture::default().setup_only();
     if provisioning {
         setup = setup.with_provision_gate(crate::session::ProvisionGate::provisioning(
             crate::provision::WarmTargets::new(),
@@ -157,8 +125,7 @@ fn provisioning_state(region_ids: &[&str], provisioning: bool) -> CoordinatorSta
     }
     CoordinatorState {
         regions: regions_config(region_ids),
-        player_token_lifetime: TEST_TOKEN_LIFETIME,
-        ..CoordinatorState::new(setup, ControlAuth::Open)
+        ..state_over(setup)
     }
 }
 
@@ -166,13 +133,13 @@ fn provisioning_state(region_ids: &[&str], provisioning: bool) -> CoordinatorSta
 /// `external_id`.
 fn region_create_body(region: &str, external_id: &str) -> Vec<u8> {
     let req = SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
+        tenant: tenant_id(),
         players: vec![PlayerHandoff {
             slot: SlotId(0),
             client_pubkey: ClientPublicKey([0xAA; 32]),
             external_ref: None,
             observer: false,
-            region: Some(rally_point_proto::control::RegionId(region.to_owned())),
+            region: Some(RegionId(region.to_owned())),
         }],
         external_id: Some(external_id.to_owned()),
         latency_estimate_ms: None,
@@ -182,79 +149,40 @@ fn region_create_body(region: &str, external_id: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn warm_endpoint_warms_known_regions_and_reports_unknown() {
-    let state = provisioning_state(&["region-a", "region-b"], true);
-    let warm = state.setup.provision().warm().clone();
-    let app = router(state);
+    // Whether a provisioning loop is running or the gate is dormant, the
+    // endpoint answers the same known/unknown split — only whether the demand
+    // is actually recorded differs, so a caller sees one shape either way.
+    for provisioning in [true, false] {
+        let state = provisioning_state(&["region-a", "region-b"], provisioning);
+        let warm = state.setup.provision().warm().clone();
+        let app = router(state);
 
-    let body = serde_json::to_vec(&serde_json::json!({
-        "tenant": "sb-test",
-        "regions": ["region-a", "region-b", "atlantis"],
-    }))
-    .unwrap();
-    let resp = signed_post(app, "/regions/warm", &body, &TEST_CLIENT_SEED).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp).await;
-    assert_eq!(
-        v["warmed"],
-        serde_json::json!(["region-a", "region-b"]),
-        "the configured regions are warmed",
-    );
-    assert_eq!(
-        v["unknown"],
-        serde_json::json!(["atlantis"]),
-        "an unconfigured region is reported, not an error",
-    );
-    // The loop reads target 1 for each warmed region, and never for the unknown.
-    assert_eq!(warm.target_at(&region("region-a"), 0), 1);
-    assert_eq!(warm.target_at(&region("region-b"), 0), 1);
-    assert_eq!(warm.target_at(&region("atlantis"), 0), 0);
-}
-
-#[tokio::test]
-async fn warm_endpoint_requires_a_valid_signature() {
-    let state = provisioning_state(&["region-a"], true);
-    let app = router(state);
-    let body = serde_json::to_vec(&serde_json::json!({
-        "tenant": "sb-test",
-        "regions": ["region-a"],
-    }))
-    .unwrap();
-
-    // Signed with a key whose public half is not the tenant's enrolled one.
-    let resp = signed_post(app.clone(), "/regions/warm", &body, &[0x22; 32]).await;
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // No signature headers at all — fails closed.
-    let resp = app
-        .oneshot(
-            axum::http::Request::builder()
-                .method("POST")
-                .uri("/regions/warm")
-                .header("content-type", "application/json")
-                .body(axum::body::Body::from(body))
-                .unwrap(),
-        )
-        .await
+        let body = serde_json::to_vec(&serde_json::json!({
+            "tenant": TEST_TENANT,
+            "regions": ["region-a", "region-b", "atlantis"],
+        }))
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-}
-
-#[tokio::test]
-async fn warm_endpoint_with_no_provisioning_loop_still_reports_known_regions() {
-    // A dormant gate: the endpoint acknowledges known regions and reports
-    // unknown ones the same way, though nothing consumes the demand.
-    let state = provisioning_state(&["region-a"], false);
-    let app = router(state);
-    let body = serde_json::to_vec(&serde_json::json!({
-        "tenant": "sb-test",
-        "regions": ["region-a", "atlantis"],
-    }))
-    .unwrap();
-    let resp = signed_post(app, "/regions/warm", &body, &TEST_CLIENT_SEED).await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    let v = body_json(resp).await;
-    assert_eq!(v["warmed"], serde_json::json!(["region-a"]));
-    assert_eq!(v["unknown"], serde_json::json!(["atlantis"]));
+        let resp = signed_post(app, "/regions/warm", &body, &TEST_CLIENT_SEED).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(
+            v["warmed"],
+            serde_json::json!(["region-a", "region-b"]),
+            "the configured regions are warmed",
+        );
+        assert_eq!(
+            v["unknown"],
+            serde_json::json!(["atlantis"]),
+            "an unconfigured region is reported, not an error",
+        );
+        // Each warmed region reads target 1 and the unknown one never does.
+        // A dormant coordinator writes the same demand into a store nothing
+        // reconciles against, so the endpoint's answer never depends on
+        // whether a provisioning loop happens to be running.
+        assert_eq!(warm.target_at(&region("region-a"), 0), 1);
+        assert_eq!(warm.target_at(&region("region-b"), 0), 1);
+        assert_eq!(warm.target_at(&region("atlantis"), 0), 0);
+    }
 }
 
 #[tokio::test]
@@ -279,13 +207,11 @@ async fn cold_region_create_returns_202_then_200_once_a_relay_enrolls() {
     // A relay for region-a enrolls; the identical retry now places in-region.
     registry::enroll(
         state.setup.registry(),
-        RelayHello::new(
-            RelayId(2),
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 14901)),
-            ProtocolVersion::CURRENT,
-            vec![0xC2; 4],
-        )
-        .with_region(rally_point_proto::control::RegionId("region-a".to_owned())),
+        (RelaySpec {
+            id: 2,
+            region: Some("region-a"),
+        })
+        .hello(),
     );
     let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
     assert_eq!(resp.status(), StatusCode::OK);
@@ -304,12 +230,12 @@ async fn cold_region_create_returns_202_then_200_once_a_relay_enrolls() {
         session.relay_regions,
         vec![rally_point_proto::control::RelayRegionLabel {
             relay_id: RelayId(2),
-            region: rally_point_proto::control::RegionId("region-a".to_owned()),
+            region: RegionId("region-a".to_owned()),
         }],
         "the response labels its home relay with the region it enrolled in",
     );
 }
 
-fn region(name: &str) -> rally_point_proto::control::RegionId {
-    rally_point_proto::control::RegionId(name.to_owned())
+fn region(name: &str) -> RegionId {
+    RegionId(name.to_owned())
 }

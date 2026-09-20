@@ -93,9 +93,7 @@ use payloads::{
 // file — see `dispatch` for why each is `pub(super)` rather than private
 // there.
 #[cfg(test)]
-use dispatch::{
-    AttemptError, SIGNATURE_HEADER, TIMESTAMP_HEADER, WEBHOOK_SIG_DOMAIN, send_attempt,
-};
+use dispatch::{AttemptError, WEBHOOK_SIG_DOMAIN, send_attempt};
 
 /// Departures already handled, keyed by `(tenant, session, slot)`. Shared across
 /// every relay control connection so the redundant reports of one leave collapse

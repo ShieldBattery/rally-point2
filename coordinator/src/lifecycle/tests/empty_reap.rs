@@ -26,7 +26,7 @@ async fn complete_empty_heartbeats_reap_a_started_session_and_release_membership
     lc.on_relay_heartbeat(
         RelayId(1),
         7,
-        &[heartbeat_session(s, &[0])],
+        &[presence_entry(&tid(), s, &[0])],
         true,
         Instant::now(),
     );
@@ -90,14 +90,19 @@ async fn an_entry_with_no_connected_slots_reaps_exactly_as_an_omission_does() {
     lc.on_relay_heartbeat(
         RelayId(1),
         7,
-        &[heartbeat_session(s, &[0])],
+        &[presence_entry(&tid(), s, &[0])],
         true,
         Instant::now(),
     );
 
     // The slot's link ends. The relay still names the session, now with no
     // connected slot and the facts it retained while the slot was here.
-    let vacated = [heartbeat_load(s, &[], &[0], &[0], Some(1_700_000_000_000))];
+    let vacated = [SessionPresence {
+        ever_connected: slots(&[0]),
+        started: slots(&[0]),
+        started_at_ms: Some(1_700_000_000_000),
+        ..presence_entry(&tid(), s, &[])
+    }];
     lc.on_relay_heartbeat(RelayId(1), 7, &vacated, true, Instant::now());
     lc.merge_load_state(&vacated);
 
@@ -139,7 +144,7 @@ async fn a_stale_empty_timer_cannot_consume_a_rearmed_timers_evidence() {
     lc.on_relay_heartbeat(
         RelayId(1),
         9,
-        &[heartbeat_session(s, &[0])],
+        &[presence_entry(&tid(), s, &[0])],
         true,
         Instant::now(),
     );
@@ -155,7 +160,7 @@ async fn a_stale_empty_timer_cannot_consume_a_rearmed_timers_evidence() {
     lc.on_relay_heartbeat(
         RelayId(1),
         9,
-        &[heartbeat_session(s, &[0])],
+        &[presence_entry(&tid(), s, &[0])],
         true,
         Instant::now(),
     );
@@ -238,7 +243,7 @@ async fn an_empty_roster_that_stops_refreshing_cannot_reap_a_session() {
     lc.on_relay_heartbeat(
         RelayId(1),
         10,
-        &[heartbeat_session(s, &[0])],
+        &[presence_entry(&tid(), s, &[0])],
         true,
         Instant::now(),
     );
@@ -276,7 +281,7 @@ async fn every_assigned_relay_must_report_empty_before_the_grace_begins() {
     lc.on_relay_heartbeat(
         RelayId(1),
         11,
-        &[heartbeat_session(s, &[0])],
+        &[presence_entry(&tid(), s, &[0])],
         true,
         Instant::now(),
     );
@@ -300,100 +305,89 @@ async fn every_assigned_relay_must_report_empty_before_the_grace_begins() {
     .expect("both complete empty rosters start and finish the grace");
 }
 
-#[tokio::test]
-async fn positive_presence_reopens_a_relays_prior_close_evidence() {
-    let setup = bare_setup();
-    let s = SessionId(93);
-    stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
-    let lc = Lifecycle::with_tunables(
-        setup,
-        LifecycleTunables {
-            empty_session_grace: SHORT,
-            ..Default::default()
-        },
-    );
-    lc.register_session(
-        tid(),
-        s,
-        vec![RelayId(1), RelayId(2)],
-        HashSet::from([SlotId(0), SlotId(1)]),
-        HashSet::new(),
-    );
-    lc.on_relay_enrolled(RelayId(1), 41);
-    lc.on_relay_enrolled(RelayId(2), 42);
-    lc.on_relay_heartbeat(
-        RelayId(1),
-        41,
-        &[heartbeat_session(s, &[0])],
-        true,
-        Instant::now(),
-    );
-
-    close(&lc, tid(), s, RelayId(1));
-    lc.on_relay_heartbeat(
-        RelayId(1),
-        41,
-        &[heartbeat_session(s, &[0])],
-        true,
-        Instant::now(),
-    );
-    lc.on_relay_heartbeat(RelayId(2), 42, &[], true, Instant::now());
-    tokio::time::sleep(SHORT * 2).await;
-    assert!(
-        lc.contains_state(&tid(), s),
-        "a relay serving a reconnected player is no longer closed or empty",
-    );
-    assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
-
-    lc.on_relay_heartbeat(RelayId(1), 41, &[], true, Instant::now());
-    assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 1);
-    timeout(SHORT * 5, async {
-        while lc.contains_state(&tid(), s) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("a later live-to-empty transition may begin a fresh grace");
+/// What reopens a relay's recorded `SessionClosed` for a session: either it
+/// reports a connected slot again, or it re-enrolls as a new process. Both say
+/// the relay may serve the session again, so its terminal notice can no longer
+/// stand in for "this relay is done with it".
+enum Reopen {
+    /// A heartbeat naming a connected slot — a player reconnected to it.
+    PositivePresence,
+    /// A fresh enrollment: the replacement process may reapply its descriptor
+    /// and serve a reconnect.
+    NewEnrollment,
 }
 
 #[tokio::test]
-async fn a_new_relay_enrollment_reopens_its_prior_close_evidence() {
-    let setup = bare_setup();
-    let s = SessionId(94);
-    stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
-    let lc = Lifecycle::with_tunables(
-        setup,
-        LifecycleTunables {
-            empty_session_grace: SHORT,
-            ..Default::default()
-        },
-    );
-    lc.register_session(
-        tid(),
-        s,
-        vec![RelayId(1), RelayId(2)],
-        HashSet::from([SlotId(0), SlotId(1)]),
-        HashSet::new(),
-    );
-    lc.on_relay_enrolled(RelayId(1), 51);
-    lc.on_relay_enrolled(RelayId(2), 53);
-    lc.on_relay_heartbeat(
-        RelayId(1),
-        51,
-        &[heartbeat_session(s, &[0])],
-        true,
-        Instant::now(),
-    );
-    close(&lc, tid(), s, RelayId(1));
+async fn a_relays_close_evidence_is_reopened_by_presence_or_a_new_enrollment() {
+    for (trigger, s) in [
+        (Reopen::PositivePresence, SessionId(93)),
+        (Reopen::NewEnrollment, SessionId(94)),
+    ] {
+        let setup = bare_setup();
+        stage_assignments(&setup, s, &[RelayId(1), RelayId(2)]);
+        let lc = Lifecycle::with_tunables(
+            setup,
+            LifecycleTunables {
+                empty_session_grace: SHORT,
+                ..Default::default()
+            },
+        );
+        lc.register_session(
+            tid(),
+            s,
+            vec![RelayId(1), RelayId(2)],
+            HashSet::from([SlotId(0), SlotId(1)]),
+            HashSet::new(),
+        );
+        lc.on_relay_enrolled(RelayId(1), 41);
+        lc.on_relay_enrolled(RelayId(2), 42);
+        lc.on_relay_heartbeat(
+            RelayId(1),
+            41,
+            &[presence_entry(&tid(), s, &[0])],
+            true,
+            Instant::now(),
+        );
 
-    lc.on_relay_enrolled(RelayId(1), 52);
-    lc.on_relay_heartbeat(RelayId(2), 53, &[], true, Instant::now());
-    tokio::time::sleep(SHORT * 2).await;
-    assert!(
-        lc.contains_state(&tid(), s),
-        "the replacement process may reapply its descriptor and serve a reconnect",
-    );
-    assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
+        close(&lc, tid(), s, RelayId(1));
+        // Relay 1's close is reopened one way or the other; relay 2's own empty
+        // roster alone must then not be enough to retire the session.
+        let relay_1_generation = match trigger {
+            Reopen::PositivePresence => {
+                lc.on_relay_heartbeat(
+                    RelayId(1),
+                    41,
+                    &[presence_entry(&tid(), s, &[0])],
+                    true,
+                    Instant::now(),
+                );
+                41
+            }
+            Reopen::NewEnrollment => {
+                lc.on_relay_enrolled(RelayId(1), 52);
+                52
+            }
+        };
+        lc.on_relay_heartbeat(RelayId(2), 42, &[], true, Instant::now());
+        tokio::time::sleep(SHORT * 2).await;
+        assert!(
+            lc.contains_state(&tid(), s),
+            "a reopened relay is neither closed nor known-empty",
+        );
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 0);
+
+        // A later live-to-empty transition on the reopened connection may begin
+        // a fresh grace, which runs to completion.
+        lc.on_relay_heartbeat(RelayId(1), relay_1_generation, &[], true, Instant::now());
+        assert_eq!(lc.metrics_census().sessions[&tid()].empty_grace, 1);
+        timeout(SHORT * 5, async {
+            while lc.contains_state(&tid(), s) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a later live-to-empty transition may begin a fresh grace");
+    }
 }
 
 #[tokio::test]
@@ -419,7 +413,7 @@ async fn partial_rosters_and_connection_changes_reset_empty_continuity() {
     lc.on_relay_heartbeat(
         RelayId(1),
         31,
-        &[heartbeat_session(s, &[0])],
+        &[presence_entry(&tid(), s, &[0])],
         true,
         Instant::now(),
     );

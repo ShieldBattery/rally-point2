@@ -7,16 +7,12 @@ use super::*;
 async fn closing_a_session_retires_its_pending_reap_directives() {
     // A reap armed for a session must not linger in the reap outbox after the
     // session fully closes: a relay reconnecting afterward would otherwise be
-    // re-synced with a stale close for a session it no longer serves.
+    // re-synced with a stale close for a session it no longer serves. Which
+    // reap policy armed the directive is beside the point here, so it is
+    // recorded straight onto the outbox rather than waited out of a timer.
     let setup = bare_setup();
     let reaps = setup.reaps().clone();
-    let lc = Lifecycle::with_tunables(
-        setup,
-        LifecycleTunables {
-            holdout_grace: SHORT,
-            ..Default::default()
-        },
-    );
+    let lc = Lifecycle::new(setup);
     let s = SessionId(1);
     lc.register_session(
         tid(),
@@ -26,14 +22,22 @@ async fn closing_a_session_retires_its_pending_reap_directives() {
         HashSet::new(),
     );
 
-    // Arm and fire the holdout reap so a directive is pending for relay 1.
-    lc.on_departure(tid(), s, SlotId(0), DepartureKind::Dropped, None, false);
-    let mut rx = reaps.subscribe(RelayId(1));
-    let directive = timeout(SHORT * 4, rx.recv())
-        .await
-        .expect("the holdout is reaped")
-        .unwrap();
-    assert_eq!(directive.slots, vec![SlotId(1)]);
+    reaps.send(
+        RelayId(1),
+        SlotClose {
+            tenant: tid(),
+            session: s,
+            slots: vec![SlotId(1)],
+        },
+    );
+    let mut armed = reaps.subscribe(RelayId(1));
+    assert_eq!(
+        armed
+            .try_recv()
+            .expect("a pending directive is replayed on subscribe")
+            .slots,
+        vec![SlotId(1)],
+    );
 
     // The session fully closes → its pending reap is retired. A relay
     // reconnecting after the close gets no stale directive replayed.

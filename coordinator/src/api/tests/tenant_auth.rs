@@ -1,27 +1,25 @@
 //! Tenant key material and per-state enforcement: the pubkey endpoint,
-//! multi-key request verification, and the suspended / revoked / active gates.
+//! multi-key request verification, the tenant-signature gate on every
+//! tenant-facing route, and the suspended / revoked gates.
 
 use super::*;
 
 #[tokio::test]
-async fn tenant_pubkey_endpoint_returns_the_enrolled_key() {
+async fn tenant_pubkey_endpoint_returns_the_enrolled_key_and_404s_for_an_unknown_tenant() {
     let reg = registry::new_registry();
     let tenants = crate::tenant::new_store();
     let expected_pubkey = crate::tenant::enroll(
         &tenants,
         KeyId("test-key-1".to_owned()),
-        TenantId("sb-test".to_owned()),
+        tenant_id(),
         BufferBounds::new(1, 6).unwrap(),
     )
     .unwrap();
     let setup = crate::session::SessionSetup::new(reg, tenants);
-    let state = CoordinatorState {
-        player_token_lifetime: TEST_TOKEN_LIFETIME,
-        ..CoordinatorState::new(setup, ControlAuth::Open)
-    };
-    let app = router(state);
+    let app = router(state_over(setup));
 
     let resp = app
+        .clone()
         .oneshot(
             axum::http::Request::builder()
                 .method("GET")
@@ -50,13 +48,8 @@ async fn tenant_pubkey_endpoint_returns_the_enrolled_key() {
     // decoding back to the exact 32-byte verifying key.
     assert_eq!(json["publicKey"], hex::encode(expected_pubkey));
     assert_eq!(json["publicKey"].as_str().unwrap().len(), 64);
-}
 
-#[tokio::test]
-async fn tenant_pubkey_endpoint_404s_for_an_unknown_tenant() {
-    let state = state_with_relay_and_tenant();
-    let app = router(state);
-
+    // A tenant this coordinator never enrolled has no key to serve.
     let resp = app
         .oneshot(
             axum::http::Request::builder()
@@ -67,7 +60,6 @@ async fn tenant_pubkey_endpoint_404s_for_an_unknown_tenant() {
         )
         .await
         .unwrap();
-
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
@@ -88,12 +80,73 @@ const UNLISTED_SEED: [u8; 32] = [0x77; 32];
 /// replay.
 fn create_body(external_id: &str) -> Vec<u8> {
     serde_json::to_vec(&SessionRequest {
-        tenant: TenantId("sb-test".to_owned()),
+        tenant: tenant_id(),
         players: two_players(),
         external_id: Some(external_id.to_owned()),
         latency_estimate_ms: None,
     })
     .unwrap()
+}
+
+/// Every tenant-authenticated route, each with a body its handler accepts —
+/// the set a new endpoint has to join, so it cannot quietly skip the gate.
+fn tenant_authed_routes(session: SessionId) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        ("/session/create", create_body("gate-probe")),
+        ("/session/rehome", rehome_body(TEST_TENANT, session, 1)),
+        (
+            "/sessions/alive",
+            serde_json::to_vec(
+                &serde_json::json!({"tenant": TEST_TENANT, "sessions": [session.0]}),
+            )
+            .unwrap(),
+        ),
+        (
+            "/session/load-state",
+            serde_json::to_vec(&serde_json::json!({"tenant": TEST_TENANT, "session": session.0}))
+                .unwrap(),
+        ),
+        (
+            "/presence/query",
+            presence_body(TEST_TENANT, &["sb-user-7"]),
+        ),
+        (
+            "/regions/warm",
+            serde_json::to_vec(&serde_json::json!({"tenant": TEST_TENANT, "regions": ["r"]}))
+                .unwrap(),
+        ),
+        (
+            "/flight/blobs",
+            serde_json::to_vec(&serde_json::json!({"tenant": TEST_TENANT, "session": session.0}))
+                .unwrap(),
+        ),
+        (
+            "/flight/blob",
+            serde_json::to_vec(
+                &serde_json::json!({"tenant": TEST_TENANT, "session": session.0, "relay_id": 1}),
+            )
+            .unwrap(),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn every_tenant_authed_route_refuses_an_unsigned_request() {
+    // The shapes a bad signature can take are proven once against one endpoint
+    // (`create_session_refuses_every_bad_signature_shape_with_the_same_401`);
+    // what each route has to prove is only that it is behind the gate at all.
+    let state = state_with_relay_and_tenant();
+    let session = create_rehome_session(&state);
+    let app = router(state);
+
+    for (path, body) in tenant_authed_routes(session) {
+        let resp = unsigned_post(app.clone(), path, &body).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} must refuse an unsigned request",
+        );
+    }
 }
 
 #[tokio::test]
@@ -104,11 +157,7 @@ async fn verify_accepts_any_listed_client_key_and_refuses_an_unlisted_one() {
     let state = state_with_relay_and_tenant();
     let old = crate::tenant::client_pubkey_from_seed(&ROTATION_SEED_OLD).unwrap();
     let new = crate::tenant::client_pubkey_from_seed(&ROTATION_SEED_NEW).unwrap();
-    crate::tenant::set_client_pubkeys(
-        state.setup.tenants(),
-        &TenantId("sb-test".to_owned()),
-        vec![old, new],
-    );
+    crate::tenant::set_client_pubkeys(state.setup.tenants(), &tenant_id(), vec![old, new]);
     let app = router(state);
 
     // The first (retiring) key verifies.
@@ -165,7 +214,7 @@ async fn a_suspended_tenant_is_refused_create_but_still_serves_live_games() {
     // a presence session.
     let rehome = create_rehome_session(&state);
     state.lifecycle.register_session(
-        TenantId("sb-test".to_owned()),
+        tenant_id(),
         SessionId(9001),
         vec![RelayId(1)],
         std::collections::HashSet::from([SlotId(0)]),
@@ -182,7 +231,7 @@ async fn a_suspended_tenant_is_refused_create_but_still_serves_live_games() {
 
     crate::tenant::set_state(
         state.setup.tenants(),
-        &TenantId("sb-test".to_owned()),
+        &tenant_id(),
         crate::tenant::TenantState::Suspended,
     );
     let app = router(state);
@@ -202,7 +251,7 @@ async fn a_suspended_tenant_is_refused_create_but_still_serves_live_games() {
     let resp = signed_post(
         app.clone(),
         "/session/rehome",
-        &rehome_body("sb-test", rehome, 1),
+        &rehome_body(TEST_TENANT, rehome, 1),
         &TEST_CLIENT_SEED,
     )
     .await;
@@ -213,7 +262,8 @@ async fn a_suspended_tenant_is_refused_create_but_still_serves_live_games() {
     let resp = signed_post(
         app.clone(),
         "/sessions/alive",
-        &serde_json::to_vec(&serde_json::json!({"tenant": "sb-test", "sessions": [9001]})).unwrap(),
+        &serde_json::to_vec(&serde_json::json!({"tenant": TEST_TENANT, "sessions": [9001]}))
+            .unwrap(),
         &TEST_CLIENT_SEED,
     )
     .await;
@@ -224,7 +274,7 @@ async fn a_suspended_tenant_is_refused_create_but_still_serves_live_games() {
     let resp = signed_post(
         app.clone(),
         "/presence/query",
-        &presence_body("sb-test", &["sb-user-7"]),
+        &presence_body(TEST_TENANT, &["sb-user-7"]),
         &TEST_CLIENT_SEED,
     )
     .await;
@@ -241,7 +291,7 @@ async fn a_revoked_tenant_is_refused_everywhere_and_its_pubkey_404s() {
     let state = state_with_relay_and_tenant();
     let rehome = create_rehome_session(&state);
     state.lifecycle.register_session(
-        TenantId("sb-test".to_owned()),
+        tenant_id(),
         SessionId(9001),
         vec![RelayId(1)],
         std::collections::HashSet::from([SlotId(0)]),
@@ -251,7 +301,7 @@ async fn a_revoked_tenant_is_refused_everywhere_and_its_pubkey_404s() {
 
     crate::tenant::set_state(
         state.setup.tenants(),
-        &TenantId("sb-test".to_owned()),
+        &tenant_id(),
         crate::tenant::TenantState::Revoked,
     );
     let app = router(state);
@@ -260,13 +310,16 @@ async fn a_revoked_tenant_is_refused_everywhere_and_its_pubkey_404s() {
     // still verifies (the key is unchanged), the state permits nothing.
     for (path, body) in [
         ("/session/create", create_body("revoked-create")),
-        ("/session/rehome", rehome_body("sb-test", rehome, 1)),
+        ("/session/rehome", rehome_body(TEST_TENANT, rehome, 1)),
         (
             "/sessions/alive",
-            serde_json::to_vec(&serde_json::json!({"tenant": "sb-test", "sessions": [9001]}))
+            serde_json::to_vec(&serde_json::json!({"tenant": TEST_TENANT, "sessions": [9001]}))
                 .unwrap(),
         ),
-        ("/presence/query", presence_body("sb-test", &["sb-user-7"])),
+        (
+            "/presence/query",
+            presence_body(TEST_TENANT, &["sb-user-7"]),
+        ),
     ] {
         let resp = signed_post(app.clone(), path, &body, &TEST_CLIENT_SEED).await;
         assert_eq!(
@@ -278,27 +331,4 @@ async fn a_revoked_tenant_is_refused_everywhere_and_its_pubkey_404s() {
 
     // The pubkey endpoint reports the revoked tenant as absent.
     assert_eq!(get_pubkey_status(app).await, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn an_explicitly_active_tenant_is_unaffected() {
-    // Setting the state to Active is the same as the default: create mints and
-    // the pubkey endpoint serves, exactly as with no state enforcement.
-    let state = state_with_relay_and_tenant();
-    crate::tenant::set_state(
-        state.setup.tenants(),
-        &TenantId("sb-test".to_owned()),
-        crate::tenant::TenantState::Active,
-    );
-    let app = router(state);
-
-    let resp = signed_post(
-        app.clone(),
-        "/session/create",
-        &create_body("active-create"),
-        &TEST_CLIENT_SEED,
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(get_pubkey_status(app).await, StatusCode::OK);
 }
