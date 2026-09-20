@@ -531,11 +531,16 @@ async fn drain_queue(mut rx: mpsc::Receiver<WebhookJob>, tenants: TenantStore) {
 }
 
 mod close;
+mod heartbeat;
 mod notices;
 mod reaps;
 mod relays;
 mod sessions;
 
+pub use heartbeat::{
+    MAX_HEARTBEAT_REGION_RTTS, MAX_HEARTBEAT_SESSION_SLOTS, MAX_HEARTBEAT_SESSIONS,
+};
+pub(crate) use heartbeat::{RegionRttIngest, RelayHeartbeat, bound_session_slot_lists};
 pub(crate) use notices::NoticeKey;
 pub use notices::SessionNotice;
 

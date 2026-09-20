@@ -11,8 +11,8 @@ use axum::Router;
 use axum::extract::ws::Message;
 use axum::http::{HeaderMap, Method, StatusCode, header::AUTHORIZATION, header::RETRY_AFTER};
 use rally_point_proto::control::{
-    BufferBounds, DescriptorKey, PlayerHandoff, RegionId, RegionRttReport, RelayToCoordinator,
-    SessionDescriptor, SessionRequest, SessionResponse, TenantId,
+    BufferBounds, DescriptorKey, PlayerHandoff, RegionId, RelayToCoordinator, SessionDescriptor,
+    SessionRequest, SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
@@ -20,7 +20,7 @@ use ring::signature::{ED25519, Ed25519KeyPair, UnparsedPublicKey};
 use tower::ServiceExt;
 
 use crate::flight_store;
-use crate::lifecycle::Lifecycle;
+use crate::lifecycle::{Lifecycle, RegionRttIngest};
 use crate::pair_rtts;
 use crate::presence;
 use crate::regions::RegionsConfig;
@@ -239,32 +239,6 @@ impl InboundFixture {
     /// The RTT ingest view over this fixture's own region config and store.
     fn rtt(&self) -> RegionRttIngest<'_> {
         idle_rtt_ingest(&self.regions, &self.store)
-    }
-
-    /// Stages a descriptor for `session` in relay 1's outbox — the declarative
-    /// per-relay assignment index the heartbeat's empty-roster accounting walks,
-    /// so a session absent from it is never even considered.
-    fn stage_descriptor(&self, tenant: &TenantId, session: SessionId) {
-        self.setup.descriptors().record(
-            RelayId(1),
-            SessionDescriptor {
-                finalized_drops: false,
-                tenant: tenant.clone(),
-                session,
-                peers: vec![],
-                bounds: BufferBounds::new(1, 6).unwrap(),
-                authority_order: vec![RelayId(1)],
-                external_id: None,
-                slot_refs: vec![],
-                observer_slots: vec![],
-                expected_slots: vec![],
-                homed_slots: vec![],
-                resumed: false,
-                departed_slots: vec![],
-                latency_estimate_ms: None,
-                relay_regions: Vec::new(),
-            },
-        );
     }
 
     /// Runs one frame from relay 1's current connection through `note_inbound`.

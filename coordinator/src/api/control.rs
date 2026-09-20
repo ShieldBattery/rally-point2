@@ -26,13 +26,14 @@ use rally_point_proto::version::{
     CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION, ProtocolVersion,
 };
 
+use crate::lifecycle::RegionRttIngest;
 use crate::presence;
 use crate::regions::RegionsConfig;
 use crate::registry;
 use crate::session;
 
 use super::control_hello::{challenge_and_verify, read_hello};
-use super::control_inbound::{ControlInbound, RegionRttIngest, run_reader};
+use super::control_inbound::{ControlInbound, run_reader};
 use super::control_writer::{WriterSources, run_writer};
 use super::request_auth::control_auth_ok;
 use super::{CoordinatorState, MAX_CONTROL_MESSAGE_BYTES, OptionalPeerAddr};

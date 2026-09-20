@@ -14,10 +14,11 @@ use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::time::unix_secs_fail_open;
 
 use crate::flight_store::{self, S3FlightStore};
+use crate::lifecycle::bound_session_slot_lists;
 use crate::notify;
 use crate::tenant;
 
-use super::control_inbound::{ControlInbound, bound_session_slot_lists};
+use super::control_inbound::ControlInbound;
 
 /// The shortest gap between "a request arrived but no store is configured" warnings,
 /// so a fleet asking a coordinator whose store config was forgotten to grant uploads

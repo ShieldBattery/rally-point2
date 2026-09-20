@@ -199,15 +199,15 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 /// Flight recordings no longer ride this connection (a relay uploads them straight to
 /// object storage via a presigned URL), so the cap is sized to the largest frame that
 /// actually does: a relay's heartbeat roster. A heartbeat carries up to
-/// [`MAX_HEARTBEAT_SESSIONS`](control_inbound::MAX_HEARTBEAT_SESSIONS) session entries — one per session the relay holds,
+/// [`MAX_HEARTBEAT_SESSIONS`](crate::lifecycle::MAX_HEARTBEAT_SESSIONS) session entries — one per session the relay holds,
 /// each a tenant id (at most
 /// [`token::MAX_STRING_LEN`](rally_point_proto::token::MAX_STRING_LEN) = 255 bytes), a
 /// session id, up to
-/// [`MAX_HEARTBEAT_SESSION_SLOTS`](control_inbound::MAX_HEARTBEAT_SESSION_SLOTS) connected
+/// [`MAX_HEARTBEAT_SESSION_SLOTS`](crate::lifecycle::MAX_HEARTBEAT_SESSION_SLOTS) connected
 /// slot numbers, and the
 /// session's retained load state (that same slot ceiling again for each of its two
 /// slot sets, plus a start stamp) — plus up to
-/// [`MAX_HEARTBEAT_REGION_RTTS`](control_inbound::MAX_HEARTBEAT_REGION_RTTS)
+/// [`MAX_HEARTBEAT_REGION_RTTS`](crate::lifecycle::MAX_HEARTBEAT_REGION_RTTS)
 /// region-RTT entries. Even at a generous ~512 bytes per session entry — a real
 /// tenant id is a short label, nowhere near the 255-byte ceiling — that worst case
 /// stays under 2 MiB, so this bounds every

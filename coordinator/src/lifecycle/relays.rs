@@ -135,9 +135,11 @@ impl Lifecycle {
     /// partial rosters turn omissions into unknown instead.
     ///
     /// `now` is injected so the continuity/freshness boundary can be tested without
-    /// wall-clock sleeps. The API calls this only after fencing the heartbeat to the
-    /// relay's current control-connection generation.
-    pub fn on_relay_heartbeat(
+    /// wall-clock sleeps. [`Lifecycle::ingest_heartbeat`] is what a real beat
+    /// arrives through, and it reaches this only after fencing the beat to the
+    /// relay's current control-connection generation and dropping the roster
+    /// entries for sessions the relay does not serve.
+    pub(crate) fn on_relay_heartbeat(
         &self,
         relay: RelayId,
         generation: u64,

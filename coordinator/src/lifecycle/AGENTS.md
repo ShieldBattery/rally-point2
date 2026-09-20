@@ -7,8 +7,13 @@ spread across these files, so grep by method name, not by file.
   constructor family, and the `abort_timers` / `drain_queue` free helpers.
 - `sessions.rs` — one session's facts: register, re-home, departure/result,
   connected/started slots, load state, presence.
-- `relays.rs` — control-connection epochs, heartbeat ingestion, empty-roster
-  evidence invalidation, metrics census.
+- `relays.rs` — control-connection epochs, the empty-roster evidence a beat's
+  roster leaves behind, its invalidation, and the metrics census.
+- `heartbeat.rs` — `RelayHeartbeat` + `ingest_heartbeat`: the single owner of
+  what a relay's beat means (the per-beat wire-shape ceilings, the generation
+  fence, the serving-relay filter, and the fan-out to presence / empty-roster
+  evidence / load state / backbone RTTs), plus the `RegionRttIngest` view the
+  RTT half folds through.
 - `close.rs` — `SessionClosed` handling, retirement, both queue pushes.
 - `notices.rs` — `SessionNotice` + `ingest_notice`: the single owner of "a relay
   reported X" (authorize the reporter, record the fact, enqueue the webhook),
@@ -18,6 +23,13 @@ spread across these files, so grep by method name, not by file.
 
 ## Invariants that are easy to break
 
+- `ingest_heartbeat` is the only way a beat enters: it bounds the wire shape,
+  fences on the connection's generation, drops the roster entries for sessions
+  the relay does not serve, and only then fans out — so a superseded
+  connection's beat has no effect at all and a forged entry costs only itself.
+  A second ingest path (a replay, a batch endpoint) would re-decide all four.
+  Truncating a roster also clears its completeness flag: a suffix the
+  coordinator dropped must never read as a session the relay said was absent.
 - `ingest_notice` is the only way a reported notice enters: it authorizes the
   reporter against the session's serving set, records the fact, then enqueues the
   webhook, in that order. A new notice kind is a `SessionNotice` variant and an

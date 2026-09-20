@@ -136,6 +136,7 @@ fn heartbeat_load(
 
 mod close;
 mod empty_reap;
+mod heartbeat;
 mod notices;
 mod reaps;
 mod rehome;

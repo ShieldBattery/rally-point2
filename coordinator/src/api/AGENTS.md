@@ -18,9 +18,12 @@ Public paths (`api::CoordinatorState`, `router`, `ControlAuth`,
   they run over, and the drain mark · `control_flight.rs` upload grants and
   load-state snapshots (reader work done off the read loop)
 
-A per-session notice is decoded here and handed to `Lifecycle::ingest_notice`,
-which owns the reporter authorization, the accounting and the webhook — this
-layer decides none of it.
+What an inbound frame *means* belongs to the module that owns the state it
+lands in: a heartbeat is decoded here and handed to
+`Lifecycle::ingest_heartbeat` (the per-beat ceilings, the generation fence, the
+serving-relay filter and the five-way fan-out), and a per-session notice to
+`Lifecycle::ingest_notice` (the reporter authorization, the accounting, the
+webhook). This layer decodes and calls once; it decides none of it.
 
 ## Easy to break
 
