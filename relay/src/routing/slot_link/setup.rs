@@ -103,7 +103,7 @@ pub(super) fn push_connect_time_state(
     // complete map, so a client applies it idempotently. A session whose gate is
     // still shut pushes nothing, and this slot picks the labels up from the
     // fan-out when the gate opens.
-    if let Some(labels) = consensus::released_region_labels(decision_makers, key) {
+    if let Some(labels) = decision_makers.released_region_labels(key) {
         deliver_region_labels_to_slot(sessions, key, slot, labels);
     }
     // A slot connecting after the phase controller already issued it a delay

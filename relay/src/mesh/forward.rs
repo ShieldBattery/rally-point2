@@ -236,7 +236,7 @@ pub(super) fn deliver_turn_to_locals(
     // serving the session — its opponents' home relays included. The map comes
     // back on the one call that opens the gate, so the labels fan out to this
     // relay's local slots exactly once.
-    if let Some(labels) = crate::consensus::maybe_release_region_labels(decision_makers, key) {
+    if let Some(labels) = decision_makers.maybe_release_region_labels(key) {
         routing::fan_out_region_labels(sessions, key, &labels);
     }
     // The desync comparator's one and only feed point. Every turn-delivery

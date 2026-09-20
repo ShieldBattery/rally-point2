@@ -8,7 +8,6 @@
 use super::*;
 
 mod departure;
-mod homing;
 mod leave;
 mod phase;
 mod session_start;
@@ -21,7 +20,6 @@ pub use departure::{
     record_departure_for_epoch, record_result, remove_slot_for_epoch, reopen_close_report,
     result_for,
 };
-pub use homing::{maybe_release_region_labels, released_region_labels, set_region_labels};
 pub use leave::{
     decide_leave, decided_slots, deregister_maker, finalized_drops_enabled,
     has_reconnectable_departure, has_undecided_departure, leave_reconcile, leave_schedulable,

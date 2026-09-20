@@ -169,8 +169,7 @@ impl MeshControl {
         // send from here is a *changed* map on a session whose gate is already
         // open (a re-home named a different relay), where the clients holding the
         // superseded map must be corrected.
-        let relabelled = consensus::set_region_labels(
-            &self.mesh.session.decision_makers,
+        let relabelled = self.mesh.session.decision_makers.set_region_labels(
             &key,
             descriptor
                 .relay_regions

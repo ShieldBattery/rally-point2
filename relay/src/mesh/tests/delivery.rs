@@ -108,7 +108,7 @@ fn delivery_relay(
         },
     ];
     assert_eq!(
-        consensus::set_region_labels(&decision_makers, &key, labels.clone()),
+        decision_makers.set_region_labels(&key, labels.clone()),
         None,
         "a descriptor alone never releases the labels",
     );
@@ -202,7 +202,8 @@ fn region_labels_reach_local_slots_only_once_the_release_delay_has_elapsed() {
     // pushed it directly — the path a late or reconnecting slot's link task
     // takes, so it is not left without labels every other member holds.
     let (_reg2, mut inbox2) = routing::register(&sessions, &key, SlotId(2), 1).unwrap();
-    let late = consensus::released_region_labels(&decision_makers, &key)
+    let late = decision_makers
+        .released_region_labels(&key)
         .expect("the gate is open, so a late slot has labels to receive");
     routing::deliver_region_labels_to_slot(&sessions, &key, SlotId(2), late);
     assert_eq!(inbox2.try_recv_region_labels().as_ref(), Some(&labels));

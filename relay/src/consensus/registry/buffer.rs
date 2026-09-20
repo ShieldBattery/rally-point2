@@ -102,15 +102,6 @@ impl DecisionMakers {
         self.lock().get_mut(key)?.active_directive()
     }
 
-    /// Records `id` as the session's own relay id on its maker, if one exists
-    /// (see [`DecisionMaker::set_own_relay_id`]). A no-op when the session has no
-    /// maker yet — nothing to stamp until one is created.
-    pub fn set_own_relay_id(&self, key: &SessionKey, id: RelayId) {
-        if let Some(maker) = self.lock().get_mut(key) {
-            maker.set_own_relay_id(id);
-        }
-    }
-
     /// Records an authority-stamped directive this relay is forwarding, if the relay
     /// has a maker for the session, so a later promotion to authority continues the
     /// session's decision numbering and baselines against the committed buffer (see

@@ -12,6 +12,7 @@ use super::*;
 
 mod authority;
 mod buffer;
+mod homing;
 
 pub use authority::{FrameRegression, MakerSync};
 
