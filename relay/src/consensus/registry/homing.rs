@@ -32,7 +32,7 @@ impl DecisionMakers {
     /// Evaluates `key`'s region-label release gate against this relay's clock,
     /// returning the map to fan out on the single call that opens it (see
     /// [`DecisionMaker::maybe_release_region_labels`]). `None` on every other call,
-    /// and when no maker exists. The delay comes from the self, so every session
+    /// and when no maker exists. The delay comes from the registry, so every session
     /// on a relay is gated by the same one.
     #[must_use]
     pub fn maybe_release_region_labels(&self, key: &SessionKey) -> Option<Vec<RegionLabel>> {

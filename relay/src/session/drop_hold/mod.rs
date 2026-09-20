@@ -332,7 +332,7 @@ impl DropHolds {
     }
 
     /// Atomically decides a re-registering slot's fate against its hold: if a
-    /// hold is pending, runs `reinstate` (the caller's `consensus::reinstate_slot`)
+    /// hold is pending, runs `reinstate` (the caller's `DecisionMakers::reinstate_slot`)
     /// and removes the hold entry, all inside one acquisition of the holds lock,
     /// then returns whatever `reinstate` reported. Returns `false` outright, never
     /// calling `reinstate`, when no hold is pending.

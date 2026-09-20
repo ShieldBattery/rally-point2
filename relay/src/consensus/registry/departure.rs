@@ -303,7 +303,7 @@ impl DecisionMakers {
     /// function only touches the decision-maker.
     pub fn decide_abandoned_departures(&self, key: &SessionKey) -> Vec<LeaveDirective> {
         // Force-decide under the lock, collecting the fresh directives; release the lock
-        // before firing notices (`departure_notice` re-locks the self to read the
+        // before firing notices (`departure_notice` re-locks the registry to read the
         // slot's retained result).
         let decided: Vec<LeaveDirective> = {
             let mut makers = self.lock();

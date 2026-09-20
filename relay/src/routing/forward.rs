@@ -120,7 +120,7 @@ impl ForwardRx {
 }
 
 /// Whether a client's `GameResult` control frame should be forwarded to
-/// `consensus::record_result`, or dropped at ingress before it ever reaches the
+/// `DecisionMakers::record_result`, or dropped at ingress before it ever reaches the
 /// decision-maker. A zero-length payload is the wire sentinel a `SlotDeparted`
 /// uses to mean "no result reported" (see `wire.proto`), so recording one as a
 /// genuine report would make a real empty result indistinguishable from no

@@ -31,7 +31,7 @@ use super::*;
 ///
 /// Safe to call whenever the session *might* be closeable: a non-empty roster,
 /// a deferral, or an already-claimed close all make it a no-op. The claim
-/// latch (`consensus::claim_close_report`) keeps two concurrent evaluations
+/// latch (`DecisionMakers::claim_close_report`) keeps two concurrent evaluations
 /// from both running the close; the roster lock, held from the emptiness
 /// check through the last registry erase, keeps a concurrent re-dial's
 /// `register` (which inserts under the same lock) from landing mid-teardown —

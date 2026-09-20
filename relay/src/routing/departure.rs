@@ -38,7 +38,7 @@ use crate::consensus::LEAVE_REASON_DROPPED;
 /// every later reconnect for the slot (nothing ever clears a record with no
 /// hold to release), and an orphaned hold would let a survivor's `RequestDrop`
 /// honor a drop against a connected player — so this stands down instead. Every
-/// call this reaches into below (`consensus::record_departure`,
+/// call this reaches into below (`DecisionMakers::record_departure`,
 /// `mesh::fan_out_slot_departed`, `hold_or_decide_leave`'s DROPPED branch) touches
 /// only its own lock, never this roster's, so holding it across them cannot
 /// deadlock or reenter it. A clean leave (`reason` != `LEAVE_REASON_DROPPED`)
@@ -152,7 +152,7 @@ pub(crate) fn announce_departure_recorded(
     // ceiling and the result are home-authored here (only this relay, the slot's
     // home, holds the retained report and computes the ceiling), so every relay
     // clamps to the identical apply frame and folds the identical result — see
-    // `consensus::reachable_frame` / `consensus::result_for`.
+    // `DecisionMakers::reachable_frame` / `DecisionMakers::result_for`.
     let stamps = consensus::DepartureStamps {
         last_frame: decision_makers.slot_frame(key, slot),
         reachable_frame: decision_makers.reachable_frame(key, slot),
@@ -323,7 +323,7 @@ pub(super) fn report_own_presence(
 /// need deciding also arms the abandoned-session timer.
 ///
 /// A *started* session that is empty session-wide ([`crate::session::presence::all_empty`])
-/// with at least one undecided departure ([`consensus::has_undecided_departure`]) is
+/// with at least one undecided departure (`DecisionMakers::has_undecided_departure`) is
 /// abandoned: nobody is left to request the held drops, so a timer is armed that, on
 /// expiry, decides them all (see [`decide_and_broadcast_abandoned`]). Any other
 /// state — a slot still live, or nothing undecided — cancels any armed timer, so a
@@ -383,13 +383,13 @@ pub(crate) fn reconcile_abandon(
 /// Decides every undecided departure for a fully-abandoned session and broadcasts
 /// the leaves, funnelling the session into its normal close cascade. Force-decides
 /// past the authority gate (an empty session names no authority; see
-/// [`consensus::decide_abandoned_departures`]) and fires one departure notice per
+/// `DecisionMakers::decide_abandoned_departures`) and fires one departure notice per
 /// slot as a side effect; the broadcast reaches no local survivor (the roster is
 /// empty) but re-syncs any peer relay's cached leave state (dedup by slot).
 ///
 /// Releases each freshly decided slot's drop hold — the decision is made now, so
 /// the hold has nothing further to gate. A slot
-/// [`consensus::decide_abandoned_departures`] dedups away (already decided) has
+/// `DecisionMakers::decide_abandoned_departures` dedups away (already decided) has
 /// no directive here, so its hold — if somehow still present — is left for the
 /// close's decided-sweep, not touched twice for no reason.
 ///

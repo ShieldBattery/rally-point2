@@ -30,7 +30,7 @@ fn sync_maker_reconciles_bounds_and_authority_on_a_repush() {
     );
 }
 
-/// At the registry-level free function: a descriptor re-push that promotes
+/// At the registry-level method: a descriptor re-push that promotes
 /// this relay must thread the caller's real held-slot set through to the
 /// maker, not silently drop it. A slot's drop hold is the token a
 /// reconnecting client's return still redeems; passing the maker an empty

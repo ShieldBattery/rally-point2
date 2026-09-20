@@ -12,7 +12,7 @@ impl DecisionMakers {
     /// controller evaluates on its own sparse schedule, before the session starts
     /// nothing is recorded, and when no maker exists there is nothing to do.
     /// `received_at` is the instant the caller pulled the packet off the socket —
-    /// stamped there, not here, so validation, fan-out, and this self's own
+    /// stamped there, not here, so validation, fan-out, and this registry's own
     /// lock contention never leak into the measured arrival phase.
     #[must_use]
     pub fn ingest_arrival_phase(

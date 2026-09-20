@@ -227,4 +227,4 @@ fn slot_departed_ingest_max_merges_the_carried_frame_with_our_own() {
     }
 }
 
-// -- Home-relay binding: `slot_homed` gates client admission --
+// -- Home-relay binding: `admits_slot` gates client admission --

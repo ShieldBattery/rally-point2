@@ -30,7 +30,7 @@ pub(super) fn activate_slot(
     let activated = mesh.session.gates.with_ingress(key, || {
         // A slot link is serving this session (again): any session-closed report an
         // earlier emptying latched no longer describes this relay, so the next
-        // emptying must report anew. See `consensus::claim_close_report`.
+        // emptying must report anew. See `DecisionMakers::claim_close_report`.
         decision_makers.reopen_close_report(key);
 
         // This client joining may change who decides the session's buffer — most

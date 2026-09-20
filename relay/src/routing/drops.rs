@@ -109,7 +109,7 @@ pub(super) fn handle_drop_request(
 /// the same hold first. That is exactly why the claim is checked: `release`
 /// returning `false` means this call lost that race, and it must stand down
 /// rather than decide anyway. Deciding unconditionally here would be a genuine
-/// correctness bug, not just redundant work — `consensus::decide_leave` records
+/// correctness bug, not just redundant work — `DecisionMakers::decide_leave` records
 /// (or *re-records*) the departure before it checks anything, so calling it after
 /// a reconnect's `reinstate_slot` already cleared the record would resurrect a
 /// departure, and then commit a leave, against a slot that is live again.

@@ -1,4 +1,4 @@
-//! The silence watch's self half — the per-tick verdict sweep — and the
+//! The silence watch's registry half — the per-tick verdict sweep — and the
 //! retained load state read alongside it.
 
 use super::*;
@@ -57,7 +57,7 @@ impl DecisionMakers {
     /// owns the links, which is why this hands the names back rather than acting
     /// on them.
     ///
-    /// The whole sweep runs under one acquisition of the self lock, and the
+    /// The whole sweep runs under one acquisition of the registry lock, and the
     /// mark is taken inside it: acting on a name takes other locks, and a slot
     /// already marked is out of the comparison regardless of how long the acting
     /// takes.

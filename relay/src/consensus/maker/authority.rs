@@ -245,7 +245,7 @@ impl DecisionMaker {
     /// verbatim re-broadcast of an already-cached directive is not in `fresh`:
     /// whichever relay cached it first already reported it, so re-announcing it
     /// again on every promotion would double-count the departure. The registry-
-    /// level free function uses `fresh` to fire exactly one departure notice per
+    /// level method uses `fresh` to fire exactly one departure notice per
     /// slot, by whichever path (`decide_leave`, `observe_leave`, or this one)
     /// first grows the cache.
     ///

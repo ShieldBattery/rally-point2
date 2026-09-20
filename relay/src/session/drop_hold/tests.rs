@@ -104,7 +104,7 @@ fn take_if_pending_reinstates_and_removes_the_hold() {
 
 #[test]
 fn take_if_pending_still_removes_the_hold_when_reinstate_loses_the_photo_finish() {
-    // `reinstate` returning false models `consensus::reinstate_slot` finding
+    // `reinstate` returning false models `DecisionMakers::reinstate_slot` finding
     // the slot's leave already decided under its own lock -- a concurrent
     // `RequestDrop` or abandoned-session force-decide won the race. The hold
     // is still removed (it is exactly as resolved as one this call

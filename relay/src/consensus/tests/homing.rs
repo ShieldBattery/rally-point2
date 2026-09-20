@@ -4,7 +4,7 @@ use super::*;
 
 /// No maker exists yet for the session — the descriptor-arrival race: a
 /// client can dial before this relay has received any descriptor. Must
-/// admit, exactly like `slot_departed`/`is_authority`'s "no maker" default,
+/// admit, exactly like `has_departure`/`is_authority`'s "no maker" default,
 /// so this check introduces no new wait or refusal window.
 #[test]
 fn slot_homed_admits_when_no_maker_exists() {
@@ -117,7 +117,7 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
 }
 
 /// With an empty homed set (unenforced — a legacy/dev descriptor), every
-/// held undecided slot counts, matching `slot_homed`'s permissive
+/// held undecided slot counts, matching `admits_slot`'s permissive
 /// admission: a relay that would admit any slot's reconnect must also wait
 /// on any slot's held drop.
 #[test]

@@ -75,13 +75,13 @@ impl DecisionMaker {
 
     /// Whether `slot` is admissible on this relay: the homed set is empty
     /// (unenforced — see the field's doc) or contains `slot`. Read by
-    /// [`slot_homed`] at client admission.
+    /// [`DecisionMakers::admits_slot`] at client admission.
     pub(in crate::consensus) fn admits_slot(&self, slot: SlotId) -> bool {
         self.homed_slots.is_empty() || self.homed_slots.contains(&slot)
     }
 
     /// Whether the descriptor strictly homes `slot` here — see the free
-    /// [`slot_strictly_homed`] for why this, unlike `admits_slot`, never
+    /// [`DecisionMakers::strictly_homes`] for why this, unlike `admits_slot`, never
     /// fails open on an empty set.
     pub(in crate::consensus) fn strictly_homes(&self, slot: SlotId) -> bool {
         self.homed_slots.contains(&slot)
