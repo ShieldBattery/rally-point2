@@ -1,7 +1,7 @@
 //! Descriptor push mechanics: full sets vs. deltas, an empty-diff wake sending
 //! nothing, and the real relay client's Join/Leave stream converging to the
 //! coordinator's watch set — including the initial connect-time Join and the
-//! Leave a session's end pushes over the still-open connection.
+//! bootstrap secret that gates the connection before any of it.
 
 use std::time::Duration;
 
@@ -13,24 +13,30 @@ use rally_point_relay::coordinator;
 use rally_point_relay::mesh::MeshCommand;
 use rally_point_relay::routing::SessionKey;
 use tokio::time::timeout;
+use tokio_tungstenite::tungstenite::http::StatusCode;
+use tokio_tungstenite::tungstenite::{ClientRequestBuilder, Error as WsError};
 
 use crate::common::{connect_and_send_hello, prove_identity, relay_key};
 use crate::helpers::*;
 
 #[tokio::test]
 async fn a_delta_capable_relay_gets_a_full_set_then_deltas() {
+    // The wiring this proves is that connect-time is always a full set — seeding
+    // the baseline every later delta diffs against — and that the writer's
+    // steady-state arm then emits deltas over a real socket. The diff shapes
+    // themselves (a second add, an in-place mutation) are pure logic the
+    // coordinator's own `diff_descriptors` tests cover without a socket, so one
+    // add and one removal are enough here.
     let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
     let mut socket = connect_and_send_hello(&base_url, relay_hello(1, 14900)).await;
     prove_identity(&mut socket, &relay_key(1)).await;
 
-    // The connect-time re-sync is always the full set (here empty), whatever the
-    // negotiated version — it seeds the baseline every later delta diffs against.
     match read_to_descriptor_update(&mut socket).await {
         CoordinatorToRelay::Descriptors { descriptors, .. } => assert!(descriptors.is_empty()),
         other => panic!("expected a full descriptor set on connect, got {other:?}"),
     }
 
-    // An add: one upsert, no removals.
+    // An add: one upsert, no removals — not the whole set.
     setup
         .descriptors()
         .record(RelayId(1), a_descriptor(1, &[2]));
@@ -47,44 +53,10 @@ async fn a_delta_capable_relay_gets_a_full_set_then_deltas() {
         other => panic!("expected an add delta, got {other:?}"),
     }
 
-    // A second add is likewise carried as just its own upsert, not the whole set.
-    setup
-        .descriptors()
-        .record(RelayId(1), a_descriptor(2, &[3]));
-    match read_to_descriptor_update(&mut socket).await {
-        CoordinatorToRelay::DescriptorDelta {
-            upserts, removals, ..
-        } => {
-            assert_eq!(
-                upserts.iter().map(|d| d.session).collect::<Vec<_>>(),
-                vec![SessionId(2)],
-            );
-            assert!(removals.is_empty());
-        }
-        other => panic!("expected a second add delta, got {other:?}"),
-    }
-
-    // An in-place mutation: session 1's peers change. The diff is by value, so the
-    // unchanged key still surfaces as an upsert carrying the new value.
-    setup
-        .descriptors()
-        .record(RelayId(1), a_descriptor(1, &[9]));
-    match read_to_descriptor_update(&mut socket).await {
-        CoordinatorToRelay::DescriptorDelta {
-            upserts, removals, ..
-        } => {
-            assert_eq!(upserts.len(), 1);
-            assert_eq!(upserts[0].session, SessionId(1));
-            assert_eq!(upserts[0].peers[0].relay_id, RelayId(9));
-            assert!(removals.is_empty());
-        }
-        other => panic!("expected an in-place mutation delta, got {other:?}"),
-    }
-
     // A removal: one removal, no upserts.
     setup
         .descriptors()
-        .remove(RelayId(1), &TenantId(TENANT.to_owned()), SessionId(2));
+        .remove(RelayId(1), &TenantId(TENANT.to_owned()), SessionId(1));
     match read_to_descriptor_update(&mut socket).await {
         CoordinatorToRelay::DescriptorDelta {
             upserts, removals, ..
@@ -94,7 +66,7 @@ async fn a_delta_capable_relay_gets_a_full_set_then_deltas() {
                 removals,
                 vec![DescriptorKey {
                     tenant: TenantId(TENANT.to_owned()),
-                    session: SessionId(2),
+                    session: SessionId(1),
                 }],
             );
         }
@@ -144,7 +116,10 @@ async fn a_pre_delta_relay_receives_full_sets_not_deltas() {
     }
 }
 
-#[tokio::test]
+// Pinned to a single-threaded runtime: the test's whole argument is that the
+// writer task cannot run between two synchronous outbox calls made without an
+// await, which only holds when the runtime has one worker.
+#[tokio::test(flavor = "current_thread")]
 async fn an_empty_diff_wake_sends_no_frame() {
     let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
     let mut socket = connect_and_send_hello(&base_url, relay_hello(1, 14900)).await;
@@ -161,9 +136,9 @@ async fn an_empty_diff_wake_sends_no_frame() {
     }
 
     // Add then immediately remove the same session, with no await between the two
-    // synchronous outbox calls: on the current-thread test runtime the writer cannot
-    // run between them, so it wakes once to a set identical to what it last sent — an
-    // empty diff — and must send nothing.
+    // synchronous outbox calls: the writer cannot run between them, so it wakes
+    // once to a set identical to what it last sent — an empty diff — and must send
+    // nothing.
     setup
         .descriptors()
         .record(RelayId(1), a_descriptor(2, &[3]));
@@ -197,7 +172,9 @@ async fn an_empty_diff_wake_sends_no_frame() {
 async fn churn_through_the_real_client_converges_to_the_watch_set() {
     // The full delta round trip end to end: the real coordinator writer emits deltas
     // and the real relay client applies them. A burst of adds and removals must leave
-    // the relay's meshed sessions equal to the coordinator's final watch set.
+    // the relay's meshed sessions equal to the coordinator's final watch set — which
+    // covers both halves of the stream, since the sessions removed here were joined
+    // first and must then be left.
     let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
     let (control, mut rx2) = relay_one_with_peer_link();
 
@@ -290,66 +267,30 @@ async fn the_pushed_descriptor_drives_a_join_on_connect() {
 }
 
 #[tokio::test]
-async fn ending_a_session_pushes_a_leave_over_the_open_connection() {
-    let (base_url, session, outbox) = coordinator_with_session(None).await;
-    let (control, mut rx2) = relay_one_with_peer_link();
-
-    tokio::spawn(coordinator::client::run_descriptor_subscriber_with(
-        coordinator::client::EnrollConfig {
-            coordinator_url: base_url,
-            bootstrap_secret: None,
-            relay_hello: relay_hello(1, 14900),
-            identity_key: relay_key(1),
-        },
-        apply_targets(control),
-        no_outbound(),
-        heartbeat(Duration::from_secs(3600)),
-        no_drain_rx(),
-        no_control_connected(),
-        backoff(),
-    ));
-
-    // The initial push joins the session.
-    let joined = timeout(Duration::from_secs(5), rx2.recv())
-        .await
-        .expect("a Join should arrive")
-        .unwrap();
-    assert_eq!(joined, MeshCommand::Join(session_key(session)));
-
-    // The session ends: dropping relay 1's descriptor pushes the shrunk set down
-    // the still-open connection, and the relay leaves the session.
-    outbox
-        .descriptors()
-        .remove(RelayId(1), &TenantId(TENANT.to_owned()), session);
-    let left = timeout(Duration::from_secs(5), rx2.recv())
-        .await
-        .expect("a Leave should be pushed when the session ends")
-        .unwrap();
-    assert_eq!(left, MeshCommand::Leave(session_key(session)));
-}
-
-#[tokio::test]
-async fn a_wrong_bootstrap_secret_drives_no_join() {
+async fn a_wrong_bootstrap_secret_is_refused_at_the_upgrade() {
+    // The bootstrap secret is checked before the WebSocket upgrade, so a relay
+    // presenting the wrong one never gets a socket to receive descriptors on —
+    // the refusal is an HTTP 401, not a silent absence of pushes.
     let (base_url, _session, _outbox) = coordinator_with_session(Some("right-secret")).await;
-    let (control, mut rx2) = relay_one_with_peer_link();
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let uri = ws_url.parse().expect("a ws:// control url");
 
-    // The relay presents the wrong secret, so every handshake is rejected (401)
-    // and it keeps retrying without ever receiving a descriptor.
-    tokio::spawn(coordinator::client::run_descriptor_subscriber_with(
-        coordinator::client::EnrollConfig {
-            coordinator_url: base_url,
-            bootstrap_secret: Some("wrong-secret".to_owned()),
-            relay_hello: relay_hello(1, 14900),
-            identity_key: relay_key(1),
-        },
-        apply_targets(control),
-        no_outbound(),
-        heartbeat(Duration::from_secs(3600)),
-        no_drain_rx(),
-        no_control_connected(),
-        backoff(),
-    ));
+    let wrong = ClientRequestBuilder::new(uri).with_header("Authorization", "Bearer wrong-secret");
+    match tokio_tungstenite::connect_async(wrong).await {
+        Err(WsError::Http(response)) => assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "a wrong bootstrap secret is refused before the upgrade",
+        ),
+        Err(other) => panic!("expected an HTTP 401, got {other:?}"),
+        Ok(_) => panic!("a wrong bootstrap secret must not open a control connection"),
+    }
 
-    let result = timeout(Duration::from_millis(500), rx2.recv()).await;
-    assert!(result.is_err(), "a rejected relay must never drive a Join");
+    // The control for it: the same request with the right secret does upgrade.
+    let uri = ws_url.parse().expect("a ws:// control url");
+    let right = ClientRequestBuilder::new(uri).with_header("Authorization", "Bearer right-secret");
+    let (_socket, response) = tokio_tungstenite::connect_async(right)
+        .await
+        .expect("the matching secret opens the control connection");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
 }

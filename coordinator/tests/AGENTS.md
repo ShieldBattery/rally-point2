@@ -16,17 +16,39 @@ port) driven over real WebSocket control connections — no direct handler calls
 
 ## common/
 
-`common/mod.rs` (`#![allow(dead_code)]`): a per-relay-id self-signed cert+key
-cache (`relay_cert`/`relay_key`, byte-stable — duplicate-id enroll compares
-fingerprints), the challenge/proof round trip (`prove_identity`), and readers
-for the connect-time lead (`expect_tenant_keys`, `expect_region_beacons`,
-`read_to_descriptors`). `descriptor_transport/helpers.rs` is that suite's own
-fixtures, not generic enough for `common/`.
+`common/mod.rs` (`#![allow(dead_code)]`) holds everything more than one suite
+needs:
+
+- `CoordinatorBuilder` — the single coordinator stand-up (`axum::serve` on an
+  ephemeral loopback port). Defaults are the dev/loopback posture; a test names
+  only what it configures (`with_regions`/`with_ledger`/`with_liveness`/
+  `with_hello_timeout`/`with_relays`/`with_relay_hello`/`with_tenant`/
+  `with_control_auth`/`with_connect_info`/`with_pending_hello_limit`). Never
+  hand-roll a `CoordinatorState` literal or a listener here — a new state field
+  should land in one place.
+- `with_connect_info` serves the way `main.rs` does, so the handler reads a real
+  transport peer; without it `peer_ip` is `None` and a ledger's expected-address
+  gate fails closed. `with_pending_hello_limit` shrinks the pending-Hello gate,
+  which is otherwise sized for a whole fleet reconnecting.
+- the per-relay-id self-signed cert+key cache (`relay_cert`/`relay_key`,
+  byte-stable — duplicate-id enroll compares fingerprints), the challenge/proof
+  round trip (`prove_identity`), the connect-time-lead readers
+  (`expect_tenant_keys`, `expect_region_beacons`, `read_to_descriptors`), the
+  registry polls (`wait_for_enrollment`/`wait_for_deregistration`) and the
+  refusal readers (`expect_close`, `expect_closed_unserved`).
+
+`descriptor_transport/helpers.rs` is that suite's own fixtures (relay-client
+stand-ins, descriptor builders, frame readers), not generic enough for
+`common/`; it re-exports the shared `TENANT`/`LIVENESS`/wait helpers so a topic
+module's `use crate::helpers::*` still reaches them.
 
 ## Timing, flake, running
 
 Enroll/deregister are asserted by polling (~2s bound), not by awaiting a
-specific frame. Short `liveness_timeout`/`hello_timeout` are passed per test —
-don't raise defaults for convenience. One test pins `flavor = "current_thread"`
-for a no-await-between-sends coalescing check. Run one suite/test with
+specific frame, and never by sleeping a guessed interval. Short
+`liveness_timeout`/`hello_timeout` are passed per test — don't raise defaults
+for convenience. Two tests pin `flavor = "current_thread"`, both because their
+argument is that the writer task cannot run between two synchronous calls made
+without an await — a property only a single-worker runtime gives. Run one
+suite/test with
 `cargo test -p rally-point-coordinator --test <suite> [<test_name> -- --exact]`.

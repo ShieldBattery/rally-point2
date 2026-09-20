@@ -4,17 +4,11 @@
 //! against the baseline the drain refreshed.
 
 use rally_point_coordinator::api::ControlAuth;
-use rally_point_coordinator::{registry, session};
-use rally_point_proto::control::{
-    CoordinatorToRelay, DescriptorKey, PlayerHandoff, RelayToCoordinator, SessionRequest, TenantId,
-};
-use rally_point_proto::ids::{RelayId, SessionId, SlotId};
-use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
+use rally_point_coordinator::registry;
+use rally_point_proto::control::{CoordinatorToRelay, DescriptorKey, TenantId};
+use rally_point_proto::ids::{RelayId, SessionId};
 
-use futures_util::SinkExt;
-use tokio_tungstenite::tungstenite::Message;
-
-use crate::common::{connect_and_send_hello, prove_identity, relay_key};
+use crate::common::{ControlSocket, connect_and_send_hello, prove_identity, relay_key};
 use crate::helpers::*;
 
 #[tokio::test]
@@ -71,102 +65,60 @@ async fn the_drain_exchange_pushes_a_full_set_and_later_deltas_stay_correct() {
 
 #[tokio::test]
 async fn a_draining_relay_gets_its_set_then_an_ack_and_is_excluded_from_new_sessions() {
-    // One relay, enrolled over the socket; it serves one session, then drains.
+    // Two relays enrolled over their own sockets, drained one after the other:
+    // relay 1 first (serving nothing, so its set is empty), then relay 2 (serving
+    // the session the create in between homed on it). Each drain pushes the
+    // relay's set before its ack, and each marks the relay unavailable — first
+    // pushing a create onto the other relay, and finally leaving none at all.
     let (base_url, setup) = serve_coordinator_exposing_setup(&[]).await;
-    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
-    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
 
-    // Enroll relay 1 via its Hello (proving possession), then give it a session so
-    // its descriptor set is non-empty at drain time.
-    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
-    socket.send(Message::Text(hello.into())).await.unwrap();
-    prove_identity(&mut socket, &relay_key(1)).await;
+    let mut socket_one = enroll_over_socket(&base_url, 1, 14900).await;
+    assert!(wait_for_enrollment(setup.registry(), RelayId(1)).await);
+    let mut socket_two = enroll_over_socket(&base_url, 2, 14901).await;
+    assert!(wait_for_enrollment(setup.registry(), RelayId(2)).await);
+
+    // Relay 1 serves nothing, so it drains with an empty set — the ack still
+    // follows it.
+    send_draining(&mut socket_one).await;
+    let set = read_until_drain_ack(&mut socket_one).await;
     assert!(
-        wait_for_enrollment(setup.registry(), RelayId(1)).await,
-        "the relay enrolls from its Hello",
+        set.is_empty(),
+        "a relay serving nothing drains with an empty set",
     );
-    let session = create_one_slot_session(&setup);
+    assert!(!registry::is_available(setup.registry(), RelayId(1)));
 
-    // The relay asks to drain.
-    let draining = serde_json::to_string(&RelayToCoordinator::Draining).unwrap();
-    socket.send(Message::Text(draining.into())).await.unwrap();
+    // A create now skips relay 1 — the lower id, normally the primary pick — and
+    // homes on the still-available relay 2.
+    let session = try_create_one_slot_session(&setup)
+        .expect("relay 2 is available")
+        .session;
+    assert_eq!(
+        setup.serving_relays(&TenantId(TENANT.to_owned()), session),
+        vec![RelayId(2)],
+        "a create skips the draining relay and homes on the available one",
+    );
 
-    // It receives its current descriptor set (naming the session) and then a
-    // DrainAck — set before ack.
-    let set = read_until_drain_ack(&mut socket).await;
+    // Relay 2 now drains: the set pushed before its ack names the session it
+    // serves.
+    send_draining(&mut socket_two).await;
+    let set = read_until_drain_ack(&mut socket_two).await;
     assert!(
         set.iter().any(|d| d.session == session),
         "the descriptor set pushed before the ack names the relay's session",
     );
+    assert!(!registry::is_available(setup.registry(), RelayId(2)));
 
-    // The coordinator has marked it draining: a new session can no longer be
-    // assigned (it was the only relay), and the registry reports it unavailable.
-    assert!(!registry::is_available(setup.registry(), RelayId(1)));
-    let err = session::create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId(TENANT.to_owned()),
-            players: vec![PlayerHandoff {
-                slot: SlotId(0),
-                client_pubkey: ClientPublicKey([0xCC; 32]),
-                external_ref: None,
-                observer: false,
-                region: None,
-            }],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap_err();
-    assert_eq!(err, registry::SessionSetupError::NoRelaysAvailable);
+    // With both relays draining, a new session can no longer be assigned at all.
+    assert_eq!(
+        try_create_one_slot_session(&setup).unwrap_err(),
+        registry::SessionSetupError::NoRelaysAvailable,
+    );
 }
 
-#[tokio::test]
-async fn a_draining_relay_is_skipped_and_a_create_picks_the_other_relay() {
-    // Relay 2 is pre-enrolled; relay 1 enrolls over the socket, then drains. A
-    // create after the drain homes on the still-available relay 2.
-    let (base_url, setup) = serve_coordinator_exposing_setup(&[(2, 14901)]).await;
-    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
-    let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
-
-    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(1, 14900))).unwrap();
-    socket.send(Message::Text(hello.into())).await.unwrap();
-    prove_identity(&mut socket, &relay_key(1)).await;
-    assert!(wait_for_enrollment(setup.registry(), RelayId(1)).await);
-
-    let draining = serde_json::to_string(&RelayToCoordinator::Draining).unwrap();
-    socket.send(Message::Text(draining.into())).await.unwrap();
-    // Its set is empty (it serves no session), and the ack still arrives after it.
-    let set = read_until_drain_ack(&mut socket).await;
-    assert!(
-        set.is_empty(),
-        "a relay serving nothing drains with an empty set"
-    );
-
-    // A fresh session homes on relay 2 — relay 1 (lower id, normally the primary) is
-    // draining and excluded from the pick.
-    let resp = session::create_session(
-        &setup,
-        SessionRequest {
-            tenant: TenantId(TENANT.to_owned()),
-            players: vec![PlayerHandoff {
-                slot: SlotId(0),
-                client_pubkey: ClientPublicKey([0xDD; 32]),
-                external_ref: None,
-                observer: false,
-                region: None,
-            }],
-            external_id: None,
-            latency_estimate_ms: None,
-        },
-        ExpiresAt(u64::MAX),
-    )
-    .unwrap()
-    .response;
-    assert_eq!(
-        resp.home_relay.relay_id,
-        RelayId(2),
-        "a create skips the draining relay and homes on the available one",
-    );
+/// Opens a control socket, enrolls `id` over it with its Hello and proof of
+/// possession, and returns the socket still open.
+async fn enroll_over_socket(base_url: &str, id: u64, port: u16) -> ControlSocket {
+    let mut socket = connect_and_send_hello(base_url, relay_hello(id, port)).await;
+    prove_identity(&mut socket, &relay_key(id)).await;
+    socket
 }

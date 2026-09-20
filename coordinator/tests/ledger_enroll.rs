@@ -5,82 +5,27 @@
 //! close code, admits the bound relay's reconnect on its certificate alone, and
 //! refuses a different certificate claiming the bound id. It also proves the
 //! coordinator-recorded advertise set overrides the hello's self-reported
-//! addresses at enroll.
+//! addresses at enroll, and that the recorded expected-address gate is measured
+//! against the connection's real transport peer.
 //!
 //! The tokenless dev / loopback path is proven unchanged by the sibling
 //! `enroll_identity` suite, which runs against a coordinator with no ledger.
 
-use std::net::{Ipv4Addr, SocketAddr};
-use std::path::Path;
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use futures_util::StreamExt;
-use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
-use rally_point_coordinator::ledger::RelayLedger;
-use rally_point_coordinator::registry::{self, RelayRegistry};
-use rally_point_coordinator::session::SessionSetup;
-use rally_point_coordinator::tenant;
-use rally_point_proto::ids::RelayId;
+use rally_point_coordinator::registry;
 use rally_point_proto::version::CONTROL_CLOSE_ENROLL_UNAUTHORIZED;
-use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
 
 mod common;
 use common::{
-    ControlSocket, answer_challenge, connect_and_send_hello, expect_identity_challenge,
-    hello_at_current, read_to_descriptors, self_signed,
+    ControlSocket, CoordinatorBuilder, connect_and_send_hello, expect_close, hello_at_current,
+    in_memory_ledger, prove_identity, read_to_descriptors, self_signed, wait_for_deregistration,
+    wait_for_enrollment,
 };
-
-/// A generous liveness deadline — these tests don't exercise the timeout.
-const LIVENESS: Duration = Duration::from_secs(30);
 
 /// The token lifetime tests mint with — comfortably longer than any test runs.
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
-
-/// Serves a ledger-backed coordinator (open auth, no regions, no tenant) on an
-/// ephemeral port. Returns the base URL, a handle to the registry so a test can
-/// observe enrollment, and the shared ledger so a test can mint ids and record
-/// tasks the served handler then authorizes against.
-async fn serve_ledger_coordinator() -> (String, RelayRegistry, Arc<RelayLedger>) {
-    let ledger =
-        Arc::new(RelayLedger::open(Path::new(":memory:")).expect("in-memory ledger opens"));
-    let reg = registry::new_registry();
-    let setup = SessionSetup::new(reg.clone(), tenant::new_store());
-    let app = api::router(CoordinatorState {
-        liveness_timeout: LIVENESS,
-        player_token_lifetime: Duration::from_secs(3600),
-        ledger: Some(ledger.clone()),
-        ..CoordinatorState::new(setup, ControlAuth::Open)
-    });
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), reg, ledger)
-}
-
-/// Reads the coordinator's next frame and asserts it is a close with
-/// `expected_code`.
-async fn expect_close(socket: &mut ControlSocket, expected_code: u16) {
-    let frame = timeout(Duration::from_secs(5), socket.next())
-        .await
-        .expect("the coordinator answers promptly")
-        .expect("a frame arrives")
-        .unwrap();
-    let Message::Close(Some(close)) = frame else {
-        panic!("expected a close frame, got {frame:?}");
-    };
-    assert_eq!(
-        u16::from(close.code),
-        expected_code,
-        "reason: {}",
-        close.reason
-    );
-}
 
 /// Reads down-frames until the descriptor re-sync every accepted enroll includes —
 /// proof the connection enrolled rather than being closed. The enrolled path leads
@@ -89,65 +34,52 @@ async fn expect_enrolled(socket: &mut ControlSocket) {
     let _ = read_to_descriptors(socket).await;
 }
 
-/// Polls the registry until `id` enrolls, up to a couple of seconds.
-async fn wait_for_enrollment(reg: &RelayRegistry, id: RelayId) -> bool {
-    for _ in 0..100 {
-        if registry::peer(reg, id).is_some() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    false
-}
-
 #[tokio::test]
-async fn a_minted_relay_enrolls_with_its_token_and_advertises_its_hello_addr() {
-    let (base_url, reg, ledger) = serve_ledger_coordinator().await;
-    let minted = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
+async fn a_recorded_advertise_set_overrides_the_hello_addresses() {
+    // A relay behind NAT self-reports a useless address, so the addresses the
+    // coordinator resolved for the task must win at enroll. With nothing
+    // recorded there is nothing to override and the hello's own address stands.
+    let ledger = in_memory_ledger();
+    let served = CoordinatorBuilder::new()
+        .with_ledger(ledger.clone())
+        .serve()
+        .await;
 
+    // Nothing recorded: the hello's self-reported address is what enrolls.
+    let self_reported = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
     let (cert_der, key) = self_signed();
-    let hello = hello_at_current(minted.relay_id.0, 14900, cert_der)
-        .with_enroll_token(minted.token.clone());
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    let nonce = expect_identity_challenge(&mut socket).await;
-    answer_challenge(&mut socket, &key, &nonce).await;
+    let hello = hello_at_current(self_reported.relay_id.0, 14900, cert_der)
+        .with_enroll_token(self_reported.token.clone());
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
 
     assert!(
-        wait_for_enrollment(&reg, minted.relay_id).await,
+        wait_for_enrollment(served.registry(), self_reported.relay_id).await,
         "a minted relay presenting its token enrolls",
     );
-    // Nothing was recorded for the id, so it enrolls with its self-reported
-    // hello address.
-    let entry = registry::entry(&reg, minted.relay_id).unwrap();
+    let entry = registry::entry(served.registry(), self_reported.relay_id).unwrap();
     assert_eq!(
         entry.relay_addr,
         SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
         "with no recorded advertise set, the hello's own address is used",
     );
-}
 
-#[tokio::test]
-async fn a_recorded_advertise_set_overrides_the_hello_addresses() {
-    let (base_url, reg, ledger) = serve_ledger_coordinator().await;
-    let minted = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
-
-    // The coordinator-resolved advertise set, recorded before the relay enrolls.
+    // A recorded advertise set: it replaces the hello's addresses entirely.
+    let recorded = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
     let v4: SocketAddr = "203.0.113.5:15000".parse().unwrap();
     let v6: SocketAddr = "[2001:db8::5]:15000".parse().unwrap();
     ledger
-        .record_task(minted.relay_id, "arn:aws:ecs:task/abc", &[], &[v4, v6])
+        .record_task(recorded.relay_id, "arn:aws:ecs:task/abc", &[], &[v4, v6])
         .expect("record the task's advertise set");
 
-    // The hello self-reports a different (loopback) address.
     let (cert_der, key) = self_signed();
-    let hello = hello_at_current(minted.relay_id.0, 14900, cert_der)
-        .with_enroll_token(minted.token.clone());
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    let nonce = expect_identity_challenge(&mut socket).await;
-    answer_challenge(&mut socket, &key, &nonce).await;
+    let hello = hello_at_current(recorded.relay_id.0, 14901, cert_der)
+        .with_enroll_token(recorded.token.clone());
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
 
-    assert!(wait_for_enrollment(&reg, minted.relay_id).await);
-    let entry = registry::entry(&reg, minted.relay_id).unwrap();
+    assert!(wait_for_enrollment(served.registry(), recorded.relay_id).await);
+    let entry = registry::entry(served.registry(), recorded.relay_id).unwrap();
     assert_eq!(
         entry.relay_addr, v4,
         "the ledger's primary address wins over the hello's self-report",
@@ -161,85 +93,183 @@ async fn a_recorded_advertise_set_overrides_the_hello_addresses() {
 
 #[tokio::test]
 async fn a_tokenless_or_wrong_token_enroll_is_refused() {
-    let (base_url, reg, ledger) = serve_ledger_coordinator().await;
+    let ledger = in_memory_ledger();
+    let served = CoordinatorBuilder::new()
+        .with_ledger(ledger.clone())
+        .serve()
+        .await;
     let minted = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
     let (cert_der, key) = self_signed();
 
     // No token at all: refused with the single generic close code.
     let hello = hello_at_current(minted.relay_id.0, 14900, cert_der.clone());
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    let nonce = expect_identity_challenge(&mut socket).await;
-    answer_challenge(&mut socket, &key, &nonce).await;
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
     expect_close(&mut socket, CONTROL_CLOSE_ENROLL_UNAUTHORIZED).await;
     assert!(
-        registry::peer(&reg, minted.relay_id).is_none(),
+        registry::peer(served.registry(), minted.relay_id).is_none(),
         "a token-less enroll never reaches the registry",
     );
 
     // A wrong token: the same generic refusal, indistinguishable on the wire.
     let hello = hello_at_current(minted.relay_id.0, 14900, cert_der)
         .with_enroll_token("not-the-real-token".to_owned());
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    let nonce = expect_identity_challenge(&mut socket).await;
-    answer_challenge(&mut socket, &key, &nonce).await;
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
     expect_close(&mut socket, CONTROL_CLOSE_ENROLL_UNAUTHORIZED).await;
-    assert!(registry::peer(&reg, minted.relay_id).is_none());
+    assert!(registry::peer(served.registry(), minted.relay_id).is_none());
 }
 
 #[tokio::test]
 async fn the_bound_cert_reconnects_tokenless_and_a_new_cert_is_refused() {
-    let (base_url, reg, ledger) = serve_ledger_coordinator().await;
+    let ledger = in_memory_ledger();
+    let served = CoordinatorBuilder::new()
+        .with_ledger(ledger.clone())
+        .serve()
+        .await;
     let minted = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
     let (cert_der, key) = self_signed();
 
     // First enroll with the token binds this certificate to the id.
     let hello = hello_at_current(minted.relay_id.0, 14900, cert_der.clone())
         .with_enroll_token(minted.token.clone());
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    let nonce = expect_identity_challenge(&mut socket).await;
-    answer_challenge(&mut socket, &key, &nonce).await;
-    assert!(wait_for_enrollment(&reg, minted.relay_id).await);
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
+    assert!(wait_for_enrollment(served.registry(), minted.relay_id).await);
     drop(socket);
     // Let the coordinator observe the drop and deregister before reconnecting.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(wait_for_deregistration(served.registry(), minted.relay_id).await);
 
     // Reconnect with the SAME certificate and NO token: the bound certificate
     // alone authorizes the reconnect.
     let hello = hello_at_current(minted.relay_id.0, 14901, cert_der.clone());
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    let nonce = expect_identity_challenge(&mut socket).await;
-    answer_challenge(&mut socket, &key, &nonce).await;
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
     expect_enrolled(&mut socket).await;
     drop(socket);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(wait_for_deregistration(served.registry(), minted.relay_id).await);
 
     // Reconnect with a DIFFERENT certificate claiming the bound id — even with a
     // valid-looking token — is refused: the fingerprint does not match the bound
-    // one, so the ledger closes 4005 before the registry is ever touched.
+    // one, so the ledger closes before the registry is ever touched. A stolen
+    // token cannot re-bind an id to a new certificate.
     let (other_cert, other_key) = self_signed();
     let hello = hello_at_current(minted.relay_id.0, 14902, other_cert)
         .with_enroll_token(minted.token.clone());
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    let nonce = expect_identity_challenge(&mut socket).await;
-    answer_challenge(&mut socket, &other_key, &nonce).await;
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &other_key).await;
     expect_close(&mut socket, CONTROL_CLOSE_ENROLL_UNAUTHORIZED).await;
 }
 
 #[tokio::test]
 async fn a_retired_id_is_refused_even_with_its_token() {
-    let (base_url, reg, ledger) = serve_ledger_coordinator().await;
+    let ledger = in_memory_ledger();
+    let served = CoordinatorBuilder::new()
+        .with_ledger(ledger.clone())
+        .serve()
+        .await;
     let minted = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
     ledger.retire(minted.relay_id).expect("retire the id");
 
     let (cert_der, key) = self_signed();
     let hello = hello_at_current(minted.relay_id.0, 14900, cert_der)
         .with_enroll_token(minted.token.clone());
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    let nonce = expect_identity_challenge(&mut socket).await;
-    answer_challenge(&mut socket, &key, &nonce).await;
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
     expect_close(&mut socket, CONTROL_CLOSE_ENROLL_UNAUTHORIZED).await;
     assert!(
-        registry::peer(&reg, minted.relay_id).is_none(),
+        registry::peer(served.registry(), minted.relay_id).is_none(),
         "a retired id can never enroll",
+    );
+}
+
+#[tokio::test]
+async fn the_expected_address_gate_is_measured_against_the_real_connection_peer() {
+    // The gate compares the ledger's recorded expected addresses against the
+    // connection's transport-level peer, which the handler only ever sees when
+    // the server was built with connect-info the way the binary builds it. Every
+    // arm below runs over a real socket from loopback, so the peer is known and
+    // is 127.0.0.1.
+    let ledger = in_memory_ledger();
+    let served = CoordinatorBuilder::new()
+        .with_ledger(ledger.clone())
+        .with_connect_info()
+        .serve()
+        .await;
+
+    // An id whose expected set contains the address this test connects from.
+    let expected_here = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
+    ledger
+        .record_task(
+            expected_here.relay_id,
+            "arn:aws:ecs:task/here",
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            &[],
+        )
+        .expect("record the expected address");
+    let (cert_der, key) = self_signed();
+    let hello = hello_at_current(expected_here.relay_id.0, 14900, cert_der)
+        .with_enroll_token(expected_here.token.clone());
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
+    assert!(
+        wait_for_enrollment(served.registry(), expected_here.relay_id).await,
+        "a relay connecting from an address the ledger expects enrolls",
+    );
+
+    // An id expecting a different address: the same loopback connection is
+    // refused with the one generic close code, and never reaches the registry.
+    let expected_elsewhere = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
+    ledger
+        .record_task(
+            expected_elsewhere.relay_id,
+            "arn:aws:ecs:task/elsewhere",
+            &["203.0.113.7".parse().unwrap()],
+            &[],
+        )
+        .expect("record the expected address");
+    let (cert_der, key) = self_signed();
+    let hello = hello_at_current(expected_elsewhere.relay_id.0, 14901, cert_der)
+        .with_enroll_token(expected_elsewhere.token.clone());
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
+    expect_close(&mut socket, CONTROL_CLOSE_ENROLL_UNAUTHORIZED).await;
+    assert!(
+        registry::peer(served.registry(), expected_elsewhere.relay_id).is_none(),
+        "a relay connecting from an address the ledger does not expect never enrolls",
+    );
+}
+
+#[tokio::test]
+async fn a_recorded_expected_address_refuses_a_server_that_cannot_see_its_peer() {
+    // Served without connect-info — as a router-`oneshot` harness or a server
+    // behind something that hides the peer would be — the handler reads the peer
+    // as unknown. A non-empty expected set then refuses rather than waving the
+    // enroll through, so losing the connect-info wiring fails closed.
+    let ledger = in_memory_ledger();
+    let served = CoordinatorBuilder::new()
+        .with_ledger(ledger.clone())
+        .serve()
+        .await;
+
+    let minted = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
+    ledger
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/here",
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            &[],
+        )
+        .expect("record the expected address");
+
+    let (cert_der, key) = self_signed();
+    let hello = hello_at_current(minted.relay_id.0, 14900, cert_der)
+        .with_enroll_token(minted.token.clone());
+    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
+    prove_identity(&mut socket, &key).await;
+    expect_close(&mut socket, CONTROL_CLOSE_ENROLL_UNAUTHORIZED).await;
+    assert!(
+        registry::peer(served.registry(), minted.relay_id).is_none(),
+        "an enroll whose peer the server never recorded is refused, not trusted",
     );
 }

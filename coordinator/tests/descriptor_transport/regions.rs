@@ -23,72 +23,63 @@ use crate::common::{
 use crate::helpers::*;
 
 #[tokio::test]
-async fn a_region_less_hello_enrolls_even_with_a_region_config() {
-    // An untagged relay always enrolls — regions are for tagged relays; a
-    // region-less hello is the dev/loopback and region-blind-fallback path.
-    let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
-    let mut socket = connect_and_send_hello(&base_url, relay_hello(9, 14909)).await;
-    // Region validation passes (untagged), so the coordinator challenges before
-    // enrolling; answer it, then the enrolled path proceeds — the tenant-key lead
-    // followed by the descriptor re-sync, not a close.
-    prove_identity(&mut socket, &relay_key(9)).await;
-    let _ = read_to_descriptors(&mut socket).await;
-    assert!(
-        wait_for_enrollment(setup.registry(), RelayId(9)).await,
-        "an untagged relay enrolls",
-    );
+async fn a_hello_the_region_config_accepts_enrolls_and_its_region_lands_in_the_entry() {
+    // Regions are for tagged relays: an untagged hello always passes (the
+    // dev/loopback and region-blind-fallback path), and a hello tagged with a
+    // configured region passes too — with the tag recorded on its registry entry,
+    // which is what session placement later reads.
+    for (region, why) in [
+        (None, "an untagged relay enrolls"),
+        (
+            Some(RegionId("region-a".to_owned())),
+            "a relay in a configured region enrolls",
+        ),
+    ] {
+        let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
+        let mut hello = relay_hello(9, 14909);
+        if let Some(region) = region.clone() {
+            hello = hello.with_region(region);
+        }
+        let mut socket = connect_and_send_hello(&base_url, hello).await;
+        // Region validation passes, so the coordinator challenges before
+        // enrolling; answer it, then the enrolled path proceeds — the tenant-key
+        // lead followed by the descriptor re-sync, not a close.
+        prove_identity(&mut socket, &relay_key(9)).await;
+        let _ = read_to_descriptors(&mut socket).await;
+        assert!(
+            wait_for_enrollment(setup.registry(), RelayId(9)).await,
+            "{why}"
+        );
+        let entry = registry::entry(setup.registry(), RelayId(9)).expect("relay 9 enrolled");
+        assert_eq!(
+            entry.region, region,
+            "the registry entry carries the enrolled region",
+        );
+    }
 }
 
 #[tokio::test]
-async fn a_valid_region_enrolls_and_lands_in_the_registry_entry() {
-    let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
-    let hello = relay_hello(9, 14909).with_region(RegionId("region-a".to_owned()));
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    // A configured region passes validation, so the coordinator challenges before
-    // enrolling; answer it, then drain the initial descriptor re-sync.
-    prove_identity(&mut socket, &relay_key(9)).await;
-    let _ = timeout(Duration::from_secs(5), {
-        use futures_util::StreamExt;
-        socket.next()
-    })
-    .await;
-    assert!(
-        wait_for_enrollment(setup.registry(), RelayId(9)).await,
-        "a relay in a configured region enrolls",
-    );
-    let entry = registry::entry(setup.registry(), RelayId(9)).expect("relay 9 enrolled");
-    assert_eq!(
-        entry.region,
-        Some(RegionId("region-a".to_owned())),
-        "the registry entry carries the enrolled region",
-    );
-}
-
-#[tokio::test]
-async fn an_unknown_region_is_refused_and_never_enrolled() {
-    // A typo'd region tag is refused rather than silently serving nobody.
-    let (base_url, setup) = serve_coordinator_with_regions(two_region_config()).await;
-    let hello = relay_hello(9, 14909).with_region(RegionId("region-z".to_owned()));
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    expect_unknown_region_close(&mut socket, "region-z").await;
-    assert!(
-        registry::peer(setup.registry(), RelayId(9)).is_none(),
-        "a relay tagged with an unknown region is never enrolled",
-    );
-}
-
-#[tokio::test]
-async fn any_region_is_refused_when_no_regions_are_configured() {
-    // With no region config at all, a region tag is unrecognizable, so a tagged
-    // relay is refused — the empty-config case of the unknown-region rule.
-    let (base_url, setup) = serve_coordinator_with_regions(RegionsConfig::default()).await;
-    let hello = relay_hello(9, 14909).with_region(RegionId("region-a".to_owned()));
-    let mut socket = connect_and_send_hello(&base_url, hello).await;
-    expect_unknown_region_close(&mut socket, "region-a").await;
-    assert!(
-        registry::peer(setup.registry(), RelayId(9)).is_none(),
-        "with no region config a tagged relay is never enrolled",
-    );
+async fn an_unrecognized_region_is_refused_and_never_enrolled() {
+    // A region tag the config does not list is refused rather than silently
+    // serving nobody — a typo'd tag and a tag offered to a coordinator with no
+    // region config at all are the same rule, the second being its empty case.
+    for (regions, tag, why) in [
+        (two_region_config(), "region-z", "a typo'd region tag"),
+        (
+            RegionsConfig::default(),
+            "region-a",
+            "any region tag when nothing is configured",
+        ),
+    ] {
+        let (base_url, setup) = serve_coordinator_with_regions(regions).await;
+        let hello = relay_hello(9, 14909).with_region(RegionId(tag.to_owned()));
+        let mut socket = connect_and_send_hello(&base_url, hello).await;
+        expect_unknown_region_close(&mut socket, tag).await;
+        assert!(
+            registry::peer(setup.registry(), RelayId(9)).is_none(),
+            "{why} is never enrolled",
+        );
+    }
 }
 
 // --- Region ping-beacon distribution ---

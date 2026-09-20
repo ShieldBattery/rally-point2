@@ -14,6 +14,11 @@ use tokio::time::timeout;
 use crate::common::{prove_identity, relay_key};
 use crate::helpers::*;
 
+/// The shortened liveness deadline both tests run against — short enough that a
+/// silent relay is dropped promptly, still several times the heartbeat interval
+/// the heartbeating test uses.
+const LIVENESS_DEADLINE: Duration = Duration::from_millis(300);
+
 #[tokio::test]
 async fn a_silent_relay_is_deregistered_after_the_liveness_deadline() {
     use futures_util::{SinkExt, StreamExt};
@@ -21,8 +26,7 @@ async fn a_silent_relay_is_deregistered_after_the_liveness_deadline() {
     use tokio_tungstenite::tungstenite::Message;
 
     // A short liveness deadline so the test doesn't wait the production timeout.
-    let (base_url, reg) =
-        serve_bare_coordinator(api::HELLO_TIMEOUT, Duration::from_millis(300)).await;
+    let (base_url, reg) = serve_bare_coordinator(api::HELLO_TIMEOUT, LIVENESS_DEADLINE).await;
     let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
     let (mut socket, _resp) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
 
@@ -57,8 +61,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
     // The liveness deadline is short, but the relay heartbeats well inside it, so
     // the coordinator keeps resetting the deadline and never deregisters it. This
     // exercises the relay actually sending heartbeats over a live connection.
-    let (base_url, reg) =
-        serve_bare_coordinator(api::HELLO_TIMEOUT, Duration::from_millis(300)).await;
+    let (base_url, reg) = serve_bare_coordinator(api::HELLO_TIMEOUT, LIVENESS_DEADLINE).await;
     let control = MeshControl::new(
         RelayId(7),
         std::sync::Arc::default(),
@@ -73,7 +76,7 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         },
         apply_targets(control),
         no_outbound(),
-        heartbeat(Duration::from_millis(100)), // heartbeat three times inside the 300ms deadline
+        heartbeat(LIVENESS_DEADLINE / 3), // three beats inside every deadline window
         no_drain_rx(),
         no_control_connected(),
         backoff(),
@@ -83,10 +86,15 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
         "the relay enrolls from its Hello",
     );
 
-    // Wait well past the liveness deadline; the heartbeats keep the relay alive.
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    assert!(
-        registry::peer(&reg, RelayId(7)).is_some(),
-        "a heartbeating relay must not be deregistered",
-    );
+    // Watch the registry past the deadline rather than sleeping a magic number:
+    // the relay must still be there at every point up to half again the deadline,
+    // by which time a coordinator ignoring the heartbeats would have dropped it.
+    let watch_until = std::time::Instant::now() + LIVENESS_DEADLINE + LIVENESS_DEADLINE / 2;
+    while std::time::Instant::now() < watch_until {
+        assert!(
+            registry::peer(&reg, RelayId(7)).is_some(),
+            "a heartbeating relay must not be deregistered",
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }

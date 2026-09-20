@@ -290,6 +290,16 @@ pub struct CoordinatorState {
     /// report nothing — the dev / no-store posture. Shared (an `Arc`) across all relay
     /// control connections and the HTTP state.
     pub flight_store: Option<Arc<S3FlightStore>>,
+    /// The gate bounding how many control connections may sit between a
+    /// completed WebSocket upgrade and a verified `Hello` at once. A connection
+    /// holds a permit only across that unauthenticated window, and one that
+    /// finds the gate saturated is refused outright rather than queued. Shared
+    /// (an `Arc`) across every control connection this state serves; [`new`]
+    /// opens it at the production size, and a test stands one up small enough to
+    /// saturate with a couple of sockets.
+    ///
+    /// [`new`]: CoordinatorState::new
+    pub pending_hellos: Arc<tokio::sync::Semaphore>,
 }
 
 impl CoordinatorState {
@@ -320,6 +330,9 @@ impl CoordinatorState {
             ledger: None,
             pair_rtts: pair_rtts::new_store(),
             flight_store: None,
+            pending_hellos: Arc::new(tokio::sync::Semaphore::new(
+                control::MAX_PENDING_CONTROL_HELLOS,
+            )),
         }
     }
 }

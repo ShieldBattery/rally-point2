@@ -8,17 +8,16 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
+use rally_point_coordinator::api::ControlAuth;
 use rally_point_coordinator::regions::RegionsConfig;
-use rally_point_coordinator::registry::RelayRegistry;
-use rally_point_coordinator::session::SessionSetup;
-use rally_point_coordinator::{registry, session, tenant};
+use rally_point_coordinator::registry::{RelayRegistry, SessionSetupError};
+use rally_point_coordinator::session::{self, SessionSetup};
 use rally_point_proto::control::{
     BufferBounds, CoordinatorToRelay, MeshPeerIdentity, PlayerHandoff, RegionId, RelayHello,
-    RelayPeer, RelayToCoordinator, SessionDescriptor, SessionRequest, TenantId,
+    RelayPeer, RelayToCoordinator, SessionDescriptor, SessionRequest, SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
-use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId};
+use rally_point_proto::token::{ClientPublicKey, ExpiresAt};
 use rally_point_proto::version::{
     CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION, ProtocolVersion,
 };
@@ -32,14 +31,13 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::common::{self, relay_cert};
+use crate::common::{self, CoordinatorBuilder, relay_cert};
 use rally_point_relay::auth::SharedRegistry;
 
-pub(crate) const TENANT: &str = "sb-test";
-
-/// A generous liveness deadline for tests that don't exercise the timeout — long
-/// enough that no enrolled relay is ever deregistered for going silent.
-pub(crate) const LIVENESS: Duration = Duration::from_secs(30);
+// The test tenant, the never-firing liveness deadline, and the enrollment /
+// deregistration polls are shared with the other suites; re-exported here so a
+// topic module's `use crate::helpers::*` still reaches them unqualified.
+pub(crate) use crate::common::{LIVENESS, TENANT, wait_for_deregistration, wait_for_enrollment};
 
 /// A notice drain that never receives anything: these descriptor-transport tests
 /// don't exercise departure/desync notification, so the subscriber's notifier arm
@@ -144,32 +142,6 @@ pub(crate) fn relay_hello(id: u64, port: u16) -> RelayHello {
     )
 }
 
-/// Polls the registry until `id` enrolls, up to a couple of seconds. Returns
-/// whether it appeared — enrollment happens asynchronously once the relay's
-/// subscriber connects and sends its Hello.
-pub(crate) async fn wait_for_enrollment(reg: &RelayRegistry, id: RelayId) -> bool {
-    for _ in 0..100 {
-        if registry::peer(reg, id).is_some() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    false
-}
-
-/// Polls the registry until `id` is gone, up to a couple of seconds. Returns
-/// whether it disappeared — deregistration happens asynchronously once the relay's
-/// control connection drops or its liveness deadline lapses.
-pub(crate) async fn wait_for_deregistration(reg: &RelayRegistry, id: RelayId) -> bool {
-    for _ in 0..100 {
-        if registry::peer(reg, id).is_none() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    false
-}
-
 /// Serves a bare coordinator (empty registry/tenant, open auth) on an ephemeral
 /// port with the given Hello-handshake and liveness deadlines, for tests that
 /// drive the control endpoint directly rather than through a session. Returns the
@@ -179,22 +151,13 @@ pub(crate) async fn serve_bare_coordinator(
     hello_timeout: Duration,
     liveness_timeout: Duration,
 ) -> (String, RelayRegistry) {
-    let reg = registry::new_registry();
-    let setup = session::SessionSetup::new(reg.clone(), tenant::new_store());
-    let app = api::router(CoordinatorState {
-        hello_timeout,
-        liveness_timeout,
-        player_token_lifetime: Duration::from_secs(3600),
-        ..CoordinatorState::new(setup, ControlAuth::Open)
-    });
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), reg)
+    let served = CoordinatorBuilder::new()
+        .with_hello_timeout(hello_timeout)
+        .with_liveness(liveness_timeout)
+        .serve()
+        .await;
+    let registry = served.registry().clone();
+    (served.base_url, registry)
 }
 
 /// Stands up a coordinator with two relays + a tenant, creates a session, and
@@ -203,24 +166,20 @@ pub(crate) async fn serve_bare_coordinator(
 pub(crate) async fn coordinator_with_session(
     bootstrap_secret: Option<&str>,
 ) -> (String, SessionId, SessionSetup) {
-    let reg = registry::new_registry();
-    registry::enroll(&reg, relay_hello(1, 14900));
-    registry::enroll(
-        &reg,
-        relay_hello(2, 14901).with_region(RegionId("region-b".to_owned())),
-    );
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId(TENANT.to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = session::SessionSetup::new(reg, tenants);
+    let control_auth = match bootstrap_secret {
+        Some(secret) => ControlAuth::Secret(secret.to_owned()),
+        None => ControlAuth::Open,
+    };
+    let served = CoordinatorBuilder::new()
+        .with_control_auth(control_auth)
+        .with_tenant()
+        .with_relays(&[(1, 14900)])
+        .with_relay_hello(relay_hello(2, 14901).with_region(RegionId("region-b".to_owned())))
+        .serve()
+        .await;
 
     let resp = session::create_session(
-        &setup,
+        &served.setup,
         SessionRequest {
             tenant: TenantId(TENANT.to_owned()),
             players: vec![
@@ -250,25 +209,7 @@ pub(crate) async fn coordinator_with_session(
     .unwrap()
     .response;
 
-    // Keep a handle to the outbox before the setup moves into the router state.
-    let outbox = setup.clone();
-    let control_auth = match bootstrap_secret {
-        Some(secret) => ControlAuth::Secret(secret.to_owned()),
-        None => ControlAuth::Open,
-    };
-    let app = api::router(CoordinatorState {
-        player_token_lifetime: Duration::from_secs(3600),
-        ..CoordinatorState::new(setup, control_auth)
-    });
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    (format!("http://{addr}"), resp.session, outbox)
+    (served.base_url, resp.session, served.setup)
 }
 
 /// A relay's Join source with a link to peer 2 registered, plus the receiver
@@ -291,22 +232,11 @@ pub(crate) fn relay_one_with_peer_link() -> (MeshControl, mpsc::UnboundedReceive
 pub(crate) async fn serve_coordinator_returning_setup(
     control_auth: ControlAuth,
 ) -> (String, SessionSetup) {
-    let reg = registry::new_registry();
-    let setup = session::SessionSetup::new(reg, tenant::new_store());
-    let outbox = setup.clone();
-    let app = api::router(CoordinatorState {
-        liveness_timeout: LIVENESS,
-        player_token_lifetime: Duration::from_secs(3600),
-        ..CoordinatorState::new(setup, control_auth)
-    });
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), outbox)
+    let served = CoordinatorBuilder::new()
+        .with_control_auth(control_auth)
+        .serve()
+        .await;
+    (served.base_url, served.setup)
 }
 
 /// A session descriptor for `session` meshing the given peer relays, for driving
@@ -435,37 +365,21 @@ pub(crate) async fn serve_coordinator_with_liveness(
     pre_enrolled: &[(u64, u16)],
     liveness_timeout: Duration,
 ) -> (String, SessionSetup) {
-    let reg = registry::new_registry();
-    for &(id, port) in pre_enrolled {
-        registry::enroll(&reg, relay_hello(id, port));
-    }
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId(TENANT.to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = session::SessionSetup::new(reg, tenants);
-    let handle = setup.clone();
-    let app = api::router(CoordinatorState {
-        liveness_timeout,
-        player_token_lifetime: Duration::from_secs(3600),
-        ..CoordinatorState::new(setup, ControlAuth::Open)
-    });
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), handle)
+    let served = CoordinatorBuilder::new()
+        .with_tenant()
+        .with_relays(pre_enrolled)
+        .with_liveness(liveness_timeout)
+        .serve()
+        .await;
+    (served.base_url, served.setup)
 }
 
-/// Creates a single-slot session for the test tenant on `setup`, returning its id.
-pub(crate) fn create_one_slot_session(setup: &SessionSetup) -> SessionId {
+/// Attempts a single-slot session for the test tenant on `setup`, returning the
+/// assignment response or the refusal — for tests that assert on *which* relay a
+/// create homes on, or that none was available at all.
+pub(crate) fn try_create_one_slot_session(
+    setup: &SessionSetup,
+) -> Result<SessionResponse, SessionSetupError> {
     session::create_session(
         setup,
         SessionRequest {
@@ -482,9 +396,12 @@ pub(crate) fn create_one_slot_session(setup: &SessionSetup) -> SessionId {
         },
         ExpiresAt(u64::MAX),
     )
-    .unwrap()
-    .response
-    .session
+    .map(|outcome| outcome.response)
+}
+
+/// Creates a single-slot session for the test tenant on `setup`, returning its id.
+pub(crate) fn create_one_slot_session(setup: &SessionSetup) -> SessionId {
+    try_create_one_slot_session(setup).unwrap().session
 }
 
 /// Reads down-frames from `socket` until a [`CoordinatorToRelay::DrainAck`] arrives,
@@ -559,31 +476,12 @@ pub(crate) async fn expect_version_refusal_close(
 pub(crate) async fn serve_coordinator_with_regions(
     regions: RegionsConfig,
 ) -> (String, SessionSetup) {
-    let reg = registry::new_registry();
-    let tenants = tenant::new_store();
-    tenant::enroll(
-        &tenants,
-        KeyId("test-key-1".to_owned()),
-        TenantId(TENANT.to_owned()),
-        BufferBounds::new(1, 6).unwrap(),
-    )
-    .unwrap();
-    let setup = session::SessionSetup::new(reg, tenants);
-    let handle = setup.clone();
-    let app = api::router(CoordinatorState {
-        liveness_timeout: LIVENESS,
-        regions,
-        player_token_lifetime: Duration::from_secs(3600),
-        ..CoordinatorState::new(setup, ControlAuth::Open)
-    });
-    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .await
-        .unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), handle)
+    let served = CoordinatorBuilder::new()
+        .with_tenant()
+        .with_regions(regions)
+        .serve()
+        .await;
+    (served.base_url, served.setup)
 }
 
 /// A two-region config (`region-a`, `region-b`) for the enroll-validation tests.

@@ -99,16 +99,14 @@ pub(super) async fn relay_control(
 /// otherwise accumulate one parked task and socket per connection, without
 /// limit, for as long as it keeps churning. Sized well above a full relay
 /// fleet reconnecting at once (a rolling deploy, a coordinator failover), so a
-/// legitimate reconnect burst never trips it.
-const MAX_PENDING_CONTROL_HELLOS: usize = 512;
-
-/// The process-wide gate [`MAX_PENDING_CONTROL_HELLOS`] enforces.
-static PENDING_HELLO_PERMITS: tokio::sync::Semaphore =
-    tokio::sync::Semaphore::const_new(MAX_PENDING_CONTROL_HELLOS);
+/// legitimate reconnect burst never trips it. The gate enforcing it is
+/// [`CoordinatorState::pending_hellos`], shared by every control connection a
+/// coordinator serves.
+pub(super) const MAX_PENDING_CONTROL_HELLOS: usize = 512;
 
 /// The standard WebSocket "try again later" close code (RFC 6455 / the IANA
-/// close-code registry), used to refuse a connection when
-/// [`PENDING_HELLO_PERMITS`] is saturated. Distinct from the
+/// close-code registry), used to refuse a connection when the pending-Hello
+/// gate ([`MAX_PENDING_CONTROL_HELLOS`]) is saturated. Distinct from the
 /// `CONTROL_CLOSE_*` codes in [`rally_point_proto::version`]: those name a
 /// specific enroll refusal a relay recognizes and reacts to individually
 /// (`classify_control_close` on the relay side); this one carries no such
@@ -176,6 +174,7 @@ async fn serve_relay_control(
         ledger,
         pair_rtts,
         flight_store,
+        pending_hellos,
         ..
     } = state;
     // Claimed before anything else: a connection that never proves an identity
@@ -184,7 +183,7 @@ async fn serve_relay_control(
     // rather than `.acquire().await` — a caller queued on the semaphore is
     // still an unbounded number of parked connections, just parked on the
     // permit instead of on the Hello read.
-    let Ok(pending_permit) = PENDING_HELLO_PERMITS.try_acquire() else {
+    let Ok(pending_permit) = pending_hellos.try_acquire() else {
         tracing::warn!("relay control connection refused: too many connections pending a Hello");
         let _ = socket
             .send(Message::Close(Some(CloseFrame {

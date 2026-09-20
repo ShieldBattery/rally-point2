@@ -16,14 +16,24 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::{Mutex, OnceLock};
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
+use rally_point_coordinator::ledger::RelayLedger;
+use rally_point_coordinator::lifecycle::Lifecycle;
+use rally_point_coordinator::regions::RegionsConfig;
+use rally_point_coordinator::registry::{self, RelayRegistry};
+use rally_point_coordinator::session::SessionSetup;
+use rally_point_coordinator::tenant;
 use rally_point_proto::control::{
-    CoordinatorToRelay, RegionBeaconTarget, RelayHello, RelayToCoordinator, TenantVerifyingKey,
+    BufferBounds, CoordinatorToRelay, RegionBeaconTarget, RelayHello, RelayToCoordinator, TenantId,
+    TenantVerifyingKey,
 };
 use rally_point_proto::ids::RelayId;
+use rally_point_proto::token::KeyId;
 use rally_point_proto::version::ProtocolVersion;
 use rally_point_relay::coordinator;
 use rustls_pki_types::PrivateKeyDer;
@@ -209,4 +219,296 @@ pub async fn read_to_descriptors(socket: &mut ControlSocket) -> String {
             other => panic!("expected a text frame, got {other:?}"),
         }
     }
+}
+
+// --- The served coordinator every suite drives ---
+
+/// The tenant these suites enroll and create sessions under.
+pub const TENANT: &str = "sb-test";
+
+/// The key id the test tenant is enrolled with.
+pub const TENANT_KEY_ID: &str = "test-key-1";
+
+/// A generous liveness deadline for tests that don't exercise the timeout — long
+/// enough that no enrolled relay is ever deregistered for going silent.
+pub const LIVENESS: Duration = Duration::from_secs(30);
+
+/// A coordinator serving on an ephemeral loopback port, plus the handles its
+/// tests assert against. The setup and lifecycle are the very ones the served
+/// router holds, so a test can drive the descriptor outbox or read per-session
+/// state while a relay is connected.
+pub struct ServedCoordinator {
+    /// `http://127.0.0.1:<port>` — what a control connection dials.
+    pub base_url: String,
+    /// The served router's session-setup context: relay registry, tenant store,
+    /// session membership, descriptor outbox.
+    pub setup: SessionSetup,
+    /// The served router's per-session lifecycle.
+    pub lifecycle: Lifecycle,
+}
+
+impl ServedCoordinator {
+    /// The relay registry the served coordinator enrolls into.
+    pub fn registry(&self) -> &RelayRegistry {
+        self.setup.registry()
+    }
+
+    /// The `ws://…/relay/control` URL a raw-socket test connects to.
+    pub fn ws_url(&self) -> String {
+        format!(
+            "{}/relay/control",
+            self.base_url.replace("http://", "ws://")
+        )
+    }
+}
+
+/// Builds and serves a coordinator for one test.
+///
+/// Every suite here needs the same thing — a real `axum::serve` on an ephemeral
+/// loopback port over a real `CoordinatorState` — differing only in a handful of
+/// knobs, so the stand-up lives here once and each test names the two or three
+/// fields it actually configures. Defaults are the dev / loopback posture: open
+/// control auth, production handshake deadline, a liveness deadline long enough
+/// never to fire, no regions, no ledger, no tenant, no pre-enrolled relays, and
+/// no connect-info (so `peer_ip` reads as unknown, as it does for every server
+/// not built with `into_make_service_with_connect_info`).
+pub struct CoordinatorBuilder {
+    control_auth: ControlAuth,
+    hello_timeout: Duration,
+    liveness_timeout: Duration,
+    regions: RegionsConfig,
+    ledger: Option<Arc<RelayLedger>>,
+    relays: Vec<RelayHello>,
+    tenant: bool,
+    connect_info: bool,
+    pending_hellos: Option<usize>,
+}
+
+impl Default for CoordinatorBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CoordinatorBuilder {
+    pub fn new() -> Self {
+        Self {
+            control_auth: ControlAuth::Open,
+            hello_timeout: api::HELLO_TIMEOUT,
+            liveness_timeout: LIVENESS,
+            regions: RegionsConfig::default(),
+            ledger: None,
+            relays: Vec::new(),
+            tenant: false,
+            connect_info: false,
+            pending_hellos: None,
+        }
+    }
+
+    /// Requires a bootstrap secret on the control upgrade instead of serving it
+    /// open.
+    pub fn with_control_auth(mut self, control_auth: ControlAuth) -> Self {
+        self.control_auth = control_auth;
+        self
+    }
+
+    /// Shortens the window a connection has to send its `Hello` (and to answer
+    /// the identity challenge, which the same deadline bounds).
+    pub fn with_hello_timeout(mut self, hello_timeout: Duration) -> Self {
+        self.hello_timeout = hello_timeout;
+        self
+    }
+
+    /// Shortens the deadline an enrolled relay may go silent for.
+    pub fn with_liveness(mut self, liveness_timeout: Duration) -> Self {
+        self.liveness_timeout = liveness_timeout;
+        self
+    }
+
+    /// Configures the placement regions an enrolling relay's tag is validated
+    /// against and whose beacons ride the connect-time lead.
+    pub fn with_regions(mut self, regions: RegionsConfig) -> Self {
+        self.regions = regions;
+        self
+    }
+
+    /// Puts the coordinator in ledger mode: only an id this ledger minted, with
+    /// its token or its bound certificate, may enroll. Pair with
+    /// [`in_memory_ledger`], which the test also keeps a handle to so it can mint
+    /// ids and record tasks the served handler then authorizes against.
+    pub fn with_ledger(mut self, ledger: Arc<RelayLedger>) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
+
+    /// Seeds the registry with relays enrolled directly (no control connection),
+    /// each on a loopback address at its given port with that id's stable
+    /// certificate.
+    pub fn with_relays(mut self, relays: &[(u64, u16)]) -> Self {
+        self.relays.extend(
+            relays
+                .iter()
+                .map(|&(id, port)| hello_at_current(id, port, relay_cert(id))),
+        );
+        self
+    }
+
+    /// Seeds the registry with one relay whose `Hello` the caller shaped (a
+    /// region tag, say).
+    pub fn with_relay_hello(mut self, hello: RelayHello) -> Self {
+        self.relays.push(hello);
+        self
+    }
+
+    /// Enrolls the test tenant, so sessions can be created and the connect-time
+    /// tenant-key push carries a key.
+    pub fn with_tenant(mut self) -> Self {
+        self.tenant = true;
+        self
+    }
+
+    /// Serves with `into_make_service_with_connect_info::<SocketAddr>()`, the way
+    /// the binary does, so the control handler reads the connection's real
+    /// transport peer address instead of `None`.
+    pub fn with_connect_info(mut self) -> Self {
+        self.connect_info = true;
+        self
+    }
+
+    /// Shrinks the gate bounding how many connections may sit between the
+    /// WebSocket upgrade and a verified `Hello` at once, so a test can saturate
+    /// it with a couple of sockets instead of the production five hundred.
+    pub fn with_pending_hello_limit(mut self, permits: usize) -> Self {
+        self.pending_hellos = Some(permits);
+        self
+    }
+
+    /// Binds an ephemeral loopback port and spawns the server on it.
+    pub async fn serve(self) -> ServedCoordinator {
+        let reg = registry::new_registry();
+        for hello in self.relays {
+            registry::enroll(&reg, hello);
+        }
+        let tenants = tenant::new_store();
+        if self.tenant {
+            tenant::enroll(
+                &tenants,
+                KeyId(TENANT_KEY_ID.to_owned()),
+                TenantId(TENANT.to_owned()),
+                BufferBounds::new(1, 6).unwrap(),
+            )
+            .unwrap();
+        }
+        let setup = SessionSetup::new(reg, tenants);
+        let handle = setup.clone();
+        let mut state = CoordinatorState {
+            hello_timeout: self.hello_timeout,
+            liveness_timeout: self.liveness_timeout,
+            regions: self.regions,
+            ledger: self.ledger,
+            ..CoordinatorState::new(setup, self.control_auth)
+        };
+        if let Some(permits) = self.pending_hellos {
+            state.pending_hellos = Arc::new(tokio::sync::Semaphore::new(permits));
+        }
+        let lifecycle = state.lifecycle.clone();
+
+        let app = api::router(state);
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        if self.connect_info {
+            tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .unwrap();
+            });
+        } else {
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+        }
+        ServedCoordinator {
+            base_url: format!("http://{addr}"),
+            setup: handle,
+            lifecycle,
+        }
+    }
+}
+
+/// Polls the registry until `id` enrolls, up to a couple of seconds. Returns
+/// whether it appeared — enrollment happens asynchronously once a relay's
+/// control connection sends its Hello and proves its identity.
+pub async fn wait_for_enrollment(reg: &RelayRegistry, id: RelayId) -> bool {
+    for _ in 0..100 {
+        if registry::peer(reg, id).is_some() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Polls the registry until `id` is gone, up to a couple of seconds. Returns
+/// whether it disappeared — deregistration happens asynchronously once the
+/// relay's control connection drops or its liveness deadline lapses.
+pub async fn wait_for_deregistration(reg: &RelayRegistry, id: RelayId) -> bool {
+    for _ in 0..100 {
+        if registry::peer(reg, id).is_none() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Reads the coordinator's next frame and asserts it is a close with
+/// `expected_code`.
+pub async fn expect_close(socket: &mut ControlSocket, expected_code: u16) {
+    let frame = timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the coordinator answers promptly")
+        .expect("a frame arrives")
+        .unwrap();
+    let Message::Close(Some(close)) = frame else {
+        panic!("expected a close frame, got {frame:?}");
+    };
+    assert_eq!(
+        u16::from(close.code),
+        expected_code,
+        "reason: {}",
+        close.reason
+    );
+}
+
+/// Asserts the coordinator ends the connection without ever serving it an
+/// application frame — the refusals it signals by dropping the socket rather
+/// than by a close code (no Hello inside the deadline, a first frame that is not
+/// a Hello). Stronger than draining until the stream ends: a handler that pushed
+/// anything at all before closing fails here.
+pub async fn expect_closed_unserved(socket: &mut ControlSocket) {
+    let ended = timeout(Duration::from_secs(2), async {
+        while let Some(frame) = socket.next().await {
+            match frame {
+                Ok(Message::Close(_)) | Err(_) => return,
+                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                Ok(other) => panic!("the connection was served a frame before closing: {other:?}"),
+            }
+        }
+    })
+    .await;
+    assert!(
+        ended.is_ok(),
+        "the coordinator must end an unenrolled connection rather than hold it",
+    );
+}
+
+/// A fresh, empty provisioned-relay ledger held entirely in memory — nothing on
+/// disk to clean up between tests, and every test gets its own.
+pub fn in_memory_ledger() -> Arc<RelayLedger> {
+    Arc::new(RelayLedger::open(Path::new(":memory:")).expect("an in-memory ledger opens"))
 }

@@ -129,7 +129,9 @@ pub enum BootLineage {
 /// bytes) over a dialing peer's presented certificate and compares it
 /// byte-for-byte against the fingerprints distributed from here in the
 /// fleet-peer set — any change to this digest must land on both sides at once.
-pub(crate) fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
+/// Public so the integration suites compare against this digest rather than
+/// re-implementing it and testing their own copy.
+pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, cert_der).as_ref());
     out
