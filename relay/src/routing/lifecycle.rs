@@ -100,7 +100,7 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
 /// stopped producing turns while the session advanced past them (see
 /// [`crate::consensus::run_silence_watch`]). Identical to [`close_slots`] but for
 /// the reason it stamps, which is what makes the closed connection carry
-/// `SILENT_SLOT_CLOSE` instead of the generic close: a client whose game thread
+/// [`close_codes::SILENT_SLOT`] instead of the generic close: a client whose game thread
 /// hung has a perfectly healthy link, and its log should say so.
 pub fn close_slots_for_silence(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
     signal_close(
@@ -193,7 +193,7 @@ pub(crate) fn abandon_refused_admission(
 }
 
 /// Fires the provisional-reap signal for each of `key`'s currently-registered
-/// slots, closing every connection with [`PROVISIONAL_EXPIRED_CLOSE`] -- the
+/// slots, closing every connection with [`close_codes::PROVISIONAL_EXPIRED`] -- the
 /// bounded-admission sweep's teardown when no descriptor named a provisionally
 /// admitted session before its deadline (see [`crate::session::provisional`]). A
 /// session absent from the roster (already gone) is simply a no-op.

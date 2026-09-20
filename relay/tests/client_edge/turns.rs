@@ -173,7 +173,7 @@ async fn a_dead_control_stream_reader_closes_the_slot_link() {
     // over with fresh streams, rather than just disarming and serving
     // datagrams forever while permanently losing both of those.
     //
-    use rally_point_relay::routing::CONTROL_STREAM_LOST_CLOSE;
+    use rally_point_proto::close_codes;
 
     let tenant = make_default_tenant();
     let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
@@ -194,7 +194,7 @@ async fn a_dead_control_stream_reader_closes_the_slot_link() {
     match slot0.connection().closed().await {
         noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
-            CONTROL_STREAM_LOST_CLOSE,
+            close_codes::CONTROL_STREAM_LOST,
             "the relay closes with the control-stream-lost code",
         ),
         other => panic!("expected an application close, got {other:?}"),
@@ -255,7 +255,8 @@ async fn acks_a_one_way_sender_with_no_peer_traffic() {
 /// relay forwards it is ever retired.
 #[tokio::test]
 async fn a_slot_that_never_acknowledges_what_it_is_sent_is_isolated() {
-    use rally_point_relay::routing::{ISOLATED_CLOSE, UNACKED_WINDOW_CAP};
+    use rally_point_proto::close_codes;
+    use rally_point_relay::routing::UNACKED_WINDOW_CAP;
 
     let tenant = make_default_tenant();
     let TestRelay { addr, ca, .. } = start_relay(registry_for_one(&tenant));
@@ -284,7 +285,7 @@ async fn a_slot_that_never_acknowledges_what_it_is_sent_is_isolated() {
     {
         noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
-            ISOLATED_CLOSE,
+            close_codes::ISOLATED,
             "an unacknowledging slot is closed with the isolated code",
         ),
         other => panic!("expected the isolated application close, got {other:?}"),

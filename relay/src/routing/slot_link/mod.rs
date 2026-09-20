@@ -175,7 +175,7 @@ pub async fn run_slot_link(
             "session retired before slot-link activation; closing the link",
         );
         link.connection().close(
-            VarInt::from_u32(crate::server::SESSION_RETIRED_CLOSE),
+            VarInt::from_u32(close_codes::SESSION_RETIRED),
             b"session retired",
         );
         end_slot_link(

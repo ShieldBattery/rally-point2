@@ -67,7 +67,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
     // Re-dial through the REAL admission gate end to end -- this is exactly the bug
     // Finding 1 fixed: before the fix, the session-emptied teardown above had
     // already swept the hold this disconnect just marked, so this handshake would
-    // be refused with `SLOT_DEPARTED_CLOSE` instead of admitted.
+    // be refused with the slot-departed close code instead of admitted.
     let client_key = keypair();
     let token = mint_token(&tenant, session, SlotId(0), client_key.public);
     let redial = endpoint.connect(addr, "localhost").unwrap().await.unwrap();

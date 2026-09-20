@@ -56,6 +56,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::time::Duration;
 
+use rally_point_proto::close_codes;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{LeaveDirective, Payload, PhaseDirective, RegionLabel};
@@ -133,15 +134,6 @@ const LEAVE_PUSH_CAPACITY: usize = 16;
 /// and the physical connection generation the level describes.
 type ConnectivityChange = (SlotId, bool, Option<u64>);
 
-/// QUIC application close code for a connection dropped because its client sent a
-/// turn that failed validation.
-const INVALID_TURN_CLOSE: u32 = 0x01;
-
-/// QUIC application close code for a connection the relay disconnects because its
-/// link fell hopelessly behind (its forward queue filled), isolating it so it can't
-/// back-pressure healthy peers.
-pub const ISOLATED_CLOSE: u32 = 0x04;
-
 /// How often a link flushes a maintenance packet when the forward stream is not
 /// already re-carrying unacked turns.
 ///
@@ -215,48 +207,6 @@ const RESUME_ANCHOR_LIE_MARGIN: u64 = 4096;
 // client's link ending (quit, network death, or isolation for lagging) surfaces
 // as a drop; a clean quit sends a leave-intent first, decided under
 // `LEAVE_REASON_LEFT` so survivors see "player left".
-
-/// QUIC application close code for a connection the relay closes on its own
-/// initiative after processing a client's leave-intent. Not an error: the
-/// client's control-stream announcement is never acked on its own terms — the
-/// relay closing the link *is* the confirmation the departing client's driver
-/// waits for once it has sent its intent.
-const LEAVE_PROCESSED_CLOSE: u32 = 0x05;
-
-/// QUIC application close code for a connection the relay closes on its own
-/// initiative because the client's control-stream reader ended while the
-/// connection was otherwise alive (a one-sided stream reset, an over-cap
-/// frame, a decode failure, or a clean EOF). That stream is the only channel
-/// `RequestDrop` and a clean leave-intent arrive on, so losing it is a link
-/// failure, not a degradation to limp on through: closing the connection here
-/// pushes the client into its ordinary reconnect path, which redials and
-/// reopens every stream fresh. Distinct from every other close code so it is
-/// diagnosable in logs, though the client's driver treats it exactly like a
-/// plain transport error (only [`crate::server::SLOT_DEPARTED_CLOSE`] gets
-/// special client-side handling).
-pub const CONTROL_STREAM_LOST_CLOSE: u32 = 0x07;
-
-/// QUIC application close code for a connection refused because its presented
-/// resume-cursor anchor exceeds [`MAX_SANE_RESUME_ANCHOR`]. Distinct from
-/// [`INVALID_TURN_CLOSE`] (which means a live turn failed validation, not a
-/// resume-time value) so it's diagnosable in logs.
-const RESUME_ANCHOR_INVALID_CLOSE: u32 = 0x09;
-
-/// QUIC application close code for a connection closed because its session was
-/// admitted provisionally -- a client dial with no descriptor yet naming the
-/// session -- and no descriptor claimed it within the provisional window (see
-/// [`crate::session::provisional`]). Distinct from every other close so a client that
-/// hits it can tell "the descriptor was simply slow" from a terminal refusal:
-/// a fresh dial re-admits with its own new provisional window, so this only
-/// ever delays a legitimate session, never bricks it.
-pub const PROVISIONAL_EXPIRED_CLOSE: u32 = 0x0A;
-
-/// QUIC application close code for a connection the relay closes because the
-/// client stopped producing turns while its session advanced past it — its game
-/// thread hung, or its process was suspended — and the lockstep simulation
-/// cannot proceed until the slot is out. Distinct from every other close so the
-/// cause is readable in a client's logs: nothing was wrong with the link.
-const SILENT_SLOT_CLOSE: u32 = 0x0D;
 
 /// Why a slot's shutdown signal was fired. The signaler stores it on the roster
 /// entry before waking the slot's link task, which reads it to pick the log line
@@ -383,7 +333,7 @@ pub struct SlotEntry {
     /// Fired by the provisional-admission sweep when this slot's session was
     /// admitted with no applied descriptor and its deadline passed with none
     /// arriving (see [`crate::session::provisional`]). Separate from `shutdown` so the
-    /// closed connection carries [`PROVISIONAL_EXPIRED_CLOSE`] specifically,
+    /// closed connection carries [`close_codes::PROVISIONAL_EXPIRED`] specifically,
     /// distinguishable from the generic reap/isolation close `shutdown` signals.
     provisional_reap: Arc<Notify>,
 }

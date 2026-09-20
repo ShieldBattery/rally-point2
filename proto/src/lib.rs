@@ -16,6 +16,8 @@
 //! - **SC:R command parsing** — `command_lengths` + var-length rules ([`commands`]).
 //! - **protocol versioning + negotiation** ([`version`]).
 //! - **typed turn coordinates / ids** shared across the logic layers ([`ids`]).
+//! - **QUIC application close codes** for the client↔relay link, the diagnosis
+//!   that outlives a dead connection ([`close_codes`]).
 //!
 //! Protobuf is only the *envelope*: the SC:R command bytes inside each payload
 //! are still hand-parsed and bounds-checked against [`commands`] on the relay.
@@ -24,6 +26,7 @@
 //! consumed by the 32-bit game DLL (`i686-pc-windows-msvc`) as well as the
 //! Linux relay / coordinator binaries.
 
+pub mod close_codes;
 pub mod commands;
 pub mod control;
 pub mod handshake;

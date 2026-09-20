@@ -20,6 +20,7 @@
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
+use rally_point_proto::close_codes;
 use rally_point_proto::handshake::{self, HandshakeError};
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::token::{
@@ -38,19 +39,6 @@ use crate::identity::Identity;
 /// which would otherwise leave the game-launch path waiting forever. Callers with
 /// their own launch budget use [`ClientEndpoint::connect_with_timeout`].
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// QUIC application close code the client uses when it abandons a dial because the
-/// authorization exchange did not finish within the deadline.
-const CONNECT_TIMEOUT_CLOSE: u32 = 0x01;
-
-/// QUIC application close code the relay uses to refuse a re-dial whose slot has
-/// already departed — a survivor's drop request was honored, or it left cleanly —
-/// so the game has moved on without it. Mirrors the relay's `SLOT_DEPARTED_CLOSE` (a wire
-/// contract); a client that sees it on a reconnect must stop retrying, since no
-/// later dial can bring the slot back. Distinct from the relay's slot-taken close
-/// (a still-live double-connect) and from any transport-level failure, both of
-/// which are worth retrying.
-const SLOT_DEPARTED_CLOSE: u32 = 0x06;
 
 /// A QUIC client endpoint for dialing relays.
 ///
@@ -238,7 +226,7 @@ impl ClientEndpoint {
             Ok(result) => result.map(|()| Link::new(connection)),
             Err(_elapsed) => {
                 connection.close(
-                    noq::VarInt::from_u32(CONNECT_TIMEOUT_CLOSE),
+                    noq::VarInt::from_u32(close_codes::CLIENT_CONNECT_TIMEOUT),
                     b"authorization timed out",
                 );
                 Err(DialError::TimedOut { timeout })
@@ -293,7 +281,7 @@ impl ClientEndpoint {
             }
             Err(_elapsed) => {
                 connection.close(
-                    noq::VarInt::from_u32(CONNECT_TIMEOUT_CLOSE),
+                    noq::VarInt::from_u32(close_codes::CLIENT_CONNECT_TIMEOUT),
                     b"authorization timed out",
                 );
                 Err(DialError::TimedOut { timeout })
@@ -309,7 +297,7 @@ fn refused_as_departed(connection: &noq::Connection) -> bool {
     matches!(
         connection.close_reason(),
         Some(noq::ConnectionError::ApplicationClosed(ref close))
-            if close.error_code == noq::VarInt::from_u32(SLOT_DEPARTED_CLOSE)
+            if close.error_code == noq::VarInt::from_u32(close_codes::SLOT_DEPARTED)
     )
 }
 

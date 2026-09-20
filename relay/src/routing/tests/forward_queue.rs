@@ -4,38 +4,47 @@
 
 use super::*;
 
-/// The seven close codes a routing path can end a slot's connection with stay
-/// distinct, because each is a diagnostic a client's own logs are read for:
-/// collapsing any two would make "the descriptor was merely slow" and "your
-/// turn was rejected" indistinguishable after the fact.
+/// Every close code the relay can end a client connection with stays distinct,
+/// because each is a diagnostic a client's own logs are read for: collapsing
+/// any two would make "the descriptor was merely slow" and "your turn was
+/// rejected" indistinguishable after the fact. Both the codes a routing path
+/// raises and the ones the accept path refuses a dial with are checked
+/// together, since a client sees them on the same connection.
 #[test]
-fn every_routing_close_code_names_its_own_cause() {
-    let routing_codes = [
-        ("a turn that failed validation", INVALID_TURN_CLOSE),
-        ("a link isolated behind its bounds", ISOLATED_CLOSE),
-        ("a leave-intent the relay processed", LEAVE_PROCESSED_CLOSE),
-        ("a lost control stream", CONTROL_STREAM_LOST_CLOSE),
-        ("an insane resume anchor", RESUME_ANCHOR_INVALID_CLOSE),
-        ("an expired provisional window", PROVISIONAL_EXPIRED_CLOSE),
-        ("a slot that went silent", SILENT_SLOT_CLOSE),
+fn every_relay_close_code_names_its_own_cause() {
+    let causes = [
+        ("a turn that failed validation", close_codes::INVALID_TURN),
+        ("a slot already connected", close_codes::SLOT_TAKEN),
+        ("an unfinished authorization", close_codes::AUTH_TIMEOUT),
+        ("a link isolated behind its bounds", close_codes::ISOLATED),
+        (
+            "a leave-intent the relay processed",
+            close_codes::LEAVE_PROCESSED,
+        ),
+        ("a slot that already departed", close_codes::SLOT_DEPARTED),
+        ("a lost control stream", close_codes::CONTROL_STREAM_LOST),
+        ("a slot homed on another relay", close_codes::SLOT_NOT_HOMED),
+        (
+            "an insane resume anchor",
+            close_codes::RESUME_ANCHOR_INVALID,
+        ),
+        (
+            "an expired provisional window",
+            close_codes::PROVISIONAL_EXPIRED,
+        ),
+        ("a retired session", close_codes::SESSION_RETIRED),
+        (
+            "a full provisional journal",
+            close_codes::PROVISIONAL_CAPACITY,
+        ),
+        ("a slot that went silent", close_codes::SILENT_SLOT),
     ];
     let mut by_code = std::collections::HashMap::new();
-    for (cause, code) in routing_codes {
+    for (cause, code) in causes {
         assert!(
             by_code.insert(code, cause).is_none(),
             "{cause} shares close code {code:#04x} with {}",
             by_code[&code],
-        );
-    }
-    // And with the server-owned codes a routing path can also surface, which a
-    // client's driver treats differently again.
-    for code in [
-        crate::server::SLOT_DEPARTED_CLOSE,
-        crate::server::SESSION_RETIRED_CLOSE,
-    ] {
-        assert!(
-            !by_code.contains_key(&code),
-            "a routing close code collides with a server-owned one ({code:#04x})",
         );
     }
 }

@@ -313,7 +313,7 @@ pub(super) fn handle_control_frame(
                 "control stream reader ended; closing so the client reconnects with fresh streams",
             );
             link.connection().close(
-                VarInt::from_u32(CONTROL_STREAM_LOST_CLOSE),
+                VarInt::from_u32(close_codes::CONTROL_STREAM_LOST),
                 b"control stream lost",
             );
             return ControlFlow::Break(());
@@ -380,8 +380,10 @@ fn handle_leave_intent(link: &mut Link, ctx: &mut SlotLinkCtx) -> ControlFlow<()
     // confirmation it waits on, so give it one now
     // rather than leaving the connection to linger
     // until some other path notices it's unused.
-    link.connection()
-        .close(VarInt::from_u32(LEAVE_PROCESSED_CLOSE), b"leave processed");
+    link.connection().close(
+        VarInt::from_u32(close_codes::LEAVE_PROCESSED),
+        b"leave processed",
+    );
     ControlFlow::Break(())
 }
 
@@ -408,8 +410,10 @@ fn handle_oversize_turn(
             cap = MAX_OVERSIZE_TURN_COMMANDS_LEN,
             "rejecting over-cap oversize client turn and closing connection",
         );
-        link.connection()
-            .close(VarInt::from_u32(INVALID_TURN_CLOSE), b"oversize turn");
+        link.connection().close(
+            VarInt::from_u32(close_codes::INVALID_TURN),
+            b"oversize turn",
+        );
         return ControlFlow::Break(());
     }
     // Dedup under the *authorized* slot — the wire slot is a
@@ -453,7 +457,7 @@ fn handle_oversize_turn(
                 "rejecting oversize client turn and closing connection",
             );
             link.connection()
-                .close(VarInt::from_u32(INVALID_TURN_CLOSE), b"invalid turn");
+                .close(VarInt::from_u32(close_codes::INVALID_TURN), b"invalid turn");
             return ControlFlow::Break(());
         }
     }

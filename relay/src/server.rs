@@ -18,53 +18,11 @@ use rally_point_transport::Link;
 use rally_point_transport::noq::{self, VarInt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use rally_point_proto::close_codes;
+
 use crate::auth::{self, AuthError, HANDSHAKE_OK, Registry, RegistryReader};
 use crate::consensus;
 use crate::routing::{self, SessionKey, Sessions};
-
-/// QUIC application close code for a connection whose authorized slot is already
-/// connected by another client.
-pub const SLOT_TAKEN_CLOSE: u32 = 0x02;
-
-/// QUIC application close code for a re-register the relay refuses because the
-/// slot's leave was already decided — a survivor's drop request was honored, or it
-/// left cleanly — so the game has moved on without it. Distinct from every transport-error close
-/// so a reconnecting client can tell "you were dropped, the session is over for
-/// you" from a mere connection failure and stop retrying. Contrast
-/// `SLOT_TAKEN_CLOSE`, which means the slot is *still connected* by a live
-/// connection (a genuine double-connect), not gone.
-pub const SLOT_DEPARTED_CLOSE: u32 = 0x06;
-
-/// QUIC application close code for a connection the relay refuses because its
-/// authorized slot is not among the session descriptor's [`homed_slots`]
-/// (non-empty) for this relay. A token binds tenant/session/slot/key but not
-/// the specific relay, so this is the home-relay-binding gate: without it, a
-/// misrouted (or malicious) client presenting a token for a slot homed on a
-/// *different* relay in a true multi-relay session could register here too,
-/// feeding this relay's clients a competing view of that slot's turns —
-/// exactly the split the mesh's topological dedup cannot detect or prevent
-/// (it only suppresses the echo, on each side, of what looks like a duplicate
-/// turn). Distinct from every other close so a misrouted client is
-/// diagnosable rather than looking like a generic double-connect or refusal.
-///
-/// [`homed_slots`]: rally_point_proto::control::SessionDescriptor::homed_slots
-pub const SLOT_NOT_HOMED_CLOSE: u32 = 0x08;
-
-/// The session's descriptor was retired — the coordinator ended the session —
-/// and this dial arrived while the retirement tombstone still stands. Nothing
-/// this relay holds can serve it: the maker, holds, and recording are swept,
-/// and admitting the dial would recreate roster and seen state for a session
-/// with no lifecycle left. A genuine re-serve is preceded by a fresh
-/// descriptor, which lifts the gate before clients dial.
-pub const SESSION_RETIRED_CLOSE: u32 = 0x0B;
-
-/// The relay's provisional-journal session ceiling is full, so a
-/// pre-descriptor connection cannot be admitted: every turn it sent would
-/// need journaling, and a turn acknowledged but retained nowhere is a
-/// permanent sequence hole. Retryable — capacity frees as descriptors drain
-/// journals and sessions retire, and a described session is never refused
-/// this way.
-pub const PROVISIONAL_CAPACITY_CLOSE: u32 = 0x0C;
 
 /// Maximum authorization handshakes in flight at once. A coarse admission backstop:
 /// connections that stall mid-handshake can only tie up this many slots of pre-auth
@@ -72,10 +30,6 @@ pub const PROVISIONAL_CAPACITY_CLOSE: u32 = 0x0C;
 /// unbounded. The per-relay capacity model and full DDoS posture come later; this
 /// is set generously so it never sheds legitimate load.
 const MAX_PENDING_HANDSHAKES: usize = 4096;
-
-/// QUIC application close code for a connection dropped because its authorization
-/// handshake did not finish within [`AUTH_TIMEOUT`].
-const AUTH_TIMEOUT_CLOSE: u32 = 0x03;
 
 /// How long a client has to complete the authorization handshake once its QUIC
 /// connection is accepted. The exchange is sub-second in practice; this bounds a
@@ -390,7 +344,7 @@ async fn serve_connection(
             Ok(result) => result?,
             Err(_elapsed) => {
                 connection.close(
-                    VarInt::from_u32(AUTH_TIMEOUT_CLOSE),
+                    VarInt::from_u32(close_codes::AUTH_TIMEOUT),
                     b"authorization timed out",
                 );
                 return Err(ConnError::AuthTimeout);
@@ -421,7 +375,7 @@ async fn serve_connection(
     // a non-empty homed set says this slot belongs to a different relay.
     if !consensus::slot_homed(&mesh.decision_makers, &key, authorized.slot) {
         connection.close(
-            VarInt::from_u32(SLOT_NOT_HOMED_CLOSE),
+            VarInt::from_u32(close_codes::SLOT_NOT_HOMED),
             b"slot not homed on this relay",
         );
         return Err(ConnError::SlotNotHomed {
@@ -447,7 +401,7 @@ async fn serve_connection(
     let hold_pending = mesh.drop_holds.is_pending(&key, authorized.slot);
     if departed && !hold_pending {
         connection.close(
-            VarInt::from_u32(SLOT_DEPARTED_CLOSE),
+            VarInt::from_u32(close_codes::SLOT_DEPARTED),
             b"slot already departed",
         );
         return Err(ConnError::SlotDeparted {
@@ -467,7 +421,7 @@ async fn serve_connection(
     // maker), so this check is monotone-safe read here before registration.
     if mesh.provisional_turns.armed() && mesh.provisional_turns.slot_sealed(&key, authorized.slot) {
         connection.close(
-            VarInt::from_u32(SLOT_DEPARTED_CLOSE),
+            VarInt::from_u32(close_codes::SLOT_DEPARTED),
             b"slot already departed",
         );
         return Err(ConnError::SlotDeparted {
@@ -485,7 +439,10 @@ async fn serve_connection(
     let Some(registered) = mesh.gates.with_ingress(&key, || {
         routing::register(&sessions, &key, authorized.slot, connection_epoch)
     }) else {
-        connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
+        connection.close(
+            VarInt::from_u32(close_codes::SESSION_RETIRED),
+            b"session retired",
+        );
         return Err(ConnError::SessionRetired {
             tenant: key.tenant,
             session: key.session,
@@ -494,7 +451,7 @@ async fn serve_connection(
     };
     let Some((mut registration, inbox)) = registered else {
         connection.close(
-            VarInt::from_u32(SLOT_TAKEN_CLOSE),
+            VarInt::from_u32(close_codes::SLOT_TAKEN),
             b"slot already connected",
         );
         // The register attempt created the session's gate on first touch;
@@ -527,7 +484,7 @@ async fn serve_connection(
             Some(true) => {}
             Some(false) => {
                 connection.close(
-                    VarInt::from_u32(PROVISIONAL_CAPACITY_CLOSE),
+                    VarInt::from_u32(close_codes::PROVISIONAL_CAPACITY),
                     b"provisional capacity exhausted",
                 );
                 drop(registration);
@@ -539,7 +496,10 @@ async fn serve_connection(
                 });
             }
             None => {
-                connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
+                connection.close(
+                    VarInt::from_u32(close_codes::SESSION_RETIRED),
+                    b"session retired",
+                );
                 return Err(ConnError::SessionRetired {
                     tenant: key.tenant,
                     session: key.session,
@@ -619,7 +579,10 @@ async fn serve_connection(
         }
         admission
     }) else {
-        connection.close(VarInt::from_u32(SESSION_RETIRED_CLOSE), b"session retired");
+        connection.close(
+            VarInt::from_u32(close_codes::SESSION_RETIRED),
+            b"session retired",
+        );
         return Err(ConnError::SessionRetired {
             tenant: key.tenant,
             session: key.session,
@@ -630,7 +593,7 @@ async fn serve_connection(
         consensus::ReconnectAdmission::Admitted { reinstated } => reinstated,
         consensus::ReconnectAdmission::Rejected => {
             connection.close(
-                VarInt::from_u32(SLOT_DEPARTED_CLOSE),
+                VarInt::from_u32(close_codes::SLOT_DEPARTED),
                 b"slot already departed",
             );
             drop(registration);

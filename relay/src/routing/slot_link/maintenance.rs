@@ -65,7 +65,7 @@ pub(super) fn handle_shutdown(link: &mut Link, ctx: &SlotLinkCtx, close_reason: 
                 "slot stopped producing turns; closing connection",
             );
             link.connection().close(
-                VarInt::from_u32(SILENT_SLOT_CLOSE),
+                VarInt::from_u32(close_codes::SILENT_SLOT),
                 b"slot stopped producing turns",
             );
         }
@@ -94,7 +94,7 @@ pub(super) fn handle_provisional_reap(link: &mut Link, ctx: &SlotLinkCtx) {
         "provisional admission expired with no applied descriptor; closing connection",
     );
     link.connection().close(
-        VarInt::from_u32(PROVISIONAL_EXPIRED_CLOSE),
+        VarInt::from_u32(close_codes::PROVISIONAL_EXPIRED),
         b"provisional admission expired",
     );
     // The teardown below announces (journals) an ordinary

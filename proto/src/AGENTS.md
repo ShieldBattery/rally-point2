@@ -2,7 +2,7 @@
 
 `rally-point-proto` is the frozen contract layer: every `pub` path under
 `rally_point_proto::{control, token, control_stream, handshake, mesh, ids,
-version, commands, beacon, messages}` is consumed by `transport`, `client`,
+version, commands, beacon, close_codes, messages}` is consumed by `transport`, `client`,
 `relay`, `coordinator`, the fuzz crate, loadgen, and the external ShieldBattery
 game DLL. **No public path may change without updating every consumer.**
 

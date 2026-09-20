@@ -7,12 +7,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::helpers::*;
+use rally_point_proto::close_codes;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::token::{
     CHALLENGE_LEN, CHANNEL_BINDING_EXPORTER_LABEL, CHANNEL_BINDING_LEN, ConnectionChallenge,
 };
-use rally_point_relay::server::{self, SLOT_TAKEN_CLOSE};
+use rally_point_relay::server;
 use rally_point_transport::noq;
 use rally_point_transport::quic::server_config;
 
@@ -131,7 +132,7 @@ async fn rejects_a_second_client_on_the_same_slot() {
     match connection.closed().await {
         noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
-            SLOT_TAKEN_CLOSE,
+            close_codes::SLOT_TAKEN,
             "the second client is refused with the slot-taken close code,              distinct from the departed slot's terminal one",
         ),
         other => panic!("expected the slot-taken application close, got {other:?}"),
@@ -213,7 +214,6 @@ async fn refuses_connections_beyond_the_handshake_limit() {
 async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     use rally_point_relay::consensus;
     use rally_point_relay::routing::SessionKey;
-    use rally_point_relay::server::SLOT_DEPARTED_CLOSE;
     use rally_point_transport::control::send_control_leave_intent;
 
     let tenant = make_default_tenant();
@@ -263,7 +263,7 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     match redial.closed().await {
         noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
-            SLOT_DEPARTED_CLOSE,
+            close_codes::SLOT_DEPARTED,
             "the re-register is refused with the terminal departed close code",
         ),
         other => panic!("expected the terminal departed application close, got {other:?}"),
@@ -278,8 +278,6 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
 /// ceiling.
 #[tokio::test]
 async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
-    use rally_point_relay::server::PROVISIONAL_CAPACITY_CLOSE;
-
     let tenant = make_default_tenant();
     let mesh = rally_point_relay::mesh::new_mesh_state_with_journal_ceiling(1);
     mesh.provisional_turns.arm();
@@ -302,7 +300,7 @@ async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
     match dial.closed().await {
         noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
-            PROVISIONAL_CAPACITY_CLOSE,
+            close_codes::PROVISIONAL_CAPACITY,
             "refused with the distinct retryable capacity close code",
         ),
         other => panic!("expected the capacity application close, got {other:?}"),
@@ -312,7 +310,6 @@ async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
 #[tokio::test]
 async fn a_slot_not_homed_on_this_relay_is_refused() {
     use rally_point_relay::routing::SessionKey;
-    use rally_point_relay::server::SLOT_NOT_HOMED_CLOSE;
 
     // A token binds tenant/session/slot/key but not the specific relay, so
     // without this check a misrouted (or malicious) client could register the
@@ -355,7 +352,7 @@ async fn a_slot_not_homed_on_this_relay_is_refused() {
     match redial.closed().await {
         noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
-            SLOT_NOT_HOMED_CLOSE,
+            close_codes::SLOT_NOT_HOMED,
             "the misrouted slot is refused with the not-homed close code",
         ),
         other => panic!("expected the not-homed application close, got {other:?}"),

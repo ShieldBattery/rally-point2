@@ -171,7 +171,7 @@ pub(super) fn apply_resume_anchor(
                 "resume-cursor anchor exceeds the sane ceiling; refusing the reconnect",
             );
             link.connection().close(
-                VarInt::from_u32(RESUME_ANCHOR_INVALID_CLOSE),
+                VarInt::from_u32(close_codes::RESUME_ANCHOR_INVALID),
                 b"resume anchor out of range",
             );
             end_slot_link(

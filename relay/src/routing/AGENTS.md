@@ -2,7 +2,7 @@
 
 ## Map
 
-- `mod.rs` — every capacity/close-code constant, `SessionKey`, `Sessions`, and
+- `mod.rs` — every capacity constant, `SessionKey`, `Sessions`, and
   `SlotEntry`/`SlotInbox`: their fields stay private *here* so every submodule
   can touch them without widening. Also the re-exports keeping `routing::X`
   paths stable.
@@ -23,10 +23,11 @@
   Crossing either does not drop the turn: it signals that slot to disconnect and
   leaves it on the roster until its own task exits. Nothing may pull a roster
   entry from under a live task, or a reconnect seats a second sender for a slot.
-- Close codes are meaningful diagnostics: `0x01` invalid turn, `0x04` isolated
-  (queue or unacked window), `0x05` leave processed, `0x07` control stream lost,
-  `0x09` insane resume anchor, `0x0A` provisional window expired, `0x0D` silent
-  slot. Don't collapse them.
+- Close codes are meaningful diagnostics — a client's only account of why its
+  link died. The whole table, both directions, lives in
+  `rally_point_proto::close_codes` with a doc comment per cause; add new ones
+  there rather than defining a number here. Don't collapse two causes onto one
+  code, and don't reuse a retired number.
 - A resume anchor is an unvalidated client value about to become window state:
   over `MAX_SANE_RESUME_ANCHOR` it is refused; merely past this relay's
   forwarded prefix it is only logged (a lagging re-home is legitimate).

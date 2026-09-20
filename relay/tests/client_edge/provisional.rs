@@ -18,7 +18,8 @@ use rally_point_transport::noq;
 /// (`provisional::run_sweep_with`), not a hand-simulated mark and reap.
 #[tokio::test]
 async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
-    use rally_point_relay::routing::{PROVISIONAL_EXPIRED_CLOSE, SessionKey};
+    use rally_point_proto::close_codes;
+    use rally_point_relay::routing::SessionKey;
     use rally_point_relay::session::provisional::{self, ProvisionalSessions};
 
     let tenant = make_default_tenant();
@@ -61,7 +62,7 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
     {
         noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
-            PROVISIONAL_EXPIRED_CLOSE,
+            close_codes::PROVISIONAL_EXPIRED,
             "reaped with the provisional-expired close code",
         ),
         other => panic!("expected the provisional-expired application close, got {other:?}"),
@@ -86,7 +87,7 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
     {
         noq::ConnectionError::ApplicationClosed(app) => assert_eq!(
             u32::try_from(u64::from(app.error_code)).unwrap(),
-            PROVISIONAL_EXPIRED_CLOSE,
+            close_codes::PROVISIONAL_EXPIRED,
             "the redial is reaped with the same close code, on its own new window",
         ),
         other => panic!("expected the provisional-expired application close, got {other:?}"),

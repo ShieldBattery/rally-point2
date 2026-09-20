@@ -102,7 +102,7 @@ pub(super) async fn handle_received(
                     "rejecting client turn and closing connection",
                 );
                 link.connection()
-                    .close(VarInt::from_u32(INVALID_TURN_CLOSE), b"invalid turn");
+                    .close(VarInt::from_u32(close_codes::INVALID_TURN), b"invalid turn");
                 return ControlFlow::Break(());
             }
         }
@@ -143,7 +143,7 @@ pub(super) async fn handle_received(
             "unacked window exhausted; isolating slot",
         );
         link.connection().close(
-            VarInt::from_u32(ISOLATED_CLOSE),
+            VarInt::from_u32(close_codes::ISOLATED),
             b"unacked window exhausted",
         );
         return ControlFlow::Break(());
@@ -216,7 +216,7 @@ pub(super) async fn handle_forwarded(
                             "unacked window exhausted; isolating slot",
                         );
                         link.connection().close(
-                            VarInt::from_u32(ISOLATED_CLOSE),
+                            VarInt::from_u32(close_codes::ISOLATED),
                             b"unacked window exhausted",
                         );
                         return ControlFlow::Break(());
@@ -272,7 +272,7 @@ pub(super) fn handle_beacon_cursor(
             "unacked window exhausted; isolating slot",
         );
         link.connection().close(
-            VarInt::from_u32(ISOLATED_CLOSE),
+            VarInt::from_u32(close_codes::ISOLATED),
             b"unacked window exhausted",
         );
         return ControlFlow::Break(());
