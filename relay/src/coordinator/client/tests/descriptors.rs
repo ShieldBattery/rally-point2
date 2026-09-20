@@ -137,7 +137,7 @@ fn a_delta_records_the_applied_set_size_after_the_delta_and_its_apply_lag() {
     );
 
     // A delta that only removes one session, staged ~1.5s ago.
-    let staged = now_unix_ms().saturating_sub(1_500);
+    let staged = rally_point_proto::time::unix_millis().saturating_sub(1_500);
     apply_message(
         &control,
         CoordinatorToRelay::DescriptorDelta {
@@ -309,7 +309,7 @@ fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
 
     // A set staged ~1.5s ago applies with a lag at least that large — the apply
     // clock is never earlier than the staging stamp we synthesize here.
-    let staged = now_unix_ms().saturating_sub(1_500);
+    let staged = rally_point_proto::time::unix_millis().saturating_sub(1_500);
     apply_message(
         &control,
         CoordinatorToRelay::Descriptors {
@@ -353,7 +353,7 @@ fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
         &control,
         CoordinatorToRelay::Descriptors {
             descriptors: vec![],
-            staged_at_unix_ms: Some(now_unix_ms() + 60_000),
+            staged_at_unix_ms: Some(rally_point_proto::time::unix_millis() + 60_000),
         },
         &applied,
         &stats,

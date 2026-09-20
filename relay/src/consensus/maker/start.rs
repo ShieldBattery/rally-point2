@@ -255,7 +255,7 @@ impl DecisionMaker {
     /// and the authority died before a beat could restate it.
     pub fn adopt_session_start(&mut self, initial_buffer_turns: Option<u32>) {
         self.latch_started();
-        self.note_started_at_ms(now_ms());
+        self.note_started_at_ms(unix_millis());
         if let Some(depth) = initial_buffer_turns {
             let clamped = self.game_safe_clamp(depth);
             self.buffer = BufferSize(clamped);

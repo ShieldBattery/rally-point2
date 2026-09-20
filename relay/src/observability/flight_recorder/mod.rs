@@ -80,7 +80,7 @@ use recording::{SessionRecording, SlotConditionsRow};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rally_point_proto::ids::{RelayId, SlotId};
@@ -348,7 +348,7 @@ impl FlightRecorder {
     pub fn record(&self, key: &SessionKey, event: FlightEvent) {
         if let Some(recording) = self.recording(key) {
             recording.push_event(EventRecord {
-                at_ms: now_ms(),
+                at_ms: rally_point_proto::time::unix_millis(),
                 event,
             });
         }
@@ -376,7 +376,7 @@ impl FlightRecorder {
             .map(Arc::clone);
         if let Some(recording) = recording {
             recording.push_event(EventRecord {
-                at_ms: now_ms(),
+                at_ms: rally_point_proto::time::unix_millis(),
                 event,
             });
         }
@@ -534,14 +534,6 @@ pub async fn run_sampler(
             |key| crate::consensus::sync_coverage(&makers, key),
         );
     }
-}
-
-/// Wall clock as unix epoch milliseconds — the blob's timestamp base.
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 #[cfg(test)]

@@ -56,12 +56,3 @@ pub(in crate::consensus) use leave::record_leave_event;
 pub(crate) use departure::{
     admit_reconnect, mark_connection_down, record_departure_for_epoch_outcome,
 };
-
-/// The current wall clock in unix epoch milliseconds — a result report's or a
-/// desync's `arrival_ms`/`detected_at_ms` stamp.
-pub(in crate::consensus) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}

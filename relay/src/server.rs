@@ -10,7 +10,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
@@ -19,6 +19,7 @@ use rally_point_transport::noq::{self, VarInt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use rally_point_proto::close_codes;
+use rally_point_proto::time;
 
 use crate::auth::{self, AuthError, HANDSHAKE_OK, Registry, RegistryReader};
 use crate::consensus;
@@ -338,7 +339,7 @@ async fn serve_connection(
         return Err(ConnError::DatagramBudgetTooSmall(error));
     }
 
-    let handshake = auth::authenticate(&connection, registry, unix_now());
+    let handshake = auth::authenticate(&connection, registry, time::unix_secs_fail_closed());
     let (authorized, resume_cursors, connection_epoch, mut handshake_send) =
         match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
             Ok(result) => result?,
@@ -638,16 +639,4 @@ async fn serve_connection(
     )
     .await;
     Ok(())
-}
-
-/// Current Unix time in seconds, used to check token expiry. A clock before the
-/// epoch (a misconfigured host) yields `u64::MAX`, which fails closed — every
-/// token reads as expired and every client is refused — rather than failing
-/// open: a `0` here would make every real expiry compare as still-in-the-future
-/// and admit expired tokens.
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(u64::MAX)
 }

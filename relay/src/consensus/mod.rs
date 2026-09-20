@@ -240,7 +240,7 @@ mod tests;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
@@ -252,6 +252,7 @@ use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
     BufferDirective, LeaveDirective, LinkConditions, RegionLabel, SlotConditions,
 };
+use rally_point_proto::time::unix_millis;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::observability::flight_recorder::BufferDecisionInputs;
@@ -259,9 +260,9 @@ use crate::routing::SessionKey;
 
 // Every submodule of this one reaches the rest of the module's internals
 // through these globs: each file's own `use super::*` picks them up, so an item
-// keeps resolving by its bare name wherever it was written.
+// keeps resolving by its bare name wherever it was written. `ops` needs no glob
+// of its own — the explicit re-exports below already name every item it has.
 use law::*;
-use ops::*;
 use registry::*;
 use slot::*;
 use sync::*;
@@ -294,6 +295,8 @@ pub use registry::{
 };
 pub use sync::SyncDivergence;
 
+#[cfg(test)]
+pub(in crate::consensus) use ops::admit_reconnect_with;
 pub(crate) use ops::{admit_reconnect, mark_connection_down, record_departure_for_epoch_outcome};
 pub(crate) use slot::{ConnectionActivation, DepartureRecordOutcome, ReconnectAdmission};
 

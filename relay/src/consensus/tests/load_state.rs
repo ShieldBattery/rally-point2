@@ -88,7 +88,7 @@ fn a_peer_adopting_the_start_directive_stands_in_its_own_start_instant() {
             ..MakerSync::new(bounds(1, 6), Authority::Peer)
         },
     );
-    let before = now_ms();
+    let before = unix_millis();
     adopt_session_start(&registry, &k, Some(4));
     assert!(session_started(&registry, &k));
     let adopted_at = load_state_of(&registry, &k)

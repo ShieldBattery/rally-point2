@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 
 use super::events::{EventRecord, SampleRecord, SlotSample, SyncCoverage};
-use super::{MAX_EVENTS_PER_SESSION, MAX_SAMPLES_PER_SESSION, now_ms};
+use super::{MAX_EVENTS_PER_SESSION, MAX_SAMPLES_PER_SESSION};
 
 /// One slot's turn-stream counters: plain atomics the hot path bumps through a
 /// pre-fetched `Arc` handle — no lock, no allocation per turn. Cumulative for
@@ -130,7 +130,7 @@ pub(super) struct SessionRecording {
 impl SessionRecording {
     pub(super) fn new() -> Self {
         Self {
-            started_at_ms: now_ms(),
+            started_at_ms: rally_point_proto::time::unix_millis(),
             events: Mutex::new(VecDeque::new()),
             events_dropped: AtomicU64::new(0),
             samples: Mutex::new(VecDeque::new()),
@@ -206,7 +206,7 @@ impl SessionRecording {
             .collect();
         slots.sort_by_key(|s| s.slot);
         SampleRecord {
-            at_ms: now_ms(),
+            at_ms: rally_point_proto::time::unix_millis(),
             slots,
             worst_e2e_lag_turns: e2e.0,
             max_relay_hops: e2e.1,

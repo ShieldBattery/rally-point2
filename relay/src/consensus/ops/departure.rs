@@ -196,7 +196,7 @@ pub fn record_result(registry: &DecisionMakers, key: &SessionKey, slot: SlotId, 
         };
         let echo = ResultEcho {
             payload,
-            arrival_ms: now_ms(),
+            arrival_ms: unix_millis(),
             session_frame: maker.session_frame().map(|f| f.0),
             slot_frame: maker.slot_frame(slot).map(|f| f.0),
         };

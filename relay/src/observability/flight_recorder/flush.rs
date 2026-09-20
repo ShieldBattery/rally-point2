@@ -12,7 +12,6 @@ use crate::routing::SessionKey;
 use super::BLOB_VERSION;
 use super::FlightRecorder;
 use super::events::FlightBlob;
-use super::now_ms;
 use super::recording::FlushOutcome;
 use super::sinks::DRAIN_FLUSH_CONCURRENCY;
 
@@ -54,7 +53,7 @@ impl FlightRecorder {
             session: key.session.0,
             relay_id: self.inner.relay_id.get().map(|r| r.0).unwrap_or(0),
             started_at_ms: recording.started_at_ms,
-            flushed_at_ms: now_ms(),
+            flushed_at_ms: rally_point_proto::time::unix_millis(),
             events_dropped: recording.events_dropped.load(Ordering::Relaxed),
             samples_dropped: recording.samples_dropped.load(Ordering::Relaxed),
             events: recording.events.lock().iter().cloned().collect(),

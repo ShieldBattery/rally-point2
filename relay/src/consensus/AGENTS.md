@@ -4,8 +4,9 @@
 
 - `mod.rs` — its `//!` header is the real design write-up (target formula, authority,
   apply horizon). Holds the public constants and the re-exports keeping every public
-  path at `consensus::X`. Submodules are private; the `use law::*` / `use ops::*` …
-  glob block is what lets each child's `use super::*` keep resolving bare names.
+  path at `consensus::X`. Submodules are private; the `use law::*` / `use registry::*`
+  … glob block is what lets each child's `use super::*` keep resolving bare names
+  (`ops` needs no glob — its explicit re-exports already name everything).
 - `law.rs` tuning + `ControlLaw` + RTT/loss/outage windows; `slot.rs` per-slot state
   and connection-epoch types; `sync/` the desync comparator; `registry.rs` the locked
   map, notices, `log_*`. `phase/`, `delivery.rs`, and `buffer_law_sim/` also live here.

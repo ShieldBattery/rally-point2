@@ -328,7 +328,7 @@ impl ControlConnStats {
             .descriptor_set_len
             .store(set_len, Ordering::Relaxed);
         if let Some(staged_at) = staged_at_unix_ms {
-            let lag = now_unix_ms().saturating_sub(staged_at);
+            let lag = rally_point_proto::time::unix_millis().saturating_sub(staged_at);
             self.inner
                 .descriptor_apply_lag_ms
                 .store(lag, Ordering::Relaxed);
@@ -345,15 +345,6 @@ impl ControlConnStats {
             descriptor_set_len: self.inner.descriptor_set_len.load(Ordering::Relaxed),
         }
     }
-}
-
-/// Wall clock as unix epoch milliseconds — the base the descriptor apply-lag
-/// measurement differences the coordinator's staging stamp against.
-fn now_unix_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// A snapshot of the coordinator control connection's observables (see

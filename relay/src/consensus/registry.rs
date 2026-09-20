@@ -291,7 +291,7 @@ pub(in crate::consensus) fn desync_notice(
     divergence: &SyncDivergence,
 ) -> DesyncNotice {
     let refs = registry.session_refs(key);
-    let detected_at_ms = now_ms();
+    let detected_at_ms = unix_millis();
     DesyncNotice {
         tenant: key.tenant.clone(),
         session: key.session,
@@ -361,7 +361,7 @@ pub(in crate::consensus) fn slot_connected_notice(
         external_id,
         external_ref,
         resumed,
-        connected_at_ms: now_ms(),
+        connected_at_ms: unix_millis(),
     }
 }
 
@@ -378,7 +378,7 @@ pub(in crate::consensus) fn session_started_notice(
         tenant: key.tenant.clone(),
         session: key.session,
         external_id: registry.session_refs(key).external_id,
-        started_at_ms: now_ms(),
+        started_at_ms: unix_millis(),
         initial_buffer_turns,
     }
 }
@@ -411,7 +411,7 @@ pub(in crate::consensus) fn slot_started_notice(
         slot,
         external_id,
         external_ref,
-        arrival_ms: now_ms(),
+        arrival_ms: unix_millis(),
         session_frame,
         slot_frame,
     }
