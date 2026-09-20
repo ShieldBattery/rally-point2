@@ -442,29 +442,21 @@ mod tests {
     }
 
     #[test]
-    fn the_one_pass_cushion_matches_the_standalone_pair_summaries() {
-        fn from_standalone_summaries(tracking: &DeliveryTracking) -> u32 {
-            let hop_term = tracking
-                .max_relay_hops()
-                .unwrap_or(1)
-                .saturating_sub(1)
-                .saturating_mul(EXTRA_HOP_CUSHION_TURNS);
-            let lag_term = tracking
-                .worst_lag_turns()
-                .map(|lag| {
-                    let excess = lag.saturating_sub(E2E_LAG_SLACK_TURNS);
-                    ((excess / E2E_LAG_TURNS_PER_CUSHION_TURN) as u32)
-                        .min(E2E_LAG_CUSHION_CAP_TURNS)
-                })
-                .unwrap_or(0);
-            hop_term + lag_term
+    fn the_one_pass_pair_summary_matches_the_standalone_summaries() {
+        // The cushion reads both summaries out of one traversal of the pair
+        // table; the standalone accessors walk it once each. Asserting the two
+        // agree — rather than re-deriving the cushion arithmetic here — keeps a
+        // legitimate change to the formula from failing this test for the wrong
+        // reason.
+        fn agrees(tracking: &DeliveryTracking) {
+            assert_eq!(
+                tracking.pair_summary(),
+                (tracking.max_relay_hops(), tracking.worst_lag_turns()),
+            );
         }
 
         let mut tracking = DeliveryTracking::default();
-        assert_eq!(
-            tracking.cushion_turns(),
-            from_standalone_summaries(&tracking)
-        );
+        agrees(&tracking);
 
         // Cursor evidence without a matching origin contributes to neither
         // summary, while complete same-home and cross-home pairs contribute to
@@ -477,10 +469,7 @@ mod tests {
         tracking.observe_delivery(slot(1), slot(2), 50, DeliveryHome::Local);
         assert_eq!(tracking.max_relay_hops(), Some(2));
         assert_eq!(tracking.worst_lag_turns(), Some(100));
-        assert_eq!(
-            tracking.cushion_turns(),
-            from_standalone_summaries(&tracking)
-        );
+        agrees(&tracking);
     }
 
     #[test]

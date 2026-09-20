@@ -44,6 +44,109 @@ mod stores;
 
 const TENANT: &str = "sb-test";
 
+/// The Join source the tests drive, with no mesh link registered.
+fn control() -> MeshControl {
+    MeshControl::new(RelayId(1), Arc::default(), Arc::default())
+}
+
+/// [`control`] with a link to `peer` registered, paired with the receiver that
+/// link's [`MeshCommand`]s arrive on.
+fn control_with_link(peer: u64) -> (MeshControl, mpsc::UnboundedReceiver<MeshCommand>) {
+    let control = control();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let _ = control.register_link(RelayId(peer), 1, tx);
+    (control, rx)
+}
+
+/// Decodes one frame a stand-in coordinator read into the message it carries.
+fn decode(message: Message) -> RelayToCoordinator {
+    let Message::Text(text) = message else {
+        panic!("a text frame");
+    };
+    serde_json::from_str(&text).expect("the frame is a relay-to-coordinator message")
+}
+
+/// A session with a decision-maker and no bounds worth speaking of — enough for
+/// the retained load state a fence or a heartbeat entry reads and re-reads.
+fn fence_fixture() -> (Sessions, Arc<crate::consensus::DecisionMakers>) {
+    let sessions: Sessions = Arc::default();
+    let decision_makers = Arc::new(crate::consensus::new_decision_makers());
+    let _ = crate::consensus::sync_maker(
+        &decision_makers,
+        &key(7),
+        crate::consensus::MakerSync::new(
+            BufferBounds { min: 1, max: 6 },
+            crate::consensus::Authority::SelfRelay,
+        ),
+    );
+    (sessions, decision_makers)
+}
+
+/// Everything one subscriber launch takes, with every seam a test is not
+/// asserting on defaulted to disabled: a closed notice pipe, no flight
+/// shipments, a drain that never fires, an empty roster beating an hour from
+/// now, and a fast ordinary redial. A test names only the fields it drives:
+///
+/// ```ignore
+/// SubscriberFixture { notices, ..Default::default() }.spawn(addr);
+/// ```
+struct SubscriberFixture {
+    control: MeshControl,
+    applied: AppliedSessions,
+    fleet: FleetMeshPeers,
+    drain_acked: watch::Sender<bool>,
+    notices: UnboundedReceiver<RelayNotice>,
+    flight: Receiver<FlightShipment>,
+    stats: ControlConnStats,
+    heartbeat: HeartbeatConfig,
+    drain: watch::Receiver<bool>,
+    connected: watch::Sender<bool>,
+    backoff: ReconnectBackoff,
+}
+
+impl Default for SubscriberFixture {
+    fn default() -> Self {
+        Self {
+            control: control(),
+            applied: AppliedSessions::default(),
+            fleet: FleetMeshPeers::default(),
+            // A throwaway sender: an ack `send` on it is a harmless no-op.
+            drain_acked: watch::channel(false).0,
+            // Both pipes' send halves drop here, so the loop's notice and flight
+            // arms disable themselves rather than spinning on a closed channel.
+            notices: mpsc::unbounded_channel().1,
+            flight: no_flight(),
+            stats: ControlConnStats::new(),
+            heartbeat: heartbeat(Duration::from_secs(3600)),
+            drain: watch::channel(false).1,
+            connected: no_connected(),
+            backoff: backoff(Duration::from_millis(20), Duration::from_secs(60)),
+        }
+    }
+}
+
+impl SubscriberFixture {
+    /// Spawns the subscriber against the stand-in coordinator listening at `addr`.
+    fn spawn(self, addr: SocketAddr) {
+        tokio::spawn(run_descriptor_subscriber_with(
+            enroll(addr, drain_hello()),
+            ControlApplyTargets {
+                control: self.control,
+                applied: self.applied,
+                fleet: self.fleet,
+                verifying_keys: SharedRegistry::default(),
+                region_targets: RegionPingTargets::default(),
+                drain_acked: self.drain_acked,
+            },
+            OutboundQueues::new(self.notices, self.flight, self.stats),
+            self.heartbeat,
+            self.drain,
+            self.connected,
+            self.backoff,
+        ));
+    }
+}
+
 fn key(session: u64) -> SessionKey {
     SessionKey {
         tenant: TenantId(TENANT.to_owned()),
@@ -111,14 +214,6 @@ fn desync_notice() -> DesyncNotice {
     }
 }
 
-/// A never-draining `drain` receiver and a throwaway `drain_acked` sender, for
-/// tests that don't exercise the drain seam. The internal channel ends drop
-/// immediately, so the loop's drain arm disables itself and an ack `send` is a
-/// harmless no-op.
-fn no_drain() -> (watch::Receiver<bool>, watch::Sender<bool>) {
-    (watch::channel(false).1, watch::channel(false).0)
-}
-
 /// A throwaway `control_connected` sender for a test that doesn't assert
 /// on the connection-state signal itself.
 fn no_connected() -> watch::Sender<bool> {
@@ -139,20 +234,6 @@ fn enroll(addr: std::net::SocketAddr, relay_hello: RelayHello) -> EnrollConfig {
         bootstrap_secret: None,
         relay_hello,
         identity_key: throwaway_identity_key(),
-    }
-}
-
-/// Apply targets with default (empty) stores and the given Join source and
-/// drain-ack signal — the common case for tests not asserting on a specific
-/// store.
-fn apply_targets(control: MeshControl, drain_acked: watch::Sender<bool>) -> ControlApplyTargets {
-    ControlApplyTargets {
-        control,
-        applied: AppliedSessions::default(),
-        fleet: FleetMeshPeers::default(),
-        verifying_keys: SharedRegistry::default(),
-        region_targets: RegionPingTargets::default(),
-        drain_acked,
     }
 }
 

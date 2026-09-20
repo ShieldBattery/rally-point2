@@ -24,9 +24,12 @@
 //! as long as it runs) and an explicit **zero threshold** (the disable switch).
 //! Both make [`run`] pend forever instead of ever resolving.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::watch;
+// The countdown reads the same clock the poll ticker sleeps on, so the two can
+// never disagree about how long the condition has held.
+use tokio::time::Instant;
 
 use crate::routing::{self, Sessions};
 
@@ -228,7 +231,7 @@ mod tests {
         assert!(tracker.observe(restart + threshold, true));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn it_exits_once_the_roster_empties_and_stays_unenrolled_past_the_threshold() {
         let threshold = Duration::from_millis(120);
         let poll = Duration::from_millis(10);
@@ -271,7 +274,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn enrolling_mid_countdown_resets_the_idle_timer() {
         let threshold = Duration::from_millis(150);
         let poll = Duration::from_millis(10);
@@ -302,38 +305,33 @@ mod tests {
             .expect("the idle-exit task completes without panicking");
     }
 
-    #[tokio::test]
-    async fn a_zero_threshold_disables_self_reap() {
-        // Idle and unenrolled, but a zero threshold is the explicit disable.
-        let sessions: Sessions = Arc::default();
-        let (_connected_tx, connected_rx) = watch::channel(false);
-        let never = run_with(
-            sessions,
-            Some(connected_rx),
+    #[tokio::test(start_paused = true)]
+    async fn self_reap_is_off_without_a_threshold_or_a_coordinator() {
+        // Both guard branches, against a roster and an enrollment state that
+        // would otherwise reap: a zero threshold is the explicit disable, and a
+        // standalone/dev relay with no control-connection watch must serve for
+        // as long as it runs.
+        let disabled = run_with(
+            Arc::default(),
+            Some(watch::channel(false).1),
             Duration::ZERO,
             Duration::from_millis(10),
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), never)
+            tokio::time::timeout(Duration::from_secs(60), disabled)
                 .await
                 .is_err(),
             "a zero threshold never self-reaps even while idle and unenrolled",
         );
-    }
 
-    #[tokio::test]
-    async fn a_relay_with_no_coordinator_never_self_reaps() {
-        // Idle roster, but no control-connection watch: a standalone/dev relay must
-        // serve for as long as it runs.
-        let sessions: Sessions = Arc::default();
-        let never = run_with(
-            sessions,
+        let standalone = run_with(
+            Arc::default(),
             None,
             Duration::from_millis(50),
             Duration::from_millis(10),
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(200), never)
+            tokio::time::timeout(Duration::from_secs(60), standalone)
                 .await
                 .is_err(),
             "a relay with no coordinator configured never self-reaps",

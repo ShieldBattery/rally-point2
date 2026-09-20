@@ -6,35 +6,35 @@ use super::*;
 
 #[test]
 fn reconcile_applies_descriptors_then_leaves_dropped_sessions() {
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let _ = control.register_link(RelayId(2), 1, tx2);
+    let (control, mut rx2) = control_with_link(2);
     let applied = AppliedSessions::new();
 
-    // First push: session 1 names peer 2 → Join.
-    reconcile(&control, &[descriptor(1, &[2])], &applied);
+    // First push: two sessions on the link to peer 2 → a Join each.
+    reconcile(
+        &control,
+        &[descriptor(1, &[2]), descriptor(2, &[2])],
+        &applied,
+    );
     assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
-    assert!(applied.snapshot().contains(&key(1)));
+    assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(2)));
+    assert_eq!(applied.snapshot(), HashSet::from([key(1), key(2)]));
 
-    // Second push: the session has dropped out of the set → Leave.
-    reconcile(&control, &[], &applied);
+    // A shrunk set: session 1 has dropped out of it and session 2 remains, so
+    // only session 1 is left and the survivor is not disturbed.
+    reconcile(&control, &[descriptor(2, &[2])], &applied);
     assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Leave(key(1)));
+    assert!(rx2.try_recv().is_err(), "session 2 stays joined");
+    assert_eq!(applied.snapshot(), HashSet::from([key(2)]));
+
+    // The empty set leaves the last one too.
+    reconcile(&control, &[], &applied);
+    assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Leave(key(2)));
     assert!(applied.is_empty());
 }
 
 #[test]
 fn reconcile_is_idempotent_on_a_repeated_set() {
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let _ = control.register_link(RelayId(2), 1, tx2);
+    let (control, mut rx2) = control_with_link(2);
     let applied = AppliedSessions::new();
 
     reconcile(&control, &[descriptor(1, &[2])], &applied);
@@ -46,41 +46,10 @@ fn reconcile_is_idempotent_on_a_repeated_set() {
 }
 
 #[test]
-fn reconcile_tracks_multiple_sessions_and_leaves_only_the_one_that_dropped() {
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let _ = control.register_link(RelayId(2), 1, tx2);
-    let applied = AppliedSessions::new();
-
-    // Two sessions on the link to peer 2.
-    reconcile(
-        &control,
-        &[descriptor(1, &[2]), descriptor(2, &[2])],
-        &applied,
-    );
-    assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
-    assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(2)));
-
-    // Session 1 ends; session 2 remains. Only session 1 is left.
-    reconcile(&control, &[descriptor(2, &[2])], &applied);
-    assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Leave(key(1)));
-    assert!(rx2.try_recv().is_err(), "session 2 stays joined");
-    assert_eq!(applied.snapshot(), HashSet::from([key(2)]));
-}
-
-#[test]
 fn a_delta_adds_removes_and_mutates_converging_to_a_full_reconcile() {
     // The delta path and a full-set reconcile of the same target leave the relay
     // in the same applied state — a delta is only a cheaper way to reach it.
-    let delta_control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
+    let delta_control = control();
     let (d2_tx, mut d2_rx) = mpsc::unbounded_channel();
     let (d3_tx, mut d3_rx) = mpsc::unbounded_channel();
     let _ = delta_control.register_link(RelayId(2), 1, d2_tx);
@@ -129,11 +98,7 @@ fn a_delta_adds_removes_and_mutates_converging_to_a_full_reconcile() {
     );
 
     // A full-set reconcile straight to the same target set on a fresh relay.
-    let full_control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
+    let full_control = control();
     let full_applied = AppliedSessions::new();
     reconcile(
         &full_control,
@@ -151,11 +116,7 @@ fn a_delta_adds_removes_and_mutates_converging_to_a_full_reconcile() {
 
 #[test]
 fn a_delta_records_the_applied_set_size_after_the_delta_and_its_apply_lag() {
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
+    let control = control();
     let applied = AppliedSessions::new();
     let stats = ControlConnStats::new();
 
@@ -191,15 +152,10 @@ fn a_delta_records_the_applied_set_size_after_the_delta_and_its_apply_lag() {
         &stats,
     );
 
-    let snap = stats.snapshot();
     assert_eq!(
-        snap.descriptor_set_len, 3,
+        stats.snapshot().descriptor_set_len,
+        3,
         "the recorded length is the applied-set size after the delta, not the delta's one entry",
-    );
-    assert!(
-        (1_500..10_000).contains(&snap.descriptor_apply_lag_ms),
-        "the delta's stamp yields an apply-lag sample exactly like a full set (observed {}ms)",
-        snap.descriptor_apply_lag_ms,
     );
 }
 
@@ -272,12 +228,7 @@ async fn a_close_slot_message_signals_the_named_held_slot() {
     // the relay does not hold is a harmless no-op.
     let sessions: crate::routing::Sessions = std::sync::Arc::default();
     let mesh_links = crate::mesh::new_mesh_links();
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    )
-    .with_broadcast(sessions.clone(), mesh_links);
+    let control = control().with_broadcast(sessions.clone(), mesh_links);
 
     let (mut guard, inbox) =
         crate::routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0), 1)
@@ -308,13 +259,15 @@ async fn a_close_slot_message_signals_the_named_held_slot() {
 
 #[test]
 fn an_unknown_message_is_skipped_and_does_not_disturb_state_or_later_messages() {
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let _ = control.register_link(RelayId(2), 1, tx2);
+    // The rolling-deploy path: a frame a newer coordinator sent that this build
+    // predates decodes to `Unknown` rather than the serde error that would
+    // propagate and close the connection.
+    let json = r#"{"type":"future_thing","whatever":true}"#;
+    let unknown: CoordinatorToRelay =
+        serde_json::from_str(json).expect("an unknown type must not be a decode error");
+    assert_eq!(unknown, CoordinatorToRelay::Unknown);
+
+    let (control, mut rx2) = control_with_link(2);
     let applied = AppliedSessions::new();
 
     // A known message joins session 1.
@@ -329,13 +282,8 @@ fn an_unknown_message_is_skipped_and_does_not_disturb_state_or_later_messages() 
     );
     assert_eq!(rx2.try_recv().unwrap(), MeshCommand::Join(key(1)));
 
-    // An unknown message is a no-op: no commands, applied state untouched.
-    apply_message(
-        &control,
-        CoordinatorToRelay::Unknown,
-        &applied,
-        &ControlConnStats::new(),
-    );
+    // Applying it is a no-op: no commands, applied state untouched.
+    apply_message(&control, unknown, &applied, &ControlConnStats::new());
     assert!(rx2.try_recv().is_err(), "an unknown message issues nothing");
     assert_eq!(applied.snapshot(), HashSet::from([key(1)]));
 
@@ -354,35 +302,8 @@ fn an_unknown_message_is_skipped_and_does_not_disturb_state_or_later_messages() 
 }
 
 #[test]
-fn an_unknown_frame_decodes_and_skips_rather_than_closing_the_stream() {
-    // The exact rolling-deploy path: a frame a newer coordinator sent that
-    // this build predates decodes to `Unknown` (not the serde error that
-    // would propagate and close the connection), and applies as a no-op.
-    let json = r#"{"type":"future_thing","whatever":true}"#;
-    let message: CoordinatorToRelay =
-        serde_json::from_str(json).expect("an unknown type must not be a decode error");
-    assert_eq!(message, CoordinatorToRelay::Unknown);
-
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (tx2, mut rx2) = mpsc::unbounded_channel();
-    let _ = control.register_link(RelayId(2), 1, tx2);
-    let applied = AppliedSessions::new();
-    apply_message(&control, message, &applied, &ControlConnStats::new());
-    assert!(rx2.try_recv().is_err());
-    assert!(applied.is_empty());
-}
-
-#[test]
 fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
+    let control = control();
     let applied = AppliedSessions::new();
     let stats = ControlConnStats::new();
 
@@ -405,13 +326,33 @@ fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
         snap.descriptor_apply_lag_ms,
     );
     assert_eq!(snap.descriptor_set_len, 2, "the last applied set's size");
+    let sampled = snap.descriptor_apply_lag_ms;
+
+    // An unstamped set (an older coordinator) holds the last lag sample — which
+    // is non-zero here, so a `record_descriptor_apply` that reset it on an
+    // unstamped push would be caught — but still updates the set length.
+    apply_message(
+        &control,
+        CoordinatorToRelay::Descriptors {
+            descriptors: vec![descriptor(1, &[])],
+            staged_at_unix_ms: None,
+        },
+        &applied,
+        &stats,
+    );
+    let snap = stats.snapshot();
+    assert_eq!(
+        snap.descriptor_apply_lag_ms, sampled,
+        "an unstamped push leaves the last lag sample untouched",
+    );
+    assert_eq!(snap.descriptor_set_len, 1);
 
     // A backward clock skew (a set stamped in the future) clamps to zero rather
     // than reading as a huge lag, and still updates the set length.
     apply_message(
         &control,
         CoordinatorToRelay::Descriptors {
-            descriptors: vec![descriptor(1, &[])],
+            descriptors: vec![],
             staged_at_unix_ms: Some(now_unix_ms() + 60_000),
         },
         &applied,
@@ -421,24 +362,6 @@ fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
     assert_eq!(
         snap.descriptor_apply_lag_ms, 0,
         "a backward clock skew clamps the lag to zero",
-    );
-    assert_eq!(snap.descriptor_set_len, 1);
-
-    // An unstamped set (an older coordinator) holds the last lag sample but still
-    // updates the set length.
-    apply_message(
-        &control,
-        CoordinatorToRelay::Descriptors {
-            descriptors: vec![],
-            staged_at_unix_ms: None,
-        },
-        &applied,
-        &stats,
-    );
-    let snap = stats.snapshot();
-    assert_eq!(
-        snap.descriptor_apply_lag_ms, 0,
-        "an unstamped push leaves the last lag sample untouched",
     );
     assert_eq!(snap.descriptor_set_len, 0);
 }

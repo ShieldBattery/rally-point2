@@ -93,14 +93,21 @@ pub fn spawn_put(
     done: mpsc::UnboundedSender<FlightPutDone>,
 ) {
     tokio::spawn(async move {
-        let outcome = put_with_retry(&url, payload, relay_id).await;
+        let outcome = put_with_retry(&url, payload, relay_id, PUT_RETRY_DELAY).await;
         let _ = done.send(FlightPutDone { request, outcome });
     });
 }
 
 /// Uploads `payload`, retrying a failed attempt up to [`MAX_PUT_ATTEMPTS`] times with a
-/// fixed gap, and reports whether it ended stored.
-async fn put_with_retry(url: &str, payload: Bytes, relay_id: RelayId) -> PutOutcome {
+/// fixed `retry_delay` gap, and reports whether it ended stored. The gap is
+/// [`PUT_RETRY_DELAY`] in production; a test passes a shorter one so the retry
+/// path is reachable without waiting out the real gap.
+async fn put_with_retry(
+    url: &str,
+    payload: Bytes,
+    relay_id: RelayId,
+    retry_delay: Duration,
+) -> PutOutcome {
     for attempt in 1..=MAX_PUT_ATTEMPTS {
         match put_once(url, payload.clone()).await {
             Ok(()) => return PutOutcome::Stored,
@@ -112,7 +119,7 @@ async fn put_with_retry(url: &str, payload: Bytes, relay_id: RelayId) -> PutOutc
                     "flight recording upload attempt failed",
                 );
                 if attempt < MAX_PUT_ATTEMPTS {
-                    tokio::time::sleep(PUT_RETRY_DELAY).await;
+                    tokio::time::sleep(retry_delay).await;
                 }
             }
         }
@@ -164,4 +171,85 @@ enum PutError {
     Status(u16),
     #[error("the upload attempt timed out")]
     TimedOut,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+
+    /// An in-process object store: an HTTP server that answers each PUT with the
+    /// next status in `statuses` (repeating the last once the script runs out)
+    /// and counts the attempts it saw, standing in for the presigned-URL target.
+    /// Returns its URL and the attempt counter.
+    async fn spawn_scripted_store(statuses: &'static [u16]) -> (String, Arc<AtomicUsize>) {
+        use tokio::net::TcpListener;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let for_app = Arc::clone(&attempts);
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(move |_body: axum::body::Bytes| {
+            let for_app = Arc::clone(&for_app);
+            async move {
+                let index = for_app.fetch_add(1, Ordering::Relaxed);
+                let status = statuses[index.min(statuses.len() - 1)];
+                axum::http::StatusCode::from_u16(status).expect("a valid scripted status")
+            }
+        });
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            format!("http://{addr}/desync/sb-test/7/1.json.zst"),
+            attempts,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_is_retried_and_a_later_success_stores_the_recording() {
+        // The presigned URL lives for minutes, so a transient 5xx is worth one
+        // more try rather than throwing the recording away.
+        let (url, attempts) = spawn_scripted_store(&[500, 200]).await;
+        let outcome = put_with_retry(
+            &url,
+            Bytes::from_static(b"compressed-bytes"),
+            RelayId(7),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(outcome, PutOutcome::Stored);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            2,
+            "the refused attempt was retried exactly once before it stored",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_never_accepts_spends_the_budget_and_reports_the_blob_lost() {
+        // Flight data is observability, never backpressure: once the attempt
+        // budget is spent the recording is reported lost rather than retried
+        // past the grant URL's expiry.
+        let (url, attempts) = spawn_scripted_store(&[500]).await;
+        let outcome = put_with_retry(
+            &url,
+            Bytes::from_static(b"compressed-bytes"),
+            RelayId(7),
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(outcome, PutOutcome::Failed);
+        assert_eq!(
+            attempts.load(Ordering::Relaxed) as u32,
+            MAX_PUT_ATTEMPTS,
+            "every attempt in the budget was spent, and no more",
+        );
+    }
 }

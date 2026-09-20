@@ -25,8 +25,8 @@ use super::heartbeat::{
     start_load_state_answer,
 };
 use super::{
-    ControlError, FLIGHT_GRANT_TIMEOUT, HeartbeatConfig, LOAD_STATE_ASK_CAPACITY,
-    MAX_INFLIGHT_FLIGHT_UPLOADS, OutboundQueues,
+    ControlError, HeartbeatConfig, LOAD_STATE_ASK_CAPACITY, MAX_INFLIGHT_FLIGHT_UPLOADS,
+    OutboundQueues,
 };
 
 /// The reader→writer routes on one control connection: frames the read half received
@@ -117,8 +117,9 @@ pub(super) enum FlightStage {
 /// PUT stores the object does this half fire that shipment's `sent` ack (delivery
 /// means *stored*) and send a
 /// [`FlightUploadDone`](RelayToCoordinator::FlightUploadDone). A refusal, an upload
-/// failure, or no grant within [`FLIGHT_GRANT_TIMEOUT`] (which also covers an older
-/// coordinator that drops the request as unknown) drops that one recording with a log
+/// failure, or no grant within the connection's grant timeout
+/// ([`FLIGHT_GRANT_TIMEOUT`](super::FLIGHT_GRANT_TIMEOUT), which also covers an
+/// older coordinator that drops the request as unknown) drops that one recording with a log
 /// — flight data is observability, never backpressure. Because each shipment carries
 /// its own id and cycle stage, several can be awaiting grants or uploading at once
 /// without interfering.
@@ -154,6 +155,7 @@ pub(super) async fn write_control_frames(
         flight,
         pending_flights,
         stats,
+        grant_timeout,
     } = outbound;
 
     // The Hello already proved liveness at t=0, so skip the immediate first tick
@@ -208,7 +210,7 @@ pub(super) async fn write_control_frames(
         next_request += 1;
         flight.request = next_request;
         flight.stage = FlightStage::AwaitingGrant {
-            deadline: Instant::now() + FLIGHT_GRANT_TIMEOUT,
+            deadline: Instant::now() + *grant_timeout,
         };
         // A send error ends the connection (via `?`) with the shipment still parked,
         // so the next connection re-requests it.
@@ -450,7 +452,7 @@ pub(super) async fn write_control_frames(
                             shipment,
                             request,
                             stage: FlightStage::AwaitingGrant {
-                                deadline: Instant::now() + FLIGHT_GRANT_TIMEOUT,
+                                deadline: Instant::now() + *grant_timeout,
                             },
                         });
                         // A send error ends the connection (via `?`) with the shipment

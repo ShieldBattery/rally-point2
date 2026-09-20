@@ -330,10 +330,25 @@ mod tests {
 
     #[test]
     fn enhanced_mode_never_downgrades_or_accepts_unbound_metadata() {
+        // An origin's mode is fixed by its first tagged turn, and neither
+        // direction may cross it afterwards: an enhanced origin that stops
+        // tagging cannot silently fall back to ring unwrapping, and a legacy
+        // one that starts tagging has no anchor its generation means anything
+        // against.
         let mut turns = SyncTurns::default();
         turns.push(SlotId(0), 0, enhanced_turn(0, 0)).unwrap();
         assert_eq!(
             turns.push(SlotId(0), 1, turn(Some(1))).unwrap_err().reason,
+            "generation_mode_mismatch"
+        );
+
+        let mut turns = SyncTurns::default();
+        turns.push(SlotId(0), 0, turn(Some(0))).unwrap();
+        assert_eq!(
+            turns
+                .push(SlotId(0), 1, enhanced_turn(1, 1))
+                .unwrap_err()
+                .reason,
             "generation_mode_mismatch"
         );
 

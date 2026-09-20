@@ -4,7 +4,9 @@
 //! stays a manageable size; every helper here is used by both.
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::*;
@@ -48,6 +50,35 @@ impl FlightSink for SlowSink {
             tokio::time::sleep(Duration::from_secs(30)).await;
             Ok(())
         })
+    }
+}
+
+/// A temporary directory under the system temp dir, unique to this process and
+/// this call, removed when the guard drops — so two concurrent `cargo test`
+/// invocations never collide on a fixed name and a panicking test leaves nothing
+/// behind.
+pub(super) struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    pub(super) fn new(label: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("rp2-{label}-{}-{unique}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        Self { path }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 

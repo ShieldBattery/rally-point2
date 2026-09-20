@@ -29,7 +29,7 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
     // A slot registered in the roster before the subscriber starts, so the
     // first beat already carries it. The guard is disarmed and the inbox held
     // so the slot stays registered for the test's duration.
-    let sessions: Sessions = Arc::default();
+    let (sessions, decision_makers) = fence_fixture();
     let (mut guard, _inbox) =
         crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3), 1)
             .expect("slot 3 registers");
@@ -38,15 +38,6 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
     // The session's decision-maker holds the load state the beat restates:
     // slot 2 arrived and dropped again (so it is off the live roster but
     // still ever-connected), slot 3 arrived and reported its game loop.
-    let decision_makers = std::sync::Arc::new(crate::consensus::new_decision_makers());
-    let _ = crate::consensus::sync_maker(
-        &decision_makers,
-        &key(7),
-        crate::consensus::MakerSync::new(
-            rally_point_proto::control::BufferBounds { min: 1, max: 6 },
-            crate::consensus::Authority::SelfRelay,
-        ),
-    );
     crate::consensus::record_slot_connected(
         &decision_makers,
         &key(7),
@@ -65,21 +56,8 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
         rally_point_proto::ids::SlotId(3),
     );
 
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (drain_rx, drain_acked) = no_drain();
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
-        ),
-        HeartbeatConfig {
+    SubscriberFixture {
+        heartbeat: HeartbeatConfig {
             sources: HeartbeatSources {
                 sessions: Arc::clone(&sessions),
                 decision_makers,
@@ -88,10 +66,9 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
             },
             interval: Duration::from_millis(50), // beat quickly so the test observes one
         },
-        drain_rx,
-        no_connected(),
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
+        ..Default::default()
+    }
+    .spawn(addr);
 
     let beat = tokio::time::timeout(Duration::from_secs(5), frame_rx)
         .await
@@ -135,16 +112,7 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
     // the coordinator has no other durable source for.
     use rally_point_proto::ids::SlotId;
 
-    let sessions: Sessions = Arc::default();
-    let decision_makers = Arc::new(crate::consensus::new_decision_makers());
-    let _ = crate::consensus::sync_maker(
-        &decision_makers,
-        &key(7),
-        crate::consensus::MakerSync::new(
-            BufferBounds { min: 1, max: 6 },
-            crate::consensus::Authority::SelfRelay,
-        ),
-    );
+    let (sessions, decision_makers) = fence_fixture();
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
     crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);
@@ -222,20 +190,11 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
 
     // What this relay holds for the session: slot 2 arrived and dropped, slot 3
     // is here and running.
-    let sessions: Sessions = Arc::default();
+    let (sessions, decision_makers) = fence_fixture();
     let (mut guard, _inbox) =
         crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3), 1)
             .expect("slot 3 registers");
     guard.disarm();
-    let decision_makers = std::sync::Arc::new(crate::consensus::new_decision_makers());
-    let _ = crate::consensus::sync_maker(
-        &decision_makers,
-        &key(7),
-        crate::consensus::MakerSync::new(
-            rally_point_proto::control::BufferBounds { min: 1, max: 6 },
-            crate::consensus::Authority::SelfRelay,
-        ),
-    );
     for slot in [2u8, 3] {
         crate::consensus::record_slot_connected(
             &decision_makers,
@@ -250,21 +209,8 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
         rally_point_proto::ids::SlotId(3),
     );
 
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (drain_rx, drain_acked) = no_drain();
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
-        ),
-        HeartbeatConfig {
+    SubscriberFixture {
+        heartbeat: HeartbeatConfig {
             sources: HeartbeatSources {
                 sessions: Arc::clone(&sessions),
                 decision_makers,
@@ -274,10 +220,9 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
             // Long enough that the snapshot is not merely a beat in disguise.
             interval: Duration::from_secs(3600),
         },
-        drain_rx,
-        no_connected(),
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
+        ..Default::default()
+    }
+    .spawn(addr);
 
     let text = tokio::time::timeout(Duration::from_secs(5), frame_rx)
         .await
@@ -313,16 +258,7 @@ fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
     // state. What differs is only what the reader may assume about ordering.
     use rally_point_proto::ids::SlotId;
 
-    let sessions: Sessions = Arc::default();
-    let decision_makers = Arc::new(crate::consensus::new_decision_makers());
-    let _ = crate::consensus::sync_maker(
-        &decision_makers,
-        &key(7),
-        crate::consensus::MakerSync::new(
-            BufferBounds { min: 1, max: 6 },
-            crate::consensus::Authority::SelfRelay,
-        ),
-    );
+    let (sessions, decision_makers) = fence_fixture();
     let (_registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
     crate::consensus::record_slot_connected(&decision_makers, &key(7), SlotId(0), false);

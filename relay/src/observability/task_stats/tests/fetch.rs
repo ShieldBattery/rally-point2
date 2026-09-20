@@ -103,27 +103,6 @@ fn parses_a_representative_docker_stats_payload() {
 }
 
 #[test]
-fn falls_back_to_percpu_usage_length_when_online_cpus_is_absent() {
-    let json = r#"{
-        "read": "2026-07-18T00:00:00Z",
-        "cpu_stats": {
-            "cpu_usage": {
-                "total_usage": 1000,
-                "percpu_usage": [100, 100, 100]
-            },
-            "system_cpu_usage": 5000
-        },
-        "memory_stats": { "usage": 100, "limit": 200 },
-        "networks": {}
-    }"#;
-
-    let parsed: StatsResponse = serde_json::from_str(json).unwrap();
-    let sample = Sample::from_stats_response(&parsed).unwrap();
-
-    assert_eq!(sample.online_cpus, 3);
-}
-
-#[test]
 fn omitted_system_cpu_counters_preserve_primary_cpu_cores() {
     let json = r#"{
         "read": "2026-07-18T00:00:20Z",
@@ -169,4 +148,22 @@ fn defaults_missing_optional_fields_to_unknown_or_zero_as_appropriate() {
     assert_eq!(sample.mem_inactive_file, 0);
     assert_eq!(sample.net_rx_bytes, None);
     assert_eq!(sample.net_tx_bytes, None);
+
+    // With `online_cpus` absent but `percpu_usage` present, the CPU count comes
+    // from that array's length rather than defaulting to zero.
+    let with_percpu = r#"{
+        "read": "2026-07-18T00:00:00Z",
+        "cpu_stats": {
+            "cpu_usage": {
+                "total_usage": 1000,
+                "percpu_usage": [100, 100, 100]
+            },
+            "system_cpu_usage": 5000
+        },
+        "memory_stats": { "usage": 100, "limit": 200 },
+        "networks": {}
+    }"#;
+    let parsed: StatsResponse = serde_json::from_str(with_percpu).unwrap();
+    let sample = Sample::from_stats_response(&parsed).unwrap();
+    assert_eq!(sample.online_cpus, 3);
 }

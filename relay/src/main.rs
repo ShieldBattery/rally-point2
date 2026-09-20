@@ -622,36 +622,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_coordinator_driven_relay_always_requires_mesh_peer_auth() {
-        // A relay with both a relay id and a coordinator URL (has_coordinator) will
-        // receive fleet-peer pushes, so it fails closed whether or not the operator
-        // set the flag — closing the boot-to-first-push window an unset flag left open.
+    fn mesh_peer_auth_fails_closed_for_a_coordinator_driven_relay() {
+        // The whole truth table of `require_flag || has_coordinator`, because a
+        // slip to `&&` is a real fail-open. A relay with both a relay id and a
+        // coordinator URL will receive fleet-peer pushes, so it fails closed
+        // whether or not the operator set the flag — closing the
+        // boot-to-first-push window an unset flag would otherwise leave open.
         assert!(mesh_peer_auth_required(false, true));
         assert!(mesh_peer_auth_required(true, true));
-    }
-
-    #[test]
-    fn a_dev_static_relay_follows_the_flag() {
-        // No coordinator: the empty fleet map stays unenforced unless the operator
-        // opts in with --require-mesh-peer-auth.
+        // No coordinator: the empty fleet map stays unenforced unless the
+        // operator opts in with --require-mesh-peer-auth.
         assert!(!mesh_peer_auth_required(false, false));
         assert!(mesh_peer_auth_required(true, false));
     }
 
     #[test]
-    fn coordinator_mode_ignores_a_supplied_tenant_pubkey() {
-        // A coordinator-driven relay receives its tenant verifying keys over the
+    fn a_supplied_tenant_pubkey_is_ignored_only_in_coordinator_mode() {
+        // The whole truth table of `has_coordinator && supplied`. A
+        // coordinator-driven relay receives its tenant verifying keys over the
         // control connection, so a pinned --tenant-pubkey is ignored (and warned
         // about) rather than seeding a static registry.
         assert!(tenant_pubkey_ignored(true, true));
         // No pubkey supplied: nothing to ignore, so no warning.
         assert!(!tenant_pubkey_ignored(true, false));
-    }
-
-    #[test]
-    fn dev_static_mode_uses_a_supplied_tenant_pubkey() {
-        // With no coordinator, --tenant-pubkey seeds the fixed registry — it is not
-        // ignored, whether or not one is supplied.
+        // With no coordinator, --tenant-pubkey seeds the fixed registry — it is
+        // not ignored, whether or not one is supplied.
         assert!(!tenant_pubkey_ignored(false, true));
         assert!(!tenant_pubkey_ignored(false, false));
     }

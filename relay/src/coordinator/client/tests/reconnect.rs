@@ -13,22 +13,21 @@ fn to_ws_scheme_rewrites_http_and_passes_ws_through() {
 
 #[test]
 fn build_request_targets_the_control_path_and_sets_the_bearer() {
-    let request = build_request("http://host:14910/", Some("s3cret")).unwrap();
-    assert_eq!(request.uri().path(), "/relay/control");
-    assert_eq!(request.uri().scheme_str(), Some("ws"));
+    let with_secret = build_request("http://host:14910/", Some("s3cret")).unwrap();
+    assert_eq!(with_secret.uri().path(), "/relay/control");
+    assert_eq!(with_secret.uri().scheme_str(), Some("ws"));
     assert_eq!(
-        request.headers().get(AUTHORIZATION).unwrap(),
+        with_secret.headers().get(AUTHORIZATION).unwrap(),
         "Bearer s3cret",
     );
+
+    // A relay the coordinator authenticates another way presents no bearer.
+    let without_secret = build_request("http://host:14910", None).unwrap();
+    assert_eq!(without_secret.uri().path(), "/relay/control");
+    assert!(without_secret.headers().get(AUTHORIZATION).is_none());
 }
 
-#[test]
-fn build_request_without_a_secret_sets_no_authorization() {
-    let request = build_request("http://host:14910", None).unwrap();
-    assert!(request.headers().get(AUTHORIZATION).is_none());
-}
-
-// --- Protocol-version refusal backoff ---
+// --- Refusal backoff ---
 
 /// Spawns a stand-in coordinator that, for every control connection, reads the
 /// enroll Hello and then closes with `close_frame` — reporting the instant each
@@ -62,179 +61,117 @@ async fn spawn_closing_coordinator(
     (addr, times_rx)
 }
 
-/// Spawns the subscriber against `addr` with a fast ordinary reconnect delay
-/// and the given version-refusal delay, returning nothing — the stand-in
-/// coordinator's accept times are the observable.
-fn spawn_subscriber_with_delays(
-    addr: std::net::SocketAddr,
-    reconnect_delay: Duration,
-    version_refused_delay: Duration,
-) {
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (drain_rx, drain_acked) = no_drain();
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
+/// Builds a close frame carrying one of the coordinator's refusal codes.
+fn refusal(code: u16, reason: &str) -> tokio_tungstenite::tungstenite::protocol::CloseFrame {
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    CloseFrame {
+        code: CloseCode::from(code),
+        reason: reason.to_owned().into(),
+    }
+}
+
+/// The gap between the first two dials a relay makes against a coordinator that
+/// answers every connection with `close_frame`, under the given redial delays.
+async fn redial_gap(
+    close_frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ordinary: Duration,
+    version_refused: Duration,
+) -> Duration {
+    let (addr, mut times_rx) = spawn_closing_coordinator(close_frame).await;
+    SubscriberFixture {
+        backoff: backoff(ordinary, version_refused),
+        ..Default::default()
+    }
+    .spawn(addr);
+
+    let first = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+        .await
+        .expect("the first dial arrives")
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+        .await
+        .expect("the relay eventually redials")
+        .unwrap();
+    second.duration_since(first)
+}
+
+#[tokio::test]
+async fn an_operator_fix_refusal_waits_the_refusal_backoff_before_redialing() {
+    // None of these resolves by redialing — a version mismatch, an unknown
+    // region, a bad signature or key mismatch, and a relay the ledger does not
+    // authorize each need a deploy or a provisioner — so all four take the long
+    // backoff instead of hot-retrying against a coordinator that will keep
+    // refusing. The four dials run concurrently, so the suite pays one backoff
+    // rather than four.
+    let cases = [
+        (
+            CONTROL_CLOSE_PROTOCOL_MISMATCH,
+            "no common protocol version: local supports v2..=v2, peer supports v1..=v1",
         ),
-        heartbeat(Duration::from_secs(3600)),
-        drain_rx,
-        no_connected(),
-        backoff(reconnect_delay, version_refused_delay),
-    ));
-}
+        (CONTROL_CLOSE_UNKNOWN_REGION, "unknown region: region-z"),
+        (
+            CONTROL_CLOSE_IDENTITY_UNPROVEN,
+            "enroll proof-of-possession failed",
+        ),
+        (
+            CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
+            "not authorized by the ledger",
+        ),
+    ];
 
-#[tokio::test]
-async fn a_version_refusal_close_waits_the_refusal_backoff_before_redialing() {
-    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-
-    // The coordinator refuses every connection with the version-mismatch close.
-    let (addr, mut times_rx) = spawn_closing_coordinator(Some(CloseFrame {
-        code: CloseCode::from(CONTROL_CLOSE_PROTOCOL_MISMATCH),
-        reason: "no common protocol version: local supports v2..=v2, \
-                 peer supports v1..=v1"
-            .into(),
-    }))
-    .await;
-
-    // Ordinary reconnect would redial in ~20ms; the refusal backoff is 500ms.
-    spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_millis(500));
-
-    let first = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
-        .await
-        .expect("the first dial arrives")
-        .unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
-        .await
-        .expect("the relay eventually redials")
-        .unwrap();
-    let gap = second.duration_since(first);
-    assert!(
-        gap >= Duration::from_millis(400),
-        "a version refusal must wait the refusal backoff, not the ordinary \
-         reconnect delay (observed gap: {gap:?})",
-    );
-}
-
-#[tokio::test]
-async fn an_unknown_region_close_waits_the_refusal_backoff_before_redialing() {
-    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-
-    // The coordinator refuses every connection with the unknown-region close —
-    // like a version mismatch, a redial changes nothing until the config is
-    // fixed, so the relay must wait the long refusal backoff, not the ordinary
-    // reconnect delay.
-    let (addr, mut times_rx) = spawn_closing_coordinator(Some(CloseFrame {
-        code: CloseCode::from(CONTROL_CLOSE_UNKNOWN_REGION),
-        reason: "unknown region: region-z".into(),
-    }))
-    .await;
-
-    spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_millis(500));
-
-    let first = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
-        .await
-        .expect("the first dial arrives")
-        .unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
-        .await
-        .expect("the relay eventually redials")
-        .unwrap();
-    let gap = second.duration_since(first);
-    assert!(
-        gap >= Duration::from_millis(400),
-        "an unknown-region refusal must wait the refusal backoff, not the ordinary \
-         reconnect delay (observed gap: {gap:?})",
-    );
-}
-
-#[tokio::test]
-async fn an_identity_unproven_close_waits_the_refusal_backoff_before_redialing() {
-    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-
-    // The coordinator refuses every connection with the identity-unproven
-    // close — a bad signature or key mismatch is a config/implementation
-    // fault, not something a redial fixes, so it takes the long backoff like
-    // a version or region refusal.
-    let (addr, mut times_rx) = spawn_closing_coordinator(Some(CloseFrame {
-        code: CloseCode::from(CONTROL_CLOSE_IDENTITY_UNPROVEN),
-        reason: "enroll proof-of-possession failed".into(),
-    }))
-    .await;
-
-    spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_millis(500));
-
-    let first = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
-        .await
-        .expect("the first dial arrives")
-        .unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
-        .await
-        .expect("the relay eventually redials")
-        .unwrap();
-    let gap = second.duration_since(first);
-    assert!(
-        gap >= Duration::from_millis(400),
-        "an identity-unproven refusal must wait the refusal backoff, not the \
-         ordinary reconnect delay (observed gap: {gap:?})",
-    );
-}
-
-#[tokio::test]
-async fn a_duplicate_relay_id_close_redials_at_the_normal_delay() {
-    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
-    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-
-    // Unlike identity-unproven, a duplicate-relay-id refusal resolves on its
-    // own (the stale entry ages out via the coordinator's liveness deadline),
-    // so it must take the ordinary short delay, not the long refusal backoff
-    // — proven the same way the plain-close test proves it: the refusal
-    // backoff is set absurdly long, so a prompt redial proves the ordinary
-    // path was taken.
-    let (addr, mut times_rx) = spawn_closing_coordinator(Some(CloseFrame {
-        code: CloseCode::from(CONTROL_CLOSE_DUPLICATE_RELAY_ID),
-        reason: "relay id already enrolled under a different certificate".into(),
-    }))
-    .await;
-    spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_secs(3600));
-
-    tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
-        .await
-        .expect("the first dial arrives")
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), times_rx.recv())
-        .await
-        .expect(
-            "a duplicate-relay-id refusal redials at the normal delay, \
-             not the long refusal backoff",
+    // The ordinary reconnect would redial in ~20ms; the refusal backoff is 500ms.
+    let gaps = futures_util::future::join_all(cases.map(|(code, reason)| async move {
+        let gap = redial_gap(
+            Some(refusal(code, reason)),
+            Duration::from_millis(20),
+            Duration::from_millis(500),
         )
-        .unwrap();
+        .await;
+        (code, gap)
+    }))
+    .await;
+
+    for (code, gap) in gaps {
+        assert!(
+            gap >= Duration::from_millis(400),
+            "close code {code} must wait the refusal backoff, not the ordinary \
+             reconnect delay (observed gap: {gap:?})",
+        );
+    }
 }
 
 #[tokio::test]
-async fn an_ordinary_close_redials_at_the_normal_delay() {
-    // The coordinator closes normally (no version refusal). With the refusal
-    // backoff set absurdly long, a redial arriving promptly proves the ordinary
-    // path took the ordinary delay — the wrong branch would blow the timeout.
-    let (addr, mut times_rx) = spawn_closing_coordinator(None).await;
-    spawn_subscriber_with_delays(addr, Duration::from_millis(20), Duration::from_secs(3600));
+async fn a_close_that_resolves_on_its_own_redials_at_the_normal_delay() {
+    // An ordinary close is just a connection ending, and a duplicate-relay-id
+    // refusal ages out by itself once the coordinator's liveness deadline
+    // retires the stale entry — so neither takes the long backoff. Proven by
+    // setting the refusal backoff absurdly long: a prompt redial can only have
+    // come from the ordinary path.
+    let cases = [
+        None,
+        Some(refusal(
+            CONTROL_CLOSE_DUPLICATE_RELAY_ID,
+            "relay id already enrolled under a different certificate",
+        )),
+    ];
 
-    tokio::time::timeout(Duration::from_secs(5), times_rx.recv())
+    let gaps = futures_util::future::join_all(cases.map(|close_frame| async move {
+        redial_gap(
+            close_frame,
+            Duration::from_millis(20),
+            Duration::from_secs(3600),
+        )
         .await
-        .expect("the first dial arrives")
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), times_rx.recv())
-        .await
-        .expect("an ordinary close redials at the normal delay, not the refusal backoff")
-        .unwrap();
+    }))
+    .await;
+
+    for gap in gaps {
+        assert!(
+            gap < Duration::from_secs(2),
+            "a close that resolves on its own redials at the normal delay, \
+             not the refusal backoff (observed gap: {gap:?})",
+        );
+    }
 }

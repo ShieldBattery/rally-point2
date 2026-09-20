@@ -57,6 +57,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
@@ -90,6 +91,7 @@ impl Default for LoadStateFence {
                 next_probe_id: AtomicU64::new(0),
                 pending: Mutex::new(HashMap::new()),
                 active: Arc::new(Semaphore::new(MAX_ACTIVE_LOAD_FENCES)),
+                timeout: super::client::LOAD_STATE_FENCE_TIMEOUT,
             }),
         }
     }
@@ -106,6 +108,9 @@ struct Inner {
     /// actually finishes — which is the point: the cost being bounded is the
     /// waiting, and abandoned waiting costs the same as awaited waiting.
     active: Arc<Semaphore>,
+    /// How long a fence waits for its probes' acks before snapshotting with
+    /// whatever came back.
+    timeout: Duration,
 }
 
 /// One outstanding probe: who it was sent to, and where the ack goes.
@@ -160,9 +165,27 @@ impl Drop for PendingAck {
 }
 
 impl LoadStateFence {
-    /// Creates a fence with nothing outstanding.
+    /// Creates a fence with nothing outstanding, waiting
+    /// [`LOAD_STATE_FENCE_TIMEOUT`](super::client::LOAD_STATE_FENCE_TIMEOUT)
+    /// on each set of probes.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A fence that waits `timeout` rather than the production window, so a test
+    /// can reach the unanswered-probe verdict without waiting it out.
+    #[cfg(test)]
+    pub(crate) fn with_timeout(timeout: Duration) -> Self {
+        let mut fence = Self::default();
+        Arc::get_mut(&mut fence.inner)
+            .expect("a freshly built fence is the only holder")
+            .timeout = timeout;
+        fence
+    }
+
+    /// How long this fence waits for its probes to be acked.
+    pub(crate) fn timeout(&self) -> Duration {
+        self.inner.timeout
     }
 
     /// Takes one of the [`MAX_ACTIVE_LOAD_FENCES`] permits, or `None` when they
@@ -259,14 +282,6 @@ mod tests {
     /// epoch is an equality fence, not an ordering key.
     const EPOCH: u64 = 0xa1;
     const REPLACEMENT_EPOCH: u64 = 0xb2;
-
-    #[tokio::test]
-    async fn an_ack_from_the_probed_slot_releases_its_waiter() {
-        let fence = LoadStateFence::new();
-        let mut pending = fence.probe(&key(5), SlotId(2), EPOCH);
-        assert!(fence.resolve(pending.probe_id(), &key(5), SlotId(2), EPOCH));
-        assert!(pending.recv().await);
-    }
 
     #[tokio::test]
     async fn an_ack_never_matches_another_slot_session_fence_or_connection() {

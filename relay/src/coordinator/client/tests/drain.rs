@@ -41,11 +41,7 @@ fn reconcile_updates_the_shared_applied_set_the_drain_predicate_reads() {
     // flips it back — what lets a drain wait out an assigned-but-undialed
     // session and exit the moment the coordinator's set empties.
     let sessions: Sessions = std::sync::Arc::default();
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
+    let control = control();
     let applied = AppliedSessions::new();
     assert!(drained_idle(&sessions, &applied));
 
@@ -68,40 +64,35 @@ async fn a_drain_trigger_sends_a_draining_frame_after_the_hello() {
 
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let (enrolled_tx, enrolled_rx) = tokio::sync::oneshot::channel();
     let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
 
-    // Stand-in coordinator: accept, complete the enroll handshake, then read
-    // the frame that follows once the relay is told to drain.
+    // Stand-in coordinator: accept, complete the enroll handshake, report that
+    // it finished, then read the frame that follows once the relay is told to
+    // drain.
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
         let hello = accept_enroll(&mut ws).await;
+        let _ = enrolled_tx.send(());
         let next = ws.next().await.unwrap().unwrap();
         let _ = frames_tx.send((hello, next));
     });
 
-    let (drain_tx, drain_rx) = watch::channel(false);
-    let (drain_acked_tx, _drain_acked_rx) = watch::channel(false);
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked_tx),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
-        ),
-        heartbeat(Duration::from_secs(3600)),
-        drain_rx,
-        no_connected(),
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
+    let (drain_tx, drain) = watch::channel(false);
+    SubscriberFixture {
+        drain,
+        ..Default::default()
+    }
+    .spawn(addr);
 
-    // Trigger the drain; the relay must send a Draining frame after its Hello.
+    // Trigger the drain only once enrollment is behind the relay, so this
+    // exercises the write half's `drain.changed()` arm rather than the
+    // connect-time re-assert the reconnect test below covers.
+    tokio::time::timeout(Duration::from_secs(5), enrolled_rx)
+        .await
+        .expect("the relay enrolls")
+        .unwrap();
     drain_tx.send(true).unwrap();
 
     let (hello, draining) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
@@ -112,13 +103,7 @@ async fn a_drain_trigger_sends_a_draining_frame_after_the_hello() {
         panic!("the first frame is the Hello");
     };
     assert!(hello.contains("\"type\":\"hello\""));
-    let Message::Text(draining) = draining else {
-        panic!("the second frame is text");
-    };
-    assert_eq!(
-        serde_json::from_str::<RelayToCoordinator>(&draining).unwrap(),
-        RelayToCoordinator::Draining,
-    );
+    assert_eq!(decode(draining), RelayToCoordinator::Draining);
 }
 
 #[tokio::test]
@@ -140,26 +125,12 @@ async fn a_drain_ack_fires_the_acked_signal() {
         std::future::pending::<()>().await;
     });
 
-    let (_drain_tx, drain_rx) = watch::channel(false);
-    let (drain_acked_tx, mut drain_acked_rx) = watch::channel(false);
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked_tx),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
-        ),
-        heartbeat(Duration::from_secs(3600)),
-        drain_rx,
-        no_connected(),
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
+    let (drain_acked, mut drain_acked_rx) = watch::channel(false);
+    SubscriberFixture {
+        drain_acked,
+        ..Default::default()
+    }
+    .spawn(addr);
 
     // The DrainAck flips the acked watch to true.
     tokio::time::timeout(Duration::from_secs(5), drain_acked_rx.changed())
@@ -191,13 +162,7 @@ async fn a_reconnect_while_draining_re_sends_draining_after_the_hello() {
             };
             assert!(hello.contains("\"type\":\"hello\""));
             let draining = ws.next().await.unwrap().unwrap();
-            let Message::Text(draining) = draining else {
-                panic!("second frame is text");
-            };
-            assert_eq!(
-                serde_json::from_str::<RelayToCoordinator>(&draining).unwrap(),
-                RelayToCoordinator::Draining,
-            );
+            assert_eq!(decode(draining), RelayToCoordinator::Draining);
             // Drop the first connection to force a reconnect; signal after the
             // second one re-sent its Draining.
             drop(ws);
@@ -207,26 +172,12 @@ async fn a_reconnect_while_draining_re_sends_draining_after_the_hello() {
 
     // Draining is already requested before the subscriber starts, so it must be
     // re-asserted on every connection right after the Hello.
-    let (_drain_tx, drain_rx) = watch::channel(true);
-    let (drain_acked_tx, _drain_acked_rx) = watch::channel(false);
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked_tx),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
-        ),
-        heartbeat(Duration::from_secs(3600)),
-        drain_rx,
-        no_connected(),
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
+    let (_drain_tx, drain) = watch::channel(true);
+    SubscriberFixture {
+        drain,
+        ..Default::default()
+    }
+    .spawn(addr);
 
     tokio::time::timeout(Duration::from_secs(5), done_rx)
         .await

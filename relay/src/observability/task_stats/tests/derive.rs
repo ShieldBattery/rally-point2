@@ -41,45 +41,30 @@ fn cpu_pct_computes_from_two_synthetic_samples() {
 }
 
 #[test]
-fn cpu_pct_is_none_on_a_zero_system_delta() {
-    let prev = Sample {
-        provider_read_unix_ns: 10 * NANOS_PER_SEC,
-        cpu_total_usage: 1_000_000_000,
-        cpu_system_usage: Some(10_000_000_000),
-        online_cpus: 4,
-        ..Default::default()
-    };
-    let curr = Sample {
-        provider_read_unix_ns: 12 * NANOS_PER_SEC,
-        cpu_total_usage: 1_500_000_000,
-        cpu_system_usage: Some(10_000_000_000),
-        online_cpus: 4,
-        ..Default::default()
-    };
-    let derived = derive(Some(&prev), &curr, TaskLimits::default());
-    assert_eq!(derived.cpu_pct, None);
-}
-
-#[test]
-fn cpu_pct_is_none_on_a_negative_system_delta() {
-    // A reversed/reset system counter must not underflow into a huge
-    // bogus percentage.
-    let prev = Sample {
-        provider_read_unix_ns: 10 * NANOS_PER_SEC,
-        cpu_total_usage: 1_000_000_000,
-        cpu_system_usage: Some(12_000_000_000),
-        online_cpus: 4,
-        ..Default::default()
-    };
-    let curr = Sample {
-        provider_read_unix_ns: 12 * NANOS_PER_SEC,
-        cpu_total_usage: 1_500_000_000,
-        cpu_system_usage: Some(10_000_000_000),
-        online_cpus: 4,
-        ..Default::default()
-    };
-    let derived = derive(Some(&prev), &curr, TaskLimits::default());
-    assert_eq!(derived.cpu_pct, None);
+fn cpu_pct_is_none_without_a_forward_system_delta() {
+    // A stalled system counter yields no denominator, and a reversed/reset one
+    // must not underflow into a huge bogus percentage.
+    for (label, previous_system, system) in [
+        ("a zero delta", 10_000_000_000, 10_000_000_000),
+        ("a reversed counter", 12_000_000_000, 10_000_000_000),
+    ] {
+        let prev = Sample {
+            provider_read_unix_ns: 10 * NANOS_PER_SEC,
+            cpu_total_usage: 1_000_000_000,
+            cpu_system_usage: Some(previous_system),
+            online_cpus: 4,
+            ..Default::default()
+        };
+        let curr = Sample {
+            provider_read_unix_ns: 12 * NANOS_PER_SEC,
+            cpu_total_usage: 1_500_000_000,
+            cpu_system_usage: Some(system),
+            online_cpus: 4,
+            ..Default::default()
+        };
+        let derived = derive(Some(&prev), &curr, TaskLimits::default());
+        assert_eq!(derived.cpu_pct, None, "{label}");
+    }
 }
 
 #[test]
@@ -338,17 +323,15 @@ fn memory_working_set_subtracts_inactive_file_and_converts_to_mib() {
     let derived = derive(None, &curr, TaskLimits::default());
     assert_eq!(derived.mem_working_set_mib, 100.0);
     assert_eq!(derived.mem_limit_mib, Some(512.0));
-}
 
-#[test]
-fn memory_working_set_saturates_when_inactive_file_exceeds_usage() {
-    // Never observed in practice, but the subtraction must not underflow.
-    let curr = Sample {
+    // An inactive file cache larger than the usage is never observed in
+    // practice, but the subtraction must saturate rather than underflow.
+    let inverted = Sample {
         mem_usage: 10,
         mem_inactive_file: 20,
         ..Default::default()
     };
-    let derived = derive(None, &curr, TaskLimits::default());
+    let derived = derive(None, &inverted, TaskLimits::default());
     assert_eq!(derived.mem_working_set_mib, 0.0);
 }
 
@@ -368,18 +351,6 @@ fn task_memory_limit_replaces_the_cgroup_unlimited_sentinel() {
     };
     let allocated = derive(None, &curr, task_limits);
     assert_eq!(allocated.mem_limit_mib, Some(1024.0));
-}
-
-#[test]
-fn network_rate_is_none_with_no_previous_sample() {
-    let curr = Sample {
-        net_rx_bytes: Some(3 * 1024 * 1024),
-        net_tx_bytes: Some(2 * 1024 * 1024),
-        ..Default::default()
-    };
-    let derived = derive(None, &curr, TaskLimits::default());
-    assert_eq!(derived.net_rx_mibps, None);
-    assert_eq!(derived.net_tx_mibps, None);
 }
 
 #[test]
@@ -407,7 +378,18 @@ fn network_rate_computes_delta_over_elapsed_time() {
 }
 
 #[test]
-fn network_rate_is_none_on_a_zero_elapsed_time() {
+fn network_rate_is_none_without_a_measurable_interval() {
+    // No previous sample at all, and a previous sample the provider stamped at
+    // the same instant: neither gives an interval to divide by.
+    let first_ever = Sample {
+        net_rx_bytes: Some(3 * 1024 * 1024),
+        net_tx_bytes: Some(2 * 1024 * 1024),
+        ..Default::default()
+    };
+    let derived = derive(None, &first_ever, TaskLimits::default());
+    assert_eq!(derived.net_rx_mibps, None);
+    assert_eq!(derived.net_tx_mibps, None);
+
     let prev = sample_at(
         10,
         Sample {

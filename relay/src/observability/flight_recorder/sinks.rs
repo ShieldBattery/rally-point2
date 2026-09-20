@@ -162,6 +162,10 @@ pub struct FlightShipment {
 /// object key.
 pub struct CoordinatorSink {
     tx: mpsc::Sender<FlightShipment>,
+    /// The compressed-size cap a shipment must fit under. [`MAX_SHIPPED_BLOB_BYTES`]
+    /// in production; a test lowers it so the backstop is reachable without
+    /// building a multi-megabyte incompressible blob to trip it.
+    cap: usize,
 }
 
 impl CoordinatorSink {
@@ -171,7 +175,18 @@ impl CoordinatorSink {
     /// [`run_descriptor_subscriber`](crate::coordinator::client::run_descriptor_subscriber),
     /// which ships each shipment and fires its ack.
     pub fn new(tx: mpsc::Sender<FlightShipment>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            cap: MAX_SHIPPED_BLOB_BYTES,
+        }
+    }
+
+    /// The same sink with a lower compressed-size cap, so a test can trip the
+    /// backstop on kilobytes rather than [`MAX_SHIPPED_BLOB_BYTES`].
+    #[cfg(test)]
+    pub(super) fn with_cap(mut self, cap: usize) -> Self {
+        self.cap = cap;
+        self
     }
 }
 
@@ -201,12 +216,12 @@ impl FlightSink for CoordinatorSink {
             let compressed = zstd::encode_all(&json[..], 0).map_err(|error| {
                 std::io::Error::other(format!("compressing flight blob: {error}"))
             })?;
-            if compressed.len() > MAX_SHIPPED_BLOB_BYTES {
+            if compressed.len() > self.cap {
                 tracing::warn!(
                     tenant = tenant.as_ref(),
                     session = session.0,
                     bytes = compressed.len(),
-                    cap = MAX_SHIPPED_BLOB_BYTES,
+                    cap = self.cap,
                     "flight recording exceeds the shipping cap; discarding it",
                 );
                 return Err(std::io::Error::other(

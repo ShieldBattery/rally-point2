@@ -5,16 +5,16 @@
 use super::*;
 
 #[tokio::test]
-async fn the_enroll_proof_precedes_a_pending_notice_and_a_drain() {
+async fn the_enroll_proof_precedes_every_kind_of_parked_work() {
     use tokio::net::TcpListener;
 
-    // The coordinator sends the IdentityChallenge as the first post-Hello
-    // frame and reads exactly one frame back expecting the IdentityProof. A
-    // relay that reconnects with a queued notice AND mid-drain would, without
-    // an enroll handshake that completes first, send that notice (or the
-    // Draining) ahead of the proof and be refused. This asserts the proof is
-    // the first frame after the challenge, with the notice and Draining
-    // strictly behind it.
+    // The coordinator sends the IdentityChallenge as the first post-Hello frame
+    // and reads exactly one frame back expecting the IdentityProof. A relay that
+    // reconnects with a queued notice, mid-drain, and holding a parked flight
+    // shipment would, without an enroll handshake that completes first, send one
+    // of those ahead of the proof and be refused — and a pending notice survives
+    // reconnects, so that locks the relay out permanently. This asserts the proof
+    // is the first frame after the challenge, with all three strictly behind it.
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
@@ -23,7 +23,7 @@ async fn the_enroll_proof_precedes_a_pending_notice_and_a_drain() {
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
         // Read the Hello, then challenge and read the very next frame — the
-        // proof must be it, ahead of the queued notice and the drain re-assert.
+        // proof must be it, ahead of everything the relay has parked.
         let hello = ws.next().await.unwrap().unwrap();
         let Message::Text(hello) = hello else {
             panic!("first frame is the Hello");
@@ -34,62 +34,62 @@ async fn the_enroll_proof_precedes_a_pending_notice_and_a_drain() {
                 .unwrap();
         ws.send(Message::Text(challenge.into())).await.unwrap();
 
-        // Capture the next three frames in wire order: proof, then the notice
-        // and the Draining (in whichever order the relay flushes them).
-        let first = ws.next().await.unwrap().unwrap();
-        let second = ws.next().await.unwrap().unwrap();
-        let third = ws.next().await.unwrap().unwrap();
-        let _ = frames_tx.send((first, second, third));
+        // Capture the next four frames in wire order: the proof, then the
+        // notice, the Draining and the upload request in whichever order the
+        // relay flushes them.
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            frames.push(ws.next().await.unwrap().unwrap());
+        }
+        let _ = frames_tx.send(frames);
     });
 
-    // Queue a notice AND set the relay mid-drain before it starts, so both
-    // would race the proof if enrollment did not complete first.
-    let (notices_tx, notices_rx) = mpsc::unbounded_channel();
+    // Queue a notice, set the relay mid-drain, and park a flight shipment before
+    // it starts, so all three would race the proof if enrollment did not
+    // complete first.
+    let (notices_tx, notices) = mpsc::unbounded_channel();
     notices_tx
         .send(RelayNotice::Departure(dropped_notice()))
         .unwrap();
-    let (_drain_tx, drain_rx) = watch::channel(true);
-    let (drain_acked_tx, _drain_acked_rx) = watch::channel(false);
+    let (flight_tx, flight) = mpsc::channel(FLIGHT_SHIP_QUEUE);
+    let (shipment, _ack) = flight_shipment();
+    flight_tx.try_send(shipment).unwrap();
+    let (_drain_tx, drain) = watch::channel(true);
 
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked_tx),
-        OutboundQueues::new(notices_rx, no_flight(), ControlConnStats::new()),
-        heartbeat(Duration::from_secs(3600)), // no heartbeat during the test
-        drain_rx,
-        no_connected(),
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
+    SubscriberFixture {
+        notices,
+        flight,
+        drain,
+        ..Default::default()
+    }
+    .spawn(addr);
 
-    let (first, second, third) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
+    let frames = tokio::time::timeout(Duration::from_secs(5), frames_rx)
         .await
         .expect("the relay sends the proof then the queued frames")
         .unwrap();
-
-    let decode = |message: Message| -> RelayToCoordinator {
-        let Message::Text(text) = message else {
-            panic!("a text frame");
-        };
-        serde_json::from_str(&text).unwrap()
-    };
+    let mut frames = frames.into_iter().map(decode);
 
     assert!(
-        matches!(decode(first), RelayToCoordinator::IdentityProof { .. }),
+        matches!(
+            frames.next().unwrap(),
+            RelayToCoordinator::IdentityProof { .. },
+        ),
         "the identity proof must be the first frame after the challenge",
     );
-    let rest = [decode(second), decode(third)];
+    let rest: Vec<RelayToCoordinator> = frames.collect();
     assert!(
         rest.contains(&RelayToCoordinator::Departure(dropped_notice())),
-        "the queued notice goes out only after the proof",
+        "the queued notice goes out only after the proof: {rest:?}",
     );
     assert!(
         rest.contains(&RelayToCoordinator::Draining),
-        "the drain re-assert goes out only after the proof",
+        "the drain re-assert goes out only after the proof: {rest:?}",
+    );
+    assert!(
+        rest.iter()
+            .any(|frame| matches!(frame, RelayToCoordinator::FlightUploadRequest { .. })),
+        "the flight upload request goes out only after the proof: {rest:?}",
     );
 }
 
@@ -123,29 +123,16 @@ async fn an_enroll_refused_after_the_proof_never_reports_control_connected() {
         while let Some(Ok(_)) = ws.next().await {}
     });
 
-    let (connected_tx, mut connected_rx) = watch::channel(false);
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (drain_rx, drain_acked) = no_drain();
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
-        ),
-        heartbeat(Duration::from_secs(3600)),
-        drain_rx,
-        connected_tx,
+    let (connected, mut connected_rx) = watch::channel(false);
+    SubscriberFixture {
+        connected,
         // A long refusal backoff so the relay does not redial and re-drive the
         // handshake during the observation window (an enroll-unauthorized close
         // takes the refusal backoff).
-        backoff(Duration::from_millis(20), Duration::from_secs(3600)),
-    ));
+        backoff: backoff(Duration::from_millis(20), Duration::from_secs(3600)),
+        ..Default::default()
+    }
+    .spawn(addr);
 
     // Actively wait for connected to flip true across the whole attempt; the
     // wait must time out, since a post-proof refusal never pushes the
@@ -180,26 +167,12 @@ async fn a_post_proof_application_frame_reports_control_connected() {
         std::future::pending::<()>().await;
     });
 
-    let (connected_tx, mut connected_rx) = watch::channel(false);
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (drain_rx, drain_acked) = no_drain();
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
-        ),
-        heartbeat(Duration::from_secs(3600)),
-        drain_rx,
-        connected_tx,
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
+    let (connected, mut connected_rx) = watch::channel(false);
+    SubscriberFixture {
+        connected,
+        ..Default::default()
+    }
+    .spawn(addr);
 
     // The relay reports connected once it reads the first post-proof
     // application frame (the TenantKeys push).
@@ -210,80 +183,4 @@ async fn a_post_proof_application_frame_reports_control_connected() {
     .await
     .expect("the relay reports the control connection connected on the first push")
     .unwrap();
-}
-
-#[tokio::test]
-async fn the_enroll_proof_precedes_a_pending_flight_request() {
-    use tokio::net::TcpListener;
-
-    // A relay that reconnects with a parked flight shipment must send its
-    // IdentityProof first: an upload-request frame ahead of the proof would be read
-    // as the proof and refused. Assert the proof is the first frame after the
-    // challenge, with the request strictly behind it.
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (frames_tx, frames_rx) = tokio::sync::oneshot::channel();
-
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.unwrap();
-        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
-        let hello = ws.next().await.unwrap().unwrap();
-        let Message::Text(hello) = hello else {
-            panic!("first frame is the Hello");
-        };
-        assert!(hello.contains("\"type\":\"hello\""));
-        let challenge =
-            serde_json::to_string(&CoordinatorToRelay::IdentityChallenge { nonce: [7u8; 32] })
-                .unwrap();
-        ws.send(Message::Text(challenge.into())).await.unwrap();
-        let first = ws.next().await.unwrap().unwrap();
-        let second = ws.next().await.unwrap().unwrap();
-        let _ = frames_tx.send((first, second));
-    });
-
-    let (flight_tx, flight_rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
-    let (shipment, _ack) = flight_shipment();
-    flight_tx.try_send(shipment).unwrap();
-
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (drain_rx, drain_acked) = no_drain();
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        apply_targets(control, drain_acked),
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            flight_rx,
-            ControlConnStats::new(),
-        ),
-        heartbeat(Duration::from_secs(3600)),
-        drain_rx,
-        no_connected(),
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
-
-    let (first, second) = tokio::time::timeout(Duration::from_secs(5), frames_rx)
-        .await
-        .expect("the relay sends the proof then the shipment")
-        .unwrap();
-    let decode = |message: Message| -> RelayToCoordinator {
-        let Message::Text(text) = message else {
-            panic!("a text frame");
-        };
-        serde_json::from_str(&text).unwrap()
-    };
-    assert!(
-        matches!(decode(first), RelayToCoordinator::IdentityProof { .. }),
-        "the identity proof precedes the flight upload request",
-    );
-    assert!(
-        matches!(
-            decode(second),
-            RelayToCoordinator::FlightUploadRequest { .. }
-        ),
-        "the flight upload request goes out only after the proof",
-    );
 }

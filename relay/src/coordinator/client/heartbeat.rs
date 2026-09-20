@@ -19,7 +19,7 @@ use crate::consensus::RetainedLoadState;
 use crate::coordinator::region_ping::RegionRttCache;
 use crate::routing::{SessionKey, Sessions};
 
-use super::{HeartbeatSources, LOAD_STATE_FENCE_TIMEOUT};
+use super::HeartbeatSources;
 
 /// A coordinator's [`CoordinatorToRelay::LoadStateRequest`](rally_point_proto::control::CoordinatorToRelay::LoadStateRequest), routed from the read
 /// half to the write half (answering it is a send, and only the writer sends).
@@ -211,7 +211,8 @@ fn spawn_load_state_answer(
 ///
 /// The verdict is `true` only when all of these hold:
 ///
-/// - every probe issued was acked within [`LOAD_STATE_FENCE_TIMEOUT`] — a probe no
+/// - every probe issued was acked within the fence's timeout
+///   ([`LOAD_STATE_FENCE_TIMEOUT`](super::LOAD_STATE_FENCE_TIMEOUT)) — a probe no
 ///   stream would take, or one that went unanswered, leaves that slot unfenced;
 /// - every slot live at the *end* that has not started acked a probe issued
 ///   against the epoch it still holds, so a slot that arrived mid-fence (never
@@ -263,7 +264,7 @@ pub(super) async fn fenced_load_state_snapshot(
     // Every probe goes out before any ack is waited on, and all of them share one
     // absolute deadline, so the fence costs at most one timeout however many slots
     // this relay homes and however many of them are slow.
-    let deadline = Instant::now() + LOAD_STATE_FENCE_TIMEOUT;
+    let deadline = Instant::now() + fence.timeout();
     let mut acked: HashMap<SlotId, u64> = HashMap::new();
     for (slot, connection_epoch, probe) in &mut probes {
         if matches!(

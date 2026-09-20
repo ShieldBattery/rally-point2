@@ -9,11 +9,10 @@ use super::*;
 
 #[tokio::test]
 async fn the_file_sink_writes_the_tenant_scoped_path() {
-    let dir = std::env::temp_dir().join(format!("rp2-flight-test-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("flight-file-sink");
     let recorder = FlightRecorder::default();
     recorder.set_identity(RelayId(7));
-    recorder.set_sink(Arc::new(FileSink::new(dir.clone())));
+    recorder.set_sink(Arc::new(FileSink::new(dir.path().to_path_buf())));
     let k = key(42);
     recorder.record(
         &k,
@@ -24,12 +23,11 @@ async fn the_file_sink_writes_the_tenant_scoped_path() {
 
     assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
 
-    let path = dir.join("sb-test").join("42").join("7.json");
+    let path = dir.path().join("sb-test").join("42").join("7.json");
     let json = std::fs::read_to_string(&path).expect("the blob file exists");
     let blob: FlightBlob = serde_json::from_str(&json).expect("the file is parseable JSON");
     assert_eq!(blob.session, 42);
     assert_eq!(blob.events.len(), 1);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -131,82 +129,85 @@ async fn the_drain_flush_respects_its_deadline_against_a_slow_sink() {
         },
     );
 
+    let deadline = Duration::from_millis(100);
     let started = std::time::Instant::now();
-    recorder.flush_all(Duration::from_millis(100)).await;
+    recorder.flush_all(deadline).await;
+    let elapsed = started.elapsed();
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the drain flush returns at its deadline, not the sink's pace",
+        (deadline..deadline * 5).contains(&elapsed),
+        "the drain flush waits its deadline and then returns, rather than the \
+         sink's 30s pace (observed {elapsed:?})",
     );
 }
 
 #[tokio::test]
 async fn the_coordinator_sink_compresses_a_shipment_that_reconstructs_the_blob() {
-    let recorder = FlightRecorder::default();
+    let recorder = Arc::new(FlightRecorder::default());
     recorder.set_identity(RelayId(9));
     let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
     recorder.set_sink(Arc::new(CoordinatorSink::new(tx)));
-    let k = key(42);
-    recorder.record(
-        &k,
-        FlightEvent::SessionStart {
-            initial_buffer_turns: Some(3),
-        },
-    );
-    recorder.record(&k, FlightEvent::SessionClosed);
 
-    // `store` blocks awaiting the connection's ack, so drive the flush
-    // concurrently with the stand-in connection that pulls it and acks.
-    let flush = tokio::spawn(async move { recorder.flush_session(&k).await });
+    // Two sessions, one of them holding a confirmed desync: the shipped flag is
+    // derived by scanning the recording's own events, so the shipping relay
+    // reports what it actually saw — which the coordinator needs when its own
+    // desync record was lost to a restart.
+    for (session, desynced) in [(42u64, false), (43, true)] {
+        let k = key(session);
+        recorder.record(
+            &k,
+            FlightEvent::SessionStart {
+                initial_buffer_turns: Some(3),
+            },
+        );
+        if desynced {
+            recorder.record(
+                &k,
+                FlightEvent::DesyncDetected {
+                    sync_ordinal: 5,
+                    diverged: vec![1],
+                    no_majority: false,
+                },
+            );
+        }
+        recorder.record(&k, FlightEvent::SessionClosed);
 
-    let shipment = rx.recv().await.expect("a shipment is queued");
-    assert_eq!(shipment.tenant.as_ref(), "sb-test");
-    assert_eq!(shipment.session, SessionId(42));
-    assert!(!shipment.desynced, "no desync event was recorded");
-    // The shipped payload is the zstd-compressed compact JSON of the blob;
-    // decompressing it reconstructs the blob exactly.
-    let json = zstd::decode_all(&shipment.payload[..]).expect("the payload decompresses");
-    let blob: FlightBlob = serde_json::from_slice(&json).expect("the payload is the blob");
-    assert_eq!(blob.tenant, "sb-test");
-    assert_eq!(blob.session, 42);
-    assert_eq!(blob.relay_id, 9);
-    assert_eq!(blob.events.len(), 2);
+        // `store` blocks awaiting the connection's ack, so drive the flush
+        // concurrently with the stand-in connection that pulls it and acks.
+        let flushing = Arc::clone(&recorder);
+        let flush = tokio::spawn(async move { flushing.flush_session(&key(session)).await });
 
-    // The ack resolves the store to Stored.
-    shipment
-        .sent
-        .send(())
-        .expect("the sink is still awaiting the ack");
-    assert_eq!(flush.await.unwrap(), FlushOutcome::Stored);
-}
+        let shipment = rx.recv().await.expect("a shipment is queued");
+        assert_eq!(shipment.tenant.as_ref(), "sb-test");
+        assert_eq!(shipment.session, SessionId(session));
+        assert_eq!(
+            shipment.desynced, desynced,
+            "the shipped flag follows the recording's own events",
+        );
+        // The shipped payload is the zstd-compressed compact JSON of the blob;
+        // decompressing it reconstructs the blob exactly.
+        let json = zstd::decode_all(&shipment.payload[..]).expect("the payload decompresses");
+        let blob: FlightBlob = serde_json::from_slice(&json).expect("the payload is the blob");
+        assert_eq!(blob.tenant, "sb-test");
+        assert_eq!(blob.session, session);
+        assert_eq!(blob.relay_id, 9);
+        assert_eq!(blob.events.len(), if desynced { 3 } else { 2 });
 
-#[tokio::test]
-async fn the_shipped_desynced_flag_is_set_only_when_a_desync_event_exists() {
-    let recorder = FlightRecorder::default();
-    let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
-    recorder.set_sink(Arc::new(CoordinatorSink::new(tx)));
-    let k = key(1);
-    recorder.record(
-        &k,
-        FlightEvent::DesyncDetected {
-            sync_ordinal: 5,
-            diverged: vec![1],
-            no_majority: false,
-        },
-    );
-    let flush = tokio::spawn(async move { recorder.flush_session(&k).await });
-    let shipment = rx.recv().await.expect("a shipment is queued");
-    assert!(
-        shipment.desynced,
-        "a DesyncDetected event sets the shipped flag",
-    );
-    shipment.sent.send(()).unwrap();
-    assert_eq!(flush.await.unwrap(), FlushOutcome::Stored);
+        // The ack resolves the store to Stored.
+        shipment
+            .sent
+            .send(())
+            .expect("the sink is still awaiting the ack");
+        assert_eq!(flush.await.unwrap(), FlushOutcome::Stored);
+    }
 }
 
 #[tokio::test]
 async fn an_oversized_compressed_blob_is_refused_and_ships_nothing() {
     let (tx, mut rx) = mpsc::channel(FLIGHT_SHIP_QUEUE);
-    let sink = CoordinatorSink::new(tx);
+    // The cap is injected so the backstop trips on kilobytes: what is under test
+    // is the refusal, not zstd's ratio over four megabytes.
+    const CAP: usize = 8 * 1024;
+    let sink = CoordinatorSink::new(tx).with_cap(CAP);
     // A blob whose *compressed* form exceeds the shipping cap — a pathological
     // payload the rings would never actually produce, built by hand to exercise
     // the wire-hygiene backstop. The tenant string is filled with high-entropy
@@ -215,8 +216,8 @@ async fn an_oversized_compressed_blob_is_refused_and_ships_nothing() {
         version: BLOB_VERSION,
         // Twice the cap of high-entropy source: even at zstd's best case on a
         // 6-bit-per-symbol alphabet (~0.75 ratio) the compressed form clears the
-        // 4 MiB cap comfortably.
-        tenant: incompressible_string(MAX_SHIPPED_BLOB_BYTES * 2),
+        // cap comfortably.
+        tenant: incompressible_string(CAP * 2),
         session: 1,
         relay_id: 0,
         started_at_ms: 1,

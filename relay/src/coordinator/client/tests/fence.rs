@@ -3,22 +3,6 @@
 
 use super::*;
 
-/// A session with a decision-maker and no bounds worth speaking of — enough for
-/// the retained load state a fence reads and re-reads.
-fn fence_fixture() -> (Sessions, Arc<crate::consensus::DecisionMakers>) {
-    let sessions: Sessions = Arc::default();
-    let decision_makers = Arc::new(crate::consensus::new_decision_makers());
-    let _ = crate::consensus::sync_maker(
-        &decision_makers,
-        &key(7),
-        crate::consensus::MakerSync::new(
-            BufferBounds { min: 1, max: 6 },
-            crate::consensus::Authority::SelfRelay,
-        ),
-    );
-    (sessions, decision_makers)
-}
-
 /// The connection epoch a fence fixture's link registers on, and the one a
 /// client that dials back in takes. Any two distinct values do — an epoch is an
 /// equality fence, not an ordering key.
@@ -158,12 +142,13 @@ async fn a_link_replaced_after_acking_leaves_the_answer_unfenced() {
 async fn a_live_unstarted_slot_that_never_acks_leaves_the_answer_unfenced() {
     // Silence is not an ack. The slot's facts still go up — the answer is as
     // real as any other — but nothing licenses reading its absence from
-    // `started` as proof its game never began. This one waits out a real
-    // `LOAD_STATE_FENCE_TIMEOUT`, which is what a stuck client costs.
+    // `started` as proof its game never began. What a stuck client costs is one
+    // fence window, so the window is injected short rather than waited out.
     use rally_point_proto::ids::SlotId;
 
     let (sessions, decision_makers) = fence_fixture();
-    let fence = crate::coordinator::load_fence::LoadStateFence::new();
+    let fence =
+        crate::coordinator::load_fence::LoadStateFence::with_timeout(Duration::from_millis(50));
     let (mut registration, mut inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");

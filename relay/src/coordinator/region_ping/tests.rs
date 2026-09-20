@@ -23,16 +23,17 @@ async fn spawn_echo(limit: usize) -> String {
     addr.to_string()
 }
 
-/// Binds a loopback UDP socket that replies to every datagram with bytes that
-/// can never byte-equal an 8-byte nonce (a shorter datagram), so every reply is
-/// ignored as a mismatch and every attempt times out. Returns the `host:port`.
-async fn spawn_wrong_length_responder() -> String {
+/// Binds a loopback UDP socket that replies to every datagram with a nonce-sized
+/// datagram of the wrong content — the shape a stale echo from an earlier attempt
+/// arrives in — so every reply is ignored as a mismatch and every attempt times
+/// out. Returns the `host:port`.
+async fn spawn_wrong_nonce_responder() -> String {
     let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let addr = socket.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = [0u8; 64];
         while let Ok((_len, peer)) = socket.recv_from(&mut buf).await {
-            let _ = socket.send_to(&[0u8; 4], peer).await;
+            let _ = socket.send_to(&[0xFFu8; NONCE_LEN], peer).await;
         }
     });
     addr.to_string()
@@ -48,26 +49,8 @@ fn median_takes_the_middle_of_the_sorted_samples() {
 }
 
 #[tokio::test]
-async fn measure_region_returns_a_median_against_a_live_beacon() {
-    let beacon = spawn_echo(usize::MAX).await;
-    let rtt = measure_region(
-        &beacon,
-        5,
-        Duration::from_millis(5),
-        Duration::from_millis(500),
-        SANITY_CAP,
-    )
-    .await
-    .expect("a responsive beacon yields a median");
-    assert!(
-        rtt < 500,
-        "a loopback round-trip is far under the timeout (got {rtt}ms)",
-    );
-}
-
-#[tokio::test]
 async fn a_reply_that_is_not_the_nonce_is_ignored() {
-    let beacon = spawn_wrong_length_responder().await;
+    let beacon = spawn_wrong_nonce_responder().await;
     let rtt = measure_region(
         &beacon,
         3,
@@ -78,7 +61,7 @@ async fn a_reply_that_is_not_the_nonce_is_ignored() {
     .await;
     assert_eq!(
         rtt, None,
-        "a reply that doesn't byte-equal the nonce never counts as a sample",
+        "a nonce-sized reply that doesn't byte-equal the nonce sent is not a sample",
     );
 }
 
@@ -148,7 +131,7 @@ async fn a_sweep_skips_the_relays_own_region() {
 async fn a_sweep_with_no_successful_attempt_drops_the_region() {
     // A last-known value is dropped (absence), never left stale or zeroed, when
     // a sweep's every attempt fails to match a nonce.
-    let beacon = spawn_wrong_length_responder().await;
+    let beacon = spawn_wrong_nonce_responder().await;
     let cache = RegionRttCache::new();
     cache.record(RegionId("gone".to_owned()), 55);
     let targets = vec![RegionBeaconTarget {

@@ -466,11 +466,15 @@ pub struct OutboundQueues {
     /// Publishes the outbound-queue occupancy (and, from the reader, the descriptor
     /// apply lag) for the task-stats reporter.
     stats: ControlConnStats,
+    /// How long a requested shipment waits for its grant before being dropped.
+    /// [`FLIGHT_GRANT_TIMEOUT`] in production; a test shortens it so the drop
+    /// path is reachable without waiting out the production window.
+    grant_timeout: Duration,
 }
 
 impl OutboundQueues {
     /// Builds the queues over the given channels and stats reporter, with the notice
-    /// slot empty and no recording in flight.
+    /// slot empty, no recording in flight, and the production grant timeout.
     pub fn new(
         notices: UnboundedReceiver<RelayNotice>,
         flight: Receiver<FlightShipment>,
@@ -482,7 +486,16 @@ impl OutboundQueues {
             flight,
             pending_flights: Vec::new(),
             stats,
+            grant_timeout: FLIGHT_GRANT_TIMEOUT,
         }
+    }
+
+    /// The same queues with a shorter grant wait, so a test can reach the
+    /// no-grant drop path without waiting out [`FLIGHT_GRANT_TIMEOUT`].
+    #[cfg(test)]
+    fn with_grant_timeout(mut self, grant_timeout: Duration) -> Self {
+        self.grant_timeout = grant_timeout;
+        self
     }
 }
 

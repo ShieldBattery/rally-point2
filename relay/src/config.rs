@@ -282,6 +282,9 @@ pub fn load_mesh_roots(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
 
     fn pem_cert_and_key() -> (String, String) {
@@ -291,143 +294,146 @@ mod tests {
         (cert_pem, key_pem)
     }
 
-    #[test]
-    fn read_pem_input_returns_inline_bytes_for_pem_content() {
-        let (cert_pem, _) = pem_cert_and_key();
-        let bytes = read_pem_input(&cert_pem, "cert").unwrap();
-        assert!(bytes.windows(10).any(|w| w == b"-----BEGIN"));
+    /// A file under the system temp dir, unique to this process and this call,
+    /// removed when the guard drops — so two concurrent `cargo test` invocations
+    /// never collide on a fixed name and a panicking test leaves nothing behind.
+    struct TempFile {
+        path: PathBuf,
+    }
+
+    impl TempFile {
+        fn write(label: &str, contents: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "rp2-relay-config-{label}-{}-{unique}.pem",
+                std::process::id(),
+            ));
+            std::fs::write(&path, contents.as_bytes()).unwrap();
+            Self { path }
+        }
+
+        fn as_str(&self) -> &str {
+            self.path.to_str().expect("a UTF-8 temp path")
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 
     #[test]
-    fn read_pem_input_reads_a_file_for_a_path() {
-        let (cert_pem, _) = pem_cert_and_key();
-        let dir = std::env::temp_dir();
-        let path = dir.join("relay_config_test_cert.pem");
-        std::fs::write(&path, cert_pem.as_bytes()).unwrap();
-        let bytes = read_pem_input(path.to_str().unwrap(), "cert").unwrap();
-        assert!(bytes.windows(10).any(|w| w == b"-----BEGIN"));
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn load_cert_parses_inline_pem_content() {
+    fn load_cert_parses_pem_passed_inline_or_as_a_path() {
+        // Both branches of the `-----BEGIN` sentinel: Fargate injects the
+        // secret's content into the env var, local dev and Docker mounts pass a
+        // path. Either way the same chain and key come back.
         let (cert_pem, key_pem) = pem_cert_and_key();
-        let (certs, key) = load_cert(&cert_pem, &key_pem).unwrap();
-        assert_eq!(certs.len(), 1);
-        assert!(!key.secret_der().is_empty());
-    }
+        let cert_file = TempFile::write("cert", &cert_pem);
+        let key_file = TempFile::write("key", &key_pem);
 
-    #[test]
-    fn load_cert_parses_a_file_path() {
-        let (cert_pem, key_pem) = pem_cert_and_key();
-        let dir = std::env::temp_dir();
-        let cert_path = dir.join("relay_config_test_cert2.pem");
-        let key_path = dir.join("relay_config_test_key2.pem");
-        std::fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
-        std::fs::write(&key_path, key_pem.as_bytes()).unwrap();
-        let (certs, key) =
-            load_cert(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap();
-        assert_eq!(certs.len(), 1);
-        assert!(!key.secret_der().is_empty());
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
+        for (label, cert_input, key_input) in [
+            ("inline PEM", cert_pem.as_str(), key_pem.as_str()),
+            ("a file path", cert_file.as_str(), key_file.as_str()),
+        ] {
+            let (certs, key) = load_cert(cert_input, key_input).unwrap();
+            assert_eq!(certs.len(), 1, "{label}");
+            assert!(!key.secret_der().is_empty(), "{label}");
+        }
     }
 
     // --- resolve_advertise_addrs ---
 
-    #[test]
-    fn resolve_advertise_addrs_prefers_a_single_explicit_override() {
-        // One flag: it is the primary and the set stays empty (a single-address
-        // advertise keeps the wire form byte-stable).
-        let advertise: SocketAddr = "203.0.113.7:14900".parse().unwrap();
-        let listen: SocketAddr = "0.0.0.0:14900".parse().unwrap();
-        assert_eq!(
-            resolve_advertise_addrs(&[advertise], listen),
-            (advertise, vec![]),
-        );
-    }
+    /// One advertise-resolution case: a label, the `--advertise-addr` flags, the
+    /// `--listen` address, and the `(primary, complete set)` expected back.
+    type AdvertiseCase<'a> = (
+        &'a str,
+        &'a [SocketAddr],
+        SocketAddr,
+        (SocketAddr, Vec<SocketAddr>),
+    );
 
     #[test]
-    fn resolve_advertise_addrs_dual_stack_keeps_the_first_flag_primary() {
-        // Two flags (a v4 + a v6): the first is the primary, and the complete
-        // set — including the primary, in flag order (the relay's preference) —
-        // rides alongside.
+    fn resolve_advertise_addrs_prefers_explicit_flags_over_the_listen_address() {
         let v4: SocketAddr = "203.0.113.7:14900".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::7]:14900".parse().unwrap();
-        let listen: SocketAddr = "[::]:14900".parse().unwrap();
-        assert_eq!(
-            resolve_advertise_addrs(&[v4, v6], listen),
-            (v4, vec![v4, v6]),
-        );
-    }
+        let concrete: SocketAddr = "192.0.2.10:14900".parse().unwrap();
+        let unspecified: SocketAddr = "[::]:14900".parse().unwrap();
+        let loopback: SocketAddr = "127.0.0.1:14900".parse().unwrap();
 
-    #[test]
-    fn resolve_advertise_addrs_uses_a_concrete_listen_address() {
-        let listen: SocketAddr = "192.0.2.10:14900".parse().unwrap();
-        assert_eq!(resolve_advertise_addrs(&[], listen), (listen, vec![]));
-    }
+        let cases: [AdvertiseCase<'_>; 4] = [
+            // One flag: it is the primary and the set stays empty, so a
+            // single-address advertise keeps the wire form byte-stable.
+            ("a single override", &[v4], unspecified, (v4, vec![])),
+            // Two flags (a v4 + a v6): the first is the primary, and the
+            // complete set — including the primary, in flag order, which is the
+            // relay's preference — rides alongside.
+            ("dual stack", &[v4, v6], unspecified, (v4, vec![v4, v6])),
+            // No flags: a concrete listen address is a routable destination.
+            ("no override", &[], concrete, (concrete, vec![])),
+            // The default `[::]` listen is not a routable address to hand a
+            // client, so the relay advertises loopback on the same port (dev).
+            (
+                "an unspecified listen",
+                &[],
+                unspecified,
+                (loopback, vec![]),
+            ),
+        ];
 
-    #[test]
-    fn resolve_advertise_addrs_falls_back_to_loopback_for_an_unspecified_listen() {
-        // The default `[::]` listen is not a routable address to hand a client, so
-        // with no override the relay advertises loopback on the same port (dev).
-        let listen: SocketAddr = "[::]:14900".parse().unwrap();
-        assert_eq!(
-            resolve_advertise_addrs(&[], listen),
-            ("127.0.0.1:14900".parse().unwrap(), vec![]),
-        );
+        for (label, advertise, listen, expected) in cases {
+            assert_eq!(
+                resolve_advertise_addrs(advertise, listen),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     // --- parse_mesh_peers ---
 
+    /// One mesh-peer parse case: a label, the `--mesh-peer` specs, and the
+    /// `(addr, id)` pairs expected back.
+    type MeshPeerCase<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, u64)]);
+
     #[test]
-    fn parse_mesh_peers_parses_ipv4_addr_and_id() {
-        let peers = parse_mesh_peers(&["127.0.0.1:9000#1".to_owned()]).unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].addr, "127.0.0.1:9000".parse().unwrap());
-        assert_eq!(peers[0].id, RelayId(1));
+    fn parse_mesh_peers_parses_each_addr_and_id_form() {
+        let cases: [MeshPeerCase<'_>; 4] = [
+            ("IPv4", &["127.0.0.1:9000#1"], &[("127.0.0.1:9000", 1)]),
+            ("bracketed IPv6", &["[::1]:9000#2"], &[("[::1]:9000", 2)]),
+            (
+                "multiple entries",
+                &["127.0.0.1:9000#1", "127.0.0.1:9001#2"],
+                &[("127.0.0.1:9000", 1), ("127.0.0.1:9001", 2)],
+            ),
+            ("no entries", &[], &[]),
+        ];
+
+        for (label, specs, expected) in cases {
+            let specs: Vec<String> = specs.iter().map(|s| (*s).to_owned()).collect();
+            let peers = parse_mesh_peers(&specs).unwrap();
+            assert_eq!(peers.len(), expected.len(), "{label}");
+            for (peer, (addr, id)) in peers.iter().zip(expected) {
+                assert_eq!(peer.addr, addr.parse().unwrap(), "{label}");
+                assert_eq!(peer.id, RelayId(*id), "{label}");
+            }
+        }
     }
 
     #[test]
-    fn parse_mesh_peers_parses_ipv6_bracketed_addr() {
-        let peers = parse_mesh_peers(&["[::1]:9000#2".to_owned()]).unwrap();
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].addr, "[::1]:9000".parse().unwrap());
-        assert_eq!(peers[0].id, RelayId(2));
-    }
-
-    #[test]
-    fn parse_mesh_peers_parses_multiple_entries() {
-        let peers =
-            parse_mesh_peers(&["127.0.0.1:9000#1".to_owned(), "127.0.0.1:9001#2".to_owned()])
-                .unwrap();
-        assert_eq!(peers.len(), 2);
-        assert_eq!(peers[0].id, RelayId(1));
-        assert_eq!(peers[1].id, RelayId(2));
-    }
-
-    #[test]
-    fn parse_mesh_peers_rejects_missing_hash() {
-        let err = parse_mesh_peers(&["127.0.0.1:9000".to_owned()]).unwrap_err();
-        assert!(err.to_string().contains("missing `#ID` suffix"));
-    }
-
-    #[test]
-    fn parse_mesh_peers_rejects_bad_address() {
-        let err = parse_mesh_peers(&["not-an-addr#1".to_owned()]).unwrap_err();
-        assert!(err.to_string().contains("address parse failed"));
-    }
-
-    #[test]
-    fn parse_mesh_peers_rejects_non_numeric_id() {
-        let err = parse_mesh_peers(&["127.0.0.1:9000#abc".to_owned()]).unwrap_err();
-        assert!(err.to_string().contains("id parse failed"));
-    }
-
-    #[test]
-    fn parse_mesh_peers_empty_input_yields_empty() {
-        let peers = parse_mesh_peers(&[]).unwrap();
-        assert!(peers.is_empty());
+    fn parse_mesh_peers_rejects_a_malformed_entry_naming_what_was_wrong() {
+        for (spec, expected) in [
+            ("127.0.0.1:9000", "missing `#ID` suffix"),
+            ("not-an-addr#1", "address parse failed"),
+            ("127.0.0.1:9000#abc", "id parse failed"),
+        ] {
+            let err = parse_mesh_peers(&[spec.to_owned()]).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "`{spec}` reports `{expected}`, got: {err}",
+            );
+        }
     }
 
     // --- load_mesh_roots ---
@@ -442,25 +448,36 @@ mod tests {
     }
 
     #[test]
-    fn load_mesh_roots_parses_inline_pem() {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let cert_pem = cert.cert.pem();
-        let own_ca = CertificateDer::from(cert.cert.der().to_vec());
-        let roots = load_mesh_roots(&Some(cert_pem), &own_ca).unwrap();
-        assert_eq!(roots.len(), 1);
-    }
+    fn load_mesh_roots_trusts_the_supplied_pem_inline_or_from_a_file() {
+        // The supplied root is deliberately a *different* certificate from the
+        // relay's own: a `load_mesh_roots` that ignored its input and fell back
+        // to `own_ca` would still produce a one-entry store, so only comparing
+        // the trust anchors catches it.
+        let supplied = rcgen::generate_simple_self_signed(vec!["mesh-root".to_owned()]).unwrap();
+        let supplied_pem = supplied.cert.pem();
+        let supplied_ca = CertificateDer::from(supplied.cert.der().to_vec());
+        let own = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let own_ca = CertificateDer::from(own.cert.der().to_vec());
 
-    #[test]
-    fn load_mesh_roots_reads_a_pem_file() {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-        let cert_pem = cert.cert.pem();
-        let own_ca = CertificateDer::from(cert.cert.der().to_vec());
-        let dir = std::env::temp_dir();
-        let path = dir.join("relay_config_mesh_roots.pem");
-        std::fs::write(&path, cert_pem.as_bytes()).unwrap();
-        let roots = load_mesh_roots(&Some(path.to_str().unwrap().to_owned()), &own_ca).unwrap();
-        assert_eq!(roots.len(), 1);
-        let _ = std::fs::remove_file(&path);
+        let expected = load_mesh_roots(&None, &supplied_ca).unwrap();
+        let fallback = load_mesh_roots(&None, &own_ca).unwrap();
+        let pem_file = TempFile::write("mesh-roots", &supplied_pem);
+
+        for (label, input) in [
+            ("inline PEM", supplied_pem.clone()),
+            ("a file path", pem_file.as_str().to_owned()),
+        ] {
+            let roots = load_mesh_roots(&Some(input), &own_ca).unwrap();
+            assert_eq!(roots.len(), 1, "{label}");
+            assert_eq!(
+                roots.roots, expected.roots,
+                "{label}: the supplied root is trusted"
+            );
+            assert_ne!(
+                roots.roots, fallback.roots,
+                "{label}: the own-CA fallback contributed nothing",
+            );
+        }
     }
 
     #[test]

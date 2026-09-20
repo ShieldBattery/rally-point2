@@ -78,32 +78,11 @@ async fn a_mesh_peers_push_updates_the_fleet_map_the_reader_exposes() {
     // observes exactly the map the received push stores.
     let fleet = FleetMeshPeers::new();
     let reader = fleet.reader();
-    let control = MeshControl::new(
-        RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
-    );
-    let (drain_rx, drain_acked) = no_drain();
-    tokio::spawn(run_descriptor_subscriber_with(
-        enroll(addr, drain_hello()),
-        ControlApplyTargets {
-            control,
-            applied: AppliedSessions::default(),
-            fleet,
-            verifying_keys: SharedRegistry::default(),
-            region_targets: RegionPingTargets::default(),
-            drain_acked,
-        },
-        OutboundQueues::new(
-            mpsc::unbounded_channel().1,
-            no_flight(),
-            ControlConnStats::new(),
-        ),
-        heartbeat(Duration::from_secs(3600)),
-        drain_rx,
-        no_connected(),
-        backoff(Duration::from_millis(20), Duration::from_secs(60)),
-    ));
+    SubscriberFixture {
+        fleet,
+        ..Default::default()
+    }
+    .spawn(addr);
 
     // The pushed set lands in the shared map the reader observes.
     let landed = tokio::time::timeout(Duration::from_secs(5), async {

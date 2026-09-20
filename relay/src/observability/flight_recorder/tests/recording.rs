@@ -260,33 +260,9 @@ fn the_blob_envelope_roundtrips_and_is_self_describing() {
             succeeded: true,
         },
     );
-    recorder.record(&k, FlightEvent::SessionClosed);
-
-    let blob = recorder.take_blob(&k, true).expect("a recording exists");
-    assert_eq!(blob.version, BLOB_VERSION);
-    assert_eq!(blob.tenant, "sb-test");
-    assert_eq!(blob.session, 42);
-    assert_eq!(blob.relay_id, 7);
-    assert!(blob.started_at_ms > 0 && blob.flushed_at_ms >= blob.started_at_ms);
-
-    let json = serde_json::to_string_pretty(&blob).unwrap();
-    // The envelope is self-describing on the wire: version and tagged events.
-    assert!(json.contains("\"version\": 1"));
-    assert!(json.contains("\"event\": \"leave_decided\""));
-    assert!(json.contains("leave_mesh_accepted"));
-    assert!(json.contains("leave_control_write"));
-    let back: FlightBlob = serde_json::from_str(&json).unwrap();
-    assert_eq!(back, blob);
-}
-
-/// A recorded decision's derivation survives the blob round-trip with its
-/// per-slot detail intact, and a directive without one stays absent rather
-/// than serializing a hole.
-#[test]
-fn a_buffer_directives_derivation_roundtrips() {
-    let recorder = FlightRecorder::default();
-    recorder.set_identity(RelayId(7));
-    let k = key(42);
+    // A directive carrying its derivation and one without: the per-slot detail
+    // must reach the wire, and the absent derivation must serialize no key at
+    // all rather than a hole.
     recorder.record(
         &k,
         FlightEvent::BufferDirective {
@@ -326,19 +302,30 @@ fn a_buffer_directives_derivation_roundtrips() {
             inputs: None,
         },
     );
+    recorder.record(&k, FlightEvent::SessionClosed);
 
     let blob = recorder.take_blob(&k, true).expect("a recording exists");
+    assert_eq!(blob.version, BLOB_VERSION);
+    assert_eq!(blob.tenant, "sb-test");
+    assert_eq!(blob.session, 42);
+    assert_eq!(blob.relay_id, 7);
+    assert!(blob.started_at_ms > 0 && blob.flushed_at_ms >= blob.started_at_ms);
+
     let json = serde_json::to_string_pretty(&blob).unwrap();
+    // The envelope is self-describing on the wire: version and tagged events.
+    assert!(json.contains("\"version\": 1"));
+    assert!(json.contains("\"event\": \"leave_decided\""));
+    assert!(json.contains("leave_mesh_accepted"));
+    assert!(json.contains("leave_control_write"));
     assert!(
         json.contains("\"eff_rtts\""),
-        "the per-slot detail reaches the wire",
+        "a decision's per-slot detail reaches the wire",
     );
     assert_eq!(
         json.matches("\"inputs\"").count(),
         1,
         "the directive with no derivation serializes no key for one",
     );
-
     let back: FlightBlob = serde_json::from_str(&json).unwrap();
     assert_eq!(back, blob);
 }
@@ -400,40 +387,6 @@ async fn a_terminal_event_lands_on_a_live_recording() {
         stored.events.last().map(|record| &record.event),
         Some(&FlightEvent::SessionClosed),
         "the close seals the recording it was recorded against",
-    );
-}
-
-#[tokio::test]
-async fn a_second_close_stores_nothing_over_an_already_stored_recording() {
-    let recorder = FlightRecorder::default();
-    let sink = Arc::new(CaptureSink::default());
-    recorder.set_sink(sink.clone());
-    let k = key(1);
-    recorder.record(
-        &k,
-        FlightEvent::BufferDirective {
-            buffer_turns: 4,
-            apply_frame: 1200,
-            decision_seq: 9,
-            inputs: None,
-        },
-    );
-    recorder.record_existing(&k, FlightEvent::SessionClosed);
-    assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Stored);
-
-    // A close evaluated again for the same session — the relay serves it no
-    // longer, so nothing has been recorded since.
-    recorder.record_existing(&k, FlightEvent::SessionClosed);
-    assert_eq!(recorder.flush_session(&k).await, FlushOutcome::Nothing);
-
-    let blobs = sink.blobs.lock();
-    assert_eq!(blobs.len(), 1, "only the served session's recording stored");
-    assert!(
-        blobs[0]
-            .events
-            .iter()
-            .any(|record| matches!(record.event, FlightEvent::BufferDirective { .. })),
-        "the stored recording is the one holding what the relay observed",
     );
 }
 

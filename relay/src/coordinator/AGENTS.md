@@ -42,7 +42,7 @@ coordinator outage must leave running games untouched.
 
 ## Testing
 
-`cargo test -p rally-point-relay --lib coordinator::` (73 tests). A stand-in
+`cargo test -p rally-point-relay --lib coordinator::` (60 tests). A stand-in
 coordinator must run the `accept_enroll` fixture before reading any application
 frame, or the relay blocks awaiting its challenge; inject short delays via
 `run_descriptor_subscriber_with` instead of waiting production intervals.
