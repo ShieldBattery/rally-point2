@@ -28,8 +28,8 @@ use crate::consensus;
 /// (multi-relay), and `reconcile_abandon` then arms the timer that decides
 /// every held drop. A session that never started has no such bound — nothing
 /// ever force-decides its holds — so its emptying closes immediately; the
-/// undecided hold itself still survives the sweep below and admits a quick
-/// re-dial, whose link re-opens the close latch when it starts serving.
+/// undecided hold itself still survives the sweep and admits a quick re-dial,
+/// whose link re-opens the close latch when it starts serving.
 ///
 /// Safe to call whenever the session *might* be closeable: a non-empty roster,
 /// a deferral, or an already-claimed close all make it a no-op. The claim
@@ -41,10 +41,11 @@ use crate::consensus;
 /// closes immediately, with no deferral to hide the window) could be admitted
 /// and then have its lobby log and replay state erased underneath it while a
 /// premature `SessionClosed` retires the session coordinator-side. Every call
-/// inside the held section touches only its own module's lock (consensus,
-/// lobby, chat, skin, turn ring, seen, drop holds, provisional), never this
-/// roster's, so holding it across them cannot deadlock or reenter — the same
-/// discipline `announce_departure` documents for its own roster-lock hold.
+/// inside the held section — the whole of `SessionState::close_emptied`
+/// included — touches only its own module's lock (consensus, lobby, chat,
+/// skin, turn ring, seen, drop holds, provisional), never this roster's, so
+/// holding it across them cannot deadlock or reenter — the same discipline
+/// `announce_departure` documents for its own roster-lock hold.
 pub(crate) fn maybe_close_emptied_session(
     sessions: &Sessions,
     mesh: &crate::mesh::MeshState,

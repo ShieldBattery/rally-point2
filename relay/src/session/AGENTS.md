@@ -1,8 +1,8 @@
 # session/ — per-session relay state
 
-Each store is keyed by `crate::key::SessionKey` (tenant + session), local to this relay,
-and lives only as long as it locally serves the session (see each module's
-teardown).
+Each store is keyed by `crate::key::SessionKey` (tenant + session), local to
+this relay, and lives only as long as it locally serves the session (see each
+module's teardown).
 
 ## File map
 
@@ -13,7 +13,8 @@ teardown).
   phases — `remove_slot` (one slot's link ended), `close_emptied` (the last
   local slot went) and `retire` (the descriptor was retired) — so a new store
   is added to the bundle and to its sweep in one place, not at three call
-  sites. `retire` deliberately does not sweep the side channels; see its doc.
+  sites. `retire` does not sweep the side channels — read its doc before
+  assuming that is on purpose.
 - `presence.rs` — own + peer live-player counts and the buffer-authority
   verdict (first still-live relay in the coordinator's priority order).
 - `lobby.rs` — pre-game `LobbyCommand` fan-out **plus an ordered replay log**

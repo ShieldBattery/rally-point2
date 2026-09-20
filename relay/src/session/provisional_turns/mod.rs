@@ -694,7 +694,7 @@ impl ProvisionalTurnPen {
 
     /// A pen with an explicit session ceiling, the one the relay is built with
     /// (`crate::session::Tunables::journal_max_sessions`). Production passes
-    /// [`MAX_JOURNALED_SESSIONS`]; a test shrinks it so an end-to-end test can
+    /// `MAX_JOURNALED_SESSIONS`; a test shrinks it so an end-to-end test can
     /// drive the admission-time capacity refusal without four thousand fixture
     /// sessions.
     pub fn with_session_ceiling(max_sessions: usize) -> Self {

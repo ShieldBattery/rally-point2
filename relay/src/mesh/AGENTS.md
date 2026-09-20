@@ -45,6 +45,11 @@
 - `control/`'s `desired` (coordinator intent) and `joined` (delivered state) maps
   are deliberately separate; every send is re-derived from their diff, so a lost
   command self-heals on the next reconcile instead of needing a retry path.
+- `MeshControl::new` takes the relay's own `MeshState` and roster, always. There
+  is no partially-wired variant: a descriptor must create the maker the turn
+  path reads, retire the gate every ingress runs through, and drain the pen the
+  turn funnel deposits into, and a control plane holding a private copy of any
+  of those would drive state nothing reads.
 - `control/apply.rs` is one long method on purpose: authority verdict, maker sync,
   region labels, provisional-turn drain, roster reconcile — reordering changes
   correctness (`gates.reopen` before `sync_maker`; drain after leave-seeding so a
