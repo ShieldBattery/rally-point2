@@ -53,9 +53,10 @@ use tokio::sync::watch;
 use crate::auth::SharedRegistry;
 use crate::consensus::RelayNotice;
 use crate::coordinator::region_ping::{RegionPingTargets, RegionRttCache};
+use crate::key::SessionKey;
 use crate::mesh::control::MeshControl;
 use crate::observability::flight_recorder::FlightShipment;
-use crate::routing::{SessionKey, Sessions};
+use crate::routing::Sessions;
 
 mod connect;
 mod heartbeat;

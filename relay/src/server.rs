@@ -23,7 +23,8 @@ use rally_point_proto::time;
 
 use crate::auth::{self, AuthError, HANDSHAKE_OK, Registry, RegistryReader};
 use crate::consensus;
-use crate::routing::{self, SessionKey, Sessions};
+use crate::key::SessionKey;
+use crate::routing::{self, Sessions};
 
 /// Maximum authorization handshakes in flight at once. A coarse admission backstop:
 /// connections that stall mid-handshake can only tie up this many slots of pre-auth

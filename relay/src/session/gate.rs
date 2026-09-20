@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// How long a retired session's gate is kept (absent a re-serve reopening it).
 /// Two windows to cover. The short one — retirement's queued mesh Leave

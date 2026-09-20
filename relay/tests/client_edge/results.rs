@@ -17,7 +17,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
     // the departure notice, and the surviving second client still gets the synced
     // leave and keeps its link.
     use rally_point_relay::consensus::{LEAVE_REASON_LEFT, RelayNotice};
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_game_result, send_control_leave_intent, spawn_control_reader,
     };
@@ -116,7 +116,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
 #[tokio::test]
 async fn a_malformed_result_report_is_dropped_without_closing_the_link() {
     use rally_point_relay::consensus::{self, RelayNotice};
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::send_control_game_result;
 
     let tenant = make_default_tenant();

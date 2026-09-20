@@ -63,7 +63,7 @@ use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// How many load-state fences this relay runs at once.
 ///

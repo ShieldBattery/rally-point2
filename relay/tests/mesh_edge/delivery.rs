@@ -5,8 +5,8 @@ use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_relay::consensus::{self, Authority, LEAVE_REASON_LEFT};
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh;
-use rally_point_relay::routing::SessionKey;
 
 use crate::helpers::*;
 

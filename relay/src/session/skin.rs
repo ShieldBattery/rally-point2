@@ -56,8 +56,8 @@ use tokio::sync::mpsc;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::PlayerSkin;
 
+use crate::key::SessionKey;
 use crate::rate_limit::{RateLimitedCounter, TokenBucket};
-use crate::routing::SessionKey;
 
 /// Depth of one member's skin-push channel. A replay is at most one blob per
 /// authoring slot ([`SKIN_MAX_SLOTS`]), so this is sized above that cap: a full

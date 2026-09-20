@@ -7,8 +7,9 @@ use std::time::Duration;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::mesh::MeshPresence;
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh;
-use rally_point_relay::routing::{SessionKey, Sessions};
+use rally_point_relay::routing::Sessions;
 
 use crate::helpers::*;
 use tokio::sync::mpsc;

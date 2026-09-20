@@ -44,7 +44,7 @@ use rally_point_transport::noq;
 use tokio::sync::mpsc;
 
 use crate::consensus::{Authority, DecisionMakers};
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// One relay's place in a session's authority order, with "this relay" already
 /// resolved against the order at descriptor time. Storing the resolution

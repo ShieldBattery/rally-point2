@@ -12,7 +12,8 @@ use rally_point_proto::messages::{
 };
 use tokio::sync::{Notify, mpsc};
 
-use crate::routing::{self, SessionKey};
+use crate::key::SessionKey;
+use crate::routing;
 
 use super::frames::*;
 use super::links::{MeshControlTx, MeshForwardTx, SessionState};

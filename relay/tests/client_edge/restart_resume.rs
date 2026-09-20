@@ -181,7 +181,7 @@ async fn a_resume_anchored_below_a_lost_oversize_turn_forwards_its_control_retry
 /// acked hole at 1 from receipts that outlived the emptied-session teardown.
 #[tokio::test]
 async fn a_held_reconnect_after_a_never_started_close_seeds_from_retained_receipts() {
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
 
     let tenant = make_default_tenant();
     let session = SessionId(324);

@@ -11,7 +11,7 @@ use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::LeaveDirective;
 
 use crate::consensus::{Authority, DecisionMakers, MakerSync, sync_maker};
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// A session key under the shared test tenant.
 pub(crate) fn session_key(session: u64) -> SessionKey {

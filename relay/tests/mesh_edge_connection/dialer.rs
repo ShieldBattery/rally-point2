@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use rally_point_proto::control::{RelayPeer, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh;
 use rally_point_relay::mesh::dialer;
 use rally_point_relay::mesh::edge;
-use rally_point_relay::routing::SessionKey;
 use rally_point_transport::rustls;
 
 use crate::helpers::*;

@@ -49,8 +49,8 @@ use tokio::sync::mpsc;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::LobbyCommand;
 
+use crate::key::SessionKey;
 use crate::rate_limit::{RateLimitedCounter, TokenBucket};
-use crate::routing::SessionKey;
 
 /// Depth of one member's lobby-push channel. Sized above [`LOBBY_LOG_MAX_COMMANDS`]
 /// so a full log replay always fits with headroom for the live commands that can

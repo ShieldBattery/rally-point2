@@ -16,8 +16,8 @@ use tokio_tungstenite::tungstenite::Message;
 
 use std::collections::HashSet;
 
+use crate::key::SessionKey;
 use crate::mesh::control::MeshControl;
-use crate::routing::SessionKey;
 
 use super::connect::{ControlDisconnect, classify_control_close};
 use super::heartbeat::LoadStateAsk;

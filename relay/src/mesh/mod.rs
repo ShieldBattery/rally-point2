@@ -77,7 +77,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rally_point_transport::MeshSessionKey;
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// Converts a relay-local [`SessionKey`] into the transport layer's
 /// [`MeshSessionKey`] — the lightweight `(session, tenant)` pair `MeshLink`

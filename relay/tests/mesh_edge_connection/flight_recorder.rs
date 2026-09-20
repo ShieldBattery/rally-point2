@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
-use rally_point_relay::routing::SessionKey;
+use rally_point_relay::key::SessionKey;
 
 use crate::helpers::*;
 

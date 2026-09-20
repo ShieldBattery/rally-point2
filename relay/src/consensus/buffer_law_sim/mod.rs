@@ -34,7 +34,7 @@ use rally_point_proto::ids::{GameFrameCount, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, SlotConditions};
 
 use crate::consensus::{Authority, ControlLaw, DecisionMaker};
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// One game turn at the SC:R rate, in microseconds.
 const TURN_US: f64 = 1_000_000.0 / 24.0;

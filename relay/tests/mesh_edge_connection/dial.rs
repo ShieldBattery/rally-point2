@@ -7,9 +7,10 @@ use std::time::Duration;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_relay::coordinator::client::FleetMeshPeers;
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh;
 use rally_point_relay::mesh::edge;
-use rally_point_relay::routing::{FORWARD_CAPACITY, SessionKey};
+use rally_point_relay::routing::FORWARD_CAPACITY;
 
 use crate::helpers::*;
 

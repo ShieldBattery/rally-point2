@@ -48,8 +48,8 @@ use tokio::sync::mpsc;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::GameChat;
 
+use crate::key::SessionKey;
 use crate::rate_limit::{RateLimitedCounter, TokenBucket};
-use crate::routing::SessionKey;
 
 /// Depth of one member's chat-push channel. Chat is bursty but small (a human
 /// typing, or a short flurry of "gg"s), and this is a non-blocking `try_send`

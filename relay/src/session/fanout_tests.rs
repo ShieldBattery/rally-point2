@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 
 use rally_point_proto::ids::SlotId;
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 use crate::test_support::session_key;
 
 /// One session-scoped fan-out registry, as the shared bodies below drive it.

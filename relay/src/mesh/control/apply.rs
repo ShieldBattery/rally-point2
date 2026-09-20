@@ -11,8 +11,9 @@ use rally_point_proto::ids::{RelayId, SlotId};
 use rally_point_proto::messages::RegionLabel;
 
 use crate::consensus::{self, Authority};
+use crate::key::SessionKey;
 use crate::mesh;
-use crate::routing::{self, SessionKey};
+use crate::routing;
 use crate::session::presence::{self, Candidate};
 
 use super::{MeshControl, PeerContact, publish_desired_peers, reconcile_peers};

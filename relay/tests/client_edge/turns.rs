@@ -51,7 +51,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
     use rally_point_proto::ids::GameFrameCount;
     use rally_point_proto::messages::{LinkConditions, SlotConditions};
     use rally_point_relay::consensus;
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
 
     let tenant = make_default_tenant();
     let session = SessionId(77);

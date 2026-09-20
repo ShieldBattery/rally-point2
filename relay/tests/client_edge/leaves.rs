@@ -19,7 +19,8 @@ use rally_point_relay::consensus::LEAVE_REASON_LEFT;
 /// timeout instead of freeing promptly.
 #[tokio::test]
 async fn a_coordinator_reap_closes_the_connection_so_the_client_observes_it_end() {
-    use rally_point_relay::routing::{self, SessionKey};
+    use rally_point_relay::key::SessionKey;
+    use rally_point_relay::routing;
 
     let tenant = make_default_tenant();
     let session = SessionId(12);
@@ -46,7 +47,7 @@ async fn a_coordinator_reap_closes_the_connection_so_the_client_observes_it_end(
 #[tokio::test]
 async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
     use rally_point_relay::consensus;
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
     };
@@ -132,7 +133,7 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
     // remove_slot, presence). This proves that follow-through doesn't produce
     // a *second* directive for the same slot: the survivor sees exactly one
     // leave push, not two.
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
     };
@@ -187,7 +188,7 @@ async fn a_turn_sent_after_the_leave_intent_is_never_forwarded() {
     // can still reach a survivor. Sending only once the relay has confirmed
     // the intent by closing the link (rather than racing the intent and a
     // turn on the wire) is what makes this deterministic to test.
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::send_control_leave_intent;
 
     let tenant = make_default_tenant();

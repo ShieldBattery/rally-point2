@@ -79,8 +79,8 @@ use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 use tokio::sync::oneshot;
 
+use crate::key::SessionKey;
 use crate::rate_limit::TokenBucket;
-use crate::routing::SessionKey;
 
 /// The map of live drop holds: each held `(session, slot)` mapped to the instant
 /// the drop was first observed on this relay. Presence means the slot is an

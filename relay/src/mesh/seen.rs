@@ -8,7 +8,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// Session-level forward-once gate: records which `(slot, seq)` turns have
 /// already been forwarded to this session's local clients, so a turn arriving

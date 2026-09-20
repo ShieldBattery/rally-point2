@@ -7,8 +7,8 @@ use std::time::Duration;
 use rally_point_proto::control::{RelayPeer, SessionDescriptor, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::Payload;
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh::control;
-use rally_point_relay::routing::SessionKey;
 
 use crate::helpers::*;
 

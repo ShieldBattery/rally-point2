@@ -10,7 +10,7 @@ use rally_point_proto::messages::Payload;
 
 #[tokio::test]
 async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_missed_turns() {
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{ControlInbound, spawn_control_reader};
 
     let tenant = make_default_tenant();
@@ -125,7 +125,7 @@ async fn a_reconnect_while_the_drop_is_held_reinstates_the_slot_and_replays_miss
 #[tokio::test]
 async fn a_reconnecting_client_is_replayed_a_leave_decided_while_it_was_gone() {
     use rally_point_relay::consensus::LEAVE_REASON_LEFT;
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
     };

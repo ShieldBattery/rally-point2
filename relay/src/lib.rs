@@ -84,6 +84,7 @@ pub mod auth;
 pub mod config;
 pub mod consensus;
 pub mod coordinator;
+pub mod key;
 pub mod mesh;
 pub mod observability;
 pub(crate) mod rate_limit;

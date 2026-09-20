@@ -20,8 +20,8 @@ use rally_point_proto::token::{
 };
 use rally_point_relay::auth::Registry;
 use rally_point_relay::consensus::{self, Authority};
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh::MeshState;
-use rally_point_relay::routing::SessionKey;
 use rally_point_relay::server;
 use rally_point_transport::quic::{client_config, server_config};
 use rally_point_transport::rustls::pki_types::CertificateDer;

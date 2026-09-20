@@ -26,7 +26,7 @@ use rally_point_proto::control::{BufferBounds, TenantId};
 use rally_point_proto::ids::{GameFrameCount, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, SlotConditions};
 use rally_point_relay::consensus::{Authority, ControlLaw, DecisionMaker};
-use rally_point_relay::routing::SessionKey;
+use rally_point_relay::key::SessionKey;
 
 /// One turn's worth of synthetic link conditions for a single slot. RTT is in
 /// microseconds; `lost`/`sent` are per-turn deltas the harness accumulates into

@@ -24,8 +24,9 @@ use rally_point_proto::token::{
 };
 use rally_point_relay::auth::{HANDSHAKE_OK, Registry};
 use rally_point_relay::consensus::{self, Authority};
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh::{self, MeshState};
-use rally_point_relay::routing::{SessionKey, Sessions};
+use rally_point_relay::routing::Sessions;
 use rally_point_relay::server;
 use rally_point_transport::control::ControlInbound;
 use rally_point_transport::quic::{client_config, server_config};

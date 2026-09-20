@@ -8,8 +8,9 @@ use std::time::Duration;
 
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::mesh::{MESH_PRESENCE_LEN, MeshPresence};
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh;
-use rally_point_relay::routing::{SessionKey, Sessions};
+use rally_point_relay::routing::Sessions;
 use rally_point_transport::quic::{mesh_client_config, server_config};
 use rally_point_transport::{MeshLink, noq, rustls};
 

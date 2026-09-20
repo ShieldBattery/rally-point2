@@ -2,10 +2,11 @@
 
 ## Map
 
-- `mod.rs` — every capacity constant, `SessionKey`, `Sessions`, and
-  `SlotEntry`/`SlotInbox`: their fields stay private *here* so every submodule
-  can touch them without widening. Also the re-exports keeping `routing::X`
-  paths stable.
+- `mod.rs` — every capacity constant, `Sessions`, and `SlotEntry`/`SlotInbox`:
+  their fields stay private *here* so every submodule can touch them without
+  widening. Also the re-exports keeping `routing::X` paths stable. The session
+  identity itself is `crate::key::SessionKey` — every per-session store in the
+  relay is keyed by it, so it belongs to none of them.
 - `forward.rs` one slot's queue + its resident-byte count; `registry.rs`
   register/deregister and roster snapshots; `fan_out.rs` one thing to many
   slots; `lifecycle.rs` session start, presence announce, close signals,

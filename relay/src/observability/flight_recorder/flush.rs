@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 use super::BLOB_VERSION;
 use super::FlightRecorder;

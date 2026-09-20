@@ -85,8 +85,8 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use rally_point_proto::ids::{RelayId, SlotId};
 
+use crate::key::SessionKey;
 use crate::mesh::ConditionsRegistry;
-use crate::routing::SessionKey;
 
 /// The most events one session's ring holds. Events are rare — connects,
 /// leaves, directives, a desync — so a real game records a few dozen; the cap

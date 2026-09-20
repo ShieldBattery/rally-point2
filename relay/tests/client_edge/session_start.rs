@@ -10,7 +10,7 @@ use rally_point_proto::ids::{SessionId, SlotId};
 
 #[tokio::test]
 async fn a_late_slot_receives_session_start_on_register() {
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{ControlInbound, spawn_control_reader};
 
     let tenant = make_default_tenant();
@@ -66,7 +66,7 @@ async fn a_late_slot_receives_session_start_on_register() {
 #[tokio::test]
 async fn fires_session_start_with_the_computed_depth_once_every_expected_slot_connects() {
     use rally_point_relay::consensus;
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{ControlInbound, spawn_control_reader};
 
     let tenant = make_default_tenant();

@@ -7,8 +7,8 @@ use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, Payload, SlotConditions};
 use rally_point_relay::consensus::delivery::DeliveryHome;
 use rally_point_relay::consensus::{Authority, ControlLaw, DecisionMaker};
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh::{MeshSeen, Seen, mark_seen, new_seen_registries};
-use rally_point_relay::routing::SessionKey;
 use rally_point_relay::session::turn_ring::{TurnOrigin, TurnRing};
 use rally_point_relay::validation::validate_turn;
 

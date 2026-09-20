@@ -255,8 +255,8 @@ use rally_point_proto::messages::{
 use rally_point_proto::time::unix_millis;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::key::SessionKey;
 use crate::observability::flight_recorder::BufferDecisionInputs;
-use crate::routing::SessionKey;
 
 // Every submodule of this one reaches the rest of the module's internals
 // through these globs: each file's own `use super::*` picks them up, so an item

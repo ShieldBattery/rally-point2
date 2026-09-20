@@ -24,9 +24,9 @@ use rally_point_proto::version::{
 use rally_point_relay::consensus::{self, RelayNotice};
 use rally_point_relay::coordinator;
 use rally_point_relay::coordinator::region_ping;
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh::MeshCommand;
 use rally_point_relay::mesh::control::MeshControl;
-use rally_point_relay::routing::SessionKey;
 use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};

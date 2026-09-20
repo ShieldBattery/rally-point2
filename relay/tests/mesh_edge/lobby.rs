@@ -6,7 +6,7 @@ use std::time::Duration;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{GameChat, LobbyCommand, PlayerSkin};
-use rally_point_relay::routing::SessionKey;
+use rally_point_relay::key::SessionKey;
 use rally_point_relay::session::lobby::LOBBY_RATE_BURST;
 
 use crate::helpers::*;

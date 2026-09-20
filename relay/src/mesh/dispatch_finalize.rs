@@ -5,7 +5,8 @@
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{FinalizeDrop, FinalizeDropResult};
 
-use crate::routing::{self, SessionKey};
+use crate::key::SessionKey;
+use crate::routing;
 
 use super::seen::forwarded_count;
 use super::{

@@ -40,7 +40,7 @@ use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::Payload;
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// The nominal per-slot turn cadence of an SC:R game at the standard game speed
 /// (~24 turns/second). The count bound is derived from it, not tuned against it.

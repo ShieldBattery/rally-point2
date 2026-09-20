@@ -13,7 +13,8 @@ use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{MeshControlFrame, Payload};
 use tokio::sync::{Notify, mpsc};
 
-use crate::routing::{self, SessionKey};
+use crate::key::SessionKey;
+use crate::routing;
 
 use super::MeshState;
 use super::link_arms::LinkDriver;

@@ -45,7 +45,8 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 
 use crate::consensus::DecisionMakers;
-use crate::routing::{self, SessionKey, Sessions};
+use crate::key::SessionKey;
+use crate::routing::{self, Sessions};
 
 /// How long a client-admitted session may go with no applied descriptor
 /// before the sweep tears it down. Generous relative to an ordinary

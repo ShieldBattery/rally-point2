@@ -62,8 +62,9 @@ use rally_point_proto::ids::RelayId;
 use tokio::sync::{mpsc, watch};
 
 use crate::consensus::{self, DecisionMakers};
+use crate::key::SessionKey;
 use crate::mesh::{MeshCommand, MeshLinks};
-use crate::routing::{SessionKey, Sessions};
+use crate::routing::Sessions;
 use crate::session::drop_hold::DropHolds;
 use crate::session::presence::{self, PresenceRegistry};
 

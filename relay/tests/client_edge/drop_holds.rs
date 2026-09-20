@@ -25,7 +25,7 @@ use rally_point_proto::ids::{SessionId, SlotId};
 #[tokio::test]
 async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the_real_gate() {
     use rally_point_relay::consensus;
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
 
     let tenant = make_default_tenant();
     let session = SessionId(310);
@@ -95,7 +95,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
 #[tokio::test]
 async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_state() {
     use rally_point_relay::consensus::{self, RelayNotice};
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_relay::session::presence::{self, Candidate};
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
@@ -222,7 +222,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
 async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_still_honor_a_request()
  {
     use rally_point_relay::consensus;
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_relay::session::presence::{self, Candidate};
     use rally_point_transport::control::{
         ControlInbound, send_control_request_drop, spawn_control_reader,

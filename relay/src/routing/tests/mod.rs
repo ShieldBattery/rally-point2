@@ -5,6 +5,7 @@
 
 use super::*;
 
+use rally_point_proto::control::TenantId;
 use rally_point_transport::Received;
 
 use crate::consensus;

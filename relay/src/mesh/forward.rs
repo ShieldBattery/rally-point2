@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{LinkConditions, MeshControlFrame, Payload, mesh_control_frame};
 
-use crate::routing::{self, SessionKey};
+use crate::key::SessionKey;
+use crate::routing;
 
 use super::conditions::{ConditionsRegistry, snapshot_conditions};
 use super::links::{MESH_STREAM_WRITE_TIMEOUT, SessionState};

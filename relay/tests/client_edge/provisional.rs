@@ -19,7 +19,7 @@ use rally_point_transport::noq;
 #[tokio::test]
 async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
     use rally_point_proto::close_codes;
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_relay::session::provisional::{self, ProvisionalSessions};
 
     let tenant = make_default_tenant();
@@ -107,8 +107,8 @@ async fn a_provisional_session_with_no_descriptor_is_reaped_at_its_deadline() {
 #[tokio::test]
 async fn a_descriptor_arriving_inside_the_window_saves_the_session_from_the_sweep() {
     use rally_point_proto::ids::RelayId;
+    use rally_point_relay::key::SessionKey;
     use rally_point_relay::mesh::control::MeshControl;
-    use rally_point_relay::routing::SessionKey;
     use rally_point_relay::session::provisional::{self, ProvisionalSessions};
 
     let tenant = make_default_tenant();

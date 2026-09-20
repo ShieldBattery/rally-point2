@@ -9,7 +9,7 @@ use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{LinkConditions, SlotConditions};
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// Per-session, per-slot network conditions a relay's home-client links
 /// observe, gathered for the latency-buffer decision-maker. Each

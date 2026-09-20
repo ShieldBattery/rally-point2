@@ -94,7 +94,7 @@ use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::Payload;
 
-use crate::routing::SessionKey;
+use crate::key::SessionKey;
 
 /// The most journaled TURNS one session may accumulate. Sized to cover the
 /// provisional window at worst-case turn traffic (a full lobby at game turn

@@ -213,7 +213,7 @@ async fn refuses_connections_beyond_the_handshake_limit() {
 #[tokio::test]
 async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     use rally_point_relay::consensus;
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::send_control_leave_intent;
 
     let tenant = make_default_tenant();
@@ -309,7 +309,7 @@ async fn a_pre_descriptor_admission_is_refused_at_the_journal_ceiling() {
 
 #[tokio::test]
 async fn a_slot_not_homed_on_this_relay_is_refused() {
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::key::SessionKey;
 
     // A token binds tenant/session/slot/key but not the specific relay, so
     // without this check a misrouted (or malicious) client could register the

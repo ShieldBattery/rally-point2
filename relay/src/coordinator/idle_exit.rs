@@ -180,7 +180,7 @@ mod tests {
     use rally_point_proto::ids::{SessionId, SlotId};
 
     use super::*;
-    use crate::routing::SessionKey;
+    use crate::key::SessionKey;
 
     fn key(session: u64) -> SessionKey {
         SessionKey {

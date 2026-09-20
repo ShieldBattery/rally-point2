@@ -1,6 +1,6 @@
 # session/ — per-session relay state
 
-Each store is keyed by `SessionKey` (tenant + session), local to this relay,
+Each store is keyed by `crate::key::SessionKey` (tenant + session), local to this relay,
 and lives only as long as it locally serves the session (see each module's
 teardown).
 

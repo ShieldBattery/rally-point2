@@ -17,7 +17,8 @@ use tokio::time::Instant;
 
 use crate::consensus::RetainedLoadState;
 use crate::coordinator::region_ping::RegionRttCache;
-use crate::routing::{SessionKey, Sessions};
+use crate::key::SessionKey;
+use crate::routing::Sessions;
 
 use super::HeartbeatSources;
 
