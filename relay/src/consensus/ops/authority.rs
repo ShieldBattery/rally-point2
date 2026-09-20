@@ -218,7 +218,9 @@ pub fn sync_maker(
     };
     for leave in &fresh {
         record_leave_event(registry, key, leave);
-        registry.notify_departure(departure_notice(registry, key, leave));
+        registry.emit_notice(RelayNotice::Departure(departure_notice(
+            registry, key, leave,
+        )));
     }
     // A seeded departure fires no departure notice (the coordinator that
     // seeded it already knows), but must still reach local survivors and mesh
@@ -277,7 +279,9 @@ pub fn set_authority(
     );
     for leave in &fresh {
         record_leave_event(registry, key, leave);
-        registry.notify_departure(departure_notice(registry, key, leave));
+        registry.emit_notice(RelayNotice::Departure(departure_notice(
+            registry, key, leave,
+        )));
     }
     leaves
 }
@@ -501,6 +505,10 @@ pub fn observe_sync_with_generation(
                 no_majority: divergence.no_majority,
             },
         );
-        registry.notify_desync(desync_notice(registry, key, &divergence));
+        registry.emit_notice(RelayNotice::Desync(desync_notice(
+            registry,
+            key,
+            &divergence,
+        )));
     }
 }

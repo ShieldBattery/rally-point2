@@ -205,7 +205,9 @@ pub fn record_result(registry: &DecisionMakers, key: &SessionKey, slot: SlotId, 
         }
         echo
     };
-    registry.notify_result(result_notice(registry, key, slot, echo));
+    registry.emit_notice(RelayNotice::Result(result_notice(
+        registry, key, slot, echo,
+    )));
 }
 
 /// The end-of-game result `slot` reported for `key`, if the relay has a maker
@@ -430,7 +432,9 @@ pub fn decide_abandoned_departures(
     for directive in &decided {
         log_leave(key, directive);
         record_leave_event(registry, key, directive);
-        registry.notify_departure(departure_notice(registry, key, directive));
+        registry.emit_notice(RelayNotice::Departure(departure_notice(
+            registry, key, directive,
+        )));
     }
     decided
 }

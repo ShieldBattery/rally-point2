@@ -24,7 +24,9 @@ pub fn record_slot_connected(
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.note_slot_connected(slot);
     }
-    registry.notify_slot_connected(slot_connected_notice(registry, key, slot, resumed));
+    registry.emit_notice(RelayNotice::SlotConnected(slot_connected_notice(
+        registry, key, slot, resumed,
+    )));
 }
 
 /// Forwards a **home** client's report that its game loop has started: retains
@@ -46,7 +48,9 @@ pub fn record_slot_started(registry: &DecisionMakers, key: &SessionKey, slot: Sl
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.note_slot_started(slot);
     }
-    registry.notify_slot_started(slot_started_notice(registry, key, slot));
+    registry.emit_notice(RelayNotice::SlotStarted(slot_started_notice(
+        registry, key, slot,
+    )));
 }
 
 /// Folds a peer relay's `SlotStarted` into the session's maker: the slot's home
@@ -165,7 +169,7 @@ pub(in crate::consensus) fn note_start_latched(
     if let Some(maker) = registry.lock().get_mut(key) {
         maker.note_started_at_ms(notice.started_at_ms);
     }
-    registry.notify_session_started(notice);
+    registry.emit_notice(RelayNotice::SessionStarted(notice));
 }
 
 /// Whether `key`'s session-start directive has already been emitted — the guard

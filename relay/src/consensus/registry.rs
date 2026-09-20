@@ -26,6 +26,16 @@ pub(in crate::consensus) struct SessionExternalRefs {
     pub(in crate::consensus) slots: HashMap<SlotId, String>,
 }
 
+impl SessionExternalRefs {
+    /// The pair of correlation ids a notice about `slot` stamps on itself: the
+    /// tenant's own id for the session, and its own id for the player in that
+    /// slot. Either is `None` when the descriptor this relay applied never
+    /// carried it, and both are when no descriptor ever named the session.
+    pub(in crate::consensus) fn stamps(&self, slot: SlotId) -> (Option<String>, Option<String>) {
+        (self.external_id.clone(), self.slots.get(&slot).cloned())
+    }
+}
+
 /// A notice a relay sends up its coordinator control connection about a running
 /// game: a slot connected, the session started, a client's game loop began, a
 /// player departed, the game desynced, or a client reported its result.
@@ -150,41 +160,6 @@ impl DecisionMakers {
         }
     }
 
-    /// Fires a departure notice (see [`emit_notice`](Self::emit_notice)).
-    pub(in crate::consensus) fn notify_departure(&self, notice: DepartureNotice) {
-        self.emit_notice(RelayNotice::Departure(notice));
-    }
-
-    /// Fires a desync notice (see [`emit_notice`](Self::emit_notice)).
-    pub(in crate::consensus) fn notify_desync(&self, notice: DesyncNotice) {
-        self.emit_notice(RelayNotice::Desync(notice));
-    }
-
-    /// Fires a result notice (see [`emit_notice`](Self::emit_notice)).
-    pub(in crate::consensus) fn notify_result(&self, notice: ResultNotice) {
-        self.emit_notice(RelayNotice::Result(notice));
-    }
-
-    /// Fires a slot-connected notice (see [`emit_notice`](Self::emit_notice)).
-    pub(in crate::consensus) fn notify_slot_connected(&self, notice: SlotConnectedNotice) {
-        self.emit_notice(RelayNotice::SlotConnected(notice));
-    }
-
-    /// Fires a session-started notice (see [`emit_notice`](Self::emit_notice)).
-    pub(in crate::consensus) fn notify_session_started(&self, notice: SessionStartedNotice) {
-        self.emit_notice(RelayNotice::SessionStarted(notice));
-    }
-
-    /// Fires a slot-started notice (see [`emit_notice`](Self::emit_notice)).
-    pub(in crate::consensus) fn notify_slot_started(&self, notice: SlotStartedNotice) {
-        self.emit_notice(RelayNotice::SlotStarted(notice));
-    }
-
-    /// Fires a session-closed notice (see [`emit_notice`](Self::emit_notice)).
-    pub(in crate::consensus) fn notify_session_closed(&self, tenant: TenantId, session: SessionId) {
-        self.emit_notice(RelayNotice::SessionClosed { tenant, session });
-    }
-
     /// Records `key`'s correlation ids from a coordinator descriptor, replacing
     /// whatever was recorded before. Called on every descriptor apply (not just
     /// the first), so a changed descriptor's refs replace rather than
@@ -207,12 +182,11 @@ impl DecisionMakers {
         self.refs.lock().remove(key);
     }
 
-    /// `key`'s correlation ids, if a coordinator descriptor ever carried them.
-    pub(in crate::consensus) fn session_refs(
-        &self,
-        key: &SessionKey,
-    ) -> Option<SessionExternalRefs> {
-        self.refs.lock().get(key).cloned()
+    /// `key`'s correlation ids. Empty — every stamp `None` — when no coordinator
+    /// descriptor ever carried them, which every notice builder treats the same
+    /// as a descriptor that carried none.
+    pub(in crate::consensus) fn session_refs(&self, key: &SessionKey) -> SessionExternalRefs {
+        self.refs.lock().get(key).cloned().unwrap_or_default()
     }
 
     /// How long this relay withholds a session's region labels after latching it
@@ -278,7 +252,7 @@ pub(in crate::consensus) fn departure_notice(
     leave: &LeaveDirective,
 ) -> DepartureNotice {
     let slot = SlotId(leave.slot as u8);
-    let refs = registry.session_refs(key);
+    let (external_id, external_ref) = registry.session_refs(key).stamps(slot);
     DepartureNotice {
         finalized: leave.finalized,
         tenant: key.tenant.clone(),
@@ -291,8 +265,8 @@ pub(in crate::consensus) fn departure_notice(
         },
         reason: leave.reason,
         leave_seq: leave.leave_seq,
-        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
-        external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+        external_id,
+        external_ref,
         // The result this slot reported before departing, folded into its
         // departure record (home-seeded, carried across the mesh). Embedding it
         // makes the departure webhook atomic terminal truth; `None` proves the
@@ -328,12 +302,15 @@ pub(in crate::consensus) fn desync_notice(
         diverged: divergence
             .diverged
             .iter()
-            .map(|slot| DivergedSlot {
-                slot: *slot,
-                external_ref: refs.as_ref().and_then(|r| r.slots.get(slot).cloned()),
+            .map(|slot| {
+                let (_, external_ref) = refs.stamps(*slot);
+                DivergedSlot {
+                    slot: *slot,
+                    external_ref,
+                }
             })
             .collect(),
-        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
+        external_id: refs.external_id.clone(),
     }
 }
 
@@ -351,13 +328,13 @@ pub(in crate::consensus) fn result_notice(
     slot: SlotId,
     echo: ResultEcho,
 ) -> ResultNotice {
-    let refs = registry.session_refs(key);
+    let (external_id, external_ref) = registry.session_refs(key).stamps(slot);
     ResultNotice {
         tenant: key.tenant.clone(),
         session: key.session,
         slot,
-        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
-        external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+        external_id,
+        external_ref,
         payload: echo.payload,
         arrival_ms: echo.arrival_ms,
         session_frame: echo.session_frame,
@@ -376,13 +353,13 @@ pub(in crate::consensus) fn slot_connected_notice(
     slot: SlotId,
     resumed: bool,
 ) -> SlotConnectedNotice {
-    let refs = registry.session_refs(key);
+    let (external_id, external_ref) = registry.session_refs(key).stamps(slot);
     SlotConnectedNotice {
         tenant: key.tenant.clone(),
         session: key.session,
         slot,
-        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
-        external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+        external_id,
+        external_ref,
         resumed,
         connected_at_ms: now_ms(),
     }
@@ -397,11 +374,10 @@ pub(in crate::consensus) fn session_started_notice(
     key: &SessionKey,
     initial_buffer_turns: Option<u32>,
 ) -> SessionStartedNotice {
-    let refs = registry.session_refs(key);
     SessionStartedNotice {
         tenant: key.tenant.clone(),
         session: key.session,
-        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
+        external_id: registry.session_refs(key).external_id,
         started_at_ms: now_ms(),
         initial_buffer_turns,
     }
@@ -418,7 +394,7 @@ pub(in crate::consensus) fn slot_started_notice(
     key: &SessionKey,
     slot: SlotId,
 ) -> SlotStartedNotice {
-    let refs = registry.session_refs(key);
+    let (external_id, external_ref) = registry.session_refs(key).stamps(slot);
     let (session_frame, slot_frame) = {
         let makers = registry.lock();
         match makers.get(key) {
@@ -433,8 +409,8 @@ pub(in crate::consensus) fn slot_started_notice(
         tenant: key.tenant.clone(),
         session: key.session,
         slot,
-        external_id: refs.as_ref().and_then(|r| r.external_id.clone()),
-        external_ref: refs.as_ref().and_then(|r| r.slots.get(&slot).cloned()),
+        external_id,
+        external_ref,
         arrival_ms: now_ms(),
         session_frame,
         slot_frame,

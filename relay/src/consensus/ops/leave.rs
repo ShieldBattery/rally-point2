@@ -115,7 +115,9 @@ pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveD
         }
         leave
     };
-    registry.notify_departure(departure_notice(registry, key, &leave));
+    registry.emit_notice(RelayNotice::Departure(departure_notice(
+        registry, key, &leave,
+    )));
     true
 }
 
@@ -183,7 +185,10 @@ pub fn decided_slots(registry: &DecisionMakers, key: &SessionKey) -> HashSet<Slo
 /// on the same channel, so the coordinator's in-order dispatch treats a delivered
 /// close as proof no earlier notice for the session is still in flight.
 pub fn session_closed(registry: &DecisionMakers, key: &SessionKey) {
-    registry.notify_session_closed(key.tenant.clone(), key.session);
+    registry.emit_notice(RelayNotice::SessionClosed {
+        tenant: key.tenant.clone(),
+        session: key.session,
+    });
     // The session's local state is gone: seal the flight recording with the
     // close event and flush it (fire-and-forget — a flush must never delay a
     // teardown). This is the recording's ordinary end; the drain path's
@@ -250,7 +255,9 @@ pub fn decide_leave(
     // `decide_leave` returns `Some` only on the authority's first decision for
     // the slot (it dedups internally), so this is the one departure notice the
     // authoring relay sends for it.
-    registry.notify_departure(departure_notice(registry, key, &directive));
+    registry.emit_notice(RelayNotice::Departure(departure_notice(
+        registry, key, &directive,
+    )));
     Some(directive)
 }
 
