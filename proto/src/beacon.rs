@@ -1,5 +1,10 @@
 //! Sans-I/O codec for the ack-beacon side-channel.
 //!
+//! Not the region ping beacon: that one is a UDP echo endpoint a client times
+//! its round trip against to rank regions (`crate::control::RegionBeaconTarget`
+//! names one, and `dev-beacon/` stands one up on loopback). This beacon carries
+//! delivery cursors inside an established session and never leaves it.
+//!
 //! Under sustained datagram loss the per-link unacked window can grow without
 //! a bound: the relay receives a client's turns slower than the client produces
 //! them, so the client keeps re-carrying turns the relay has not yet seen, and

@@ -1,5 +1,11 @@
 //! The ack-beacon side-channel driver helpers, shared by the client and relay.
 //!
+//! Not the region ping beacon: that one is a UDP echo endpoint a client times
+//! its round trip against to rank regions
+//! (`rally_point_proto::control::RegionBeaconTarget` names one, and
+//! `dev-beacon/` stands one up on loopback). This beacon carries delivery
+//! cursors inside an established session and never leaves it.
+//!
 //! [`spawn_beacon_reader`] and [`BeaconWriter`] own no `Link` state, so they live
 //! here in the transport crate where both endpoints use one tested copy rather
 //! than two divergent duplicates. Cancel-safety is the whole reason this is a

@@ -1,6 +1,12 @@
 //! A loopback stand-in for a region's ping endpoints, so latency-based region
 //! ranking is exercisable without real infrastructure.
 //!
+//! Not the ack beacon: that one (`rally_point_proto::beacon`) is a per-link
+//! side-channel inside an established session, carrying delivery cursors so a
+//! peer can retire turns whose datagram acks were lost. This beacon is the
+//! region ping target a client times a round trip against before a session
+//! exists.
+//!
 //! A game client measures its latency to a region by pinging that region's
 //! endpoints: a **UDP beacon** (the primary — send bytes, get the same bytes
 //! back, time the round trip) and a **TCP fallback** (measure connect time when
