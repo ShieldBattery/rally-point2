@@ -8,16 +8,87 @@ use std::time::Duration;
 
 use axum::extract::ws::Message;
 use futures_util::SinkExt;
-use rally_point_proto::control::{CoordinatorToRelay, DescriptorKey, SessionDescriptor};
+use rally_point_proto::control::{
+    CoordinatorToRelay, DescriptorKey, MeshPeerIdentity, RegionBeaconTarget, SessionDescriptor,
+    TenantVerifyingKey,
+};
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::time::unix_millis;
 use rally_point_proto::version::ProtocolVersion;
 
+use crate::attest::LoadStateAsk;
 use crate::descriptors::SlotClose;
+use crate::regions::RegionsConfig;
 use crate::registry;
 use crate::session::SessionSetup;
+use crate::tenant;
 
-use super::control::{ControlWrite, WriterSources};
+use super::control::{ControlWrite, DrainSend};
+
+/// The writer half's outbound sources: the per-relay descriptor and reap outboxes,
+/// the fleet mesh-peer watch, the reader's drain-exchange directives, and the
+/// connect-time payloads led out ahead of any steady-state push. Bundled because
+/// they are all consumed by the one writer and nowhere else, so they are moved in
+/// together and owned for the connection's life.
+pub(super) struct WriterSources {
+    /// This relay's current descriptor set, latest-wins, re-synced on connect and
+    /// pushed on every change.
+    descriptors: tokio::sync::watch::Receiver<Vec<SessionDescriptor>>,
+    /// The fleet mesh-peer set, shared across every connection and pushed on
+    /// membership changes.
+    mesh_peers: tokio::sync::watch::Receiver<Vec<MeshPeerIdentity>>,
+    /// This relay's reap directives, coalesced per session before each is sent.
+    reaps: tokio::sync::mpsc::UnboundedReceiver<SlotClose>,
+    /// Load-state questions addressed to this relay, each answered with one request
+    /// frame down the connection.
+    load_state: tokio::sync::mpsc::Receiver<LoadStateAsk>,
+    /// The attestation broker the questions above come from, so the writer can drop
+    /// one whose waiter has already gone before spending a frame on it.
+    attest: crate::attest::LoadStateAttest,
+    /// The reader's directives to emit a drain exchange's set-then-ack.
+    drain: tokio::sync::mpsc::UnboundedReceiver<DrainSend>,
+    /// Ready flight-upload grant/refusal frames the reader minted (a presign runs off
+    /// the read loop and pushes its result here), forwarded to the relay verbatim.
+    grants: tokio::sync::mpsc::UnboundedReceiver<CoordinatorToRelay>,
+    /// The tenant verifying keys, led out first so a relay can verify a session's
+    /// client tokens before that session's descriptor arrives.
+    tenant_keys: Vec<TenantVerifyingKey>,
+    /// The region ping-beacon targets, led out after the keys; empty on a
+    /// region-blind coordinator.
+    beacon_targets: Vec<RegionBeaconTarget>,
+}
+
+impl WriterSources {
+    /// Subscribes this connection to every coordinator→relay source the writer
+    /// draws from, and snapshots the connect-time lead.
+    ///
+    /// The descriptor and reap outboxes' fresh subscribes replace any prior
+    /// sender, so a reconnect owns the live receivers; the mesh-peer watch is
+    /// shared across every connection. The tenant keys and region beacons are
+    /// immutable per process, snapshotted here and led out ahead of the first
+    /// descriptor (a relay that reconnects re-receives them). Only `drain` and
+    /// `grants` are passed in — they are the reader's ends of two channels this
+    /// connection creates.
+    pub(super) fn new(
+        setup: &SessionSetup,
+        relay_id: RelayId,
+        regions: &RegionsConfig,
+        drain: tokio::sync::mpsc::UnboundedReceiver<DrainSend>,
+        grants: tokio::sync::mpsc::UnboundedReceiver<CoordinatorToRelay>,
+    ) -> Self {
+        Self {
+            descriptors: setup.descriptors().subscribe(relay_id),
+            mesh_peers: registry::subscribe_mesh_peers(setup.registry()),
+            reaps: setup.reaps().subscribe(relay_id),
+            load_state: setup.attest().subscribe(relay_id),
+            attest: setup.attest().clone(),
+            drain,
+            grants,
+            tenant_keys: tenant::all_verifying_keys(setup.tenants()),
+            beacon_targets: regions.beacon_targets(),
+        }
+    }
+}
 
 /// Owns the write half and every coordinator→relay send. Leads with the
 /// connect-time sequence in a fixed order — tenant keys, region beacons (when any),
@@ -482,36 +553,4 @@ where
             false
         }
     }
-}
-
-/// Applies the synchronous part of a relay's coordinated-drain exchange after it
-/// sent a [`RelayToCoordinator::Draining`]: mark it ineligible for new assignments,
-/// returning whether the mark applied (so the caller then directs the writer to send
-/// the set + ack).
-///
-/// The mark is taken under the assignment lock ([`SessionSetup::lock_assignment`]),
-/// so it linearizes against any in-flight `create_session`/`rehome`: after it lands,
-/// every session that will ever name this relay has already staged its descriptor in
-/// the relay's outbox, so the set the writer then reads is provably complete.
-///
-/// A mark that does **not** apply — a stale generation, meaning a newer connection
-/// re-enrolled this relay (its fresh enroll cleared the flag) — draws no ack: that
-/// live connection runs its own drain exchange when its `Draining` arrives.
-pub(super) fn apply_drain_mark(setup: &SessionSetup, relay_id: RelayId, generation: u64) -> bool {
-    let applied = {
-        let _assign = setup.lock_assignment();
-        registry::mark_draining(setup.registry(), relay_id, generation)
-    };
-    if !applied {
-        // A stale connection's Draining: the live successor acks its own drain.
-        tracing::debug!(
-            relay_id = relay_id.0,
-            "ignoring a Draining frame from a stale control connection",
-        );
-        return false;
-    }
-    let region = registry::entry(setup.registry(), relay_id).and_then(|entry| entry.region);
-    crate::metrics::relay_drained(region.as_ref());
-    tracing::info!(relay_id = relay_id.0, "relay draining; sending set + ack");
-    true
 }

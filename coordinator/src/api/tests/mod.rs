@@ -29,7 +29,6 @@ use crate::registry;
 use crate::session;
 use crate::test_support::*;
 
-use super::control::*;
 use super::control_flight::*;
 use super::control_inbound::*;
 use super::control_writer::*;
@@ -350,15 +349,7 @@ fn note_inbound_frame(
 ) -> InboundAction {
     let mut flight = FlightUploadState::new(tokio::sync::mpsc::unbounded_channel().0);
     note_inbound(
-        &ControlInbound {
-            setup,
-            notices,
-            lifecycle,
-            relay_id,
-            generation,
-            rtt,
-            flight_store: None,
-        },
+        &ControlInbound::new(setup, notices, lifecycle, relay_id, generation, rtt, None),
         &mut flight,
         message,
     )

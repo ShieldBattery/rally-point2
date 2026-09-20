@@ -2,11 +2,12 @@
 //!
 //! Holds the `GET /relay/control` handler, the enroll handshake that runs before
 //! a relay reaches the registry (pending-Hello gate, version negotiation, region
-//! validation, proof of possession, ledger authorization), and the shared types
-//! the reader and writer halves are driven from.
+//! validation, proof of possession, ledger authorization), and the split that
+//! runs the reader and writer halves against each other. Each half owns the
+//! inputs it is driven from; what lives here is only what both touch — the two
+//! socket halves and the reader→writer drain directive.
 
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
@@ -19,29 +20,20 @@ use axum::{
 };
 use futures_util::StreamExt;
 use futures_util::stream::{SplitSink, SplitStream};
-use rally_point_proto::control::{
-    CoordinatorToRelay, MeshPeerIdentity, RegionBeaconTarget, SessionDescriptor, TenantVerifyingKey,
-};
-use rally_point_proto::ids::RelayId;
+use rally_point_proto::control::CoordinatorToRelay;
 use rally_point_proto::version::{
     self, CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
     CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION, ProtocolVersion,
 };
 
-use crate::attest::LoadStateAsk;
-use crate::descriptors::SlotClose;
-use crate::flight_store::S3FlightStore;
-use crate::lifecycle::Lifecycle;
-use crate::notify::NoticeDedup;
 use crate::presence;
 use crate::regions::RegionsConfig;
 use crate::registry;
-use crate::session::{self, SessionSetup};
-use crate::tenant;
+use crate::session;
 
 use super::control_hello::{challenge_and_verify, read_hello};
-use super::control_inbound::{RegionRttIngest, run_reader};
-use super::control_writer::run_writer;
+use super::control_inbound::{ControlInbound, RegionRttIngest, run_reader};
+use super::control_writer::{WriterSources, run_writer};
 use super::request_auth::control_auth_ok;
 use super::{CoordinatorState, MAX_CONTROL_MESSAGE_BYTES, OptionalPeerAddr};
 
@@ -477,15 +469,15 @@ async fn serve_relay_control(
         store: &pair_rtts,
         ledger: ledger.as_deref(),
     };
-    let inbound = ControlInbound {
-        setup: &setup,
-        notices: &notices,
-        lifecycle: &lifecycle,
+    let inbound = ControlInbound::new(
+        &setup,
+        &notices,
+        &lifecycle,
         relay_id,
         generation,
-        rtt: &rtt_ingest,
-        flight_store: flight_store.as_ref(),
-    };
+        &rtt_ingest,
+        flight_store.as_ref(),
+    );
     push_and_watch(socket, &inbound, &regions, liveness_timeout, negotiated).await;
 
     // The connection ended: clear the presence this connection reported, so its
@@ -520,65 +512,6 @@ pub(super) type ControlRead = SplitStream<WebSocket>;
 /// "now emit set-then-ack" signal that must originate from the writer to keep every
 /// send on one task.
 pub(super) struct DrainSend;
-
-/// The immutable inputs for handling one inbound relay frame: the coordinator state
-/// a frame's side effects read and update, this connection's identity and
-/// generation, and the RTT-ingest and flight-store handles a heartbeat or recording
-/// lands through. Bundled because they travel together from enroll into the reader
-/// and on into [`note_inbound`] on every frame, never individually — the borrowed
-/// fields let the reader hold them without owning any of the shared state.
-pub(super) struct ControlInbound<'a> {
-    /// The session-setup context: registry, membership, and outboxes a frame reads
-    /// or mutates.
-    pub(super) setup: &'a SessionSetup,
-    /// The relay-notice dedup sets a departure/desync/result collapses against.
-    pub(super) notices: &'a NoticeDedup,
-    /// The per-session lifecycle a notice or `SessionClosed` advances.
-    pub(super) lifecycle: &'a Lifecycle,
-    /// The relay identity this connection enrolled as — the only id a frame may
-    /// report under.
-    pub(super) relay_id: RelayId,
-    /// This connection's enroll generation, fencing a stale connection's late frame
-    /// against a reconnect.
-    pub(super) generation: u64,
-    /// The backbone-RTT ingest a heartbeat's `region_rtts` fold through.
-    pub(super) rtt: &'a RegionRttIngest<'a>,
-    /// The durable flight sink a shipped recording is stored into, when configured.
-    pub(super) flight_store: Option<&'a Arc<S3FlightStore>>,
-}
-
-/// The writer half's outbound sources: the per-relay descriptor and reap outboxes,
-/// the fleet mesh-peer watch, the reader's drain-exchange directives, and the
-/// connect-time payloads led out ahead of any steady-state push. Bundled because
-/// they are all consumed by the one writer and nowhere else, so they are moved in
-/// together and owned for the connection's life.
-pub(super) struct WriterSources {
-    /// This relay's current descriptor set, latest-wins, re-synced on connect and
-    /// pushed on every change.
-    pub(super) descriptors: tokio::sync::watch::Receiver<Vec<SessionDescriptor>>,
-    /// The fleet mesh-peer set, shared across every connection and pushed on
-    /// membership changes.
-    pub(super) mesh_peers: tokio::sync::watch::Receiver<Vec<MeshPeerIdentity>>,
-    /// This relay's reap directives, coalesced per session before each is sent.
-    pub(super) reaps: tokio::sync::mpsc::UnboundedReceiver<SlotClose>,
-    /// Load-state questions addressed to this relay, each answered with one request
-    /// frame down the connection.
-    pub(super) load_state: tokio::sync::mpsc::Receiver<LoadStateAsk>,
-    /// The attestation broker the questions above come from, so the writer can drop
-    /// one whose waiter has already gone before spending a frame on it.
-    pub(super) attest: crate::attest::LoadStateAttest,
-    /// The reader's directives to emit a drain exchange's set-then-ack.
-    pub(super) drain: tokio::sync::mpsc::UnboundedReceiver<DrainSend>,
-    /// Ready flight-upload grant/refusal frames the reader minted (a presign runs off
-    /// the read loop and pushes its result here), forwarded to the relay verbatim.
-    pub(super) grants: tokio::sync::mpsc::UnboundedReceiver<CoordinatorToRelay>,
-    /// The tenant verifying keys, led out first so a relay can verify a session's
-    /// client tokens before that session's descriptor arrives.
-    pub(super) tenant_keys: Vec<TenantVerifyingKey>,
-    /// The region ping-beacon targets, led out after the keys; empty on a
-    /// region-blind coordinator.
-    pub(super) beacon_targets: Vec<RegionBeaconTarget>,
-}
 
 /// Serves an enrolled relay's control connection by splitting the socket into a
 /// reader and a writer that run until either ends. Returns when the connection is
@@ -616,23 +549,7 @@ async fn push_and_watch(
     // writer while the async presign runs off the read loop.
     let (grants_tx, grants) = tokio::sync::mpsc::unbounded_channel::<CoordinatorToRelay>();
 
-    // Every coordinator→relay source the writer draws from. The descriptor and reap
-    // outboxes' fresh subscribes replace any prior sender, so a reconnect owns the
-    // live receivers; the mesh-peer watch is shared across every connection. The
-    // tenant keys and region beacons are immutable per process, snapshotted here and
-    // led out ahead of the first descriptor (a relay that reconnects re-receives
-    // them).
-    let mut sources = WriterSources {
-        descriptors: setup.descriptors().subscribe(relay_id),
-        mesh_peers: registry::subscribe_mesh_peers(setup.registry()),
-        reaps: setup.reaps().subscribe(relay_id),
-        load_state: setup.attest().subscribe(relay_id),
-        attest: setup.attest().clone(),
-        drain,
-        grants,
-        tenant_keys: tenant::all_verifying_keys(setup.tenants()),
-        beacon_targets: regions.beacon_targets(),
-    };
+    let mut sources = WriterSources::new(setup, relay_id, regions, drain, grants);
 
     // The two halves run concurrently until one returns; the other's future is then
     // dropped (cancelled) here. A drop is safe on both sides: the reader only ever

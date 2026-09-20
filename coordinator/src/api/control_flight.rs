@@ -17,8 +17,7 @@ use crate::flight_store::{self, S3FlightStore};
 use crate::notify;
 use crate::tenant;
 
-use super::control::ControlInbound;
-use super::control_inbound::{bound_session_slot_lists, relay_serves_session};
+use super::control_inbound::{ControlInbound, bound_session_slot_lists, relay_serves_session};
 
 /// The shortest gap between "a request arrived but no store is configured" warnings,
 /// so a fleet asking a coordinator whose store config was forgotten to grant uploads

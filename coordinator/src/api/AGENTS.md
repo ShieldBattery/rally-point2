@@ -10,11 +10,13 @@ Public paths (`api::CoordinatorState`, `router`, `ControlAuth`,
 - `sessions.rs` create / rehome / alive · `load_state.rs` the attested load read
 - `queries.rs` presence, flight blob reads, warm, pubkey, regions
 - `request_auth.rs` bearer check + tenant request signatures
-- `control.rs` the endpoint, the enroll handshake, and the per-connection types
-  (`ControlInbound`, `WriterSources`) both halves are driven from
-- `control_hello.rs` pre-enroll reads · `control_writer.rs` send half
-- `control_inbound.rs` read half + frame dispatch · `control_flight.rs` upload
-  grants and load-state snapshots (reader work done off the read loop)
+- `control.rs` the endpoint, the enroll handshake, and the socket/channel types
+  both halves share (`ControlRead`, `ControlWrite`, `DrainSend`)
+- `control_hello.rs` pre-enroll reads · `control_writer.rs` send half, and the
+  `WriterSources` it draws from
+- `control_inbound.rs` read half + frame dispatch, the `ControlInbound` inputs
+  they run over, and the drain mark · `control_flight.rs` upload grants and
+  load-state snapshots (reader work done off the read loop)
 
 ## Easy to break
 

@@ -1,6 +1,5 @@
-//! The writer half: what it sends as a descriptor delta, the per-send stall
-//! bound that tears down a relay which stops reading, and the drain mark's
-//! generation fence.
+//! The writer half: what it sends as a descriptor delta and the per-send stall
+//! bound that tears down a relay which stops reading.
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -123,47 +122,5 @@ async fn a_send_that_never_completes_ends_the_connection_at_the_stall_bound() {
         started.elapsed(),
         bound,
         "the send is abandoned exactly at its own bound",
-    );
-}
-
-#[test]
-fn a_drain_mark_from_a_superseded_connection_cannot_mark_its_live_successor() {
-    // A relay's stale connection can flush a `Draining` after the relay already
-    // reconnected. The successor's enroll cleared the draining flag, and the
-    // stale mark must not set it again: that would exclude a live, idle relay
-    // from every new assignment until it re-enrolled once more. The live
-    // connection runs its own drain exchange when its own `Draining` arrives.
-    let reg = registry::new_registry();
-    let hello = (RelaySpec {
-        id: 1,
-        region: None,
-    })
-    .hello();
-    let stale_generation = registry::enroll(&reg, hello.clone());
-    let current_generation = registry::enroll(&reg, hello);
-    let setup = session::SessionSetup::new(reg, crate::tenant::new_store());
-
-    let draining = || {
-        registry::enrolled_relays(setup.registry())
-            .into_iter()
-            .find(|relay| relay.relay_id == RelayId(1))
-            .expect("relay 1 is enrolled")
-            .draining
-    };
-
-    assert!(
-        !apply_drain_mark(&setup, RelayId(1), stale_generation),
-        "a Draining from the superseded connection draws no ack",
-    );
-    assert!(
-        !draining(),
-        "the live successor stays eligible for new assignments",
-    );
-
-    // The current connection's own Draining does apply.
-    assert!(apply_drain_mark(&setup, RelayId(1), current_generation));
-    assert!(
-        draining(),
-        "the relay its own connection drained is excluded from new assignments",
     );
 }

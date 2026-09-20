@@ -5,6 +5,7 @@
 //! heartbeat's vectors are bounded against, the backbone-RTT ingest, and the
 //! serving-set check that stops one relay reporting in another's name.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::Message;
@@ -15,20 +16,72 @@ use rally_point_proto::control::{
 use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::time::unix_secs_fail_open;
 
+use crate::flight_store::S3FlightStore;
 use crate::ledger::RelayLedger;
-use crate::notify;
+use crate::lifecycle::Lifecycle;
+use crate::notify::{self, NoticeDedup};
 use crate::pair_rtts::{self, PairRttStore};
 use crate::presence;
 use crate::regions::RegionsConfig;
 use crate::registry;
 use crate::session::{self, SessionSetup};
 
-use super::control::{ControlInbound, ControlRead, DrainSend};
+use super::control::{ControlRead, DrainSend};
 use super::control_flight::{
     FlightUploadState, handle_flight_upload_done, handle_flight_upload_request,
     handle_load_state_snapshot,
 };
-use super::control_writer::apply_drain_mark;
+
+/// The immutable inputs for handling one inbound relay frame: the coordinator state
+/// a frame's side effects read and update, this connection's identity and
+/// generation, and the RTT-ingest and flight-store handles a heartbeat or recording
+/// lands through. Bundled because they travel together from enroll into the reader
+/// and on into [`note_inbound`] on every frame, never individually — the borrowed
+/// fields let the reader hold them without owning any of the shared state.
+pub(super) struct ControlInbound<'a> {
+    /// The session-setup context: registry, membership, and outboxes a frame reads
+    /// or mutates.
+    pub(super) setup: &'a SessionSetup,
+    /// The relay-notice dedup sets a departure/desync/result collapses against.
+    pub(super) notices: &'a NoticeDedup,
+    /// The per-session lifecycle a notice or `SessionClosed` advances.
+    pub(super) lifecycle: &'a Lifecycle,
+    /// The relay identity this connection enrolled as — the only id a frame may
+    /// report under.
+    pub(super) relay_id: RelayId,
+    /// This connection's enroll generation, fencing a stale connection's late frame
+    /// against a reconnect.
+    pub(super) generation: u64,
+    /// The backbone-RTT ingest a heartbeat's `region_rtts` fold through.
+    pub(super) rtt: &'a RegionRttIngest<'a>,
+    /// The durable flight sink a shipped recording is stored into, when configured.
+    pub(super) flight_store: Option<&'a Arc<S3FlightStore>>,
+}
+
+impl<'a> ControlInbound<'a> {
+    /// Bundles one enrolled connection's frame-handling inputs. Taken as
+    /// arguments rather than as a struct literal so a new input lands on this
+    /// signature and every construction site has to answer for it.
+    pub(super) fn new(
+        setup: &'a SessionSetup,
+        notices: &'a NoticeDedup,
+        lifecycle: &'a Lifecycle,
+        relay_id: RelayId,
+        generation: u64,
+        rtt: &'a RegionRttIngest<'a>,
+        flight_store: Option<&'a Arc<S3FlightStore>>,
+    ) -> Self {
+        Self {
+            setup,
+            notices,
+            lifecycle,
+            relay_id,
+            generation,
+            rtt,
+            flight_store,
+        }
+    }
+}
 
 /// Owns the read half, the liveness deadline, and every inbound side effect. Runs
 /// `note_inbound` synchronously on each frame in arrival order, refreshes the
@@ -582,4 +635,36 @@ pub(super) fn relay_serves_session(
 ) -> bool {
     let serving = setup.serving_relays(tenant, session);
     serving.is_empty() || serving.contains(&relay_id)
+}
+
+/// Applies the synchronous part of a relay's coordinated-drain exchange after it
+/// sent a [`RelayToCoordinator::Draining`]: mark it ineligible for new assignments,
+/// returning whether the mark applied (so the caller then directs the writer to send
+/// the set + ack).
+///
+/// The mark is taken under the assignment lock ([`SessionSetup::lock_assignment`]),
+/// so it linearizes against any in-flight `create_session`/`rehome`: after it lands,
+/// every session that will ever name this relay has already staged its descriptor in
+/// the relay's outbox, so the set the writer then reads is provably complete.
+///
+/// A mark that does **not** apply — a stale generation, meaning a newer connection
+/// re-enrolled this relay (its fresh enroll cleared the flag) — draws no ack: that
+/// live connection runs its own drain exchange when its `Draining` arrives.
+pub(super) fn apply_drain_mark(setup: &SessionSetup, relay_id: RelayId, generation: u64) -> bool {
+    let applied = {
+        let _assign = setup.lock_assignment();
+        registry::mark_draining(setup.registry(), relay_id, generation)
+    };
+    if !applied {
+        // A stale connection's Draining: the live successor acks its own drain.
+        tracing::debug!(
+            relay_id = relay_id.0,
+            "ignoring a Draining frame from a stale control connection",
+        );
+        return false;
+    }
+    let region = registry::entry(setup.registry(), relay_id).and_then(|entry| entry.region);
+    crate::metrics::relay_drained(region.as_ref());
+    tracing::info!(relay_id = relay_id.0, "relay draining; sending set + ack");
+    true
 }
