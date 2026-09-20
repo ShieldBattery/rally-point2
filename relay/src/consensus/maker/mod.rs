@@ -234,7 +234,7 @@ pub struct DecisionMaker {
     /// session descriptor). Empty means unenforced — a standalone relay, a
     /// dev-injected descriptor, or a coordinator that predates the field —
     /// exactly like `expected_slots` empty disables the start directive. Read
-    /// by [`slot_homed`] at client admission, in `server.rs`, to refuse a
+    /// by [`slot_homed`] at the client edge's home-relay gate, to refuse a
     /// token authorized for a slot this relay does not home: a token binds
     /// tenant/session/slot/key but not the relay, so without this check the
     /// same slot could register on two relays in a true multi-relay session.

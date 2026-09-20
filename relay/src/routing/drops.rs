@@ -107,7 +107,7 @@ pub(super) fn handle_drop_request(
 ///
 /// `held_for`'s read and `release`'s claim below are two separate lock
 /// acquisitions, not one atomic check-and-take — a concurrent reconnect's
-/// `DropHolds::take_if_pending` (`server.rs`) can slip in between them and claim
+/// `DropHolds::take_if_pending` (the client edge's `Admission`) can slip in between them and claim
 /// the same hold first. That is exactly why the claim is checked: `release`
 /// returning `false` means this call lost that race, and it must stand down
 /// rather than decide anyway. Deciding unconditionally here would be a genuine

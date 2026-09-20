@@ -31,7 +31,7 @@ use crate::consensus::LEAVE_REASON_DROPPED;
 /// below, so a `register` racing this disconnect can't land in the gap:
 /// whichever of the two acquires the roster lock first is authoritative. If this
 /// disconnect wins (the seat is still empty), it announces normally, and a
-/// reconnect that registers moments later (`server.rs`) reads the fresh hold and
+/// reconnect that registers moments later (the client edge's `Admission`) reads the fresh hold and
 /// reinstates. If the reconnect wins (the seat is already reoccupied), announcing
 /// here would record a departure and mark a hold against a slot that is, as of
 /// this check, already live again — an orphaned record would wrongly refuse

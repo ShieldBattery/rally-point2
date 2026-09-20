@@ -426,7 +426,7 @@ fn dispatch_mesh_control_frame(
             //
             // Hold claim, state restoration, and epoch activation are one
             // Holds→Maker transition, mirroring the home relay's own re-register
-            // (`server.rs`). A failed admission is terminal for this frame: the
+            // (the client edge's `Admission`). A failed admission is terminal for this frame: the
             // hold may already have been decided, or a final leave may have
             // arrived first, and fanning out true would resurrect that slot.
             if change.connected {

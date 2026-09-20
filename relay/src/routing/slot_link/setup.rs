@@ -20,7 +20,7 @@ pub(super) fn activate_slot(
 ) -> bool {
     let decision_makers = &mesh.session.decision_makers;
     // The activation prologue runs as ONE ingress critical section: the
-    // admission gate (`server.rs`) necessarily released across the
+    // admission gate (the client edge's `Admission`) necessarily released across the
     // handshake-ack await before this task started, so a retirement can land
     // in between — and these mutations would then recreate the close-report,
     // presence, and condition state the sweep just removed, for a session the

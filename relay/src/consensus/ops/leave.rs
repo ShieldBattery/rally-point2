@@ -122,7 +122,7 @@ pub fn observe_leave(registry: &DecisionMakers, key: &SessionKey, leave: &LeaveD
 }
 
 /// Whether `slot` is admissible on this relay per `key`'s session descriptor
-/// (see `DecisionMaker`'s `admits_slot`) — read at client admission (`server.rs`)
+/// (see `DecisionMaker`'s `admits_slot`) — read at the client edge's home-relay gate
 /// to refuse a token authorized for a slot the coordinator did not assign here.
 ///
 /// `true` (admit) when no maker exists for the session: this is the same

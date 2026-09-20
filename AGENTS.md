@@ -64,7 +64,7 @@ Full rationale in `docs/architecture.md`. The ones easy to break by accident:
   `foo/tests/<topic>.rs` (child modules of `foo`, so private items stay
   reachable), and big integration suites are `tests/<suite>/main.rs` with topic
   files. Subject areas with non-obvious rules carry their own `AGENTS.md`
-  (`relay/src/{consensus,mesh,routing,coordinator,session,observability}`,
+  (`relay/src/{consensus,mesh,routing,coordinator,session,server,observability}`,
   `coordinator/src/{api,session,lifecycle,provision}`, `client/src/driver`,
   `transport/src`, `proto/src`, `relay/tests`, `coordinator/tests`) — read the
   one for the area you are touching.

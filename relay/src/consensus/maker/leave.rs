@@ -253,7 +253,7 @@ impl DecisionMaker {
     /// not yet decided, of a slot this relay homes
     /// (`admits_slot`), and named in `held` — the caller's
     /// current set of pending drop holds. All three conditions mirror the
-    /// re-register admission gate (`server.rs`): only a departed-but-held slot
+    /// re-register admission gate (the client edge's `Admission`): only a departed-but-held slot
     /// is admitted back, only on its home relay, and a decided leave refuses it
     /// terminally. So the session-emptied close waits on exactly these — a
     /// peer-homed slot's hold (kept for authority-handoff robustness) and an

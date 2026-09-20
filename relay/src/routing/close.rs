@@ -13,7 +13,7 @@ use crate::consensus;
 /// departure of a homed slot promises a reconnect.
 ///
 /// While such a departure is undecided, its drop hold is the admission token a
-/// re-dial claims on this relay (`server.rs`), and the retained registries are
+/// re-dial claims on this relay (the client edge's `Admission`), and the retained registries are
 /// what make the admitted resume whole: the replay ring catches the client's
 /// sim up and the lobby log restores its setup state. Closing eagerly would
 /// also retire the session coordinator-side — on a single-relay session this
