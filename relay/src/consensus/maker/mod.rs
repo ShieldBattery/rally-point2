@@ -19,7 +19,7 @@ mod session_start;
 mod silence;
 mod sync;
 
-pub use departure::{DepartureStamps, RecordedDeparture};
+pub use departure::{DepartureStamps, FinalizeOutcome, RecordedDeparture};
 pub use silence::SilentSlot;
 
 pub(in crate::consensus) use departure::Departure;

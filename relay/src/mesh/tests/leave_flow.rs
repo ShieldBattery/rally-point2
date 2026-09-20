@@ -143,8 +143,7 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
     let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
-    crate::consensus::record_departure(
-        &makers,
+    makers.record_departure(
         &key,
         SlotId(0),
         crate::consensus::DepartureStamps::default(),
@@ -188,19 +187,13 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
     let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
-    assert!(crate::consensus::activate_connection_epoch(
-        &makers,
-        &key,
-        SlotId(0),
-        11,
-    ));
-    assert!(crate::consensus::record_departure_for_epoch(
-        &makers,
+    assert!(makers.activate_connection_epoch(&key, SlotId(0), 11));
+    assert!(makers.record_departure_for_epoch(
         &key,
         SlotId(0),
         crate::consensus::DepartureStamps::default(),
         0x4000_0006,
-        Some(11),
+        Some(11)
     ));
 
     let (mut guard, mut inbox) =
@@ -234,12 +227,7 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
     dispatch_mesh_control(connected(22), RelayId(9), &joined, &sessions, &mesh_state);
     assert!(!mesh_state.session.drop_holds.is_pending(&key, SlotId(0)));
     assert_eq!(inbox.try_recv_connectivity(), None);
-    assert!(!crate::consensus::connection_epoch_matches(
-        &makers,
-        &key,
-        SlotId(0),
-        Some(22),
-    ));
+    assert!(!makers.connection_epoch_matches(&key, SlotId(0), Some(22)));
 }
 
 #[test]
@@ -250,12 +238,7 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
         let makers = Arc::clone(&mesh_state.session.decision_makers);
         let key = control_key();
         test_maker(&makers, &key, crate::consensus::Authority::Peer);
-        assert!(crate::consensus::activate_connection_epoch(
-            &makers,
-            &key,
-            SlotId(0),
-            11,
-        ));
+        assert!(makers.activate_connection_epoch(&key, SlotId(0), 11));
         let (mut guard, mut inbox) =
             routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");
         guard.disarm();

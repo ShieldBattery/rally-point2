@@ -91,8 +91,7 @@ fn a_departure_uncovers_a_not_yet_started_session() {
     );
     assert!(!registry.note_slot_present(&k, SlotId(0)));
     // Slot 0 departs, retiring it from the live-slot set.
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(0),
         DepartureStamps::default(),

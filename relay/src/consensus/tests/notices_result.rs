@@ -26,7 +26,7 @@ fn record_result_fires_one_notice_per_slot() {
     registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
     registry.observe_frame(&k, SlotId(1), GameFrameCount(52));
 
-    record_result(&registry, &k, SlotId(1), vec![0xDE, 0xAD]);
+    registry.record_result(&k, SlotId(1), vec![0xDE, 0xAD]);
     let notice = recv_result(&mut rx);
     assert_eq!(notice.tenant, k.tenant);
     assert_eq!(notice.session, k.session);
@@ -45,7 +45,7 @@ fn record_result_fires_one_notice_per_slot() {
 
     // A second report from the same slot records nothing (first-writer-wins)
     // and so fires no second notice.
-    record_result(&registry, &k, SlotId(1), vec![0xBE, 0xEF]);
+    registry.record_result(&k, SlotId(1), vec![0xBE, 0xEF]);
     assert!(
         rx.try_recv().is_err(),
         "no re-fire for an already-reported slot",
@@ -59,7 +59,7 @@ fn record_result_on_a_relay_without_a_maker_is_a_no_op() {
     let (registry, mut rx) = notifying_registry();
     let k = key();
 
-    record_result(&registry, &k, SlotId(0), vec![0x01]);
+    registry.record_result(&k, SlotId(0), vec![0x01]);
     assert!(rx.try_recv().is_err(), "no maker, so no notice");
 }
 
@@ -79,10 +79,10 @@ fn record_result_rejects_an_ill_formed_payload() {
         let k = key();
         let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
-        record_result(&registry, &k, SlotId(0), payload);
+        registry.record_result(&k, SlotId(0), payload);
         assert!(rx.try_recv().is_err(), "an {label} payload fires no notice");
         assert!(
-            result_for(&registry, &k, SlotId(0)).is_none(),
+            registry.result_for(&k, SlotId(0)).is_none(),
             "an {label} payload is never retained",
         );
     }
@@ -109,8 +109,7 @@ fn record_departure_rejects_an_oversize_mesh_folded_result() {
         session_frame: Some(40),
         slot_frame: Some(40),
     };
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps {
@@ -149,15 +148,16 @@ fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
 
     // Slot 1 reports its result: the standalone result notice fires, and the
     // echo is retained.
-    record_result(&registry, &k, SlotId(1), vec![0xDE, 0xAD]);
+    registry.record_result(&k, SlotId(1), vec![0xDE, 0xAD]);
     let result_notice = recv_result(&mut rx);
     assert_eq!(result_notice.payload, vec![0xDE, 0xAD]);
 
     // Slot 1 departs — the home relay seeds the departure record with its
     // retained result, exactly as `announce_departure` does.
-    let retained = result_for(&registry, &k, SlotId(1)).expect("the result is retained");
-    record_departure(
-        &registry,
+    let retained = registry
+        .result_for(&k, SlotId(1))
+        .expect("the result is retained");
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps {
@@ -221,8 +221,7 @@ fn an_embedded_result_folds_first_non_none_wins() {
         session_frame: Some(40),
         slot_frame: Some(50),
     };
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps {
@@ -240,8 +239,7 @@ fn an_embedded_result_folds_first_non_none_wins() {
         session_frame: Some(41),
         slot_frame: Some(51),
     };
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps {
@@ -253,8 +251,7 @@ fn an_embedded_result_folds_first_non_none_wins() {
     );
 
     // A `None`-carrying re-record (the home's own `decide_leave`) preserves it.
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps::default(),

@@ -81,7 +81,7 @@ impl DecisionMaker {
     }
 
     /// Decides `slot`'s leave **without** the authority gate, used only to close out
-    /// a fully-abandoned session (see [`decide_abandoned_departures`]). With every
+    /// a fully-abandoned session (see [`DecisionMakers::decide_abandoned_departures`]). With every
     /// slot session-wide disconnected, presence names no authority — the verdict is
     /// [`Authority::Peer`] on every relay — so an authority-gated decide would leave
     /// the departures undecided forever. There are no clients left to desync, so

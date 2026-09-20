@@ -59,7 +59,7 @@ pub fn forward_client_turn(
             Overflow,
         }
         let Some(verdict) = mesh.session.gates.with_ingress(key, || {
-            if crate::consensus::maker_exists(&mesh.session.decision_makers, key) {
+            if mesh.session.decision_makers.maker_exists(key) {
                 return Funnel::Proceed(payload);
             }
             match mesh

@@ -132,7 +132,7 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
     let makers = Arc::clone(&mesh_state.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
-    let _ = crate::consensus::activate_connection_epoch(&makers, &key, SlotId(0), 22);
+    let _ = makers.activate_connection_epoch(&key, SlotId(0), 22);
 
     let (mut guard, mut inbox) =
         routing::register(&sessions, &key, SlotId(5), 1).expect("local survivor registers");

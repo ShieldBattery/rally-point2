@@ -221,8 +221,7 @@ pub(super) fn drop_slot(
     k: &SessionKey,
     slot: SlotId,
 ) {
-    crate::consensus::record_departure(
-        makers,
+    makers.record_departure(
         k,
         slot,
         crate::consensus::DepartureStamps {

@@ -31,7 +31,7 @@ pub(super) fn activate_slot(
         // A slot link is serving this session (again): any session-closed report an
         // earlier emptying latched no longer describes this relay, so the next
         // emptying must report anew. See `consensus::claim_close_report`.
-        consensus::reopen_close_report(decision_makers, key);
+        decision_makers.reopen_close_report(key);
 
         // This client joining may change who decides the session's buffer — most
         // notably a first client arriving on the relay that heads the authority

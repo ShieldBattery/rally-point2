@@ -129,8 +129,8 @@ fn terminal_departure_metadata_merges_without_weakening_the_epoch_fence() {
     let makers = new_decision_makers();
     let session = key();
     makers.lock().insert(session.clone(), peer_maker());
-    assert!(activate_connection_epoch(&makers, &session, SlotId(0), 11,));
-    assert!(activate_connection_epoch(&makers, &session, SlotId(0), 22,));
+    assert!(makers.activate_connection_epoch(&session, SlotId(0), 11));
+    assert!(makers.activate_connection_epoch(&session, SlotId(0), 22));
     assert!(makers.observe_leave(&session, &leave(0, LEAVE_REASON_DROPPED, 41, 1)));
 
     let result = ResultEcho {
@@ -140,8 +140,7 @@ fn terminal_departure_metadata_merges_without_weakening_the_epoch_fence() {
         slot_frame: Some(40),
     };
     assert_eq!(
-        record_departure_for_epoch_outcome(
-            &makers,
+        makers.record_departure_for_epoch_outcome(
             &session,
             SlotId(0),
             DepartureStamps {
@@ -151,7 +150,7 @@ fn terminal_departure_metadata_merges_without_weakening_the_epoch_fence() {
                 ..Default::default()
             },
             LEAVE_REASON_DROPPED,
-            Some(11),
+            Some(11)
         ),
         DepartureRecordOutcome::Terminal,
         "a final leave still accepts late home-authored terminal metadata",

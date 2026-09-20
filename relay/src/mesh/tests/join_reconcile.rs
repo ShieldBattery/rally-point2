@@ -21,8 +21,7 @@ fn reconcile_leaves_on_join_re_announces_known_state() {
     let leave = makers
         .decide_leave(&key, SlotId(1), 3)
         .expect("the authority decides slot 1's leave");
-    crate::consensus::record_departure(
-        &makers,
+    makers.record_departure(
         &key,
         SlotId(2),
         crate::consensus::DepartureStamps {

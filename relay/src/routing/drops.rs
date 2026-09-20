@@ -141,11 +141,10 @@ pub(crate) fn honor_drop_request(
             // and undecided, never frame-scheduled.
             if decision_makers.finalized_drops_enabled(key) {
                 if decision_makers.strictly_homes(key, target) {
-                    let outcome = consensus::finalize_drop(
-                        decision_makers,
+                    let outcome = decision_makers.finalize_drop(
                         key,
                         target,
-                        consensus::departure_epoch(decision_makers, key, target),
+                        decision_makers.departure_epoch(key, target),
                         || crate::mesh::forwarded_count(seen, key, target),
                     );
                     tracing::info!(
@@ -184,7 +183,7 @@ pub(crate) fn honor_drop_request(
                         mesh_links,
                         key,
                         target,
-                        consensus::departure_epoch(decision_makers, key, target),
+                        decision_makers.departure_epoch(key, target),
                     );
                 }
                 return;
@@ -314,8 +313,7 @@ pub(crate) fn complete_finalized_drop(
         );
         return;
     }
-    consensus::record_departure(
-        decision_makers,
+    decision_makers.record_departure(
         key,
         target,
         consensus::DepartureStamps {

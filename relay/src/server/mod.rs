@@ -426,7 +426,7 @@ async fn serve_connection(
     // refusal.
     if mesh.session.provisional_turns.armed() {
         let reserved = mesh.session.gates.with_ingress(&key, || {
-            consensus::maker_exists(&mesh.session.decision_makers, &key)
+            mesh.session.decision_makers.maker_exists(&key)
                 || mesh.session.provisional_turns.reserve(&key)
         });
         match reserved {

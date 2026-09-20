@@ -32,7 +32,7 @@ pub struct DepartureStamps {
     /// `Departure::final_turn_count`).
     pub final_turn_count: Option<u64>,
     /// Whether `final_turn_count` on a DROPPED departure was derived through
-    /// home-side finalization (see [`finalize_drop`]) — the proof every count
+    /// home-side finalization (see [`DecisionMakers::finalize_drop`]) — the proof every count
     /// ingress requires before accepting a dropped count.
     pub finalized: bool,
 }
@@ -94,6 +94,26 @@ pub(in crate::consensus) struct Departure {
     /// the record itself so Join-time reconciliation cannot accidentally stamp
     /// it with a newer generation from mutable live-link state.
     pub(in crate::consensus) connection_epoch: Option<u64>,
+}
+
+/// The home-side outcome of a drop finalization (see [`DecisionMakers::finalize_drop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// The slot's generation is sealed terminal and `final_turn_count` is its
+    /// gap-free forwarded count — the authority may decide the leave with it.
+    Finalized {
+        /// The sealed count.
+        final_turn_count: u64,
+    },
+    /// The slot has a live (reconnected) generation — the drop must not be
+    /// decided; the game continues with the slot present.
+    RejectedLive,
+    /// This relay holds no gap-free forwarded prefix for the slot (a
+    /// collapsed sparse window, a post-rehome home with no cursor
+    /// continuity, or no maker at all). The drop stays undecided — never a
+    /// frame-scheduled fallback, which is exactly the unsoundness
+    /// finalization exists to remove.
+    RejectedNoCursor,
 }
 
 impl DecisionMaker {
@@ -255,7 +275,7 @@ impl DecisionMaker {
     /// [`crate::session::drop_hold::DropHolds::end_session`]), so a reconnect racing a
     /// force-decide on this exact slot could otherwise land here. This check is
     /// what keeps that race safe under the registry's single-mutex serialization:
-    /// [`crate::consensus::decide_abandoned_departures`] holds the same lock for
+    /// [`DecisionMakers::decide_abandoned_departures`] holds the same lock for
     /// its entire read-then-decide sequence, so this call either runs entirely
     /// before it (nothing decided yet — clears normally) or entirely after (the
     /// leave is already cached — a no-op that leaves the decided state, and the
@@ -281,6 +301,124 @@ impl DecisionMaker {
         state.connection_up_at = Some(Instant::now());
         self.slots.insert(slot, state);
         true
+    }
+
+    /// The connection generation recorded on `slot`'s departure, if any —
+    /// echoed into a `FinalizeDrop` so the home's answer is correlatable.
+    /// `None` for a legacy-mode departure, or no record.
+    pub(in crate::consensus) fn departure_epoch(&self, slot: SlotId) -> Option<u64> {
+        self.departures.get(&slot).and_then(|d| d.connection_epoch)
+    }
+
+    /// Merges the terminal metadata of a `SlotDeparted` that arrived after the
+    /// slot's final leave was already cached, and forgets the slot's delivery
+    /// tracking.
+    ///
+    /// A final leave is stronger than the physical-link generation fence: its
+    /// `SlotDeparted` may arrive afterward on a different reliable peer stream,
+    /// including after a newer generation was already marked down. Only the
+    /// terminal metadata is merged — that stale generation must not mutate the
+    /// current connection tombstone or recreate a drop hold.
+    pub(in crate::consensus) fn merge_terminal_departure(
+        &mut self,
+        slot: SlotId,
+        stamps: DepartureStamps,
+        reason: u32,
+    ) {
+        self.note_departure(slot, stamps, reason, None);
+        self.delivery.forget_slot(slot);
+    }
+
+    /// Seals `slot`'s generation terminally-in-progress so its gap-free
+    /// forwarded count can be snapshotted, or answers the request outright.
+    ///
+    /// `Ok(())` means the seal is installed and the caller must now read the
+    /// cursor and hand the result to
+    /// [`finish_finalize`](Self::finish_finalize); `Err` is the whole answer,
+    /// with nothing sealed. The snapshot the caller then takes is stable
+    /// because the slot has no live link (checked here, under the same lock
+    /// admission uses) and the seal refuses any new one; the slot's own home is
+    /// the only ingress that feeds its cursor.
+    ///
+    /// Idempotent: a re-request after the leave was already decided answers
+    /// from the decided directive's finalized count (or `RejectedLive` when the
+    /// slot was decided without one — nothing here may ever contradict a
+    /// decided leave).
+    ///
+    /// `requested_epoch` is the departed connection generation the requester is
+    /// finalizing, checked against this relay's own departure record for the
+    /// slot: a mismatch means the request describes a generation this home has
+    /// moved past (the slot reconnected and dropped again since the request was
+    /// authored, or the record was seeded by a rehome), and sealing against it
+    /// would answer for the wrong departure — rejected as `RejectedLive` so the
+    /// requester re-asks with its current record.
+    pub(in crate::consensus) fn seal_for_finalize(
+        &mut self,
+        slot: SlotId,
+        requested_epoch: Option<u64>,
+    ) -> Result<(), FinalizeOutcome> {
+        if let Some(decided) = self.decided_leaves.get(&slot) {
+            return Err(match (decided.finalized, decided.final_turn_count) {
+                (true, Some(final_turn_count)) => FinalizeOutcome::Finalized { final_turn_count },
+                _ => FinalizeOutcome::RejectedLive,
+            });
+        }
+        if self.connection_is_up(slot) {
+            return Err(FinalizeOutcome::RejectedLive);
+        }
+        if self.departure_epoch(slot) != requested_epoch {
+            return Err(FinalizeOutcome::RejectedLive);
+        }
+        // A home gained mid-session (rehome) has a cursor covering only what
+        // it forwarded itself, not the slot's whole ingress history — a
+        // non-`None` prefix can still stop short of turns other relays'
+        // clients already consumed, so it must never be sealed as a count.
+        if self.rehomed_homes.contains(&slot) {
+            return Err(FinalizeOutcome::RejectedNoCursor);
+        }
+        // Pre-frame (no framed turn observed anywhere, and none on the
+        // slot's own record): the game has not started, nothing is stalled,
+        // and the leave the count would feed has no scheduling basis yet —
+        // sealing admission here would only lock a lobby slot out of
+        // rejoining while the decide side could never complete. Refuse
+        // without sealing; the drop stays held and a later request, once
+        // frames exist, finalizes normally.
+        if !self.leave_schedulable(slot) {
+            return Err(FinalizeOutcome::RejectedNoCursor);
+        }
+        self.finalizing_drops.insert(slot);
+        Ok(())
+    }
+
+    /// Completes a sealed finalization with the count the caller's cursor read
+    /// produced: stamps it into the departure record with the finalization
+    /// proof, so the leave the authority then decides carries it (see
+    /// [`commit_leave`](Self::commit_leave)). With no count, the seal is lifted
+    /// again so a later reconnect can still resume the slot.
+    pub(in crate::consensus) fn finish_finalize(
+        &mut self,
+        slot: SlotId,
+        count: Option<u64>,
+    ) -> FinalizeOutcome {
+        match count {
+            Some(final_turn_count) => {
+                self.note_departure(
+                    slot,
+                    DepartureStamps {
+                        final_turn_count: Some(final_turn_count),
+                        finalized: true,
+                        ..DepartureStamps::default()
+                    },
+                    LEAVE_REASON_DROPPED,
+                    None,
+                );
+                FinalizeOutcome::Finalized { final_turn_count }
+            }
+            None => {
+                self.finalizing_drops.remove(&slot);
+                FinalizeOutcome::RejectedNoCursor
+            }
+        }
     }
 
     /// The slots whose leave this relay has already decided or cached for this

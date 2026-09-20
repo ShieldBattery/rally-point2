@@ -67,12 +67,7 @@ fn a_superseded_lease_runs_neither_a_queued_dispatch_nor_a_queued_join() {
     let makers = Arc::clone(&mesh.session.decision_makers);
     let key = control_key();
     test_maker(&makers, &key, crate::consensus::Authority::Peer);
-    assert!(crate::consensus::activate_connection_epoch(
-        &makers,
-        &key,
-        SlotId(0),
-        22,
-    ));
+    assert!(makers.activate_connection_epoch(&key, SlotId(0), 22));
 
     let peer = RelayId(9);
     let old = new_mesh_link_attempt();
@@ -95,12 +90,7 @@ fn a_superseded_lease_runs_neither_a_queued_dispatch_nor_a_queued_join() {
             .is_none()
     );
     assert_eq!(inbox.try_recv_connectivity(), None);
-    assert!(crate::consensus::connection_epoch_matches(
-        &makers,
-        &key,
-        SlotId(0),
-        Some(22),
-    ));
+    assert!(makers.connection_epoch_matches(&key, SlotId(0), Some(22)));
 
     // The stale driver's queued Join, into a registry of its own so the
     // emptiness assertion is about this registration alone.

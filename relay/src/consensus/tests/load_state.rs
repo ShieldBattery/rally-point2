@@ -34,8 +34,8 @@ fn retained_load_state_outlives_the_links_it_was_recorded_from() {
     );
 
     // Both slots' links end.
-    assert!(remove_slot_for_epoch(&registry, &k, SlotId(1), None));
-    assert!(remove_slot_for_epoch(&registry, &k, SlotId(2), None));
+    assert!(registry.remove_slot_for_epoch(&k, SlotId(1), None));
+    assert!(registry.remove_slot_for_epoch(&k, SlotId(2), None));
 
     let load = load_state_of(&registry, &k);
     assert_eq!(

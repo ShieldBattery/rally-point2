@@ -180,21 +180,19 @@ pub(super) fn finalize_fixture(
 
     let subject = SlotId(FINALIZE_SUBJECT_SLOT);
     match departure {
-        PeerDrop::Recorded(None) => crate::consensus::record_departure(
-            &mesh.session.decision_makers,
+        PeerDrop::Recorded(None) => mesh.session.decision_makers.record_departure(
             &key,
             subject,
             crate::consensus::DepartureStamps::default(),
             crate::consensus::LEAVE_REASON_DROPPED,
         ),
         PeerDrop::Recorded(epoch) => assert!(
-            crate::consensus::record_departure_for_epoch(
-                &mesh.session.decision_makers,
+            mesh.session.decision_makers.record_departure_for_epoch(
                 &key,
                 subject,
                 crate::consensus::DepartureStamps::default(),
                 crate::consensus::LEAVE_REASON_DROPPED,
-                epoch,
+                epoch
             ),
             "the subject's drop is recorded for its connection generation",
         ),

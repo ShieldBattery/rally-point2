@@ -136,12 +136,8 @@ pub(super) fn handle_control_frame(
                     "dropping inadmissible game-result payload",
                 );
             } else {
-                consensus::record_result(
-                    &ctx.decision_makers,
-                    &ctx.key,
-                    ctx.slot,
-                    payload.to_vec(),
-                );
+                ctx.decision_makers
+                    .record_result(&ctx.key, ctx.slot, payload.to_vec());
             }
         }
         // The client's report that its game loop has started. Bound

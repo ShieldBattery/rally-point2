@@ -19,7 +19,6 @@ use rally_point_transport::{Link, LinkError, Received};
 use inbound::log_link_closed;
 use tokio::time::{Instant, sleep_until};
 
-use crate::consensus;
 use crate::consensus::LEAVE_REASON_LEFT;
 use crate::routing::departure::report_own_presence;
 use crate::routing::drops::handle_drop_request;

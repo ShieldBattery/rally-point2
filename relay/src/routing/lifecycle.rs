@@ -181,7 +181,7 @@ pub(crate) fn abandon_refused_admission(
         if sessions.lock().contains_key(key) {
             return false;
         }
-        if consensus::maker_exists(&mesh.session.decision_makers, key) {
+        if mesh.session.decision_makers.maker_exists(key) {
             return false;
         }
         if !mesh.session.provisional_turns.discard_if_empty(key) {

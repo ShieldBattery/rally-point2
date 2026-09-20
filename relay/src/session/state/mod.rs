@@ -191,8 +191,7 @@ impl SessionState {
     ) -> ReconnectAdmission {
         self.drop_holds
             .resolve_reconnect(key, slot, |hold_pending| {
-                let transition = crate::consensus::resolve_reconnect(
-                    &self.decision_makers,
+                let transition = self.decision_makers.resolve_reconnect(
                     key,
                     slot,
                     epoch,
@@ -303,7 +302,7 @@ impl SessionState {
         // teardown's announce racing this close can never be classified away
         // and then deleted: it either refuses the discard or lands in a fresh,
         // retained journal.
-        if crate::consensus::maker_exists(&self.decision_makers, key) {
+        if self.decision_makers.maker_exists(key) {
             self.provisional.clear(key);
         } else if self.provisional_turns.discard_if_empty(key) {
             self.provisional.clear(key);

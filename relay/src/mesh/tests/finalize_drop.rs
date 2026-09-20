@@ -14,8 +14,7 @@ fn the_home_answers_finalize_drop_with_the_sealed_count() {
         &[FINALIZE_SUBJECT_SLOT],
         PeerDrop::Untouched,
     );
-    crate::consensus::record_departure(
-        &fixture.mesh.session.decision_makers,
+    fixture.mesh.session.decision_makers.record_departure(
         &fixture.key,
         SUBJECT,
         crate::consensus::DepartureStamps {

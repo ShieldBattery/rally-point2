@@ -325,7 +325,7 @@ async fn duplicate_arm_and_expiry_decide_at_most_once() {
     );
 
     // A duplicate decide after the fact is a no-op — all already decided.
-    let again = crate::consensus::decide_abandoned_departures(&makers, &k);
+    let again = makers.decide_abandoned_departures(&k);
     assert!(
         again.is_empty(),
         "a duplicate abandoned-decide finds nothing left to decide",

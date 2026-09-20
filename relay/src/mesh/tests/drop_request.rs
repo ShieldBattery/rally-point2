@@ -28,8 +28,7 @@ async fn a_mesh_request_drop_decides_the_leave_at_the_authority_only_and_never_e
         // zero unlock floor, so the hold is "past the floor" from the first
         // instant.
         makers.observe_frame(&key, SlotId(0), GameFrameCount(50));
-        crate::consensus::record_departure(
-            &makers,
+        makers.record_departure(
             &key,
             SlotId(0),
             crate::consensus::DepartureStamps {

@@ -178,21 +178,22 @@ fn dispatch_mesh_control_frame(
                 mesh.session
                     .drop_holds
                     .record_and_maybe_hold(&key, slot, || {
-                        let outcome = crate::consensus::record_departure_for_epoch_outcome(
-                            &mesh.session.decision_makers,
-                            &key,
-                            slot,
-                            stamps.clone(),
-                            departed.reason,
-                            departed.connection_epoch,
-                        );
+                        let outcome = mesh
+                            .session
+                            .decision_makers
+                            .record_departure_for_epoch_outcome(
+                                &key,
+                                slot,
+                                stamps.clone(),
+                                departed.reason,
+                                departed.connection_epoch,
+                            );
                         (
                             outcome,
                             outcome == crate::consensus::DepartureRecordOutcome::Pending,
                         )
                     })
-            } else if crate::consensus::record_departure_for_epoch(
-                &mesh.session.decision_makers,
+            } else if mesh.session.decision_makers.record_departure_for_epoch(
                 &key,
                 slot,
                 stamps,
@@ -433,8 +434,7 @@ fn dispatch_mesh_control_frame(
                 {
                     return;
                 }
-            } else if !crate::consensus::mark_connection_down(
-                &mesh.session.decision_makers,
+            } else if !mesh.session.decision_makers.mark_connection_down(
                 &key,
                 slot,
                 change.connection_epoch,

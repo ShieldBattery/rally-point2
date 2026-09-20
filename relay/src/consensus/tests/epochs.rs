@@ -258,13 +258,12 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
     let holds = state.drop_holds.clone();
     let session = key();
     makers.lock().insert(session.clone(), peer_maker());
-    assert!(activate_connection_epoch(&makers, &session, SlotId(0), 11));
+    assert!(makers.activate_connection_epoch(&session, SlotId(0), 11));
 
     // The old departure linearizes first: reconnect observes and claims the
     // complete departure+hold transition, restores state, and opens E2.
     assert!(holds.record_and_maybe_hold(&session, SlotId(0), || {
-        let recorded = record_departure_for_epoch(
-            &makers,
+        let recorded = makers.record_departure_for_epoch(
             &session,
             SlotId(0),
             DepartureStamps::default(),
@@ -287,8 +286,7 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
         ReconnectAdmission::Admitted { reinstated: false }
     );
     assert!(!holds.record_and_maybe_hold(&session, SlotId(0), || {
-        let recorded = record_departure_for_epoch(
-            &makers,
+        let recorded = makers.record_departure_for_epoch(
             &session,
             SlotId(0),
             DepartureStamps::default(),
@@ -299,12 +297,7 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
     }));
     assert!(!holds.is_pending(&session, SlotId(0)));
     assert!(!makers.has_departure(&session, SlotId(0)));
-    assert!(connection_epoch_matches(
-        &makers,
-        &session,
-        SlotId(0),
-        Some(33)
-    ));
+    assert!(makers.connection_epoch_matches(&session, SlotId(0), Some(33)));
 }
 
 #[test]
@@ -344,8 +337,7 @@ fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
     let (stale_tx, stale_rx) = std::sync::mpsc::channel();
     let stale = std::thread::spawn(move || {
         attempting_tx.send(()).unwrap();
-        let recorded = record_departure_for_epoch(
-            &stale_makers,
+        let recorded = stale_makers.record_departure_for_epoch(
             &stale_key,
             SlotId(0),
             DepartureStamps::default(),
@@ -367,12 +359,7 @@ fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
     );
     stale.join().unwrap();
     assert!(!makers.has_departure(&session, SlotId(0)));
-    assert!(connection_epoch_matches(
-        &makers,
-        &session,
-        SlotId(0),
-        Some(22)
-    ));
+    assert!(makers.connection_epoch_matches(&session, SlotId(0), Some(22)));
 }
 
 /// The bundle both reconnect-ordering tests drive: an immediate drop unlock

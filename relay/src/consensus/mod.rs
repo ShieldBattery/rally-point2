@@ -230,7 +230,6 @@ mod buffer_law_sim;
 
 mod law;
 mod maker;
-mod ops;
 mod registry;
 mod slot;
 mod sync;
@@ -265,28 +264,21 @@ use crate::observability::events::{
 
 // Every submodule of this one reaches the rest of the module's internals
 // through these globs: each file's own `use super::*` picks them up, so an item
-// keeps resolving by its bare name wherever it was written. `ops` needs no glob
-// of its own — the explicit re-exports below already name every item it has.
+// keeps resolving by its bare name wherever it was written.
 use law::*;
 use registry::*;
 use slot::*;
 use sync::*;
 
 pub use law::ControlLaw;
-pub use maker::{DecisionMaker, DepartureStamps, RecordedDeparture, SilentSlot};
-pub use ops::{
-    FinalizeOutcome, activate_connection_epoch, claim_close_report, connection_epoch_matches,
-    decide_abandoned_departures, departure_epoch, finalize_drop, maker_exists, record_departure,
-    record_departure_for_epoch, record_result, remove_slot_for_epoch, reopen_close_report,
-    result_for,
-};
+pub use maker::{DecisionMaker, DepartureStamps, FinalizeOutcome, RecordedDeparture, SilentSlot};
+
 pub use registry::{
     DecisionMakers, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,
     new_decision_makers, new_decision_makers_with_region_delay, normalize_observed_leave,
 };
 pub use sync::SyncDivergence;
 
-pub(crate) use ops::{mark_connection_down, record_departure_for_epoch_outcome, resolve_reconnect};
 pub(crate) use slot::{
     ConnectionActivation, DepartureRecordOutcome, ReconnectAdmission, ReconnectTransition,
 };

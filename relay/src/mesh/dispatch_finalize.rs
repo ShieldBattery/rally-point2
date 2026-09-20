@@ -38,13 +38,12 @@ pub(super) fn dispatch_finalize_drop(request: FinalizeDrop, key: &SessionKey, me
     {
         return;
     }
-    let outcome = crate::consensus::finalize_drop(
-        &mesh.session.decision_makers,
-        key,
-        slot,
-        request.connection_epoch,
-        || forwarded_count(&mesh.seen, key, slot),
-    );
+    let outcome =
+        mesh.session
+            .decision_makers
+            .finalize_drop(key, slot, request.connection_epoch, || {
+                forwarded_count(&mesh.seen, key, slot)
+            });
     tracing::info!(
         tenant = key.tenant.as_ref(),
         session = session_id.0,
@@ -103,9 +102,7 @@ pub(super) fn dispatch_finalize_drop_result(
     // reads `None`) and a re-drop records the newer generation, so
     // either drift rejects the stale answer here; the requester's
     // next honored drop request re-asks with the current epoch.
-    if result.connection_epoch
-        != crate::consensus::departure_epoch(&mesh.session.decision_makers, key, slot)
-    {
+    if result.connection_epoch != mesh.session.decision_makers.departure_epoch(key, slot) {
         tracing::warn!(
             tenant = key.tenant.as_ref(),
             session = session_id.0,

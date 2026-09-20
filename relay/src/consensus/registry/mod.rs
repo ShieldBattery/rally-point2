@@ -12,6 +12,7 @@ use super::*;
 
 mod authority;
 mod buffer;
+mod departure;
 mod homing;
 mod leave;
 mod phase;

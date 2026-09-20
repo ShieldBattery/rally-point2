@@ -156,7 +156,7 @@ pub(crate) fn announce_departure_recorded(
     let stamps = consensus::DepartureStamps {
         last_frame: decision_makers.slot_frame(key, slot),
         reachable_frame: decision_makers.reachable_frame(key, slot),
-        result: consensus::result_for(decision_makers, key, slot),
+        result: decision_makers.result_for(key, slot),
         final_turn_count,
         // A link-death departure is never born finalized; the proof only ever
         // enters the record through `finalize_drop`'s stamp.
@@ -167,8 +167,7 @@ pub(crate) fn announce_departure_recorded(
         // hold lock stays held while `record` takes the maker lock, then the
         // hold is installed before either becomes externally observable.
         drop_holds.record_and_maybe_hold(key, slot, || {
-            let outcome = consensus::record_departure_for_epoch_outcome(
-                decision_makers,
+            let outcome = decision_makers.record_departure_for_epoch_outcome(
                 key,
                 slot,
                 stamps.clone(),
@@ -180,8 +179,7 @@ pub(crate) fn announce_departure_recorded(
                 outcome == consensus::DepartureRecordOutcome::Pending,
             )
         })
-    } else if consensus::record_departure_for_epoch(
-        decision_makers,
+    } else if decision_makers.record_departure_for_epoch(
         key,
         slot,
         stamps.clone(),
@@ -451,7 +449,10 @@ pub(super) fn decide_and_broadcast_abandoned(
         );
         return;
     }
-    let leaves = consensus::decide_abandoned_departures(&mesh.session.decision_makers, key);
+    let leaves = mesh
+        .session
+        .decision_makers
+        .decide_abandoned_departures(key);
     if !leaves.is_empty() {
         tracing::info!(
             tenant = key.tenant.as_ref(),

@@ -9,15 +9,14 @@ use super::*;
 fn finalize_drop_seals_stamps_and_the_leave_carries_the_count() {
     let registry = finalized_drop_registry(&key(), &[0, 1]);
     let k = key();
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps::default(),
         LEAVE_REASON_DROPPED,
     );
 
-    let outcome = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
+    let outcome = registry.finalize_drop(&k, SlotId(1), None, || Some(42));
     assert_eq!(
         outcome,
         FinalizeOutcome::Finalized {
@@ -51,9 +50,9 @@ fn finalize_drop_seals_stamps_and_the_leave_carries_the_count() {
 fn finalize_drop_rejects_a_live_generation() {
     let registry = finalized_drop_registry(&key(), &[0, 1]);
     let k = key();
-    assert!(activate_connection_epoch(&registry, &k, SlotId(1), 7));
+    assert!(registry.activate_connection_epoch(&k, SlotId(1), 7));
 
-    let outcome = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
+    let outcome = registry.finalize_drop(&k, SlotId(1), None, || Some(42));
     assert_eq!(outcome, FinalizeOutcome::RejectedLive);
     assert!(
         !registry
@@ -73,8 +72,7 @@ fn finalize_drop_rejects_a_live_generation() {
 fn finalize_drop_without_a_cursor_fails_closed_and_lifts_the_seal() {
     let registry = finalized_drop_registry(&key(), &[0, 1]);
     let k = key();
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps::default(),
@@ -82,7 +80,7 @@ fn finalize_drop_without_a_cursor_fails_closed_and_lifts_the_seal() {
     );
 
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), None, || None),
+        registry.finalize_drop(&k, SlotId(1), None, || None),
         FinalizeOutcome::RejectedNoCursor,
     );
     assert!(
@@ -96,7 +94,7 @@ fn finalize_drop_without_a_cursor_fails_closed_and_lifts_the_seal() {
     );
     // A retry with a cursor succeeds.
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), None, || Some(7)),
+        registry.finalize_drop(&k, SlotId(1), None, || Some(7)),
         FinalizeOutcome::Finalized {
             final_turn_count: 7
         },
@@ -109,20 +107,19 @@ fn finalize_drop_without_a_cursor_fails_closed_and_lifts_the_seal() {
 fn finalize_drop_is_idempotent_after_the_decide() {
     let registry = finalized_drop_registry(&key(), &[0, 1]);
     let k = key();
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps::default(),
         LEAVE_REASON_DROPPED,
     );
-    let _ = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
+    let _ = registry.finalize_drop(&k, SlotId(1), None, || Some(42));
     let _ = registry
         .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
         .expect("decides");
 
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), None, || Some(999)),
+        registry.finalize_drop(&k, SlotId(1), None, || Some(999)),
         FinalizeOutcome::Finalized {
             final_turn_count: 42
         },
@@ -203,14 +200,13 @@ fn a_finalized_count_survives_a_resumed_session() {
     let registry = finalized_drop_registry(&key(), &[0, 1]);
     let k = key();
     registry.lock().get_mut(&k).unwrap().resumed = true;
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps::default(),
         LEAVE_REASON_DROPPED,
     );
-    let _ = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
+    let _ = registry.finalize_drop(&k, SlotId(1), None, || Some(42));
 
     let leave = registry
         .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
@@ -240,21 +236,15 @@ fn finalize_refuses_a_home_gained_by_a_rehome() {
         },
     );
     let stamps = framed(40);
-    record_departure(
-        &registry,
-        &k,
-        SlotId(1),
-        stamps.clone(),
-        LEAVE_REASON_DROPPED,
-    );
+    registry.record_departure(&k, SlotId(1), stamps.clone(), LEAVE_REASON_DROPPED);
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), None, || Some(42)),
+        registry.finalize_drop(&k, SlotId(1), None, || Some(42)),
         FinalizeOutcome::RejectedNoCursor,
         "a rehome-gained home never seals a count, cursor or not",
     );
-    record_departure(&registry, &k, SlotId(0), stamps, LEAVE_REASON_DROPPED);
+    registry.record_departure(&k, SlotId(0), stamps, LEAVE_REASON_DROPPED);
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(0), None, || Some(7)),
+        registry.finalize_drop(&k, SlotId(0), None, || Some(7)),
         FinalizeOutcome::Finalized {
             final_turn_count: 7
         },
@@ -280,9 +270,9 @@ fn finalize_refuses_every_home_of_a_resumed_created_maker() {
             ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
         },
     );
-    record_departure(&registry, &k, SlotId(1), framed(40), LEAVE_REASON_DROPPED);
+    registry.record_departure(&k, SlotId(1), framed(40), LEAVE_REASON_DROPPED);
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), None, || Some(42)),
+        registry.finalize_drop(&k, SlotId(1), None, || Some(42)),
         FinalizeOutcome::RejectedNoCursor,
     );
 }
@@ -296,26 +286,25 @@ fn finalize_refuses_every_home_of_a_resumed_created_maker() {
 fn finalize_rejects_a_request_naming_a_stale_generation() {
     let registry = finalized_drop_registry(&key(), &[0, 1]);
     let k = key();
-    assert!(record_departure_for_epoch(
-        &registry,
+    assert!(registry.record_departure_for_epoch(
         &k,
         SlotId(1),
         framed(40),
         LEAVE_REASON_DROPPED,
-        Some(7),
+        Some(7)
     ));
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), None, || Some(42)),
+        registry.finalize_drop(&k, SlotId(1), None, || Some(42)),
         FinalizeOutcome::RejectedLive,
         "an epoch-less request against an epoch-recorded departure is stale",
     );
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), Some(3), || Some(42)),
+        registry.finalize_drop(&k, SlotId(1), Some(3), || Some(42)),
         FinalizeOutcome::RejectedLive,
         "a request naming an older generation is stale",
     );
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), Some(7), || Some(42)),
+        registry.finalize_drop(&k, SlotId(1), Some(7), || Some(42)),
         FinalizeOutcome::Finalized {
             final_turn_count: 42
         },
@@ -337,15 +326,14 @@ fn finalize_refuses_a_pre_frame_drop_without_sealing() {
             ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
         },
     );
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps::default(),
         LEAVE_REASON_DROPPED,
     );
     assert_eq!(
-        finalize_drop(&registry, &k, SlotId(1), None, || Some(3)),
+        registry.finalize_drop(&k, SlotId(1), None, || Some(3)),
         FinalizeOutcome::RejectedNoCursor,
     );
     assert!(

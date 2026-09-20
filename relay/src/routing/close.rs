@@ -4,8 +4,6 @@
 
 use super::*;
 
-use crate::consensus;
-
 /// Closes out this relay's serving state for a session whose local roster is
 /// empty — the coordinator `SessionClosed` notice plus the per-session
 /// registries (lobby log, chat, skin map, forwarded-turn replay ring,
@@ -116,7 +114,10 @@ fn maybe_close_emptied_session_gated(
     // ever reach. The abandon timer's expiry does not: that timer arms only
     // while a maker exists, so a missing one proves the descriptor was retired
     // mid-window and the close already ran and reached the coordinator.
-    let claimed = consensus::claim_close_report(&mesh.session.decision_makers, key)
+    let claimed = mesh
+        .session
+        .decision_makers
+        .claim_close_report(key)
         .unwrap_or(!close_claim_requires_maker);
     if !claimed {
         return;

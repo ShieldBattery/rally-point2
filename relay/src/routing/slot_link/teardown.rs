@@ -105,8 +105,7 @@ pub(in crate::routing) fn end_slot_link(
             .get(key)
             .is_some_and(|slots| slots.contains_key(&slot));
         if !reoccupied {
-            let _ = consensus::remove_slot_for_epoch(
-                &mesh.session.decision_makers,
+            let _ = mesh.session.decision_makers.remove_slot_for_epoch(
                 key,
                 slot,
                 Some(connection_epoch),

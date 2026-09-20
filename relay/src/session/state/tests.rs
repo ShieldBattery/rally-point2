@@ -203,10 +203,7 @@ async fn retire_sweeps_everything_the_descriptor_owned() {
     seeded.state.retire(&seeded.key, &seeded.seen);
 
     assert!(seeded.state.gates.is_retired(&seeded.key));
-    assert!(!crate::consensus::maker_exists(
-        &seeded.state.decision_makers,
-        &seeded.key
-    ));
+    assert!(!seeded.state.decision_makers.maker_exists(&seeded.key));
     assert_eq!(presence::verdict(&seeded.state.presence, &seeded.key), None);
     assert_eq!(seeded.state.provisional_turns.held(&seeded.key), 0);
     assert_eq!(seeded.state.turn_ring.len(&seeded.key), 0);

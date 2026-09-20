@@ -30,8 +30,7 @@ fn home(session: &SessionState, key: &SessionKey, expected: &[u8], homed: &[u8])
 
 /// Records a departure for `slot` the way a dropped link's teardown would.
 fn depart(session: &SessionState, key: &SessionKey, slot: SlotId) {
-    crate::consensus::record_departure(
-        &session.decision_makers,
+    session.decision_makers.record_departure(
         key,
         slot,
         DepartureStamps::default(),

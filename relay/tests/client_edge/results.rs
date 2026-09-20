@@ -114,7 +114,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
 /// empty result indistinguishable from no result once the slot departs.
 #[tokio::test]
 async fn a_malformed_result_report_is_dropped_without_closing_the_link() {
-    use rally_point_relay::consensus::{self, RelayNotice};
+    use rally_point_relay::consensus::RelayNotice;
     use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::send_control_game_result;
 
@@ -162,7 +162,7 @@ async fn a_malformed_result_report_is_dropped_without_closing_the_link() {
         )
         .await;
         assert!(
-            consensus::result_for(&makers, &key, SlotId(0)).is_none(),
+            makers.result_for(&key, SlotId(0)).is_none(),
             "{case} must never be retained",
         );
 

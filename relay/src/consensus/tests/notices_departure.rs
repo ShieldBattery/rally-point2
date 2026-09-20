@@ -127,7 +127,7 @@ fn promotion_re_derivation_fires_exactly_one_departure_notice() {
         HashMap::from([(SlotId(1), "sb-user-9".to_owned())]),
     );
     registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
-    record_departure(&registry, &k, SlotId(1), framed(50), 3);
+    registry.record_departure(&k, SlotId(1), framed(50), 3);
     assert!(rx.try_recv().is_err(), "recording alone fires nothing");
 
     // Promoted (the dead authority was the only other relay in the

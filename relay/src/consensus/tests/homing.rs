@@ -84,8 +84,7 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
 
     // A peer-homed slot drops: undecided session-wide and held, but its
     // reconnect (if any) lands on its own home relay.
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(1),
         DepartureStamps::default(),
@@ -97,8 +96,7 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
     // This relay's own homed slot drops: while held, the close must wait —
     // but with the hold gone (a clean leave releases it), nothing can be
     // admitted back, so nothing waits.
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(0),
         DepartureStamps::default(),
@@ -129,8 +127,7 @@ fn a_reconnectable_departure_counts_every_held_slot_when_the_homed_set_is_empty(
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::Peer);
     let held: HashSet<SlotId> = [SlotId(3)].into_iter().collect();
     assert!(!registry.has_reconnectable_departure(&k, &held));
-    record_departure(
-        &registry,
+    registry.record_departure(
         &k,
         SlotId(3),
         DepartureStamps::default(),
@@ -173,25 +170,25 @@ fn claim_close_report_latches_once_until_reopened() {
     let registry = new_decision_makers();
     let k = key();
     assert_eq!(
-        claim_close_report(&registry, &k),
+        registry.claim_close_report(&k),
         None,
         "no maker: nothing to latch, and no verdict",
     );
 
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
     assert_eq!(
-        claim_close_report(&registry, &k),
+        registry.claim_close_report(&k),
         Some(true),
         "the first claim wins",
     );
     assert_eq!(
-        claim_close_report(&registry, &k),
+        registry.claim_close_report(&k),
         Some(false),
         "a second evaluation finds the close already reported",
     );
-    reopen_close_report(&registry, &k);
+    registry.reopen_close_report(&k);
     assert_eq!(
-        claim_close_report(&registry, &k),
+        registry.claim_close_report(&k),
         Some(true),
         "serving again reopens the latch for the next emptying",
     );
