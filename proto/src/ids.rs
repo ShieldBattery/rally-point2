@@ -44,7 +44,7 @@ impl std::fmt::Display for SessionId {
 /// peer's *configured* id and connects only if it is the lower. The higher
 /// id stays in its accept loop and lets the dial arrive, so there is no race
 /// to resolve on the wire. The tie-break therefore needs the peer's id known
-/// ahead of time (from the coordinator-assigned topology, Phase 3), not
+/// ahead of time (from the coordinator-assigned topology), not
 /// discovered by exchanging ids over a stream — by the time such an exchange
 /// could run, the dial that needed deciding has already happened.
 ///
@@ -55,9 +55,9 @@ impl std::fmt::Display for SessionId {
 /// reaches. That labeling does not decide the dial — it just lets a relay aim a
 /// session join at the right link instead of broadcasting.
 ///
-/// Real relay-to-relay authentication and tenant binding land with the
-/// coordinator (Phase 3); the id is the ordering key that establishment needs
-/// before that, and nothing more.
+/// Authenticating a relay-to-relay link and binding it to a tenant are the
+/// coordinator's concern, not this id's: the id is the ordering key
+/// establishment needs, and nothing more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RelayId(pub u64);
 
