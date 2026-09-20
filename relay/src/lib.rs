@@ -28,8 +28,8 @@
 //!   each relay↔relay QUIC connection (dial when lower-id, accept otherwise),
 //!   exchange a peer-identity hello so each link is labeled with its peer's id,
 //!   and spawn a `run_mesh_link` driver. The Join/Leave stream that drives
-//!   session membership is pluggable — the test sends it today, the
-//!   coordinator's session-descriptor push does in production (Phase 3).
+//!   session membership is pluggable — the coordinator's session-descriptor
+//!   push drives it in production, a test harness in the unit tests.
 //! - **mesh::control** ([`mesh::control`]) — the Join source: holds the per-peer
 //!   `MeshCommand` senders the connection half surfaces and turns a coordinator
 //!   `SessionDescriptor` into targeted `Join`/`Leave` on the links serving that
@@ -86,11 +86,12 @@ pub mod consensus;
 pub mod coordinator;
 pub mod mesh;
 pub mod observability;
+pub(crate) mod rate_limit;
 pub mod routing;
 pub mod server;
 pub mod session;
 pub mod validation;
 
 /// Default UDP port the relay listens on for client + mesh QUIC connections.
-// TODO: reconcile with the Fargate task def + per-game IP rotation.
+// TODO: reconcile with the Fargate task def.
 pub const DEFAULT_PORT: u16 = 14_900;

@@ -51,7 +51,7 @@ pub(crate) struct Cli {
     /// the other, exactly one must, so each compares its own id to a peer's
     /// configured id and dials only when it is the lower. Leave absent to run
     /// without a mesh edge (single-relay `C–S–C`). In production the
-    /// coordinator assigns the relay id (Phase 3).
+    /// coordinator assigns the relay id when it provisions the task.
     #[arg(long, env = "RELAY_ID")]
     pub(crate) relay_id: Option<u64>,
 
@@ -70,7 +70,8 @@ pub(crate) struct Cli {
     /// with two relays sharing one self-signed cert, pass that same cert here;
     /// if absent, the relay's own leaf cert is trusted (the shared-cert dev
     /// case). In production, relay-to-relay trust comes from an internal CA
-    /// (both relays trust the same CA root) — Phase 3.
+    /// (both relays trust the same CA root), and the coordinator's fleet-peer
+    /// push pins each peer's leaf certificate on top of that.
     #[arg(long, env = "RELAY_MESH_ROOTS")]
     pub(crate) mesh_roots: Option<String>,
 

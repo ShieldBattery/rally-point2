@@ -254,7 +254,7 @@ pub fn parse_mesh_peers(specs: &[String]) -> color_eyre::Result<Vec<MeshPeer>> {
 ///
 /// In production, relay-to-relay trust comes from an internal CA (both relays
 /// trust the same CA root; each relay's cert is signed by it on startup), not
-/// from this dev fallback. That lands with the coordinator (Phase 3).
+/// from this dev fallback.
 pub fn load_mesh_roots(
     mesh_roots: &Option<String>,
     own_ca: &CertificateDer<'_>,

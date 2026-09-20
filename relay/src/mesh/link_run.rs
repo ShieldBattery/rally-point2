@@ -26,9 +26,9 @@ use super::links::{MeshLinkExit, MeshLinkLease, MeshRttCache, SessionState};
 /// peer also serves as clients connect and games start — so it takes a stream
 /// of these commands rather than an upfront list. Join opens the session's
 /// transport state on the link and registers its forward channel; Leave
-/// closes and deregisters it. Today the test harness drives the channel
-/// directly; the coordinator's session-descriptor push (Phase 3) will be the
-/// production source.
+/// closes and deregisters it. In production the commands come from the
+/// coordinator's session-descriptor push; the unit tests drive the channel
+/// directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MeshCommand {
     /// Start serving `key`'s session on this link. Opens per-session transport

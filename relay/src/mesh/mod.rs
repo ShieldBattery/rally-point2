@@ -20,8 +20,12 @@
 //! ([`should_dial_mesh`](rally_point_transport::should_dial_mesh)): each relay
 //! compares its own id to the peer's configured id and dials only when it is the
 //! lower, so exactly one side connects and there is no two-way race to resolve
-//! on the wire. Authenticated relay tokens and tenant binding land with the
-//! coordinator (Phase 3); this increment has no auth token.
+//! on the wire. An accepted peer's claimed id is then pinned against the leaf
+//! certificate the coordinator's fleet-peer push recorded for it (see
+//! `edge::verify_mesh_peer_identity`), so a relay cannot join the mesh as an id
+//! it does not hold the key for. The dev/loopback static mesh receives no such
+//! push and stays unauthenticated unless `--require-mesh-peer-auth` forces the
+//! check to fail closed.
 
 pub mod control;
 pub mod dialer;
