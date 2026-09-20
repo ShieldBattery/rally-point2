@@ -404,9 +404,9 @@ pub(crate) fn reconcile_abandon(
 /// this session's close (the deferral it exists to end never happened), and also
 /// when no decision-maker exists anymore: the timer only ever armed while one
 /// did, so a missing maker proves the descriptor was retired mid-window — the
-/// close already ran and reached the coordinator — and
-/// [`consensus::claim_close_report`]'s no-maker default (`true`, meant for
-/// sessions that never had a maker) must not re-report it. The force-decide
+/// close already ran and reached the coordinator, and must not be reported
+/// again. That is the opposite of how an ordinary emptying reads a missing
+/// maker, which is why the two entry points differ. The force-decide
 /// above still runs either way — the undecided holds it releases outlive the
 /// close, and nothing else ever releases them.
 ///

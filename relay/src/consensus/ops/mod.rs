@@ -31,10 +31,10 @@ pub use departure::{
     result_for,
 };
 pub use leave::{
-    claim_close_report_with_maker, decide_leave, decided_slots, deregister_maker,
-    finalized_drops_enabled, has_reconnectable_departure, has_undecided_departure, leave_reconcile,
-    leave_schedulable, normalize_observed_leave, observe_leave, reachable_frame, reinstate_slot,
-    session_closed, slot_departed, slot_homed, slot_leave_decided, slot_strictly_homed,
+    decide_leave, decided_slots, deregister_maker, finalized_drops_enabled,
+    has_reconnectable_departure, has_undecided_departure, leave_reconcile, leave_schedulable,
+    normalize_observed_leave, observe_leave, reachable_frame, reinstate_slot, session_closed,
+    slot_departed, slot_homed, slot_leave_decided, slot_strictly_homed,
 };
 pub use silence::{
     SILENCE_CHECK_INTERVAL, note_forward_advance, retained_load_state, retained_load_states,

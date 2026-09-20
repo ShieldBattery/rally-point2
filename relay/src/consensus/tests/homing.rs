@@ -172,27 +172,33 @@ fn force_decide_leave_commits_with_no_frame_basis() {
 }
 
 /// The session-closed report latches once per emptying and reopens when the
-/// relay serves the session again — and with no maker to latch on, every
-/// claim succeeds (the only close such a session can reach).
+/// relay serves the session again — and reports no verdict at all with no
+/// maker to latch on, leaving that reading to the caller.
 #[test]
 fn claim_close_report_latches_once_until_reopened() {
     let registry = new_decision_makers();
     let k = key();
-    assert!(claim_close_report(&registry, &k));
-    assert!(
+    assert_eq!(
         claim_close_report(&registry, &k),
-        "no maker: every emptying reports",
+        None,
+        "no maker: nothing to latch, and no verdict",
     );
 
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
-    assert!(claim_close_report(&registry, &k), "the first claim wins");
-    assert!(
-        !claim_close_report(&registry, &k),
+    assert_eq!(
+        claim_close_report(&registry, &k),
+        Some(true),
+        "the first claim wins",
+    );
+    assert_eq!(
+        claim_close_report(&registry, &k),
+        Some(false),
         "a second evaluation finds the close already reported",
     );
     reopen_close_report(&registry, &k);
-    assert!(
+    assert_eq!(
         claim_close_report(&registry, &k),
+        Some(true),
         "serving again reopens the latch for the next emptying",
     );
 }

@@ -270,9 +270,9 @@ pub use law::ControlLaw;
 pub use maker::{DecisionMaker, DepartureStamps, RecordedDeparture, SilentSlot};
 pub use ops::{
     FinalizeOutcome, FrameRegression, MakerSync, SILENCE_CHECK_INTERVAL, activate_connection_epoch,
-    active_directive, adopt_session_start, claim_close_report, claim_close_report_with_maker,
-    commanded_phase_delay, connection_epoch_matches, decide_abandoned_departures, decide_leave,
-    decided_slots, departure_epoch, deregister_maker, finalize_drop, finalized_drops_enabled,
+    active_directive, adopt_session_start, claim_close_report, commanded_phase_delay,
+    connection_epoch_matches, decide_abandoned_departures, decide_leave, decided_slots,
+    departure_epoch, deregister_maker, finalize_drop, finalized_drops_enabled,
     has_reconnectable_departure, has_undecided_departure, ingest_arrival_phase,
     ingest_local_condition, ingest_local_conditions, ingest_remote_conditions, is_authority,
     leave_reconcile, leave_schedulable, maker_exists, mark_session_started,

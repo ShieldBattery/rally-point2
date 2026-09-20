@@ -363,15 +363,20 @@ pub fn maker_exists(registry: &DecisionMakers, key: &SessionKey) -> bool {
 }
 
 /// Claims the one session-closed report for `key` (see
-/// [`DecisionMaker::claim_close_report`]): `true` means the caller runs the close,
-/// `false` that an earlier evaluation already did. `true` when no maker exists —
-/// with nowhere to latch, every emptying reports, which is also the only close
-/// such a session (no descriptor, no decide paths) can ever reach.
-pub fn claim_close_report(registry: &DecisionMakers, key: &SessionKey) -> bool {
+/// [`DecisionMaker::claim_close_report`]). `Some(true)` means the caller runs
+/// the close, `Some(false)` that an earlier evaluation already did, and `None`
+/// that the session has no decision-maker to latch on.
+///
+/// What `None` means is the caller's to decide — it reads one way for a session
+/// that never had a descriptor and the opposite way for one whose descriptor was
+/// retired, so neither can be the default here. It comes back from the same
+/// registry acquisition as the claim rather than from a separate existence
+/// check, so a retirement cannot land between the two.
+pub fn claim_close_report(registry: &DecisionMakers, key: &SessionKey) -> Option<bool> {
     registry
         .lock()
         .get_mut(key)
-        .is_none_or(DecisionMaker::claim_close_report)
+        .map(DecisionMaker::claim_close_report)
 }
 
 /// Clears `key`'s session-closed latch because a slot link is serving the session

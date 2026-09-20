@@ -53,14 +53,10 @@ pub(crate) fn maybe_close_emptied_session(
     maybe_close_emptied_session_inner(sessions, mesh, key, false)
 }
 
-/// [`maybe_close_emptied_session`] for the abandon timer's expiry: the close
-/// claim additionally requires a decision-maker to still exist, in one atomic
-/// registry acquisition (see [`consensus::claim_close_report_with_maker`]). The
-/// timer only ever arms while a maker exists, so a missing one at expiry proves
-/// the descriptor was retired mid-window and the close already ran — and a
-/// separate exists-then-claim pair would leave a gap for that retirement to
-/// land in, restoring `claim_close_report`'s no-maker default and duplicating
-/// the close.
+/// [`maybe_close_emptied_session`] for the abandon timer's expiry, which reads a
+/// missing decision-maker the opposite way: the timer only ever arms while a
+/// maker exists, so a missing one at expiry proves the descriptor was retired
+/// mid-window and the close already ran. It must not report a second one.
 pub(super) fn maybe_close_emptied_session_for_abandon_expiry(
     sessions: &Sessions,
     mesh: &crate::mesh::MeshState,
@@ -109,11 +105,15 @@ fn maybe_close_emptied_session_gated(
         );
         return;
     }
-    let claimed = if close_claim_requires_maker {
-        consensus::claim_close_report_with_maker(&mesh.decision_makers, key)
-    } else {
-        consensus::claim_close_report(&mesh.decision_makers, key)
-    };
+    // A session with no decision-maker has nowhere to latch a claim, and the two
+    // entry points read that opposite ways — so the default is chosen here, not
+    // inside the claim. An ordinary emptying reports: a session no descriptor
+    // ever named has no decide paths, so its emptying is the only close it can
+    // ever reach. The abandon timer's expiry does not: that timer arms only
+    // while a maker exists, so a missing one proves the descriptor was retired
+    // mid-window and the close already ran and reached the coordinator.
+    let claimed = consensus::claim_close_report(&mesh.decision_makers, key)
+        .unwrap_or(!close_claim_requires_maker);
     if !claimed {
         return;
     }
