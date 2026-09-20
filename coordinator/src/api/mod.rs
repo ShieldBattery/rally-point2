@@ -89,6 +89,7 @@ use crate::regions::RegionsConfig;
 use crate::session::SessionSetup;
 
 mod control;
+mod control_enroll;
 mod control_flight;
 mod control_hello;
 mod control_inbound;
@@ -320,7 +321,7 @@ impl CoordinatorState {
             pair_rtts: pair_rtts::PairRttStore::new(),
             flight_store: None,
             pending_hellos: Arc::new(tokio::sync::Semaphore::new(
-                control::MAX_PENDING_CONTROL_HELLOS,
+                control_enroll::MAX_PENDING_CONTROL_HELLOS,
             )),
         }
     }

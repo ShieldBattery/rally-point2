@@ -28,6 +28,7 @@ use crate::registry;
 use crate::session;
 use crate::test_support::*;
 
+use super::control_enroll::*;
 use super::control_flight::*;
 use super::control_inbound::*;
 use super::control_writer::*;
@@ -35,6 +36,7 @@ use super::queries::*;
 use super::request_auth::*;
 use super::sessions::*;
 
+mod control_enroll;
 mod control_inbound;
 mod control_writer;
 mod flight;

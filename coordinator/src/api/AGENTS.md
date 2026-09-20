@@ -10,9 +10,14 @@ Public paths (`api::CoordinatorState`, `router`, `ControlAuth`,
 - `sessions.rs` create / rehome / alive · `load_state.rs` the attested load read
 - `queries.rs` presence, flight blob reads, warm, pubkey, regions
 - `request_auth.rs` bearer check + tenant request signatures
-- `control.rs` the endpoint, the enroll handshake, and the socket/channel types
-  both halves share (`ControlRead`, `ControlWrite`, `DrainSend`)
-- `control_hello.rs` pre-enroll reads · `control_writer.rs` send half, and the
+- `control.rs` the endpoint, the socket loop that drives the enroll handshake,
+  and the socket/channel types both halves share (`ControlRead`,
+  `ControlWrite`, `DrainSend`)
+- `control_enroll.rs` the enroll sequence itself as a typed state machine
+  (`EnrollHandshake` / `EnrollStep`), plus the pending-Hello gate's size and the
+  close code a saturated gate sends
+- `control_hello.rs` the socket reads the sequence is fed from: the opening
+  `Hello`, then every later frame · `control_writer.rs` send half, and the
   `WriterSources` it draws from
 - `control_inbound.rs` read half + frame dispatch, the `ControlInbound` inputs
   they run over, and the drain mark · `control_flight.rs` upload grants and
@@ -30,7 +35,11 @@ webhook). This layer decodes and calls once; it decides none of it.
 - Enroll order is load-bearing: pending-Hello permit → Hello → version negotiate
   → region check → proof-of-possession → **drop the permit** → ledger → registry.
   The permit covers only the unauthenticated window; moving the drop changes what
-  the gate actually bounds.
+  the gate actually bounds. `EnrollHandshake` is that order — its stage picks
+  which step a frame drives, every refusal is decided (and logged) there, and
+  `control.rs` only sends what it returns. It names no axum/tungstenite type and
+  never awaits, so `tests/control_enroll.rs` walks the whole sequence, and each
+  refusal point, without a socket; assert where the permit is still held.
 - `peer_ip` arrives only when the server was built with
   `into_make_service_with_connect_info`. In-process TLS keeps the real peer
   visible; behind an L7 proxy a ledger's expected-address check would compare
