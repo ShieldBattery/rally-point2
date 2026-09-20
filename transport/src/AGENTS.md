@@ -24,7 +24,9 @@ reliable-ordered protocol). Read it before touching `ack_manager/` or `link/`.
 
 - Every `pub` item keeps its original path (`rally_point_transport::ack_manager::X`
   etc.) via `pub use` from each `mod.rs`; submodules stay private. `client`, `relay`,
-  `loadgen`, the benches, and the game DLL depend on those paths.
+  `loadgen` and the benches depend on those paths and must be updated together with
+  any move. The game DLL reaches only `Link` and the `rustls` re-export, so those two
+  are the paths that cannot move at all.
 - A `Packet` seq is an ack handle, not an ordering key; `recv` returns one packet's
   new payloads in arrival order. Anything that looks like reordering, retransmit on
   timeout, or head-of-line blocking is a regression, not a fix.
