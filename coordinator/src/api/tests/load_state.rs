@@ -50,7 +50,7 @@ fn spawn_attesting_relay(
     } = opts;
     tokio::spawn(async move {
         let regions = RegionsConfig::default();
-        let store = pair_rtts::new_store();
+        let store = pair_rtts::PairRttStore::new();
         let rtt = idle_rtt_ingest(&regions, &store);
         while let Some(ask) = asks.recv().await {
             if let Some(seen) = &seen {
@@ -428,7 +428,7 @@ async fn a_snapshot_correlated_to_another_relays_request_is_discarded() {
     let ask = asks_one.recv().await.expect("the question was queued");
 
     let regions = RegionsConfig::default();
-    let store = pair_rtts::new_store();
+    let store = pair_rtts::PairRttStore::new();
     let rtt = idle_rtt_ingest(&regions, &store);
     let frame = Message::Text(
         serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {

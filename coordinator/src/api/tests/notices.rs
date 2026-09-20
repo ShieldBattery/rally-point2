@@ -89,7 +89,7 @@ fn report(
         // heartbeat and terminal-close arms consult it.
         0,
         message,
-        &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::new_store()),
+        &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::PairRttStore::new()),
     );
 }
 

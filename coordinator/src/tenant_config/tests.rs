@@ -73,7 +73,7 @@ fn a_valid_config_loads_and_enrolls_with_default_and_explicit_bounds() {
         ("ENV_A".to_owned(), key_a.base64.clone()),
         ("ENV_B".to_owned(), key_b.base64.clone()),
     ]);
-    let store = tenant::new_store();
+    let store = tenant::TenantStore::new();
     enroll_all(&store, &config, |name| env.get(name).cloned()).expect("all tenants enroll");
 
     let a = TenantId("tenant-a".to_owned());
@@ -285,7 +285,7 @@ fn an_unknown_top_level_field_is_rejected() {
 fn a_missing_env_var_fails_enrollment() {
     let json = single_tenant_json("active", "ABSENT_ENV", &one_valid_pubkey(), "");
     let config = from_json(&json).unwrap();
-    let store = tenant::new_store();
+    let store = tenant::TenantStore::new();
 
     // No entry for ABSENT_ENV — the lookup returns None.
     match enroll_all(&store, &config, |_| None) {
@@ -310,7 +310,7 @@ fn base64_of_non_pkcs8_bytes_fails_enrollment() {
     let config = from_json(&json).unwrap();
 
     // Not base64 at all.
-    let store = tenant::new_store();
+    let store = tenant::TenantStore::new();
     let not_base64 = HashMap::from([("ENV".to_owned(), "not valid base64 %%%".to_owned())]);
     assert!(matches!(
         enroll_all(&store, &config, |name| not_base64.get(name).cloned()),
@@ -318,7 +318,7 @@ fn base64_of_non_pkcs8_bytes_fails_enrollment() {
     ));
 
     // Valid base64, but the decoded bytes are not a PKCS#8 keypair.
-    let store = tenant::new_store();
+    let store = tenant::TenantStore::new();
     let not_pkcs8 = HashMap::from([("ENV".to_owned(), BASE64_STANDARD.encode([0u8; 16]))]);
     assert!(matches!(
         enroll_all(&store, &config, |name| not_pkcs8.get(name).cloned()),

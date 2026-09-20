@@ -228,11 +228,11 @@ impl SessionFixture {
     /// The fleet and the tenant without a session — for the tests whose subject
     /// is what happens when the coordinator holds no session record at all.
     pub(crate) fn setup_only(&self) -> SessionSetup {
-        let reg = registry::new_registry();
+        let reg = registry::RelayRegistry::new();
         for relay in &self.relays {
             registry::enroll(&reg, relay.hello());
         }
-        let tenants = tenant::new_store();
+        let tenants = tenant::TenantStore::new();
         tenant::enroll(
             &tenants,
             KeyId("test-key-1".to_owned()),

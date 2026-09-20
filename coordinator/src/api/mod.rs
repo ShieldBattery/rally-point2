@@ -312,7 +312,7 @@ impl CoordinatorState {
     /// they configure, so a new field lands in one place rather than in every
     /// state literal in the crate.
     pub fn new(setup: SessionSetup, control_auth: ControlAuth) -> Self {
-        let notices = notify::new_dedup();
+        let notices = notify::NoticeDedup::new();
         let lifecycle = Lifecycle::new(setup.clone());
         // Let the lifecycle prune these dedup sets when it removes a session's
         // state, so they don't grow for the process lifetime.
@@ -328,7 +328,7 @@ impl CoordinatorState {
             regions: RegionsConfig::default(),
             player_token_lifetime: DEFAULT_PLAYER_TOKEN_LIFETIME,
             ledger: None,
-            pair_rtts: pair_rtts::new_store(),
+            pair_rtts: pair_rtts::PairRttStore::new(),
             flight_store: None,
             pending_hellos: Arc::new(tokio::sync::Semaphore::new(
                 control::MAX_PENDING_CONTROL_HELLOS,

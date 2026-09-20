@@ -75,9 +75,11 @@ pub struct PresenceStore {
     entries: Arc<Mutex<HashMap<SlotKey, PresenceEntry>>>,
 }
 
-/// Creates an empty presence store (a coordinator no relay has beaten at yet).
-pub fn new_store() -> PresenceStore {
-    PresenceStore::default()
+impl PresenceStore {
+    /// Creates an empty presence store (a coordinator no relay has beaten at yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// Applies one relay's heartbeat roster as of `now`: removes every entry this

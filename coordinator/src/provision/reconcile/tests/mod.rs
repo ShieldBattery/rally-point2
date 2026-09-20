@@ -187,12 +187,12 @@ struct Harness {
 
 impl Harness {
     fn new(regions: Vec<RegionId>, idle_grace: Duration, launch_deadline: Duration) -> Self {
-        let reg = registry::new_registry();
+        let reg = registry::RelayRegistry::new();
         let setup = SessionSetup::new(reg.clone(), tenant_store());
         let ledger =
             Arc::new(RelayLedger::open(Path::new(":memory:")).expect("in-memory ledger opens"));
         let warm = WarmTargets::new();
-        let pair_rtts = crate::pair_rtts::new_store();
+        let pair_rtts = crate::pair_rtts::PairRttStore::new();
         let fake = FakeProvisioner::new();
         let config = ProvisionConfig {
             regions,

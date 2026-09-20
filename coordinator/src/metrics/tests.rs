@@ -16,7 +16,7 @@ use crate::{registry, session, tenant};
 /// A coordinator state with one enrolled (untagged) relay and one active
 /// tenant, with no ledger or flight store — enough for the gauges to render.
 fn test_state() -> CoordinatorState {
-    let reg = registry::new_registry();
+    let reg = registry::RelayRegistry::new();
     registry::enroll(
         &reg,
         RelayHello::new(
@@ -26,7 +26,7 @@ fn test_state() -> CoordinatorState {
             vec![0xC1; 4],
         ),
     );
-    let tenants = tenant::new_store();
+    let tenants = tenant::TenantStore::new();
     tenant::enroll(
         &tenants,
         KeyId("k1".to_owned()),

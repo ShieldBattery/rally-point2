@@ -385,11 +385,11 @@ impl CoordinatorBuilder {
 
     /// Binds an ephemeral loopback port and spawns the server on it.
     pub async fn serve(self) -> ServedCoordinator {
-        let reg = registry::new_registry();
+        let reg = registry::RelayRegistry::new();
         for hello in self.relays {
             registry::enroll(&reg, hello);
         }
-        let tenants = tenant::new_store();
+        let tenants = tenant::TenantStore::new();
         if self.tenant {
             tenant::enroll(
                 &tenants,

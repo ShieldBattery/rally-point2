@@ -165,7 +165,7 @@ fn issued_tokens_verify_on_the_relay() {
 
 #[test]
 fn no_relays_available_fails_without_consuming_the_session_id() {
-    let setup = SessionSetup::new(registry::new_registry(), tenant_store());
+    let setup = SessionSetup::new(registry::RelayRegistry::new(), tenant_store());
     let req = request(two_players());
     let candidate = candidate_session_id(&setup);
     let result = create_session(&setup, req.clone(), ExpiresAt(u64::MAX));
@@ -182,7 +182,7 @@ fn no_relays_available_fails_without_consuming_the_session_id() {
 
 #[test]
 fn unenrolled_tenant_fails() {
-    let setup = SessionSetup::new(registry::new_registry(), tenant::new_store());
+    let setup = SessionSetup::new(registry::RelayRegistry::new(), tenant::TenantStore::new());
     enroll_fleet(setup.registry(), &[(1, 14900, None, false)]);
     let result = create_session(
         &setup,

@@ -42,7 +42,7 @@ async fn a_departure_posts_one_webhook_with_body_and_signature_and_dedups_relays
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, session) = setup_with_session(Some("game-99"), Some("sb-user-7"));
     notify_at(&setup, url);
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     // Two relays report the same departure; the coordinator must webhook once.
@@ -97,7 +97,7 @@ async fn a_clean_leave_is_classified_left_and_omits_an_unstored_slot_ref() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, session) = setup_with_session(Some("game-42"), None);
     notify_at(&setup, url);
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     handle_departure(
@@ -133,7 +133,7 @@ async fn a_departure_embeds_a_base64_result_when_the_slot_reported_one() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let (setup, session) = setup_with_session(Some("game-99"), Some("sb-user-7"));
     notify_at(&setup, url);
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     let mut with_result = notice(session, 0, DepartureKind::Left, 3);
@@ -170,7 +170,7 @@ async fn a_notice_carrying_its_own_refs_delivers_even_with_no_stored_session() {
     // process lifetime) must still deliver a correct webhook.
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let setup = setup_without_session(url);
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     let mut restart_notice = notice(SessionId(777), 0, DepartureKind::Dropped, 0x4000_0006);
@@ -245,7 +245,7 @@ async fn the_shared_drop_branches_are_silent_no_ops() {
             // or not the endpoint answers, and the enqueue is what is asserted.
             notify_at(&setup, "http://127.0.0.1:1/hook".to_owned());
         }
-        let dedup = new_dedup();
+        let dedup = NoticeDedup::new();
         let lifecycle = Lifecycle::new(setup.clone());
 
         let target = match branch {

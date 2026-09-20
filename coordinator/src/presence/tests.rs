@@ -30,7 +30,7 @@ fn fresh_for(store: &PresenceStore, tenant: &TenantId, now: Instant) -> Vec<(Ses
 fn a_beat_replaces_the_relays_prior_roster() {
     // Declarative replace: a slot absent from the next beat disappears; the
     // beat's own slots are the whole truth.
-    let store = new_store();
+    let store = PresenceStore::new();
     let now = Instant::now();
     apply_heartbeat(&store, RelayId(1), 5, &roster(1, &[0, 2]), now);
     assert_eq!(
@@ -53,7 +53,7 @@ fn an_entry_naming_no_slots_reports_no_presence() {
     // can go on restating the load state it retained for it. Presence is a
     // live view, so such an entry must contribute nothing — exactly as
     // leaving the session out of the roster does.
-    let store = new_store();
+    let store = PresenceStore::new();
     let now = Instant::now();
     apply_heartbeat(&store, RelayId(1), 5, &roster(1, &[0]), now);
     assert_eq!(fresh_now(&store, now), vec![(SessionId(1), SlotId(0))]);
@@ -67,7 +67,7 @@ fn a_query_sees_only_its_own_tenants_presence() {
     // Presence is a tenant-scoped answer about a tenant's own players: another
     // tenant's roster sitting in the same store must never surface in this
     // tenant's query, whatever session and slot ids the two happen to share.
-    let store = new_store();
+    let store = PresenceStore::new();
     let now = Instant::now();
     let other = TenantId("sb-other".to_owned());
     apply_heartbeat(&store, RelayId(1), 5, &roster(1, &[0]), now);
@@ -98,7 +98,7 @@ fn a_stale_generations_beat_cannot_clobber_a_newer_connections_entries() {
     // (generation 5) names that very slot. Neither the replace nor the insert
     // may touch the entry — and the entry must keep generation 8's provenance,
     // not be rewritten under generation 5.
-    let store = new_store();
+    let store = PresenceStore::new();
     let now = Instant::now();
     apply_heartbeat(&store, RelayId(1), 8, &roster(1, &[0]), now);
     apply_heartbeat(&store, RelayId(1), 5, &roster(1, &[0]), now);
@@ -129,7 +129,7 @@ fn clear_connection_is_fenced_by_exact_generation() {
     // (generation 8) has already reported fresh presence; the old
     // connection's drop-clear (generation 5) must remove only its own
     // entries — the same race the registry's enroll fencing closes.
-    let store = new_store();
+    let store = PresenceStore::new();
     let now = Instant::now();
     apply_heartbeat(&store, RelayId(1), 8, &roster(1, &[0]), now);
 
@@ -150,7 +150,7 @@ fn expiry_is_lazy_at_query_time() {
     // An entry past the TTL is filtered by the query, not swept: querying
     // "now" sees it, querying past the TTL does not — and the entry's later
     // refresh (a beat finally getting through) revives it.
-    let store = new_store();
+    let store = PresenceStore::new();
     let reported = Instant::now();
     apply_heartbeat(&store, RelayId(1), 5, &roster(1, &[0]), reported);
 

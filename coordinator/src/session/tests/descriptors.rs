@@ -221,7 +221,7 @@ fn a_dual_stack_enrollment_flows_through_response_descriptor_and_rehome() {
     let v4_2: SocketAddr = "203.0.113.2:14900".parse().unwrap();
     let v6_2: SocketAddr = "[2001:db8::2]:14900".parse().unwrap();
 
-    let reg = registry::new_registry();
+    let reg = registry::RelayRegistry::new();
     registry::enroll(
         &reg,
         RelayHello::new(RelayId(1), v4_1, ProtocolVersion::CURRENT, fake_cert(1))

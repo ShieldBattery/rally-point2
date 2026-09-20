@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     // Tenant sources are mutually exclusive (clap enforces `--tenants` conflicts
     // with `--dev-tenant`). With neither, no tenants are enrolled and every
     // tenant request is refused — a valid, if inert, coordinator.
-    let tenants = tenant::new_store();
+    let tenants = tenant::TenantStore::new();
     if cli.dev_tenant {
         enroll_dev_tenant(&tenants, &cli)?;
     } else if let Some(path) = &cli.tenants {
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     // substrate is configured). Present ⇒ hold-until-ready create is on and the
     // warm endpoint's demand is shared with the loop. Absent ⇒ the setup keeps its
     // dormant gate and every hold-until-ready behavior is off.
-    let mut setup = session::SessionSetup::new(registry::new_registry(), tenants)
+    let mut setup = session::SessionSetup::new(registry::RelayRegistry::new(), tenants)
         .with_session_ceiling(cli.max_sessions)
         .with_finalized_drops(cli.enable_finalized_drops);
     if let Some(ceiling) = cli.max_sessions {
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
     // a scale-to-zero; memory-only (still functional within a process lifetime) when no
     // ledger is configured. A read failure is logged and left empty rather than failing
     // startup — the table is informational telemetry, not a serving prerequisite.
-    let pair_rtts = pair_rtts::new_store();
+    let pair_rtts = pair_rtts::PairRttStore::new();
     if let Some(ledger) = &ledger {
         match ledger.direction_rtts() {
             Ok(rows) => {

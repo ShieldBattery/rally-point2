@@ -44,7 +44,7 @@ fn the_feature_switch_off_keeps_cohorts_but_disables_the_handshake() {
     // schedules regardless of the feature), but the session runs without the
     // handshake -- and a rehome still stays in-cohort, keyed on the recorded
     // build class rather than the feature flag.
-    let reg = registry::new_registry();
+    let reg = registry::RelayRegistry::new();
     enroll_fleet(&reg, &[(1, 14900, None, true), (2, 14901, None, false)]);
     let setup = SessionSetup::new(reg, tenant_store()).with_finalized_drops(false);
     let resp = create_default_session(&setup);

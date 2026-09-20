@@ -5,7 +5,7 @@ use crate::test_support::{hello, hello_with_cert};
 
 #[test]
 fn enroll_then_peer_roundtrips() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     assert!(is_empty(&reg));
 
     enroll(&reg, hello(1, 14900));
@@ -26,7 +26,7 @@ fn enroll_then_peer_roundtrips() {
 
 #[test]
 fn enroll_hands_out_strictly_increasing_generations() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let g0 = enroll(&reg, hello(1, 14900));
     let g1 = enroll(&reg, hello(1, 14999)); // same relay reconnecting
     let g2 = enroll(&reg, hello(2, 14901)); // a different relay
@@ -39,7 +39,7 @@ fn remove_if_current_keeps_a_relay_that_already_reconnected() {
     // The reconnect race: connection #1 enrolls, connection #2 re-enrolls the
     // same relay (a reconnect), then connection #1's drop fires. The stale
     // generation must not evict the live entry connection #2 installed.
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let stale = enroll(&reg, hello(1, 14900));
     let current = enroll(&reg, hello(1, 14999));
     assert_ne!(stale, current);
@@ -59,7 +59,7 @@ fn remove_if_current_keeps_a_relay_that_already_reconnected() {
 
 #[test]
 fn mark_draining_applies_under_the_current_generation() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     // Marking an id that was never enrolled is a no-op.
     assert!(!mark_draining(&reg, RelayId(7), 0));
 
@@ -81,7 +81,7 @@ fn mark_draining_applies_under_the_current_generation() {
 fn mark_draining_ignores_a_stale_generation() {
     // A stale connection's Draining must not mark an entry a newer connection
     // re-enrolled (whose fresh enroll cleared the flag deliberately).
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let stale = enroll(&reg, hello(1, 14900));
     let current = enroll(&reg, hello(1, 14999));
     assert_ne!(stale, current);
@@ -101,7 +101,7 @@ fn mark_draining_ignores_a_stale_generation() {
 
 #[test]
 fn generation_is_current_tracks_re_enrollment() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let stale = enroll(&reg, hello(1, 14900));
     assert!(generation_is_current(&reg, RelayId(1), stale));
 
@@ -118,7 +118,7 @@ fn generation_is_current_tracks_re_enrollment() {
 fn re_enroll_clears_the_draining_flag() {
     // A relay that reconnects mid-drain is fresh: its enroll clears the flag, so
     // it must re-send Draining to re-mark itself.
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let g0 = enroll(&reg, hello(1, 14900));
     assert!(mark_draining(&reg, RelayId(1), g0));
     assert!(!is_available(&reg, RelayId(1)));
@@ -132,7 +132,7 @@ fn re_enroll_clears_the_draining_flag() {
 
 #[test]
 fn clear_draining_re_admits_under_the_current_generation() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     // Clearing an id that was never enrolled is a no-op.
     assert!(!clear_draining(&reg, RelayId(7), 0));
 
@@ -155,7 +155,7 @@ fn clear_draining_re_admits_under_the_current_generation() {
 fn clear_draining_ignores_a_stale_generation() {
     // A stale connection's clear must not re-admit an entry a newer connection
     // re-enrolled — the same fence mark_draining honors, in the other direction.
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let stale = enroll(&reg, hello(1, 14900));
     let current = enroll(&reg, hello(1, 14999));
     assert!(mark_draining(&reg, RelayId(1), current));
@@ -176,7 +176,7 @@ fn clear_draining_ignores_a_stale_generation() {
 
 #[test]
 fn is_enrolled_tracks_presence_including_draining() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     assert!(!is_enrolled(&reg, RelayId(1)));
     let generation = enroll(&reg, hello(1, 14900));
     assert!(is_enrolled(&reg, RelayId(1)));
@@ -194,7 +194,7 @@ fn is_enrolled_tracks_presence_including_draining() {
 
 #[test]
 fn enrolled_relays_snapshots_id_region_generation_and_draining() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let region = rally_point_proto::control::RegionId("us-east".to_owned());
     let g1 = enroll(&reg, hello(1, 14900).with_region(region.clone()));
     enroll(&reg, hello(2, 14901)); // untagged
@@ -216,7 +216,7 @@ fn enrolled_relays_snapshots_id_region_generation_and_draining() {
 
 #[test]
 fn available_entries_excludes_a_draining_relay() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let g1 = enroll(&reg, hello(1, 14900));
     enroll(&reg, hello(2, 14901));
 
@@ -240,7 +240,7 @@ fn available_entries_excludes_a_draining_relay() {
 
 #[test]
 fn enroll_publishes_a_fingerprinted_mesh_peer_set() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     assert!(mesh_peers(&reg).is_empty(), "no relays enrolled, no peers");
 
     enroll(&reg, hello(2, 14902));
@@ -258,7 +258,7 @@ fn enroll_publishes_a_fingerprinted_mesh_peer_set() {
 
 #[test]
 fn a_subscriber_re_syncs_the_current_set_and_wakes_on_membership_change() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     enroll(&reg, hello(1, 14901));
 
     // A fresh subscriber re-syncs the current set as its initial value.
@@ -285,7 +285,7 @@ fn a_subscriber_re_syncs_the_current_set_and_wakes_on_membership_change() {
 
 #[test]
 fn try_enroll_refuses_a_live_id_bound_to_a_different_certificate() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     enroll(&reg, hello(1, 14900)); // cert [1u8; 4]
 
     // A different certificate claiming the live id is refused, and the
@@ -309,7 +309,7 @@ fn try_enroll_refuses_a_live_id_bound_to_a_different_certificate() {
 
 #[test]
 fn try_enroll_replaces_on_the_same_certificate_and_enrolls_fresh_ids() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let g1 = try_enroll(&reg, hello(1, 14900)).expect("a fresh id enrolls");
 
     // The same certificate re-enrolling is this relay's own reconnect: it
@@ -322,7 +322,7 @@ fn try_enroll_replaces_on_the_same_certificate_and_enrolls_fresh_ids() {
 
 #[test]
 fn deregistration_shrinks_the_mesh_peer_set() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let g1 = enroll(&reg, hello(1, 14901));
     enroll(&reg, hello(2, 14902));
     assert_eq!(mesh_peers(&reg).len(), 2);
@@ -340,7 +340,7 @@ fn deregistration_shrinks_the_mesh_peer_set() {
 
 #[test]
 fn a_repeated_boot_id_is_the_only_thing_that_proves_continuity() {
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     // A relay id never seen before has no prior process to have lost anything.
     assert_eq!(
         note_boot_id(&reg, RelayId(1), Some(7)),
@@ -366,7 +366,7 @@ fn an_absent_boot_id_never_proves_continuity_in_either_direction() {
     // survived, and neither can the coordinator on its behalf — so its every
     // enroll reads as a restart, and an enroll that follows one cannot lean on
     // it either.
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     assert_eq!(note_boot_id(&reg, RelayId(1), None), BootLineage::Broken);
     assert_eq!(note_boot_id(&reg, RelayId(1), None), BootLineage::Broken);
     assert_eq!(note_boot_id(&reg, RelayId(1), Some(7)), BootLineage::Broken);
@@ -378,7 +378,7 @@ fn boot_id_memory_is_per_relay_and_outlives_deregistration() {
     // The registry entry goes away when a control connection drops; the process
     // identity must not, or every reconnect would read as a first enroll and
     // silently claim a continuity nothing verified.
-    let reg = new_registry();
+    let reg = RelayRegistry::new();
     let generation = enroll(&reg, hello(1, 14901));
     assert_eq!(
         note_boot_id(&reg, RelayId(1), Some(7)),

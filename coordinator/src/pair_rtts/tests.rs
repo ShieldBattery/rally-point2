@@ -5,7 +5,7 @@ use crate::test_support::region;
 fn a_single_present_direction_serves_as_is() {
     // Only one end has reported this link, so the served row is that direction's
     // own value, not an average.
-    let store = new_store();
+    let store = PairRttStore::new();
     assert!(
         store.record(&region("us-east"), &region("eu-west"), 87, 100),
         "a direction's first report is a change",
@@ -22,7 +22,7 @@ fn a_single_present_direction_serves_as_is() {
 fn direction_snapshot_keeps_the_two_directions_apart() {
     // The averaged snapshot collapses a pair to one row; the direction snapshot
     // keeps each measured direction as its own origin-tagged row.
-    let store = new_store();
+    let store = PairRttStore::new();
     let east = region("us-east");
     let west = region("us-west");
     store.record(&east, &west, 54, 10);
@@ -49,7 +49,7 @@ fn cross_direction_reports_never_overwrite_and_the_average_holds() {
     // Per-direction slots keep them apart: they never overwrite each other, and
     // the served value is their round-half-up average, steady across alternating
     // heartbeats.
-    let store = new_store();
+    let store = PairRttStore::new();
     let east = region("us-east");
     let west = region("us-west");
     // Canonical order: us-east <= us-west, so a = us-east, b = us-west. Each
@@ -103,7 +103,7 @@ fn a_same_direction_report_within_the_dead_band_keeps_the_stored_value() {
     // One origin's noisy medians for the same direction: a report within the band
     // keeps the slot's value and signals nothing; one past the band is a real
     // shift that lands.
-    let store = new_store();
+    let store = PairRttStore::new();
     assert!(store.record(&region("a"), &region("b"), 87, 10));
     assert!(
         !store.record(&region("a"), &region("b"), 87 + RTT_DEADBAND_MIN_MS, 20),
@@ -125,7 +125,7 @@ fn a_same_direction_report_within_the_dead_band_keeps_the_stored_value() {
 
     // On a long path the band scales: 5% of the stored value once that exceeds the
     // floor. Stored 200 -> band 10: a report 10 away is absorbed, 11 lands.
-    let long = new_store();
+    let long = PairRttStore::new();
     assert!(long.record(&region("x"), &region("y"), 200, 10));
     assert!(
         !long.record(&region("x"), &region("y"), 210, 20),
@@ -147,7 +147,7 @@ fn the_served_average_rounds_half_up() {
         ((10, 10), 10), // equal directions
     ];
     for ((from_a, from_b), expected) in cases {
-        let store = new_store();
+        let store = PairRttStore::new();
         let a = region("a");
         let b = region("b");
         assert!(
@@ -168,7 +168,7 @@ fn the_served_average_rounds_half_up() {
 
 #[test]
 fn covered_pairs_reports_a_pair_with_any_direction() {
-    let store = new_store();
+    let store = PairRttStore::new();
     assert!(
         store.covered_pairs().is_empty(),
         "an empty store covers no pairs",
@@ -194,7 +194,7 @@ fn covered_pairs_reports_a_pair_with_any_direction() {
 fn a_same_region_report_is_rejected() {
     // A relay's round-trip to its own region's beacon is zero by definition and
     // must never enter the table.
-    let store = new_store();
+    let store = PairRttStore::new();
     assert!(!store.record(&region("us-east"), &region("us-east"), 0, 100));
     assert!(
         store.snapshot().is_empty(),
@@ -209,7 +209,7 @@ fn seed_loads_directional_rows_and_canonicalizes() {
     // origin — fill both slots, served as their average. The seeded pairs also
     // come back out sorted by (a, b) whatever order the ledger listed them in,
     // which is the order `GET /regions` serves.
-    let store = new_store();
+    let store = PairRttStore::new();
     store.seed(vec![
         // A non-canonical pair (a > b) whose origin is the larger id.
         DirectionRttRow {

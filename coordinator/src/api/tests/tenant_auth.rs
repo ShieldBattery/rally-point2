@@ -6,8 +6,8 @@ use super::*;
 
 #[tokio::test]
 async fn tenant_pubkey_endpoint_returns_the_enrolled_key_and_404s_for_an_unknown_tenant() {
-    let reg = registry::new_registry();
-    let tenants = crate::tenant::new_store();
+    let reg = registry::RelayRegistry::new();
+    let tenants = crate::tenant::TenantStore::new();
     let expected_pubkey = crate::tenant::enroll(
         &tenants,
         KeyId("test-key-1".to_owned()),

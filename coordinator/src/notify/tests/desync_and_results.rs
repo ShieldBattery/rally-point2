@@ -40,7 +40,7 @@ async fn a_desync_posts_one_signed_webhook_and_dedups_by_sync_ordinal() {
     // A tenant enrolled (for the signing key) but no session created this
     // lifetime: the notice's self-stamped refs carry the webhook.
     let setup = setup_without_session(url);
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     // Two at-least-once redeliveries of the same event webhook once.
@@ -87,7 +87,7 @@ async fn a_desync_posts_one_signed_webhook_and_dedups_by_sync_ordinal() {
 async fn a_no_majority_desync_omits_absent_optionals_and_carries_an_empty_diverged() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;
     let setup = setup_without_session(url);
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     // A no-majority desync with no game frame — gameFrame must be omitted, not
@@ -124,7 +124,7 @@ async fn a_desync_with_no_gameid_from_any_source_is_a_silent_no_op() {
         &TenantId(TEST_TENANT.to_owned()),
         Some(NotifyConfig { url }),
     );
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     // Neither the notice nor the stored session has a gameId.
@@ -221,7 +221,7 @@ async fn a_result_posts_one_signed_webhook_with_base64_payload_and_dedups_by_slo
     // A tenant enrolled (for the signing key) but no session created this
     // lifetime: the notice's self-stamped refs carry the webhook.
     let setup = setup_without_session(url);
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     // Two at-least-once redeliveries of the same slot's report webhook once.
@@ -278,7 +278,7 @@ async fn a_result_with_no_notice_refs_falls_back_to_the_stored_session() {
         &TenantId(TEST_TENANT.to_owned()),
         Some(NotifyConfig { url }),
     );
-    let dedup = new_dedup();
+    let dedup = NoticeDedup::new();
     let lifecycle = Lifecycle::new(setup.clone());
 
     handle_result(

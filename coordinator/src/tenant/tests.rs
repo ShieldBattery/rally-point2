@@ -16,7 +16,7 @@ fn a_pkcs8_v1_document_enrolls_and_derives_the_matching_verifying_key() {
     let mut doc = V1_PREFIX.to_vec();
     doc.extend_from_slice(&seed);
 
-    let store = new_store();
+    let store = TenantStore::new();
     let enrolled = enroll_from_pkcs8(
         &store,
         KeyId("test-key-1".to_owned()),
@@ -32,7 +32,7 @@ fn a_pkcs8_v1_document_enrolls_and_derives_the_matching_verifying_key() {
 
 #[test]
 fn non_pkcs8_bytes_still_fail_enrollment() {
-    let store = new_store();
+    let store = TenantStore::new();
     let err = enroll_from_pkcs8(
         &store,
         KeyId("test-key-1".to_owned()),
@@ -52,7 +52,7 @@ fn non_pkcs8_bytes_still_fail_enrollment() {
 fn bounds_past_the_game_safe_ceiling_fail_enrollment() {
     use rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX;
 
-    let store = new_store();
+    let store = TenantStore::new();
     let err = enroll(
         &store,
         KeyId("test-key-1".to_owned()),
@@ -83,7 +83,7 @@ fn bounds_past_the_game_safe_ceiling_fail_enrollment() {
 fn inverted_bounds_fail_enrollment() {
     use rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX;
 
-    let store = new_store();
+    let store = TenantStore::new();
     let err = enroll(
         &store,
         KeyId("test-key-1".to_owned()),
@@ -102,7 +102,7 @@ fn inverted_bounds_fail_enrollment() {
 }
 
 fn store_with_tenant() -> (TenantStore, KeyId, TenantId) {
-    let store = new_store();
+    let store = TenantStore::new();
     let kid = KeyId("test-key-1".to_owned());
     let tenant = TenantId("sb-test".to_owned());
     enroll(
@@ -188,7 +188,7 @@ fn re_enroll_replaces_key() {
 
 #[test]
 fn all_verifying_keys_returns_every_enrolled_tenant() {
-    let store = new_store();
+    let store = TenantStore::new();
     let bounds = BufferBounds::new(1, 6).unwrap();
     let pk_a = enroll(
         &store,
@@ -219,7 +219,7 @@ fn all_verifying_keys_returns_every_enrolled_tenant() {
 fn enroll_generated_pkcs8_re_enrolls_the_same_key() {
     // The dev restart flow: enroll fresh, persist the PKCS#8, re-enroll
     // from it on a new (restarted) store — same verifying key.
-    let store = new_store();
+    let store = TenantStore::new();
     let bounds = BufferBounds::new(1, 6).unwrap();
     let generated = enroll_generated(
         &store,
@@ -229,7 +229,7 @@ fn enroll_generated_pkcs8_re_enrolls_the_same_key() {
     )
     .unwrap();
 
-    let restarted = new_store();
+    let restarted = TenantStore::new();
     let re_enrolled = enroll_from_pkcs8(
         &restarted,
         KeyId("dev-key-1".to_owned()),

@@ -66,8 +66,8 @@ fn one_region_config() -> RegionsConfig {
 async fn serve_coordinator() -> (String, RelayRegistry, Arc<RelayLedger>, SessionSetup) {
     let ledger =
         Arc::new(RelayLedger::open(std::path::Path::new(":memory:")).expect("ledger opens"));
-    let reg = registry::new_registry();
-    let setup = SessionSetup::new(reg.clone(), tenant::new_store());
+    let reg = registry::RelayRegistry::new();
+    let setup = SessionSetup::new(reg.clone(), tenant::TenantStore::new());
     let state = CoordinatorState {
         liveness_timeout: Duration::from_secs(30),
         regions: one_region_config(),
@@ -135,7 +135,7 @@ async fn provisioning_lifecycle_launches_enrolls_drains_and_re_mints_a_fresh_id(
         setup,
         ledger.clone(),
         warm.clone(),
-        pair_rtts::new_store(),
+        pair_rtts::PairRttStore::new(),
         provisioner.clone(),
     );
 

@@ -158,7 +158,7 @@ impl SessionSetup {
             descriptors: RelayDescriptors::new(),
             reaps: RelayReaps::new(),
             attest: LoadStateAttest::new(),
-            presence: crate::presence::new_store(),
+            presence: crate::presence::PresenceStore::new(),
             next_session: Arc::new(AtomicU64::new(first_session_id())),
             rehomes: Arc::new(Mutex::new(HashMap::new())),
             rehome_limiter: RehomeLimiter::default(),

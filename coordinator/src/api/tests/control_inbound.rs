@@ -39,7 +39,7 @@ fn a_current_heartbeat_folds_region_rtts_and_a_stale_one_does_not() {
     // fold into the pair store — but only from the relay's CURRENT connection: a
     // superseded (stale-generation) beat is dropped whole, the same fence presence
     // is under.
-    let reg = registry::new_registry();
+    let reg = registry::RelayRegistry::new();
     let hello = (RelaySpec {
         id: 1,
         region: Some("region-a"),
@@ -49,12 +49,12 @@ fn a_current_heartbeat_folds_region_rtts_and_a_stale_one_does_not() {
     // generation is no longer current.
     let stale_generation = registry::enroll(&reg, hello.clone());
     let current_generation = registry::enroll(&reg, hello);
-    let setup = crate::session::SessionSetup::new(reg, crate::tenant::new_store());
+    let setup = crate::session::SessionSetup::new(reg, crate::tenant::TenantStore::new());
     let lifecycle = Lifecycle::new(setup.clone());
-    let notices = notify::new_dedup();
+    let notices = notify::NoticeDedup::new();
     let regions = regions_config(&["region-a", "region-b"]);
     let relay_region = RegionId("region-a".to_owned());
-    let store = pair_rtts::new_store();
+    let store = pair_rtts::PairRttStore::new();
     let rtt = RegionRttIngest {
         relay_region: Some(&relay_region),
         regions: &regions,
@@ -165,7 +165,7 @@ async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_ten
     lifecycle.on_relay_enrolled(RelayId(1), generation);
 
     let regions = RegionsConfig::default();
-    let store = pair_rtts::new_store();
+    let store = pair_rtts::PairRttStore::new();
     let rtt = idle_rtt_ingest(&regions, &store);
     // Slot 0 arrived and dropped again; slot 1 is here and running.
     let beat = heartbeat_with_sessions(vec![rally_point_proto::control::SessionPresence {
@@ -249,7 +249,7 @@ async fn session_closed_from_a_superseded_connection_cannot_close_the_live_epoch
     lifecycle.on_relay_enrolled(RelayId(1), current_generation);
 
     let regions = RegionsConfig::default();
-    let store = pair_rtts::new_store();
+    let store = pair_rtts::PairRttStore::new();
     let rtt = idle_rtt_ingest(&regions, &store);
     let occupied = heartbeat_with_sessions(vec![presence_entry(&tenant, session, &[0])]);
     note_inbound_frame(
@@ -383,9 +383,9 @@ async fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
     );
 
     let lifecycle = Lifecycle::new(setup.clone());
-    let notices = notify::new_dedup();
+    let notices = notify::NoticeDedup::new();
     let regions = RegionsConfig::default();
-    let store = pair_rtts::new_store();
+    let store = pair_rtts::PairRttStore::new();
     let rtt = idle_rtt_ingest(&regions, &store);
 
     let beat = heartbeat_with_sessions(vec![
@@ -494,7 +494,7 @@ async fn heartbeat_session_slot_list_beyond_the_cap_is_truncated() {
 
 #[test]
 fn heartbeat_region_rtt_reports_beyond_the_cap_are_truncated() {
-    let reg = registry::new_registry();
+    let reg = registry::RelayRegistry::new();
     let generation = registry::enroll(
         &reg,
         (RelaySpec {
@@ -503,15 +503,15 @@ fn heartbeat_region_rtt_reports_beyond_the_cap_are_truncated() {
         })
         .hello(),
     );
-    let setup = session::SessionSetup::new(reg, crate::tenant::new_store());
+    let setup = session::SessionSetup::new(reg, crate::tenant::TenantStore::new());
     let lifecycle = Lifecycle::new(setup.clone());
-    let notices = notify::new_dedup();
+    let notices = notify::NoticeDedup::new();
 
     let overshoot = MAX_HEARTBEAT_REGION_RTTS + 5;
     let region_ids: Vec<String> = (0..overshoot).map(|i| format!("region-{i}")).collect();
     let region_id_strs: Vec<&str> = region_ids.iter().map(String::as_str).collect();
     let regions = regions_config(&region_id_strs);
-    let store = pair_rtts::new_store();
+    let store = pair_rtts::PairRttStore::new();
     let relay_region = RegionId("origin".to_owned());
     let rtt = RegionRttIngest {
         relay_region: Some(&relay_region),
@@ -546,7 +546,7 @@ fn a_drain_mark_from_a_superseded_connection_cannot_mark_its_live_successor() {
     // stale mark must not set it again: that would exclude a live, idle relay
     // from every new assignment until it re-enrolled once more. The live
     // connection runs its own drain exchange when its own `Draining` arrives.
-    let reg = registry::new_registry();
+    let reg = registry::RelayRegistry::new();
     let hello = (RelaySpec {
         id: 1,
         region: None,
@@ -554,7 +554,7 @@ fn a_drain_mark_from_a_superseded_connection_cannot_mark_its_live_successor() {
     .hello();
     let stale_generation = registry::enroll(&reg, hello.clone());
     let current_generation = registry::enroll(&reg, hello);
-    let setup = session::SessionSetup::new(reg, crate::tenant::new_store());
+    let setup = session::SessionSetup::new(reg, crate::tenant::TenantStore::new());
 
     let draining = || {
         registry::enrolled_relays(setup.registry())

@@ -221,7 +221,7 @@ fn setup_with_session_and_notify(url: String) -> (SessionSetup, NoticeDedup, Lif
     }
     .build();
     let lifecycle = Lifecycle::new(setup.clone());
-    (setup, notify::new_dedup(), lifecycle, session)
+    (setup, notify::NoticeDedup::new(), lifecycle, session)
 }
 
 /// The inputs `note_inbound` needs with nothing staged: a registry holding
@@ -284,7 +284,7 @@ impl InboundFixture {
 }
 
 fn bare_inbound_fixture() -> InboundFixture {
-    let reg = registry::new_registry();
+    let reg = registry::RelayRegistry::new();
     let generation = registry::enroll(
         &reg,
         (RelaySpec {
@@ -293,15 +293,15 @@ fn bare_inbound_fixture() -> InboundFixture {
         })
         .hello(),
     );
-    let setup = session::SessionSetup::new(reg, crate::tenant::new_store());
+    let setup = session::SessionSetup::new(reg, crate::tenant::TenantStore::new());
     let lifecycle = Lifecycle::new(setup.clone());
     InboundFixture {
         setup,
-        notices: notify::new_dedup(),
+        notices: notify::NoticeDedup::new(),
         lifecycle,
         generation,
         regions: RegionsConfig::default(),
-        store: pair_rtts::new_store(),
+        store: pair_rtts::PairRttStore::new(),
     }
 }
 

@@ -170,17 +170,25 @@ pub struct NoticeDedup {
     pub desync_marks: DesyncMarks,
 }
 
-/// Creates an empty notice dedup set (departures + desyncs + results + slot
-/// arrivals + session starts + game-loop starts + desync marks).
-pub fn new_dedup() -> NoticeDedup {
-    NoticeDedup {
-        departures: Arc::new(Mutex::new(HashSet::new())),
-        desyncs: Arc::new(Mutex::new(HashSet::new())),
-        results: Arc::new(Mutex::new(HashSet::new())),
-        slot_connects: Arc::new(Mutex::new(HashSet::new())),
-        session_starts: Arc::new(Mutex::new(HashSet::new())),
-        slot_starts: Arc::new(Mutex::new(HashSet::new())),
-        desync_marks: Arc::new(Mutex::new(HashMap::new())),
+impl Default for NoticeDedup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NoticeDedup {
+    /// Creates an empty notice dedup set (departures + desyncs + results + slot
+    /// arrivals + session starts + game-loop starts + desync marks).
+    pub fn new() -> Self {
+        Self {
+            departures: Arc::new(Mutex::new(HashSet::new())),
+            desyncs: Arc::new(Mutex::new(HashSet::new())),
+            results: Arc::new(Mutex::new(HashSet::new())),
+            slot_connects: Arc::new(Mutex::new(HashSet::new())),
+            session_starts: Arc::new(Mutex::new(HashSet::new())),
+            slot_starts: Arc::new(Mutex::new(HashSet::new())),
+            desync_marks: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 

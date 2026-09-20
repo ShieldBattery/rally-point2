@@ -180,7 +180,7 @@ async fn the_dispatch_semaphore_bounds_concurrent_in_flight_attempts() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let tenants = tenant::new_store();
+    let tenants = tenant::TenantStore::new();
     tenant::enroll(
         &tenants,
         KeyId("k1".to_owned()),

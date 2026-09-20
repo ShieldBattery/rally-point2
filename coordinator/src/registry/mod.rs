@@ -505,10 +505,12 @@ pub fn mesh_peers(registry: &RelayRegistry) -> Vec<MeshPeerIdentity> {
     registry.mesh_peers.borrow().clone()
 }
 
-/// Creates an empty relay registry for a coordinator with no relays phoned
-/// home yet.
-pub fn new_registry() -> RelayRegistry {
-    RelayRegistry::default()
+impl RelayRegistry {
+    /// Creates an empty relay registry for a coordinator with no relays phoned
+    /// home yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 /// Why a session request could not be served.

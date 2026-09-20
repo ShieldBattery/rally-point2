@@ -67,7 +67,7 @@ pub(crate) fn hello_with_cert(id: u64, port: u16, cert_der: Vec<u8>) -> RelayHel
 
 /// A tenant store with `tid()` enrolled under bounds `1..=6`.
 pub(crate) fn tenant_store() -> TenantStore {
-    let tenants = tenant::new_store();
+    let tenants = tenant::TenantStore::new();
     tenant::enroll(
         &tenants,
         test_key_id(),
@@ -87,7 +87,7 @@ pub(crate) type FleetRelay<'a> = (u64, u16, Option<&'a str>, bool);
 /// store, and returns the [`SessionSetup`] over both plus each relay's enroll
 /// generation in the order given (a drain mark or a fenced removal needs it).
 pub(crate) fn fleet(relays: &[FleetRelay<'_>]) -> (SessionSetup, Vec<u64>) {
-    let reg = registry::new_registry();
+    let reg = registry::RelayRegistry::new();
     let generations = enroll_fleet(&reg, relays);
     (SessionSetup::new(reg, tenant_store()), generations)
 }

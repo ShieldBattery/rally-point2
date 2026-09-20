@@ -171,13 +171,13 @@ pub struct PairRttStore {
     pairs: Arc<Mutex<HashMap<PairKey, PairDirections>>>,
 }
 
-/// Creates an empty backbone-RTT table (a coordinator that has aggregated no
-/// measurements yet).
-pub fn new_store() -> PairRttStore {
-    PairRttStore::default()
-}
-
 impl PairRttStore {
+    /// Creates an empty backbone-RTT table (a coordinator that has aggregated no
+    /// measurements yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Folds one relay's measured round-trip for a pair into the table, stamping it
     /// `now_unix`. The pair `(relay_region, reported_region)` is canonicalized; the
     /// relay's own region is the direction's origin, so the value lands in the

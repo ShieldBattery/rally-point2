@@ -555,9 +555,11 @@ pub enum KeyError {
     InvertedBounds { min: u32, max: u32 },
 }
 
-/// Creates an empty tenant store for a coordinator with no tenants enrolled.
-pub fn new_store() -> TenantStore {
-    TenantStore::default()
+impl TenantStore {
+    /// Creates an empty tenant store for a coordinator with no tenants enrolled.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 #[cfg(test)]
