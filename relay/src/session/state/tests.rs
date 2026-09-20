@@ -216,7 +216,12 @@ async fn retire_sweeps_everything_the_descriptor_owned() {
     assert!(!seeded.state.drop_holds.is_pending(&seeded.key, SlotId(0)));
     assert!(!seeded.state.drop_holds.abandon_armed(&seeded.key));
 
-    // The side channels are NOT swept here: only the emptied close drops them,
-    // and it runs under the gate this retirement just closed.
-    assert!(seeded.side_channels_retained());
+    // The side channels go too: the emptied close that would otherwise drop
+    // them is refused by the gate this retirement just closed, so a session
+    // retired with members still connected has no other sweep coming.
+    assert!(
+        !seeded.side_channels_retained(),
+        "retirement is terminal, so the lobby log, chat state and skin map \
+         must not outlive the session",
+    );
 }

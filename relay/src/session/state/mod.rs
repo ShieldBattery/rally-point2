@@ -301,11 +301,12 @@ impl SessionState {
     /// `seen` is the forward-once gate, swept here for the same reason the
     /// replay ring is (see [`close_emptied`](Self::close_emptied)).
     ///
-    /// The side channels are *not* swept here: only the emptied close drops
-    /// the lobby log, chat state and skin map, so a session retired while
-    /// local slots are still connected leaves them behind — the emptied close
-    /// that would have dropped them runs under the gate this just closed and
-    /// is refused.
+    /// The side channels are swept here too, not only by the emptied close: a
+    /// session retired while local slots are still connected never runs that
+    /// close (each slot's later teardown is refused by the gate this just
+    /// shut), so without this sweep its lobby log, chat state and skin map
+    /// would outlive the session for the relay's lifetime. Nothing can still
+    /// need them — a retired session admits no reconnect to replay them to.
     ///
     /// The flight recording's close seal is not released here either: the
     /// caller clears it last, after its own mesh `Leave` commands are queued,
@@ -335,6 +336,14 @@ impl SessionState {
         // or releasing), and nothing else ever sweeps the entries.
         self.drop_holds.cancel_abandon(key);
         self.drop_holds.end_session_terminal(key);
+        // The lobby log, chat state and skin map ordinarily fall with the
+        // relay's last local member (the emptied close), but a session retired
+        // while members are still connected never reaches that close — their
+        // later teardowns are refused by the retired gate — so this is their
+        // only remaining sweep. Idempotent when the emptied close already ran.
+        crate::session::lobby::end_session(&self.lobby, key);
+        crate::session::chat::end_session(&self.chat, key);
+        crate::session::skin::end_session(&self.skins, key);
     }
 }
 
