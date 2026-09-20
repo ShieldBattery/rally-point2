@@ -10,8 +10,8 @@ fn a_coordinator_assigned_order_overrides_id_order() {
     // our_id 1, peer 2. Id order would make us the authority; the
     // coordinator ranked relay 2 first (it is the session's home relay),
     // so relay 2 decides.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
     control.apply_descriptor(&descriptor_with_order(1, &[2], &[2, 1]));
     assert!(
         !makers.lock().get(&key(1)).unwrap().is_authority(),
@@ -19,8 +19,8 @@ fn a_coordinator_assigned_order_overrides_id_order() {
     );
 
     // The same relay ranked first decides, whatever its id.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(3), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(3);
+    let makers = mesh.session.decision_makers.clone();
     control.apply_descriptor(&descriptor_with_order(1, &[2], &[3, 2]));
     assert!(
         makers.lock().get(&key(1)).unwrap().is_authority(),
@@ -33,9 +33,9 @@ fn presence_hands_authority_off_between_descriptor_pushes() {
     // The handoff path with no coordinator involved: relay 2 heads the
     // order and decides; its players all leave; the presence report the
     // mesh driver records flips the verdict to us — no re-push needed.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let presence_registry = Arc::new(presence::new_presence_registry());
-    let control = MeshControl::new(RelayId(1), makers.clone(), presence_registry.clone());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
+    let presence_registry = mesh.session.presence.clone();
     control.apply_descriptor(&descriptor_with_order(1, &[2], &[2, 1]));
     assert!(!makers.lock().get(&key(1)).unwrap().is_authority());
 
@@ -74,8 +74,8 @@ fn a_resumed_descriptor_latches_started_and_seeds_departures() {
     // latch the session started (never wait on the full expected set, which lists
     // the departed slot that will never dial) and record the departure as already
     // decided.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
 
     let mut desc = descriptor(1, &[]);
     desc.expected_slots = vec![SlotId(0), SlotId(1), SlotId(2)];
@@ -162,11 +162,7 @@ fn a_resumed_descriptor_latches_started_and_seeds_departures() {
 /// that will never come.
 #[tokio::test]
 async fn a_resumed_descriptor_fans_seeded_leaves_to_already_connected_survivors() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let sessions = Sessions::default();
-    let mesh_links = crate::mesh::new_mesh_links();
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
-        .with_broadcast(sessions.clone(), mesh_links.clone());
+    let (control, _mesh, sessions) = control_over(1);
 
     // The survivor — and the departed subject itself — both admitted
     // before any descriptor arrived (provisional admission).
@@ -214,19 +210,8 @@ async fn a_resumed_descriptor_fans_seeded_leaves_to_already_connected_survivors(
 /// a moment later.
 #[test]
 fn a_pre_descriptor_turn_is_held_and_drained_current_by_the_descriptor() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let sessions = Sessions::default();
-    let mesh_state = crate::mesh::MeshState {
-        session: crate::session::SessionState {
-            decision_makers: makers.clone(),
-            ..crate::session::SessionState::default()
-        },
-        ..crate::mesh::MeshState::default()
-    };
+    let (control, mesh_state, sessions) = control_over(1);
     mesh_state.session.provisional_turns.arm();
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
-        .with_broadcast(sessions.clone(), mesh_state.links.clone())
-        .with_turn_path(mesh_state.clone());
 
     let (_reg, mut survivor) = crate::routing::register(&sessions, &key(1), SlotId(0), 1).unwrap();
     crate::mesh::forward_client_turn(
@@ -261,19 +246,8 @@ fn a_pre_descriptor_turn_is_held_and_drained_current_by_the_descriptor() {
 /// the exact post-count ingress the pen exists to close.
 #[test]
 fn a_seeded_departed_slots_held_turns_die_at_the_fence() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let sessions = Sessions::default();
-    let mesh_state = crate::mesh::MeshState {
-        session: crate::session::SessionState {
-            decision_makers: makers.clone(),
-            ..crate::session::SessionState::default()
-        },
-        ..crate::mesh::MeshState::default()
-    };
+    let (control, mesh_state, sessions) = control_over(1);
     mesh_state.session.provisional_turns.arm();
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
-        .with_broadcast(sessions.clone(), mesh_state.links.clone())
-        .with_turn_path(mesh_state.clone());
 
     let (_reg, mut survivor) = crate::routing::register(&sessions, &key(1), SlotId(0), 1).unwrap();
     // The departed subject dials provisionally and originates a turn past
@@ -322,19 +296,9 @@ fn a_seeded_departed_slots_held_turns_die_at_the_fence() {
 /// slot waiting for the coordinator's holdout reap.
 #[test]
 fn a_pre_descriptor_clean_leave_is_journaled_and_drained_with_its_count() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let sessions = Sessions::default();
-    let mesh_state = crate::mesh::MeshState {
-        session: crate::session::SessionState {
-            decision_makers: makers.clone(),
-            ..crate::session::SessionState::default()
-        },
-        ..crate::mesh::MeshState::default()
-    };
+    let (control, mesh_state, sessions) = control_over(1);
+    let makers = mesh_state.session.decision_makers.clone();
     mesh_state.session.provisional_turns.arm();
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
-        .with_broadcast(sessions.clone(), mesh_state.links.clone())
-        .with_turn_path(mesh_state.clone());
 
     let (_reg, mut survivor) = crate::routing::register(&sessions, &key(1), SlotId(0), 1).unwrap();
     // The leaver plays two framed turns and cleanly leaves, all before the
@@ -410,19 +374,9 @@ fn a_pre_descriptor_clean_leave_is_journaled_and_drained_with_its_count() {
 /// departure.
 #[test]
 fn a_journaled_leave_with_no_local_survivors_still_drains_and_decides() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let sessions = Sessions::default();
-    let mesh_state = crate::mesh::MeshState {
-        session: crate::session::SessionState {
-            decision_makers: makers.clone(),
-            ..crate::session::SessionState::default()
-        },
-        ..crate::mesh::MeshState::default()
-    };
+    let (control, mesh_state, sessions) = control_over(1);
+    let makers = mesh_state.session.decision_makers.clone();
     mesh_state.session.provisional_turns.arm();
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
-        .with_broadcast(sessions.clone(), mesh_state.links.clone())
-        .with_turn_path(mesh_state.clone());
 
     // The leaver plays one framed turn and cleanly leaves; its link (and
     // with it the whole local roster) is gone before the descriptor.
@@ -474,8 +428,8 @@ fn a_journaled_leave_with_no_local_survivors_still_drains_and_decides() {
 /// recording that would displace the real stored one.
 #[test]
 fn a_descriptor_replay_does_not_unseal_a_closed_flight_recording() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
     let desc = descriptor(1, &[]);
     control.apply_descriptor(&desc);
 

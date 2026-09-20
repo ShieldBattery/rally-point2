@@ -7,7 +7,7 @@ use super::*;
 
 #[test]
 fn joins_only_named_peers_never_broadcasts() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let (tx2, mut rx2) = link();
     let (tx3, mut rx3) = link();
     let _ = control.register_link(RelayId(2), 1, tx2);
@@ -25,7 +25,7 @@ fn joins_only_named_peers_never_broadcasts() {
 
 #[test]
 fn descriptor_before_link_joins_when_the_link_registers() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
 
     // The descriptor names peer 2, but its link has not established yet.
     control.apply_descriptor(&descriptor(1, &[2]));
@@ -38,7 +38,7 @@ fn descriptor_before_link_joins_when_the_link_registers() {
 
 #[test]
 fn re_applied_descriptor_leaves_a_dropped_peer() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let (tx2, mut rx2) = link();
     let (tx3, mut rx3) = link();
     let _ = control.register_link(RelayId(2), 1, tx2);
@@ -60,7 +60,7 @@ fn re_applied_descriptor_leaves_a_dropped_peer() {
 
 #[test]
 fn end_session_leaves_all_peers_and_forgets_membership() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let (tx2, mut rx2) = link();
     let (tx3, mut rx3) = link();
     let _ = control.register_link(RelayId(2), 1, tx2);
@@ -82,7 +82,7 @@ fn end_session_leaves_all_peers_and_forgets_membership() {
 
 #[test]
 fn end_session_on_an_unknown_session_is_a_no_op() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let (tx2, mut rx2) = link();
     let _ = control.register_link(RelayId(2), 1, tx2);
     // Never applied a descriptor for session 9.
@@ -92,7 +92,7 @@ fn end_session_on_an_unknown_session_is_a_no_op() {
 
 #[test]
 fn late_older_registration_cannot_replace_or_resurrect_after_the_new_link_dies() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     control.apply_descriptor(&descriptor(1, &[2]));
 
     let (old_tx, mut old_rx) = link();
@@ -125,7 +125,7 @@ fn drops_a_descriptor_self_reference() {
     // A descriptor that erroneously lists this relay among its own peers
     // must not produce a self-join — a relay never meshes with itself — and
     // must not publish it as a peer to dial either.
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let mut peers_rx = control.desired_peers();
     let (tx1, mut rx1) = link();
     // Even if a link were somehow registered under our own id, we don't join.
@@ -148,7 +148,7 @@ fn a_terminal_leave_is_delivered_under_backlog() {
     // precisely because a dropped terminal `Leave` has no later event to
     // correct it. The backlog here is deeper than the bounded channel this
     // replaced, and every command must come out in order.
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let (tx2, mut rx2) = link();
     let _ = control.register_link(RelayId(2), 1, tx2);
 
@@ -174,7 +174,7 @@ fn a_closed_link_is_dropped_and_a_reconnect_re_syncs() {
     // When a link's driver has exited (its receiver dropped), the stale
     // sender is removed but intent is kept, so a reconnect re-joins from
     // scratch rather than the session being lost.
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let (tx2_dead, rx2_dead) = link();
     let _ = control.register_link(RelayId(2), 1, tx2_dead);
     drop(rx2_dead); // the driver exited; the channel is now closed
@@ -192,7 +192,7 @@ fn a_closed_link_is_dropped_and_a_reconnect_re_syncs() {
 
 #[test]
 fn apply_descriptor_publishes_desired_peers_with_addresses() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let mut peers_rx = control.desired_peers();
     assert!(peers_rx.borrow_and_update().is_empty());
 
@@ -215,7 +215,7 @@ fn apply_descriptor_publishes_desired_peers_with_addresses() {
 
 #[test]
 fn ending_a_session_republishes_the_shrunk_peer_set() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let mut peers_rx = control.desired_peers();
     control.apply_descriptor(&descriptor(1, &[2]));
     peers_rx.borrow_and_update();
@@ -227,7 +227,7 @@ fn ending_a_session_republishes_the_shrunk_peer_set() {
 
 #[test]
 fn an_unchanged_peer_set_does_not_republish() {
-    let control = MeshControl::new(RelayId(1), Arc::default(), Arc::default());
+    let (control, _mesh, _sessions) = control_over(1);
     let mut peers_rx = control.desired_peers();
     control.apply_descriptor(&descriptor(1, &[2]));
     peers_rx.borrow_and_update();
@@ -247,10 +247,10 @@ fn apply_descriptor_stamps_correlation_ids_that_a_departure_notice_carries() {
     // the tenant's correlation ids, applied, must leave the registry able
     // to stamp them into a departure notice -- without depending on the
     // coordinator's in-memory session-refs store surviving to notice time.
-    let makers = Arc::new(consensus::new_decision_makers());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(tx);
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
 
     let mut first = descriptor(1, &[]);
     first.external_id = Some("game-old".to_owned());
@@ -295,8 +295,8 @@ fn apply_descriptor_stamps_correlation_ids_that_a_departure_notice_carries() {
 fn a_repushed_descriptor_moves_authority_with_the_relay_set() {
     // The id-order fallback, stated directly: our_id 3 with peer 2 present
     // means the peer is lower, so it decides, not us.
-    let deferring = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(3), deferring.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(3);
+    let deferring = mesh.session.decision_makers.clone();
     control.apply_descriptor(&descriptor(1, &[2]));
     assert!(
         !deferring.lock().get(&key(1)).unwrap().is_authority(),
@@ -305,8 +305,8 @@ fn a_repushed_descriptor_moves_authority_with_the_relay_set() {
 
     // Relay 2 starts as the session's only relay: it is the authority, which
     // is also what a single-relay (no-peer) descriptor must produce.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(2), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(2);
+    let makers = mesh.session.decision_makers.clone();
     control.apply_descriptor(&descriptor(1, &[]));
     assert!(
         makers.lock().get(&key(1)).unwrap().is_authority(),

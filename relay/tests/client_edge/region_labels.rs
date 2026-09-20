@@ -1,12 +1,12 @@
 //! Region labels are held back from clients until the release delay elapses.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::helpers::*;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_relay::mesh::MeshState;
+use rally_point_relay::routing::Sessions;
 use rally_point_relay::session::{SessionState, Tunables};
 
 /// End to end over real client connections: a coordinator descriptor's region
@@ -36,13 +36,9 @@ async fn region_labels_reach_clients_only_after_the_release_delay() {
         region_release_delay: release_delay,
         ..Tunables::default()
     }));
-    // The same decision-maker registry the relay's turn path holds, so the
-    // descriptor applied here lands on the very maker the release gate reads.
-    let control = MeshControl::new(
-        RelayId(1),
-        mesh.session.decision_makers.clone(),
-        Arc::default(),
-    );
+    // The same state the relay's turn path holds, so the descriptor applied
+    // here lands on the very maker the release gate reads.
+    let control = MeshControl::new(RelayId(1), &mesh, Sessions::default());
     let labels = vec![
         RelayRegionLabel {
             relay_id: RelayId(1),

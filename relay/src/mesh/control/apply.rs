@@ -52,7 +52,7 @@ impl MeshControl {
         // this descriptor, once applied, does not). Always overwrites: a
         // changed re-applied descriptor's refs replace rather than accumulate
         // alongside a stale copy.
-        self.decision_makers.set_session_refs(
+        self.mesh.session.decision_makers.set_session_refs(
             &key,
             descriptor.external_id.clone(),
             descriptor
@@ -101,8 +101,9 @@ impl MeshControl {
                 }
             })
             .collect();
-        presence::set_order(&self.presence, &key, order);
-        let authority = presence::verdict(&self.presence, &key).unwrap_or(Authority::Peer);
+        presence::set_order(&self.mesh.session.presence, &key, order);
+        let authority =
+            presence::verdict(&self.mesh.session.presence, &key).unwrap_or(Authority::Peer);
         // A verdict that promotes this relay (e.g. the coordinator dropped the
         // former authority from the order because it crashed — a case presence
         // alone can't catch, since a crashed relay sends no zero report) yields
@@ -120,8 +121,8 @@ impl MeshControl {
         // retirement gate so its ingress — clients, turns, mesh frames —
         // dispatches again. Before `sync_maker`, so no window exists where
         // the maker is visible but the gate still refuses.
-        self.gates.reopen(&key);
-        let held_slots = self.drop_holds.pending_slots(&key);
+        self.mesh.session.gates.reopen(&key);
+        let held_slots = self.mesh.session.drop_holds.pending_slots(&key);
         // A rehome (resumed) descriptor's departed-slot seeds — and the
         // resumed latch that stops leaves decided from here on from carrying
         // exact final turn counts — install inside `sync_maker`'s registry
@@ -134,7 +135,7 @@ impl MeshControl {
         // before this descriptor (whose one registration-time leave
         // reconciliation predates the seed).
         let leaves = consensus::sync_maker(
-            &self.decision_makers,
+            &self.mesh.session.decision_makers,
             &key,
             consensus::MakerSync::from_descriptor(descriptor, authority, held_slots),
         );
@@ -143,20 +144,20 @@ impl MeshControl {
         // otherwise still reap it on the original deadline. A session that
         // was never provisional (a mesh Join, or a descriptor that beat every
         // client dial) has nothing here to clear.
-        self.provisional.clear(&key);
+        self.mesh.session.provisional.clear(&key);
         // Stamps this relay's own id onto the maker so a buffer directive it
         // queues as authority carries the deterministic decision_seq
         // tie-break (see `BufferDirective.authority_relay_id`). Idempotent;
         // run on every descriptor push, not just creation, since `sync_maker`
         // itself re-syncs an existing maker the same way.
-        consensus::set_own_relay_id(&self.decision_makers, &key, self.our_id);
+        consensus::set_own_relay_id(&self.mesh.session.decision_makers, &key, self.our_id);
         // Feed the descriptor-derived inputs to the initial-depth computation: the
         // tenant's latency hint, and whether this is a single-relay session (no
         // mesh peers) — the latter decides both the fully-observed rule and the
         // multi-relay hop cushion. Set on create and every re-sync, like the
         // observer/expected/homed sets above.
         consensus::set_session_shape(
-            &self.decision_makers,
+            &self.mesh.session.decision_makers,
             &key,
             descriptor.latency_estimate_ms,
             new_peers.is_empty(),
@@ -167,7 +168,7 @@ impl MeshControl {
         // open (a re-home named a different relay), where the clients holding the
         // superseded map must be corrected.
         let relabelled = consensus::set_region_labels(
-            &self.decision_makers,
+            &self.mesh.session.decision_makers,
             &key,
             descriptor
                 .relay_regions
@@ -181,7 +182,7 @@ impl MeshControl {
         if let Some(labels) = relabelled {
             routing::fan_out_region_labels(&self.sessions, &key, &labels);
         }
-        mesh::broadcast_leaves(&self.sessions, &self.mesh_links, &key, leaves);
+        mesh::broadcast_leaves(&self.sessions, &self.mesh.links, &key, leaves);
         if descriptor.resumed && !descriptor.departed_slots.is_empty() {
             // A seeded departed slot may still hold a live local link — a
             // provisionally admitted dial that raced the descriptor. Its
@@ -194,7 +195,7 @@ impl MeshControl {
             crate::routing::close_slots(&self.sessions, &key, &departed);
         }
         if descriptor.resumed {
-            self.decision_makers.flight_recorder().record(
+            self.mesh.session.decision_makers.flight_recorder().record(
                 &key,
                 crate::observability::flight_recorder::FlightEvent::ResumedDescriptorApplied {
                     departed_slots: descriptor.departed_slots.len() as u32,
@@ -219,9 +220,7 @@ impl MeshControl {
         // atomic empty-check resolves the session — so nothing is ever
         // announced ahead of ingress it should have ordered behind, and
         // nothing deposits past the completed drain.
-        if let Some(turn_path) = &self.turn_path
-            && let Some(mut batch) = turn_path.session.provisional_turns.begin_drain(&key)
-        {
+        if let Some(mut batch) = self.mesh.session.provisional_turns.begin_drain(&key) {
             loop {
                 // The batch stays charged against the journal's byte budget
                 // until replayed — the budget tracks resident memory, and
@@ -235,7 +234,7 @@ impl MeshControl {
                         crate::session::provisional_turns::PennedIngress::Turn(slot, payload) => {
                             mesh::forward_client_turn(
                                 &self.sessions,
-                                turn_path,
+                                &self.mesh,
                                 &key,
                                 slot,
                                 payload,
@@ -263,8 +262,9 @@ impl MeshControl {
                             // superseding deposit sits in the Draining
                             // queue, so a later pass of this loop replays
                             // it.
-                            let _ = turn_path.session.gates.with_exclusive(&key, || {
-                                if !turn_path
+                            let _ = self.mesh.session.gates.with_exclusive(&key, || {
+                                if !self
+                                    .mesh
                                     .session
                                     .provisional_turns
                                     .departure_is_current(&key, slot, revision)
@@ -279,13 +279,13 @@ impl MeshControl {
                                     return;
                                 }
                                 let exact_count = (reason == consensus::LEAVE_REASON_LEFT)
-                                    .then(|| mesh::forwarded_count(&turn_path.seen, &key, slot))
+                                    .then(|| mesh::forwarded_count(&self.mesh.seen, &key, slot))
                                     .flatten();
                                 let _ = routing::announce_departure_recorded(
-                                    &self.drop_holds,
-                                    &self.decision_makers,
+                                    &self.mesh.session.drop_holds,
+                                    &self.mesh.session.decision_makers,
                                     &self.sessions,
-                                    &self.mesh_links,
+                                    &self.mesh.links,
                                     &key,
                                     slot,
                                     reason,
@@ -296,11 +296,11 @@ impl MeshControl {
                         }
                     }
                 }
-                turn_path
+                self.mesh
                     .session
                     .provisional_turns
                     .release_drained(batch_bytes);
-                match turn_path.session.provisional_turns.continue_drain(&key) {
+                match self.mesh.session.provisional_turns.continue_drain(&key) {
                     crate::session::provisional_turns::DrainStep::More(next) => batch = next,
                     crate::session::provisional_turns::DrainStep::Done => break,
                 }
@@ -342,13 +342,13 @@ impl MeshControl {
         let mut reconcile_started_session = false;
         for slot in registered_slots {
             reconcile_started_session |=
-                consensus::note_slot_present(&self.decision_makers, &key, slot);
+                consensus::note_slot_present(&self.mesh.session.decision_makers, &key, slot);
         }
         if reconcile_started_session {
             crate::routing::deliver_session_start(
                 &self.sessions,
-                &self.decision_makers,
-                &self.mesh_links,
+                &self.mesh.session.decision_makers,
+                &self.mesh.links,
                 &key,
             );
         }
@@ -359,8 +359,8 @@ impl MeshControl {
         // expected set.
         crate::routing::maybe_start_session(
             &self.sessions,
-            &self.decision_makers,
-            &self.mesh_links,
+            &self.mesh.session.decision_makers,
+            &self.mesh.links,
             &key,
         );
 

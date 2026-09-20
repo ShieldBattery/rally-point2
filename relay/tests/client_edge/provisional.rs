@@ -8,6 +8,7 @@ use crate::helpers::*;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_relay::mesh::MeshState;
+use rally_point_relay::routing::Sessions;
 use rally_point_relay::session::{SessionState, Tunables};
 use rally_point_transport::noq;
 
@@ -133,17 +134,11 @@ async fn a_descriptor_arriving_inside_the_window_saves_the_session_from_the_swee
     // Armed exactly as production coordinator wiring arms it, so the reap
     // exercises the journal paths a coordinator-managed relay runs.
     mesh.session.provisional_turns.arm();
-    // Points at the same decision-maker registry and provisional map the
-    // relay serves this session with, so `apply_descriptor` here is
-    // indistinguishable from one the coordinator subscriber would have
-    // applied -- this test drives the real clearing path, not a hand call
-    // into `ProvisionalSessions` directly.
-    let control = MeshControl::new(
-        RelayId(1),
-        mesh.session.decision_makers.clone(),
-        Arc::default(),
-    )
-    .with_provisional(provisional.clone());
+    // Points at the same state the relay serves this session with, so
+    // `apply_descriptor` here is indistinguishable from one the coordinator
+    // subscriber would have applied -- this test drives the real clearing
+    // path, not a hand call into `ProvisionalSessions` directly.
+    let control = MeshControl::new(RelayId(1), &mesh, Sessions::default());
 
     let relay = start_relay_with_mesh(registry_for_one(&tenant), mesh);
 

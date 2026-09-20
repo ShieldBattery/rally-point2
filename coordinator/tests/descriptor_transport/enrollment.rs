@@ -46,8 +46,8 @@ async fn a_relays_hello_enrolls_it_into_the_registry() {
     // receives drives nothing.
     let control = MeshControl::new(
         RelayId(5),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
+        &rally_point_relay::mesh::MeshState::default(),
+        rally_point_relay::routing::Sessions::default(),
     );
     tokio::spawn(coordinator::client::run_descriptor_subscriber_with(
         coordinator::client::EnrollConfig {
@@ -184,8 +184,8 @@ async fn dropping_the_control_connection_deregisters_the_relay() {
     // A relay holds its control connection open; its Hello enrolls it.
     let control = MeshControl::new(
         RelayId(7),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
+        &rally_point_relay::mesh::MeshState::default(),
+        rally_point_relay::routing::Sessions::default(),
     );
     let handle = tokio::spawn(coordinator::client::run_descriptor_subscriber_with(
         coordinator::client::EnrollConfig {

@@ -323,38 +323,22 @@ async fn main() -> Result<()> {
         // keeps the drivers' command channels alive — `run_mesh_link` ends when
         // its command sender is dropped, so the registry holding each sender is
         // what keeps a freshly established (not-yet-joined) link parked and ready.
-        // Share the decision-maker registry the turn path holds (in `mesh_state`)
-        // so a maker created here on a coordinator descriptor is the same one the
-        // slot-link and mesh-link tasks feed conditions into and stamp decisions on.
-        let mesh_control = control::MeshControl::new(
-            RelayId(our_id),
-            mesh_state.session.decision_makers.clone(),
-            mesh_state.session.presence.clone(),
-        )
-        // Wire the turn-path handles so a descriptor-driven authority promotion
-        // (e.g. the coordinator dropping a crashed former authority) can
-        // re-broadcast any synced leave that authority never delivered.
-        .with_broadcast(Arc::clone(&sessions), mesh_state.links.clone())
-        // Wire the real drop-hold registry so that same promotion skips a slot
-        // whose drop is still held undecided, exactly like the presence-driven
-        // promotion already does — without this, a descriptor re-push racing a
-        // reconnect would decide (and broadcast) a leave for a slot a client is
-        // actively returning to.
-        .with_drop_holds(mesh_state.session.drop_holds.clone())
-        // Wire the real provisional-admission registry so a descriptor
-        // applying here clears the provisional mark client admission may have
-        // left on the session (`server.rs`), rather than leaving it to expire
-        // on a relay the descriptor already covers.
-        .with_provisional(mesh_state.session.provisional.clone())
-        // Wire the relay-wide session gates, so the descriptor retirement this
-        // control plane performs closes the same ingress boundary the turn
-        // path, mesh dispatch, and client admission run through.
-        .with_gates(mesh_state.session.gates.clone())
-        // Wire the full turn-path state, so a descriptor applying here drains
-        // the provisional-turn pen through the ordinary forward path — the
-        // freshly created maker's seeded decided leaves then fence a departed
-        // slot's held turns instead of letting them reach survivors.
-        .with_turn_path(mesh_state.clone());
+        //
+        // It takes the turn path's own state, so everything a descriptor
+        // touches is the state the turn path reads: the maker created here is
+        // the one the slot-link and mesh-link tasks feed and stamp; a
+        // descriptor-driven authority promotion (the coordinator dropping a
+        // crashed former authority) re-broadcasts the synced leave that
+        // authority never delivered to this relay's own clients and its mesh
+        // peers, skipping a slot whose drop is still held undecided exactly as
+        // the presence-driven promotion does; an applying descriptor clears the
+        // provisional mark client admission left on the session and drains the
+        // provisional-turn pen through the ordinary forward path, where the
+        // fresh maker's seeded decided leaves fence a departed slot's held
+        // turns; and retirement closes the same ingress gate the turn path,
+        // mesh dispatch, and client admission run through.
+        let mesh_control =
+            control::MeshControl::new(RelayId(our_id), &mesh_state, Arc::clone(&sessions));
         // The flight recorder's create-on-first-touch consults the same gates,
         // so a retired session's straggling event cannot begin a recording.
         mesh_state

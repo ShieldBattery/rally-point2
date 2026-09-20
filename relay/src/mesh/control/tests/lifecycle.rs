@@ -11,13 +11,15 @@ use super::*;
 /// clean the hold entries.
 #[tokio::test]
 async fn end_session_sweeps_undecided_holds_and_the_abandon_timer() {
-    let holds = DropHolds::new(
-        std::time::Duration::from_secs(3600),
-        std::time::Duration::from_secs(3600),
-    );
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control =
-        MeshControl::new(RelayId(1), makers.clone(), Arc::default()).with_drop_holds(holds.clone());
+    let mesh = crate::mesh::MeshState::new(crate::session::SessionState::with_tunables(
+        crate::session::Tunables {
+            drop_unlock: std::time::Duration::from_secs(3600),
+            abandon_timeout: std::time::Duration::from_secs(3600),
+            ..Default::default()
+        },
+    ));
+    let holds = mesh.session.drop_holds.clone();
+    let control = MeshControl::new(RelayId(1), &mesh, Sessions::default());
     control.apply_descriptor(&descriptor(1, &[]));
 
     holds.hold(key(1), SlotId(0));
@@ -45,10 +47,7 @@ async fn end_session_sweeps_undecided_holds_and_the_abandon_timer() {
 /// came.
 #[tokio::test]
 async fn end_session_sweeps_retained_receipts_and_replay_state() {
-    let mesh_state = crate::mesh::MeshState::default();
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control =
-        MeshControl::new(RelayId(1), makers, Arc::default()).with_turn_path(mesh_state.clone());
+    let (control, mesh_state, _sessions) = control_over(1);
     control.apply_descriptor(&descriptor(1, &[]));
 
     crate::mesh::mark_seen(&mesh_state.seen, &key(1), SlotId(0), 0);
@@ -86,9 +85,8 @@ fn a_descriptor_reconciles_dials_that_raced_it_and_starts_the_session() {
     // descriptor must reconcile the roster it already holds into the maker it
     // creates, reach coverage, and deliver the start directive to the
     // connected clients.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let sessions = Sessions::default();
-    let mesh_links = crate::mesh::new_mesh_links();
+    let (control, mesh, sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
 
     // Seat slots {0, 1} in the roster, as registration does before a link
     // task runs — hold the guards and inboxes so the slots stay registered
@@ -110,8 +108,6 @@ fn a_descriptor_reconciles_dials_that_raced_it_and_starts_the_session() {
         "an announce with no maker yet drops the presence and fires no start",
     );
 
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
-        .with_broadcast(sessions.clone(), mesh_links);
     let mut desc = descriptor(1, &[]);
     desc.expected_slots = vec![SlotId(0), SlotId(1)];
     control.apply_descriptor(&desc);
@@ -139,9 +135,8 @@ fn a_reconcile_over_a_partial_roster_waits_for_the_late_slot() {
     // session starts only once slot 1 later announces. This is also the
     // ordinary (non-rehome) descriptor's own guarantee: without `resumed`,
     // nothing latches the session started ahead of coverage.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let sessions = Sessions::default();
-    let mesh_links = crate::mesh::new_mesh_links();
+    let (control, mesh, sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
 
     let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0), 1)
         .expect("slot 0 registers into an empty roster");
@@ -150,8 +145,6 @@ fn a_reconcile_over_a_partial_roster_waits_for_the_late_slot() {
         "slot 0's announce with no maker yet drops the presence",
     );
 
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default())
-        .with_broadcast(sessions.clone(), mesh_links);
     let mut desc = descriptor(1, &[]);
     desc.expected_slots = vec![SlotId(0), SlotId(1)];
     control.apply_descriptor(&desc);
@@ -185,8 +178,8 @@ fn a_leave_decision_lands_in_the_flight_recorder() {
     // The consensus-side flight tap, through the production decide path: a
     // decided synced leave records its event (slot, kind, apply coordinates)
     // into the session's recording.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
     control.apply_descriptor(&descriptor(1, &[])); // single relay: self-authority
 
     consensus::observe_frame(
@@ -218,8 +211,8 @@ fn a_leave_decision_lands_in_the_flight_recorder() {
 
 #[test]
 fn end_session_destroys_the_maker() {
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
 
     control.apply_descriptor(&descriptor(1, &[]));
     assert!(makers.lock().contains_key(&key(1)));
@@ -260,8 +253,8 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
     // same helpers the turn path uses make it decide, and the decision is
     // available to stamp onto the turns this relay forwards.
     {
-        let makers = Arc::new(consensus::new_decision_makers());
-        let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+        let (control, mesh, _sessions) = control_over(1);
+        let makers = mesh.session.decision_makers.clone();
         control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6), SelfRelay
 
         consensus::observe_frame(&makers, &key(1), SlotId(0), GameFrameCount(1));
@@ -282,8 +275,8 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
     // The malicious case: a cross-relay destination understating its cursor
     // by miles. The delivery inputs may add AT MOST one hop turn plus the
     // capped lag term on top of that 4-turn baseline.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
     let mut desc = descriptor(1, &[]);
     desc.bounds = BufferBounds::new(1, 20).unwrap();
     control.apply_descriptor(&desc);
@@ -315,8 +308,8 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
 
     // The same inputs under tight bounds: the existing BufferBounds clamp
     // still has the last word.
-    let makers = Arc::new(consensus::new_decision_makers());
-    let control = MeshControl::new(RelayId(1), makers.clone(), Arc::default());
+    let (control, mesh, _sessions) = control_over(1);
+    let makers = mesh.session.decision_makers.clone();
     control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6)
     consensus::observe_turn_frame(
         &makers,

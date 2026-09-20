@@ -44,9 +44,23 @@ mod stores;
 
 const TENANT: &str = "sb-test";
 
-/// The Join source the tests drive, with no mesh link registered.
+/// The Join source the tests drive, with no mesh link registered, over its own
+/// turn-path state — returned beside it so a test can assert on the registries
+/// and roster a descriptor drove.
+fn control_over_state() -> (
+    MeshControl,
+    crate::mesh::MeshState,
+    crate::routing::Sessions,
+) {
+    let mesh = crate::mesh::MeshState::default();
+    let sessions = crate::routing::Sessions::default();
+    let control = MeshControl::new(RelayId(1), &mesh, sessions.clone());
+    (control, mesh, sessions)
+}
+
+/// [`control_over_state`] for a test that only watches what the links are told.
 fn control() -> MeshControl {
-    MeshControl::new(RelayId(1), Arc::default(), Arc::default())
+    control_over_state().0
 }
 
 /// [`control`] with a link to `peer` registered, paired with the receiver that

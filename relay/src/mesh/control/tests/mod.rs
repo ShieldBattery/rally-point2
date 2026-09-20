@@ -68,6 +68,18 @@ fn descriptor_with_order(session: u64, peers: &[u64], order: &[u64]) -> SessionD
     }
 }
 
+/// A `MeshControl` over its own turn-path state, returned beside it: the shape
+/// production wires, in miniature. Every registry a descriptor touches — the
+/// makers, presence, the gates, the drop holds, the provisional mark and the
+/// turn pen — is the one the returned `MeshState` and roster hold, so a test
+/// asserts against exactly what the control plane drove.
+fn control_over(our_id: u64) -> (MeshControl, MeshState, Sessions) {
+    let mesh = MeshState::default();
+    let sessions = Sessions::default();
+    let control = MeshControl::new(RelayId(our_id), &mesh, sessions.clone());
+    (control, mesh, sessions)
+}
+
 mod authority;
 mod lifecycle;
 mod membership;

@@ -217,8 +217,8 @@ pub(crate) async fn coordinator_with_session(
 pub(crate) fn relay_one_with_peer_link() -> (MeshControl, mpsc::UnboundedReceiver<MeshCommand>) {
     let control = MeshControl::new(
         RelayId(1),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
+        &rally_point_relay::mesh::MeshState::default(),
+        rally_point_relay::routing::Sessions::default(),
     );
     let (tx2, rx2) = mpsc::unbounded_channel::<MeshCommand>();
     let _ = control.register_link(RelayId(2), 1, tx2);

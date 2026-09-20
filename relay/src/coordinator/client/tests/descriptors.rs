@@ -168,9 +168,8 @@ fn a_delta_upsert_reconciles_dials_that_raced_it_and_starts_the_session() {
     // coverage, and delivers the start directive to the connected clients.
     use rally_point_proto::ids::SlotId;
 
-    let makers = std::sync::Arc::new(crate::consensus::new_decision_makers());
-    let sessions: crate::routing::Sessions = std::sync::Arc::default();
-    let mesh_links = crate::mesh::new_mesh_links();
+    let (control, mesh, sessions) = control_over_state();
+    let makers = mesh.session.decision_makers.clone();
 
     let (_reg0, mut inbox0) = crate::routing::register(&sessions, &key(1), SlotId(0), 1)
         .expect("slot 0 registers into an empty roster");
@@ -185,8 +184,6 @@ fn a_delta_upsert_reconciles_dials_that_raced_it_and_starts_the_session() {
         "an announce with no maker yet drops the presence",
     );
 
-    let control = MeshControl::new(RelayId(1), makers.clone(), std::sync::Arc::default())
-        .with_broadcast(sessions.clone(), mesh_links);
     let applied = AppliedSessions::new();
 
     // The session's descriptor arrives as a delta upsert (single relay, no peers).
@@ -226,9 +223,7 @@ async fn a_close_slot_message_signals_the_named_held_slot() {
     // A CloseSlot down-frame reaches the roster: the named slot's shutdown
     // signal fires (its link task would then close and deregister), and a slot
     // the relay does not hold is a harmless no-op.
-    let sessions: crate::routing::Sessions = std::sync::Arc::default();
-    let mesh_links = crate::mesh::new_mesh_links();
-    let control = control().with_broadcast(sessions.clone(), mesh_links);
+    let (control, _mesh, sessions) = control_over_state();
 
     let (mut guard, inbox) =
         crate::routing::register(&sessions, &key(1), rally_point_proto::ids::SlotId(0), 1)

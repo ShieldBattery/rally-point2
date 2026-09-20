@@ -31,21 +31,15 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
         session,
     };
 
-    // Relay A (id 1) dials; relay B (id 2) accepts. Each control shares its
-    // relay's decision-maker and presence registries, as the binary wires it —
-    // the descriptor's order must land where the turn-path reports do.
+    // Relay A (id 1) dials; relay B (id 2) accepts. Each control drives its
+    // relay's own turn-path state, as the binary wires it — the descriptor's
+    // order must land where the turn-path reports do.
     let relay_a = Relay::start(&tenant, 1);
     let mut relay_b = Relay::start(&tenant, 2);
-    let control_a = control::MeshControl::new(
-        RelayId(1),
-        relay_a.mesh.session.decision_makers.clone(),
-        relay_a.mesh.session.presence.clone(),
-    );
-    let control_b = control::MeshControl::new(
-        RelayId(2),
-        relay_b.mesh.session.decision_makers.clone(),
-        relay_b.mesh.session.presence.clone(),
-    );
+    let control_a =
+        control::MeshControl::new(RelayId(1), &relay_a.mesh, Arc::clone(&relay_a.sessions));
+    let control_b =
+        control::MeshControl::new(RelayId(2), &relay_b.mesh, Arc::clone(&relay_b.sessions));
 
     let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
     let mut links_a = dial_a_to_b(&relay_a, &relay_b);
@@ -144,22 +138,14 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     };
 
     // Relay A (id 1) is the authority (id-order fallback); relay B (id 2)
-    // accepts A's dial. Each Join source shares its relay's REAL registries, so
-    // the makers the descriptors create are the ones the link tasks feed.
+    // accepts A's dial. Each Join source drives its relay's REAL state, so the
+    // makers the descriptors create are the ones the link tasks feed.
     let relay_a = Relay::start(&tenant, 1);
     let mut relay_b = Relay::start(&tenant, 2);
-    let control_a = control::MeshControl::new(
-        RelayId(1),
-        Arc::clone(&relay_a.mesh.session.decision_makers),
-        Arc::clone(&relay_a.mesh.session.presence),
-    )
-    .with_broadcast(Arc::clone(&relay_a.sessions), relay_a.mesh.links.clone());
-    let control_b = control::MeshControl::new(
-        RelayId(2),
-        Arc::clone(&relay_b.mesh.session.decision_makers),
-        Arc::clone(&relay_b.mesh.session.presence),
-    )
-    .with_broadcast(Arc::clone(&relay_b.sessions), relay_b.mesh.links.clone());
+    let control_a =
+        control::MeshControl::new(RelayId(1), &relay_a.mesh, Arc::clone(&relay_a.sessions));
+    let control_b =
+        control::MeshControl::new(RelayId(2), &relay_b.mesh, Arc::clone(&relay_b.sessions));
 
     let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
     let mut links_a = dial_a_to_b(&relay_a, &relay_b);

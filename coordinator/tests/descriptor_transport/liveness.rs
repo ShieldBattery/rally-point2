@@ -64,8 +64,8 @@ async fn a_heartbeating_relay_stays_registered_past_the_liveness_deadline() {
     let (base_url, reg) = serve_bare_coordinator(api::HELLO_TIMEOUT, LIVENESS_DEADLINE).await;
     let control = MeshControl::new(
         RelayId(7),
-        std::sync::Arc::default(),
-        std::sync::Arc::default(),
+        &rally_point_relay::mesh::MeshState::default(),
+        rally_point_relay::routing::Sessions::default(),
     );
     let _handle = tokio::spawn(coordinator::client::run_descriptor_subscriber_with(
         coordinator::client::EnrollConfig {

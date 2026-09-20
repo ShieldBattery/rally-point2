@@ -61,12 +61,11 @@ use rally_point_proto::control::RelayPeer;
 use rally_point_proto::ids::RelayId;
 use tokio::sync::{mpsc, watch};
 
-use crate::consensus::{self, DecisionMakers};
+use crate::consensus;
 use crate::key::SessionKey;
-use crate::mesh::{MeshCommand, MeshLinks};
+use crate::mesh::{MeshCommand, MeshState};
 use crate::routing::Sessions;
-use crate::session::drop_hold::DropHolds;
-use crate::session::presence::{self, PresenceRegistry};
+use crate::session::presence;
 
 /// Drives the mesh links' `Join`/`Leave` commands from coordinator session
 /// descriptors. Clone it cheaply (the state is behind one `Arc`) to hand a copy
@@ -77,53 +76,20 @@ pub struct MeshControl {
     /// descriptor ever lists it (a relay never meshes with itself), and to
     /// resolve this relay's own place in each session's authority order.
     our_id: RelayId,
-    /// Per-session decision-makers, created and destroyed here as descriptors
-    /// arrive and sessions end. Shared with the turn path (via `MeshState`) so the
-    /// slot-link and mesh-link tasks feed conditions in and stamp decisions out.
-    decision_makers: Arc<DecisionMakers>,
-    /// Per-session presence: each descriptor's authority order is recorded
-    /// here, and the live-player reports the roster and mesh deliver combine
-    /// with it into the authority verdict. Shared with the turn-path tasks
-    /// (via `MeshState`) for the same reason as the decision-makers.
-    presence: Arc<PresenceRegistry>,
-    /// The turn-path handles a descriptor-driven authority promotion needs to
-    /// re-broadcast any synced leave the demoted authority never delivered: local
-    /// survivors via `sessions`, peer survivors via `mesh_links`. Empty registries
-    /// by default (a control plane with no turn path — tests, a standalone
-    /// descriptor driver); wired to the real ones with [`with_broadcast`](Self::with_broadcast).
+    /// The relay's turn-path state, shared (never a private copy): the
+    /// decision-makers this creates on a descriptor and destroys on a
+    /// retirement are the ones the slot-link and mesh-link tasks feed and
+    /// stamp; the presence order recorded here is the one their live-player
+    /// reports land on; the gates retired here are the boundary every ingress
+    /// runs through; the drop holds read here are the ones a reconnect could
+    /// still claim; and the provisional-turn pen drained here is the one the
+    /// turn funnel deposits into. A control plane wired to anything else would
+    /// silently drive state nothing reads.
+    mesh: MeshState,
+    /// The local roster, for the pushes a descriptor can trigger at this
+    /// relay's own clients: a synced leave a demoted authority never
+    /// delivered, a corrected region-label map, a coordinator reap.
     sessions: Sessions,
-    mesh_links: MeshLinks,
-    /// This relay's undecided drop holds, read on every `apply_descriptor` so a
-    /// descriptor-driven promotion skips a slot whose drop a client could still
-    /// return from — the same protection the presence-driven promotion
-    /// ([`presence::recompute`]) already gets from its caller. A fresh,
-    /// never-shared registry by default (a control plane with no turn path —
-    /// tests, a standalone descriptor driver): it is always empty, so
-    /// `apply_descriptor` degrades to treating every undecided departure as
-    /// immediately decidable, exactly like the behavior this replaces. Wired to
-    /// the real per-relay registry with [`with_drop_holds`](Self::with_drop_holds).
-    drop_holds: DropHolds,
-    /// The relay's provisional-admission registry, cleared here whenever a
-    /// descriptor names a session -- a fresh, never-shared registry by
-    /// default (a control plane with no turn path — tests, a standalone
-    /// descriptor driver), where clearing is a harmless no-op against state
-    /// nothing else ever marks. Wired to the real per-relay registry with
-    /// [`with_provisional`](Self::with_provisional).
-    provisional: crate::session::provisional::ProvisionalSessions,
-    /// The per-session terminal ingress boundary. Descriptor application
-    /// reopens a session's gate (a genuine re-serve) and retirement closes it
-    /// before sweeping — see [`crate::session::gate`]. A fresh, never-shared
-    /// registry by default (a control plane with no turn path); wired to the
-    /// relay-wide one with [`with_gates`](Self::with_gates).
-    gates: crate::session::gate::SessionGates,
-    /// The relay's full turn-path state, wired with
-    /// [`with_turn_path`](Self::with_turn_path) so descriptor application can
-    /// drain the provisional-turn pen through the ordinary forward path the
-    /// moment the maker exists (and the seeded decided-leave fence with it).
-    /// `None` by default (a control plane with no turn path — tests, a
-    /// standalone descriptor driver), where nothing ever pens a turn and
-    /// there is nothing to drain.
-    turn_path: Option<crate::mesh::MeshState>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -171,41 +137,19 @@ mod tests;
 
 impl MeshControl {
     /// Creates an empty `MeshControl` for a relay with no peer links and no
-    /// sessions yet. `our_id` is this relay's id. `decision_makers` is the
-    /// registry the relay's turn path holds (via `MeshState`), so a maker this
-    /// creates on a descriptor is the one the slot-link and mesh-link tasks
-    /// feed and stamp — a required argument, because a `MeshControl` minting
-    /// its own registry would create makers the turn path silently never
-    /// reads. `presence` is required for the same reason: the order recorded
-    /// here must be the one the turn-path tasks' live-player reports land on,
-    /// or the authority verdict would never move. A caller with no turn path
-    /// (tests, a standalone control plane) passes `Arc::default()` for both.
-    pub fn new(
-        our_id: RelayId,
-        decision_makers: Arc<DecisionMakers>,
-        presence: Arc<PresenceRegistry>,
-    ) -> Self {
+    /// sessions yet. `our_id` is this relay's id; `mesh` and `sessions` are the
+    /// turn-path state this control plane drives — the same registries the
+    /// slot-link and mesh-link tasks hold, cloned here (every field is a shared
+    /// handle). A control plane with no turn path — a standalone descriptor
+    /// driver, a test that only watches `Join`/`Leave` — passes a state of its
+    /// own (`&MeshState::default()`, `Sessions::default()`): still real and
+    /// self-consistent, just not shared with anything.
+    pub fn new(our_id: RelayId, mesh: &MeshState, sessions: Sessions) -> Self {
         let (desired_peers_tx, _) = watch::channel(Vec::new());
         Self {
             our_id,
-            decision_makers,
-            presence,
-            sessions: Sessions::default(),
-            mesh_links: crate::mesh::new_mesh_links(),
-            // A fresh, never-shared registry: nothing ever holds anything in
-            // it, so `apply_descriptor` reads an always-empty held set unless
-            // `with_drop_holds` wires the real one. Production values are used
-            // even for this placeholder purely so its unlock/abandon timings
-            // are never surprising if something did reach it unwired.
-            drop_holds: DropHolds::new(
-                crate::session::drop_hold::DROP_UNLOCK,
-                crate::session::drop_hold::ABANDONED_SESSION_TIMEOUT,
-            ),
-            provisional: crate::session::provisional::ProvisionalSessions::new(
-                crate::session::provisional::PROVISIONAL_WINDOW,
-            ),
-            gates: crate::session::gate::SessionGates::default(),
-            turn_path: None,
+            mesh: mesh.clone(),
+            sessions,
             inner: Arc::new(Mutex::new(Inner {
                 links: HashMap::new(),
                 latest_generations: HashMap::new(),
@@ -215,68 +159,6 @@ impl MeshControl {
                 desired_peers_tx,
             })),
         }
-    }
-
-    /// Wires the turn-path handles so a descriptor-driven authority *promotion*
-    /// can re-broadcast a synced leave the demoted authority never delivered —
-    /// pushing it to local survivors (`sessions`) and peer survivors
-    /// (`mesh_links`) — and so a descriptor that changes an already-released
-    /// region-label map can correct the local slots still holding the superseded
-    /// one. The production relay calls this with the same registries the turn
-    /// path holds; a control plane with no turn path leaves the empty defaults
-    /// from [`new`](Self::new), where both pushes are harmless no-ops against
-    /// empty registries.
-    pub fn with_broadcast(mut self, sessions: Sessions, mesh_links: MeshLinks) -> Self {
-        self.sessions = sessions;
-        self.mesh_links = mesh_links;
-        self
-    }
-
-    /// Wires the relay-wide session-gate registry, so the retire/reopen this
-    /// control plane performs is the same boundary the turn path, client
-    /// admission, and mesh dispatch run their ingress through. The production
-    /// relay passes `MeshState::gates`; a control plane with no turn path
-    /// keeps the default fresh registry, where gating is a harmless no-op.
-    pub fn with_gates(mut self, gates: crate::session::gate::SessionGates) -> Self {
-        self.gates = gates;
-        self
-    }
-
-    /// Wires the real per-relay drop-hold registry, so a descriptor-driven
-    /// authority promotion skips a slot whose drop is still held undecided —
-    /// the same protection the presence-driven promotion already has. The
-    /// production relay calls this with the same [`DropHolds`] the turn path
-    /// holds (via `MeshState`); a control plane with no turn path leaves the
-    /// harmless placeholder from [`new`](Self::new).
-    pub fn with_drop_holds(mut self, drop_holds: DropHolds) -> Self {
-        self.drop_holds = drop_holds;
-        self
-    }
-
-    /// Wires the real per-relay provisional-admission registry, so
-    /// `apply_descriptor` clears a session's provisional mark the moment a
-    /// descriptor names it. The production relay calls this with the same
-    /// [`crate::session::provisional::ProvisionalSessions`] the turn path holds (via
-    /// `MeshState`); a control plane with no turn path leaves the harmless
-    /// placeholder from [`new`](Self::new).
-    pub fn with_provisional(
-        mut self,
-        provisional: crate::session::provisional::ProvisionalSessions,
-    ) -> Self {
-        self.provisional = provisional;
-        self
-    }
-
-    /// Wires the relay's full turn-path state, so `apply_descriptor` can
-    /// drain the provisional-turn pen through the ordinary forward path the
-    /// moment a descriptor creates the session's maker — the freshly seeded
-    /// decided-leave fence then sorts a departed slot's held turns (dropped)
-    /// from a current slot's (forwarded). The production relay passes its
-    /// `MeshState` clone; a control plane with no turn path has nothing
-    /// penned and skips the drain.
-    pub fn with_turn_path(mut self, turn_path: crate::mesh::MeshState) -> Self {
-        self.turn_path = Some(turn_path);
-        self
     }
 
     /// Subscribes to the set of peers this relay currently needs mesh links to
@@ -345,9 +227,9 @@ impl MeshControl {
         // maker, read a `SlotDeparted` as an undecided drop, and recreate a
         // drop hold (or report a second close, or re-create a flight
         // recording) for a session that no longer exists.
-        self.gates.retire(key);
-        consensus::deregister_maker(&self.decision_makers, key);
-        presence::forget(&self.presence, key);
+        self.mesh.session.gates.retire(key);
+        consensus::deregister_maker(&self.mesh.session.decision_makers, key);
+        presence::forget(&self.mesh.session.presence, key);
         // Discard any turns still penned for the session — with the maker
         // gone and the gate retired, no descriptor will ever drain them. The
         // replay ring and forward-once seen state fall with them: the
@@ -357,19 +239,17 @@ impl MeshControl {
         // promise — with the descriptor gone there is no admission path left,
         // so nothing else would ever sweep a retained pair whose reconnect
         // never came. Idempotent when the emptied close already removed them.
-        if let Some(turn_path) = &self.turn_path {
-            turn_path.session.provisional_turns.discard(key);
-            turn_path.session.turn_ring.end_session(key);
-            crate::mesh::deregister_seen(&turn_path.seen, key);
-        }
+        self.mesh.session.provisional_turns.discard(key);
+        self.mesh.session.turn_ring.end_session(key);
+        crate::mesh::deregister_seen(&self.mesh.seen, key);
         // Retirement is terminal for the session's drop bookkeeping: with the
         // descriptor gone there is no admission path left for a held slot's
         // reconnect and no decide path for its leave, so any armed abandon
         // timer and every remaining hold would otherwise leak forever — the
         // timer's expiry stands down on the forgotten presence (never deciding
         // or releasing), and nothing else ever sweeps the entries.
-        self.drop_holds.cancel_abandon(key);
-        self.drop_holds.end_session_terminal(key);
+        self.mesh.session.drop_holds.cancel_abandon(key);
+        self.mesh.session.drop_holds.end_session_terminal(key);
         {
             let mut inner = self.inner.lock();
             if let Some(peers) = inner.desired.remove(key) {
@@ -383,7 +263,11 @@ impl MeshControl {
         // key must be able to record again. An in-flight event a link driver
         // was already delivering can still slip past this ordering; the
         // repeat-store warn diagnoses that residual.
-        self.decision_makers.flight_recorder().clear_close_seal(key);
+        self.mesh
+            .session
+            .decision_makers
+            .flight_recorder()
+            .clear_close_seal(key);
     }
 }
 
