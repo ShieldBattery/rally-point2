@@ -8,14 +8,17 @@
 - `run.rs` — `into_parts` (the one place a driver is split into link + seam + state),
   `run` / `run_reconnecting` / `session`: who owns closing the connection.
 - `session.rs` — one connection's setup, the `select!` loop, and `ArmFlow`.
-- `inbound.rs` / `outbound.rs` — the extracted `select!` arm bodies (relay → game, game → relay).
+- `wire.rs` — `Wire`: the per-connection stream halves, their bookkeeping, and the
+  `*_alive` arm gates. Thrown away on a reconnect, unlike `LoopState`.
+- `inbound.rs` / `outbound.rs` — the extracted `select!` arm bodies (relay → game, game → relay),
+  each over `(&mut Wire, &mut LoopState, &mut GameSeam)`.
 - `connectivity.rs` — `ConnectivityFence`: which relay-stamped link-lifecycle changes
   may still move the game's display, and whose departure is final.
-- `send.rs` — one turn's wire handoff, packet send, the delivered-through cursor push.
+- `send.rs` — one turn's wire handoff, packet send, the unacked-window cap check.
 - `reorder.rs` — `SlotReorder`: the per-slot ordered-release buffer and the delivery
   cursor a resume is read back from.
 - `state.rs` — `GameSeam` (and the one place both halves of the seam's channels are wired),
-  `LoopState`.
+  `LoopState`: everything a re-dialed session must carry across.
 - `reconnect.rs` / `retention.rs` — re-dial + escalation; `RetentionRing` and what a
   resume re-sends off it, and how it anchors.
 - `backoff.rs` — non-blocking game pushes, the waits that keep servicing the seam, jittered backoff.
@@ -26,7 +29,11 @@
 - An arm handler returns `ArmFlow`: `Teardown` is the old `break 'serve` (falls into
   `drain_and_settle`), `End` the old `return`. Swapping them changes whether the game's final
   turns are drained. A bare `continue` inside a handler continues *its own* loop, never the
-  session loop.
+  session loop. The four best-effort arms return `()` — they can only ever keep serving.
+- The link and the two reader receivers stay outside `Wire` on purpose: the `select!`
+  borrows them directly to build its futures, so they cannot sit in a struct the arm
+  bodies also take by `&mut`. Anything per-connection that the arms only touch inside
+  their bodies belongs in `Wire`; anything a reconnect must carry belongs in `LoopState`.
 - Turns are datagrams and `seq` is only an ack handle. Loss is covered by redundancy and the
   maintenance flush, never retransmit-on-timeout; order is restored by the per-slot release.
 - A turn too large for any datagram diverts to the reliable control stream, never enters the

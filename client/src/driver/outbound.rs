@@ -4,47 +4,34 @@
 //! skin blobs, drop requests. Grouped because they all end at the same two
 //! exits, the datagram path and the control stream.
 
-use std::collections::VecDeque;
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{GameChat, LobbyCommand, Payload, PlayerSkin};
+use rally_point_transport::Link;
 use rally_point_transport::control::{
     send_control_chat, send_control_game_result, send_control_game_started, send_control_lobby,
     send_control_request_drop, send_control_skin,
 };
-use rally_point_transport::{Link, noq};
-use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
-use crate::leave_announcer::LeaveAnnouncer;
-use crate::phase::{PhaseSlew, PhaseStatus};
-
-use super::retention::RetentionRing;
 use super::send::{OutboundSend, send_game_turn};
 use super::session::ArmFlow;
-use super::{ChatOut, DriverError, DriverTiming, HELD_TURN_CAP};
+use super::state::{GameSeam, LoopState};
+use super::wire::Wire;
+use super::{ChatOut, DriverError, HELD_TURN_CAP};
 
 /// One turn the game produced. With no send-phase delay in effect it goes
 /// straight to the wire; under a delay it joins the hold queue, and once
 /// anything is held every later turn queues behind it so wire order always
 /// matches production order.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn on_outgoing_turn(
     outgoing: Option<Payload>,
     link: &mut Link,
-    control_send: &mut noq::SendStream,
-    announcer: &mut LeaveAnnouncer,
-    next_outbound_seq: &mut u64,
-    retention: &mut RetentionRing,
+    wire: &mut Wire,
+    state: &mut LoopState,
+    seam: &GameSeam,
     own_slot: SlotId,
-    flush_deadline: &mut Instant,
-    acks_owed: &mut bool,
-    timing: DriverTiming,
-    outbound: &mpsc::Receiver<Payload>,
-    held: &mut VecDeque<(Instant, Payload)>,
-    phase_slew: &mut PhaseSlew,
-    phase_status: &watch::Sender<PhaseStatus>,
 ) -> ArmFlow {
     match outgoing {
         // A turn the game produced. Its local echo already ran
@@ -57,31 +44,24 @@ pub(super) async fn on_outgoing_turn(
         // zero, so wire order always matches production order.
         Some(payload) => {
             let now = Instant::now();
-            let delay_us = phase_slew.advance(now);
-            let _ = phase_status.send_replace(phase_slew.status());
-            if delay_us == 0 && held.is_empty() {
-                match send_game_turn(
-                    link,
-                    control_send,
-                    announcer,
-                    next_outbound_seq,
-                    retention,
-                    own_slot,
-                    flush_deadline,
-                    acks_owed,
-                    timing,
-                    payload,
-                )
-                .await
-                {
+            let delay_us = state.phase_slew.advance(now);
+            let _ = seam.phase_status.send_replace(state.phase_slew.status());
+            if delay_us == 0 && state.held.is_empty() {
+                match send_game_turn(link, wire, state, own_slot, payload).await {
                     OutboundSend::Sent => {}
                     OutboundSend::EndSession(result) => return ArmFlow::End(result),
                 }
                 // The turn just sent may have been the last one
                 // outstanding, in which case a pending leave intent
                 // is now ready to go out.
-                if let Err(error) = announcer
-                    .maybe_send(control_send, outbound, held.is_empty(), link)
+                if let Err(error) = state
+                    .announcer
+                    .maybe_send(
+                        &mut wire.control_send,
+                        &seam.outbound,
+                        state.held.is_empty(),
+                        link,
+                    )
                     .await
                 {
                     return ArmFlow::End(Err(DriverError::from(error)));
@@ -91,32 +71,19 @@ pub(super) async fn on_outgoing_turn(
                 // Never due ahead of an already-held turn: a
                 // delay slewing downward must not reorder the
                 // wire against production order.
-                let due = held.back().map_or(due, |&(prev, _)| due.max(prev));
-                held.push_back((due, payload));
+                let due = state.held.back().map_or(due, |&(prev, _)| due.max(prev));
+                state.held.push_back((due, payload));
                 // The memory backstop: a producer outrunning
                 // the turn cadence would otherwise grow the
                 // hold without bound (the bounded channel is
                 // being drained into it). Send the oldest
                 // early — order and delivery hold, only its
                 // remaining delay is forfeited.
-                while held.len() > HELD_TURN_CAP {
-                    let Some((_, early)) = held.pop_front() else {
+                while state.held.len() > HELD_TURN_CAP {
+                    let Some((_, early)) = state.held.pop_front() else {
                         break;
                     };
-                    match send_game_turn(
-                        link,
-                        control_send,
-                        announcer,
-                        next_outbound_seq,
-                        retention,
-                        own_slot,
-                        flush_deadline,
-                        acks_owed,
-                        timing,
-                        early,
-                    )
-                    .await
-                    {
+                    match send_game_turn(link, wire, state, own_slot, early).await {
                         OutboundSend::Sent => {}
                         OutboundSend::EndSession(result) => return ArmFlow::End(result),
                     }
@@ -137,45 +104,31 @@ pub(super) async fn on_outgoing_turn(
 /// branch that drains the hold queue mid-session, so the
 /// announcer check runs after it — the last held turn going out
 /// may release a pending leave intent.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn on_held_due(
     link: &mut Link,
-    control_send: &mut noq::SendStream,
-    announcer: &mut LeaveAnnouncer,
-    next_outbound_seq: &mut u64,
-    retention: &mut RetentionRing,
+    wire: &mut Wire,
+    state: &mut LoopState,
+    seam: &GameSeam,
     own_slot: SlotId,
-    flush_deadline: &mut Instant,
-    acks_owed: &mut bool,
-    timing: DriverTiming,
-    outbound: &mpsc::Receiver<Payload>,
-    held: &mut VecDeque<(Instant, Payload)>,
 ) -> ArmFlow {
     let now = Instant::now();
-    while held.front().is_some_and(|&(due, _)| due <= now) {
-        let Some((_, payload)) = held.pop_front() else {
+    while state.held.front().is_some_and(|&(due, _)| due <= now) {
+        let Some((_, payload)) = state.held.pop_front() else {
             break;
         };
-        match send_game_turn(
-            link,
-            control_send,
-            announcer,
-            next_outbound_seq,
-            retention,
-            own_slot,
-            flush_deadline,
-            acks_owed,
-            timing,
-            payload,
-        )
-        .await
-        {
+        match send_game_turn(link, wire, state, own_slot, payload).await {
             OutboundSend::Sent => {}
             OutboundSend::EndSession(result) => return ArmFlow::End(result),
         }
     }
-    if let Err(error) = announcer
-        .maybe_send(control_send, outbound, held.is_empty(), link)
+    if let Err(error) = state
+        .announcer
+        .maybe_send(
+            &mut wire.control_send,
+            &seam.outbound,
+            state.held.is_empty(),
+            link,
+        )
         .await
     {
         return ArmFlow::End(Err(DriverError::from(error)));
@@ -194,17 +147,15 @@ pub(super) async fn on_held_due(
 pub(super) async fn on_result(
     payload: Option<Vec<u8>>,
     link: &Link,
-    control_send: &mut noq::SendStream,
-    announcer: &mut LeaveAnnouncer,
-    outbound: &mpsc::Receiver<Payload>,
-    held: &VecDeque<(Instant, Payload)>,
-    result_alive: &mut bool,
+    wire: &mut Wire,
+    state: &mut LoopState,
+    seam: &GameSeam,
 ) -> ArmFlow {
     match payload {
         Some(payload) => {
-            if announcer.result_sent() {
+            if state.announcer.result_sent() {
                 tracing::debug!("dropping extra game-result payload; one already sent");
-            } else if announcer.sent() {
+            } else if state.announcer.sent() {
                 tracing::debug!("dropping game-result payload arriving after leave intent");
             } else {
                 // A best-effort report: a failed send is not worth
@@ -214,17 +165,25 @@ pub(super) async fn on_result(
                 // outcome from the departure that follows. Latch it
                 // as sent regardless, so the leave-intent hold
                 // releases and no retry piles up.
-                if let Err(error) = send_control_game_result(control_send, payload.into()).await {
+                if let Err(error) =
+                    send_control_game_result(&mut wire.control_send, payload.into()).await
+                {
                     tracing::debug!(
                         %error,
                         "game-result send failed; dropping the report"
                     );
                 }
-                announcer.note_result_sent();
+                state.announcer.note_result_sent();
                 // Sending the result may have been the last thing
                 // a pending leave intent was holding for.
-                if let Err(error) = announcer
-                    .maybe_send(control_send, outbound, held.is_empty(), link)
+                if let Err(error) = state
+                    .announcer
+                    .maybe_send(
+                        &mut wire.control_send,
+                        &seam.outbound,
+                        state.held.is_empty(),
+                        link,
+                    )
                     .await
                 {
                     return ArmFlow::End(Err(DriverError::from(error)));
@@ -234,7 +193,7 @@ pub(super) async fn on_result(
         // The game dropped its result sender without ever handing
         // one over: nothing to send, and the leave-intent hold is
         // still bounded by the safety timeout.
-        None => *result_alive = false,
+        None => wire.result_alive = false,
     }
     ArmFlow::Serve
 }
@@ -249,18 +208,12 @@ pub(super) async fn on_result(
 /// re-assertion, or a fence probe answered ahead of it, has already
 /// carried the frame. Disarmed on the channel's first resolution,
 /// like the leave-intent and result branches.
-pub(super) async fn on_game_started(
-    signal: Option<()>,
-    control_send: &mut noq::SendStream,
-    game_started_announced: &mut bool,
-    game_started_on_stream: &mut bool,
-    game_started_alive: &mut bool,
-) {
-    *game_started_alive = false;
-    if signal.is_some() && !*game_started_announced {
-        *game_started_announced = true;
-        match send_control_game_started(control_send).await {
-            Ok(()) => *game_started_on_stream = true,
+pub(super) async fn on_game_started(signal: Option<()>, wire: &mut Wire, state: &mut LoopState) {
+    wire.game_started_alive = false;
+    if signal.is_some() && !state.game_started_announced {
+        state.game_started_announced = true;
+        match send_control_game_started(&mut wire.control_send).await {
+            Ok(()) => wire.game_started_on_stream = true,
             Err(error) => tracing::debug!(
                 %error,
                 "game-started send failed; retrying on the next stream"
@@ -295,9 +248,8 @@ pub(super) async fn on_game_started(
 /// scope until lobby commands carry real delivery confirmation.
 pub(super) async fn on_lobby_out(
     bytes: Option<Vec<u8>>,
-    control_send: &mut noq::SendStream,
-    announcer: &LeaveAnnouncer,
-    lobby_out_alive: &mut bool,
+    wire: &mut Wire,
+    state: &LoopState,
 ) -> ArmFlow {
     match bytes {
         Some(bytes) => {
@@ -305,11 +257,15 @@ pub(super) async fn on_lobby_out(
                 slot: 0,
                 payload: bytes.into(),
             };
-            if let Err(error) = send_control_lobby(control_send, command).await {
-                return ArmFlow::End(announcer.absorb_link_close(Err(DriverError::from(error))));
+            if let Err(error) = send_control_lobby(&mut wire.control_send, command).await {
+                return ArmFlow::End(
+                    state
+                        .announcer
+                        .absorb_link_close(Err(DriverError::from(error))),
+                );
             }
         }
-        None => *lobby_out_alive = false,
+        None => wire.lobby_out_alive = false,
     }
     ArmFlow::Serve
 }
@@ -324,11 +280,7 @@ pub(super) async fn on_lobby_out(
 /// than tearing the session down over a dropped chat line.
 /// Disarmed only when the game drops its sender (chat streams for
 /// the whole game, unlike lobby).
-pub(super) async fn on_chat_out(
-    chat: Option<ChatOut>,
-    control_send: &mut noq::SendStream,
-    chat_out_alive: &mut bool,
-) {
+pub(super) async fn on_chat_out(chat: Option<ChatOut>, wire: &mut Wire) {
     match chat {
         Some(ChatOut {
             target_kind,
@@ -341,14 +293,14 @@ pub(super) async fn on_chat_out(
                 target_slot,
                 text,
             };
-            if let Err(error) = send_control_chat(control_send, message).await {
+            if let Err(error) = send_control_chat(&mut wire.control_send, message).await {
                 tracing::debug!(
                     %error,
                     "game-chat send failed; dropping the message"
                 );
             }
         }
-        None => *chat_out_alive = false,
+        None => wire.chat_out_alive = false,
     }
 }
 
@@ -361,25 +313,21 @@ pub(super) async fn on_chat_out(
 /// blob costs only a wrong cosmetic — so log it and keep the driver
 /// running rather than tearing the session down. Disarmed only when
 /// the game drops its sender.
-pub(super) async fn on_skin_out(
-    bytes: Option<Vec<u8>>,
-    control_send: &mut noq::SendStream,
-    skin_out_alive: &mut bool,
-) {
+pub(super) async fn on_skin_out(bytes: Option<Vec<u8>>, wire: &mut Wire) {
     match bytes {
         Some(bytes) => {
             let skin = PlayerSkin {
                 slot: 0,
                 payload: bytes.into(),
             };
-            if let Err(error) = send_control_skin(control_send, skin).await {
+            if let Err(error) = send_control_skin(&mut wire.control_send, skin).await {
                 tracing::debug!(
                     %error,
                     "player-skin send failed; dropping the blob"
                 );
             }
         }
-        None => *skin_out_alive = false,
+        None => wire.skin_out_alive = false,
     }
 }
 
@@ -392,14 +340,12 @@ pub(super) async fn on_skin_out(
 /// a lost request is not correctness-critical — the survivor can
 /// simply click again, and the `LeaveDirective` for the target is the
 /// only confirmation. Disarmed only when the game drops its sender.
-pub(super) async fn on_request_drop(
-    target: Option<SlotId>,
-    control_send: &mut noq::SendStream,
-    request_drop_alive: &mut bool,
-) {
+pub(super) async fn on_request_drop(target: Option<SlotId>, wire: &mut Wire) {
     match target {
         Some(target) => {
-            if let Err(error) = send_control_request_drop(control_send, u32::from(target.0)).await {
+            if let Err(error) =
+                send_control_request_drop(&mut wire.control_send, u32::from(target.0)).await
+            {
                 tracing::debug!(
                     %error,
                     target = target.0,
@@ -407,6 +353,6 @@ pub(super) async fn on_request_drop(
                 );
             }
         }
-        None => *request_drop_alive = false,
+        None => wire.request_drop_alive = false,
     }
 }

@@ -1,20 +1,16 @@
 //! One turn's wire handoff and the small primitives around it: assigning a
 //! turn its origin identity and choosing the datagram or control-stream path,
-//! sending a packet, pushing delivered-through cursors, and the unacked-window
-//! cap check.
+//! sending a packet, and the unacked-window cap check.
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::Payload;
-use rally_point_transport::beacon::BeaconWriter;
 use rally_point_transport::control::send_control_turn;
-use rally_point_transport::{Link, LinkError, noq};
+use rally_point_transport::{Link, LinkError};
 use tokio::time::Instant;
 
-use crate::leave_announcer::LeaveAnnouncer;
-
-use super::reorder::SlotReorder;
-use super::retention::RetentionRing;
-use super::{DriverError, DriverTiming, UNACKED_WINDOW_CAP};
+use super::state::LoopState;
+use super::wire::Wire;
+use super::{DriverError, UNACKED_WINDOW_CAP};
 
 /// The outcome of one turn's wire handoff: sent (keep looping), or the session
 /// must end with the given result — an absorbed post-leave close (`Ok`) or a
@@ -30,17 +26,11 @@ pub(super) enum OutboundSend {
 /// the datagram path when it fits, diverted to the reliable control stream
 /// when it cannot. Stamping happens here, at actual send, so however a turn
 /// reached this point the seq stream is assigned in wire order.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_game_turn(
     link: &mut Link,
-    control_send: &mut noq::SendStream,
-    announcer: &LeaveAnnouncer,
-    next_outbound_seq: &mut u64,
-    retention: &mut RetentionRing,
+    wire: &mut Wire,
+    state: &mut LoopState,
     own_slot: SlotId,
-    flush_deadline: &mut Instant,
-    acks_owed: &mut bool,
-    timing: DriverTiming,
     mut payload: Payload,
 ) -> OutboundSend {
     // Assign this turn its origin seq and slot — the client is the sole
@@ -50,12 +40,12 @@ pub(super) async fn send_game_turn(
     // under the same `own_slot` the resume anchor and ack-beacon retirement
     // use, so an in-flight turn is not stranded under a phantom slot-0 key
     // across a reconnect.
-    payload.seq = *next_outbound_seq;
+    payload.seq = state.next_outbound_seq;
     payload.slot = u32::from(own_slot.0);
-    *next_outbound_seq += 1;
+    state.next_outbound_seq += 1;
     // Retain a copy for a possible re-home re-injection before the turn is
     // handed to the link (which moves it).
-    retention.push(&payload);
+    state.retention.push(&payload);
     let fits = match link.payload_fits(&payload) {
         Ok(fits) => fits,
         Err(error) => return OutboundSend::EndSession(Err(DriverError::from(error))),
@@ -67,9 +57,9 @@ pub(super) async fn send_game_turn(
         // the flush retransmits.
         match send_packet(link, Some(payload)) {
             Ok(carried_redundancy) => {
-                *acks_owed = false;
+                wire.acks_owed = false;
                 if carried_redundancy {
-                    *flush_deadline = Instant::now() + timing.flush_interval;
+                    wire.flush_deadline = Instant::now() + state.timing.flush_interval;
                 }
                 if let Some(error) = window_cap_error(link) {
                     return OutboundSend::EndSession(Err(error));
@@ -79,7 +69,7 @@ pub(super) async fn send_game_turn(
             // announced our leave, the relay closing the link out from under
             // this send is the expected confirmation, not a failure.
             Err(error) => {
-                return OutboundSend::EndSession(announcer.absorb_link_close(Err(error)));
+                return OutboundSend::EndSession(state.announcer.absorb_link_close(Err(error)));
             }
         }
     } else {
@@ -90,9 +80,11 @@ pub(super) async fn send_game_turn(
         // dropping it would desync lockstep) — but once the leave intent is
         // out, the relay closing the stream under this write is the expected
         // confirmation, not a failure.
-        if let Err(error) = send_control_turn(control_send, payload).await {
+        if let Err(error) = send_control_turn(&mut wire.control_send, payload).await {
             return OutboundSend::EndSession(
-                announcer.absorb_link_close(Err(DriverError::from(error))),
+                state
+                    .announcer
+                    .absorb_link_close(Err(DriverError::from(error))),
             );
         }
     }
@@ -122,26 +114,6 @@ pub(super) fn send_packet(link: &mut Link, payload: Option<Payload>) -> Result<b
         }
         Err(error) => Err(error.into()),
     }
-}
-
-/// Pushes each slot's delivered-through cursor to the peer so it can
-/// force-advance its unacked window past turns it now knows we received.
-/// `BeaconWriter` pushes only cursors that advanced past its last-sent state, so a
-/// static cursor (a genuine forward gap) sends nothing — the cap handles that.
-pub(super) async fn flush_delivered_cursors(
-    link: &Link,
-    beacon_send: &mut noq::SendStream,
-    beacon_writer: &mut BeaconWriter,
-    reorder: &SlotReorder,
-) {
-    beacon_writer
-        .flush(
-            beacon_send,
-            reorder
-                .slots()
-                .filter_map(|slot| link.delivered_through(slot).map(|c| (slot, c))),
-        )
-        .await;
 }
 
 /// The error to fail the session with when `link`'s unacked window has crossed

@@ -3,27 +3,22 @@
 //! through one ordered per-slot release, so a turn is delivered the same way
 //! whichever path brought it.
 
-use std::collections::VecDeque;
-
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeaveDirective, Payload};
-use rally_point_transport::beacon::BeaconWriter;
+use rally_point_proto::messages::Payload;
 use rally_point_transport::control::{
     ControlInbound, send_control_game_started, send_control_load_state_probe_ack,
     send_control_phase_applied,
 };
-use rally_point_transport::{Link, LinkError, Received, noq};
-use tokio::sync::{mpsc, watch};
+use rally_point_transport::{Link, LinkError, Received};
+use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::leave_announcer::LeaveAnnouncer;
-use crate::phase::{PhaseSlew, PhaseStatus};
-
 use super::backoff::{GamePush, push_to_game};
-use super::connectivity::ConnectivityFence;
 use super::reorder::{Release, SlotReorder};
-use super::send::{flush_delivered_cursors, window_cap_error};
+use super::send::window_cap_error;
 use super::session::ArmFlow;
+use super::state::{GameSeam, LoopState};
+use super::wire::Wire;
 use super::{ChatOut, DriverError};
 
 /// Buffers a received packet's fresh turns into their slots' reorder queues and
@@ -59,19 +54,12 @@ pub(super) fn ingest_fresh_turns(
 /// delivered-through cursors, and check the unacked-window cap. The link dedups
 /// and orders within a datagram but follows arrival order across them, so the
 /// ordering the game sees is restored here, never on the wire.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn on_received(
     received: Result<Received, LinkError>,
     link: &mut Link,
-    control_send: &mut noq::SendStream,
-    beacon_send: &mut noq::SendStream,
-    beacon_writer: &mut BeaconWriter,
-    acks_owed: &mut bool,
-    reorder: &mut SlotReorder,
-    inbound: &mpsc::Sender<Payload>,
-    outbound: &mpsc::Receiver<Payload>,
-    announcer: &mut LeaveAnnouncer,
-    held: &VecDeque<(Instant, Payload)>,
+    wire: &mut Wire,
+    state: &mut LoopState,
+    seam: &GameSeam,
 ) -> ArmFlow {
     let received = match received {
         Ok(received) => received,
@@ -80,28 +68,34 @@ pub(super) async fn on_received(
         // a link failure — `absorb_link_close` turns it into a
         // clean stop; before that it is a real failure.
         Err(error) => {
-            return ArmFlow::End(announcer.absorb_link_close(Err(error.into())));
+            return ArmFlow::End(state.announcer.absorb_link_close(Err(error.into())));
         }
     };
     // Only a payload-bearing packet needs an ack in return; owing one
     // for the relay's ack-only flush would just bounce ack-only packets
     // back and forth on an otherwise idle link.
     if received.carried_payloads {
-        *acks_owed = true;
+        wire.acks_owed = true;
     }
-    match ingest_fresh_turns(received.fresh, reorder, inbound) {
+    match ingest_fresh_turns(received.fresh, &mut state.reorder, &seam.inbound) {
         Release::Delivered => {}
         Release::GameClosed => return ArmFlow::Teardown,
         Release::GameStalled => return ArmFlow::End(Err(DriverError::GameStalled)),
     }
-    flush_delivered_cursors(link, beacon_send, beacon_writer, reorder).await;
+    wire.flush_delivered_cursors(link, &state.reorder).await;
     if let Some(error) = window_cap_error(link) {
         return ArmFlow::End(Err(error));
     }
     // An ack folded into the manager above may be the last one
     // a pending leave intent was waiting on.
-    if let Err(error) = announcer
-        .maybe_send(control_send, outbound, held.is_empty(), link)
+    if let Err(error) = state
+        .announcer
+        .maybe_send(
+            &mut wire.control_send,
+            &seam.outbound,
+            state.held.is_empty(),
+            link,
+        )
         .await
     {
         return ArmFlow::End(Err(DriverError::from(error)));
@@ -122,30 +116,12 @@ pub(super) async fn on_received(
 /// advances across it and a copy that somehow arrived both ways collapses to
 /// one delivery. It then joins the same per-slot reorder buffer, so the game
 /// sees one ordered stream regardless of which path each turn took.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn on_control_frame(
     received: Option<ControlInbound>,
     link: &mut Link,
-    control_send: &mut noq::SendStream,
-    beacon_send: &mut noq::SendStream,
-    beacon_writer: &mut BeaconWriter,
-    reorder: &mut SlotReorder,
-    inbound: &mpsc::Sender<Payload>,
-    leaves: &mpsc::Sender<LeaveDirective>,
-    lobby_in: &mpsc::Sender<(SlotId, Vec<u8>)>,
-    chat_in: &mpsc::Sender<(SlotId, ChatOut)>,
-    skin_in: &mpsc::Sender<(SlotId, Vec<u8>)>,
-    session_start: &mpsc::Sender<Option<u32>>,
-    connectivity: &mpsc::Sender<(SlotId, bool)>,
-    region_labels: &mpsc::Sender<Vec<(u64, String)>>,
-    phase_status: &watch::Sender<PhaseStatus>,
-    phase_slew: &mut PhaseSlew,
-    announcer: &mut LeaveAnnouncer,
-    game_started: &mut bool,
-    game_started_announced: &mut bool,
-    game_started_out: &mut mpsc::Receiver<()>,
-    game_started_on_stream: &mut bool,
-    connectivity_fence: &mut ConnectivityFence,
+    wire: &mut Wire,
+    state: &mut LoopState,
+    seam: &mut GameSeam,
 ) -> ArmFlow {
     match received {
         // A relay-pushed synced leave: hand it to the game's leave
@@ -166,8 +142,8 @@ pub(super) async fn on_control_frame(
                 );
                 return ArmFlow::Serve;
             };
-            connectivity_fence.mark_terminal(SlotId(slot_id));
-            match push_to_game(leaves, leave) {
+            state.connectivity.mark_terminal(SlotId(slot_id));
+            match push_to_game(&seam.leaves, leave) {
                 GamePush::Sent => {}
                 GamePush::Full => {
                     tracing::warn!("game stopped draining synced leaves");
@@ -218,7 +194,7 @@ pub(super) async fn on_control_frame(
                 );
                 return ArmFlow::Serve;
             };
-            match push_to_game(lobby_in, (SlotId(slot_id), command.payload.to_vec())) {
+            match push_to_game(&seam.lobby_in, (SlotId(slot_id), command.payload.to_vec())) {
                 GamePush::Sent => {}
                 GamePush::Full => {
                     tracing::warn!("game stopped draining lobby commands");
@@ -249,7 +225,7 @@ pub(super) async fn on_control_frame(
                 target_slot: chat.target_slot,
                 text: chat.text,
             };
-            match push_to_game(chat_in, (SlotId(slot_id), out)) {
+            match push_to_game(&seam.chat_in, (SlotId(slot_id), out)) {
                 GamePush::Sent => {}
                 GamePush::Full => {
                     tracing::debug!("dropping game-chat message; the game is not draining chat");
@@ -275,7 +251,7 @@ pub(super) async fn on_control_frame(
                 );
                 return ArmFlow::Serve;
             };
-            match push_to_game(skin_in, (SlotId(slot_id), skin.payload.to_vec())) {
+            match push_to_game(&seam.skin_in, (SlotId(slot_id), skin.payload.to_vec())) {
                 GamePush::Sent => {}
                 GamePush::Full => {
                     tracing::debug!("dropping player-skin blob; the game is not draining skins");
@@ -293,8 +269,8 @@ pub(super) async fn on_control_frame(
             // The game has started: from here a dead home relay may
             // escalate to coordinator-mediated failover. Latched, and
             // kept across reconnects via the persistent state.
-            *game_started = true;
-            match push_to_game(session_start, initial_buffer_turns) {
+            state.game_started = true;
+            match push_to_game(&seam.session_start, initial_buffer_turns) {
                 GamePush::Sent => {}
                 GamePush::Full => {
                     tracing::warn!("game stopped draining session-start directives");
@@ -322,10 +298,13 @@ pub(super) async fn on_control_frame(
                 return ArmFlow::Serve;
             };
             let subject = SlotId(slot_id);
-            if !connectivity_fence.admit(subject, change.connected, change.connection_epoch) {
+            if !state
+                .connectivity
+                .admit(subject, change.connected, change.connection_epoch)
+            {
                 return ArmFlow::Serve;
             }
-            match push_to_game(connectivity, (subject, change.connected)) {
+            match push_to_game(&seam.connectivity, (subject, change.connected)) {
                 GamePush::Sent => {}
                 GamePush::Full => {
                     tracing::debug!("dropping connectivity change; the game is not draining them");
@@ -348,7 +327,7 @@ pub(super) async fn on_control_frame(
                 .into_iter()
                 .map(|label| (label.relay_id, label.region))
                 .collect();
-            match push_to_game(region_labels, labels) {
+            match push_to_game(&seam.region_labels, labels) {
                 GamePush::Sent => {}
                 GamePush::Full => {
                     tracing::debug!("dropping region labels; the game is not draining them");
@@ -367,8 +346,10 @@ pub(super) async fn on_control_frame(
         // connect-time re-push) is idempotent, and the relay's
         // next measurement cycle corrects any residue.
         Some(ControlInbound::PhaseDirective(directive)) => {
-            phase_slew.retarget(directive.delay_us, directive.slew_us_per_s, Instant::now());
-            let _ = phase_status.send_replace(phase_slew.status());
+            state
+                .phase_slew
+                .retarget(directive.delay_us, directive.slew_us_per_s, Instant::now());
+            let _ = seam.phase_status.send_replace(state.phase_slew.status());
             tracing::debug!(
                 delay_us = directive.delay_us,
                 slew_us_per_s = directive.slew_us_per_s,
@@ -380,7 +361,9 @@ pub(super) async fn on_control_frame(
             // silence. Best-effort: on a dead stream the
             // session is about to end anyway, and the parked
             // command costs only unfinished alignment.
-            if let Err(error) = send_control_phase_applied(control_send, directive.delay_us).await {
+            if let Err(error) =
+                send_control_phase_applied(&mut wire.control_send, directive.delay_us).await
+            {
                 tracing::debug!(
                     %error,
                     "phase-applied ack failed; the relay parks this slot's command",
@@ -403,21 +386,22 @@ pub(super) async fn on_control_frame(
         // best-effort for the same reason. Answering consumes the
         // signal, so the live arm below has nothing left to re-send.
         Some(ControlInbound::LoadStateProbe(probe_id)) => {
-            if game_started_out.try_recv().is_ok() {
-                *game_started_announced = true;
+            if seam.game_started.try_recv().is_ok() {
+                state.game_started_announced = true;
             }
-            if *game_started_announced && !*game_started_on_stream {
-                match send_control_game_started(control_send).await {
-                    Ok(()) => *game_started_on_stream = true,
+            if state.game_started_announced && !wire.game_started_on_stream {
+                match send_control_game_started(&mut wire.control_send).await {
+                    Ok(()) => wire.game_started_on_stream = true,
                     Err(error) => tracing::debug!(
                         %error,
                         "game-started send ahead of a fence ack failed; withholding the ack"
                     ),
                 }
             }
-            let report_owed = *game_started_announced && !*game_started_on_stream;
+            let report_owed = state.game_started_announced && !wire.game_started_on_stream;
             if !report_owed
-                && let Err(error) = send_control_load_state_probe_ack(control_send, probe_id).await
+                && let Err(error) =
+                    send_control_load_state_probe_ack(&mut wire.control_send, probe_id).await
             {
                 tracing::debug!(
                     %error,
@@ -454,13 +438,13 @@ pub(super) async fn on_control_frame(
                 Err(error) => return ArmFlow::End(Err(DriverError::from(error))),
             };
             if fresh {
-                reorder.observe(slot, payload);
-                match reorder.release_into(inbound) {
+                state.reorder.observe(slot, payload);
+                match state.reorder.release_into(&seam.inbound) {
                     Release::Delivered => {}
                     Release::GameClosed => return ArmFlow::Teardown,
                     Release::GameStalled => return ArmFlow::End(Err(DriverError::GameStalled)),
                 }
-                flush_delivered_cursors(link, beacon_send, beacon_writer, reorder).await;
+                wire.flush_delivered_cursors(link, &state.reorder).await;
             }
         }
         // The reader task ended: a one-sided stream reset, an
@@ -482,7 +466,11 @@ pub(super) async fn on_control_frame(
         // error arm would have produced.
         None => {
             tracing::info!("control stream reader ended");
-            return ArmFlow::End(announcer.absorb_link_close(Err(DriverError::ControlStreamLost)));
+            return ArmFlow::End(
+                state
+                    .announcer
+                    .absorb_link_close(Err(DriverError::ControlStreamLost)),
+            );
         }
     }
     ArmFlow::Serve

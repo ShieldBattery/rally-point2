@@ -3,20 +3,15 @@
 //! window with the flush re-carry running, and waiting for the relay's own
 //! close to prove the reliable control stream was read in full.
 
-use std::collections::VecDeque;
-
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::Payload;
+use rally_point_transport::Link;
 use rally_point_transport::control::{send_control_game_result, send_control_game_started};
-use rally_point_transport::{Link, noq};
-use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 
-use crate::leave_announcer::LeaveAnnouncer;
-
-use super::retention::RetentionRing;
+use super::DriverError;
 use super::send::{OutboundSend, send_game_turn, send_packet};
-use super::{DriverError, DriverTiming};
+use super::state::{GameSeam, LoopState};
+use super::wire::Wire;
 
 /// The game closed its seam. Everything it produced in its final
 /// moments must still reach the relay — lockstep stalls forever on a
@@ -29,85 +24,48 @@ use super::{DriverError, DriverTiming};
 /// in the outbound channel, then a queued leave-intent signal and a
 /// queued result report. A link failure mid-drain classifies exactly
 /// as a live send's would.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_and_settle(
     link: &mut Link,
-    control_send: &mut noq::SendStream,
-    announcer: &mut LeaveAnnouncer,
-    next_outbound_seq: &mut u64,
-    retention: &mut RetentionRing,
+    wire: &mut Wire,
+    state: &mut LoopState,
+    seam: &mut GameSeam,
     own_slot: SlotId,
-    flush_deadline: &mut Instant,
-    acks_owed: &mut bool,
-    timing: DriverTiming,
-    outbound: &mut mpsc::Receiver<Payload>,
-    held: &mut VecDeque<(Instant, Payload)>,
-    leave_intent: &mut mpsc::Receiver<()>,
-    result: &mut mpsc::Receiver<Vec<u8>>,
-    game_started_out: &mut mpsc::Receiver<()>,
-    game_started_announced: &mut bool,
 ) -> Result<(), DriverError> {
-    while let Some((_, payload)) = held.pop_front() {
-        match send_game_turn(
-            link,
-            control_send,
-            announcer,
-            next_outbound_seq,
-            retention,
-            own_slot,
-            flush_deadline,
-            acks_owed,
-            timing,
-            payload,
-        )
-        .await
-        {
+    while let Some((_, payload)) = state.held.pop_front() {
+        match send_game_turn(link, wire, state, own_slot, payload).await {
             OutboundSend::Sent => {}
             OutboundSend::EndSession(result) => return result,
         }
     }
-    while let Ok(payload) = outbound.try_recv() {
-        match send_game_turn(
-            link,
-            control_send,
-            announcer,
-            next_outbound_seq,
-            retention,
-            own_slot,
-            flush_deadline,
-            acks_owed,
-            timing,
-            payload,
-        )
-        .await
-        {
+    while let Ok(payload) = seam.outbound.try_recv() {
+        match send_game_turn(link, wire, state, own_slot, payload).await {
             OutboundSend::Sent => {}
             OutboundSend::EndSession(result) => return result,
         }
     }
-    if leave_intent.try_recv().is_ok() {
-        announcer.arm(timing.leave_intent_timeout);
+    if seam.leave_intent.try_recv().is_ok() {
+        state.announcer.arm(state.timing.leave_intent_timeout);
     }
-    if game_started_out.try_recv().is_ok() && !*game_started_announced {
+    if seam.game_started.try_recv().is_ok() && !state.game_started_announced {
         // The game closed its seam with the announcement still unread, so
         // this is the only stream that will ever carry it — there is no next
         // one to re-assert on. Retained anyway, so the whole session agrees
         // on the fact, and written best-effort like the live arm.
-        *game_started_announced = true;
-        if let Err(error) = send_control_game_started(control_send).await {
+        state.game_started_announced = true;
+        if let Err(error) = send_control_game_started(&mut wire.control_send).await {
             tracing::debug!(%error, "game-started send failed at teardown; dropping it");
         }
     }
-    if let Ok(payload) = result.try_recv()
-        && !announcer.result_sent()
-        && !announcer.sent()
+    if let Ok(payload) = seam.result.try_recv()
+        && !state.announcer.result_sent()
+        && !state.announcer.sent()
     {
         // Mirrors the live result arm: best-effort, latched as sent
         // either way so the leave-intent hold below releases.
-        if let Err(error) = send_control_game_result(control_send, payload.into()).await {
+        if let Err(error) = send_control_game_result(&mut wire.control_send, payload.into()).await {
             tracing::debug!(%error, "game-result send failed at teardown; dropping the report");
         }
-        announcer.note_result_sent();
+        state.announcer.note_result_sent();
     }
 
     // Sending is not delivering: the caller closes the connection the
@@ -117,8 +75,8 @@ pub(super) async fn drain_and_settle(
     // sent moments before the seam closed — with the ordinary flush
     // re-carry running so a lost datagram is retransmitted, the same
     // recovery a live turn gets, compressed into teardown.
-    let settle_deadline = Instant::now() + timing.teardown_settle;
-    let mut settle_flush = Instant::now() + timing.flush_interval;
+    let settle_deadline = Instant::now() + state.timing.teardown_settle;
+    let mut settle_flush = Instant::now() + state.timing.flush_interval;
     let mut link_gone = false;
     while link.payloads_in_flight() > 0 {
         tokio::select! {
@@ -134,7 +92,7 @@ pub(super) async fn drain_and_settle(
                     link_gone = true;
                     break;
                 }
-                settle_flush = Instant::now() + timing.flush_interval;
+                settle_flush = Instant::now() + state.timing.flush_interval;
             }
             () = sleep_until(settle_deadline) => break,
         }
@@ -169,16 +127,26 @@ pub(super) async fn drain_and_settle(
     // control stream, and that difference is what the caller's error
     // handling (and the operator reading the logs) keys on.
     if !link_gone {
-        if let Err(error) = announcer
-            .maybe_send(control_send, outbound, held.is_empty(), link)
+        if let Err(error) = state
+            .announcer
+            .maybe_send(
+                &mut wire.control_send,
+                &seam.outbound,
+                state.held.is_empty(),
+                link,
+            )
             .await
         {
-            return announcer.absorb_link_close(Err(DriverError::from(error)));
+            return state
+                .announcer
+                .absorb_link_close(Err(DriverError::from(error)));
         }
-        if announcer.deadline().is_some()
-            && let Err(error) = announcer.force_send(control_send).await
+        if state.announcer.deadline().is_some()
+            && let Err(error) = state.announcer.force_send(&mut wire.control_send).await
         {
-            return announcer.absorb_link_close(Err(DriverError::from(error)));
+            return state
+                .announcer
+                .absorb_link_close(Err(DriverError::from(error)));
         }
     }
 
@@ -199,8 +167,8 @@ pub(super) async fn drain_and_settle(
     // best-effort: if the stream is already reset, the wait below still
     // observes whatever the relay does about it.
     if !link_gone {
-        let _ = control_send.finish();
-        let stream_deadline = Instant::now() + timing.teardown_settle;
+        let _ = wire.control_send.finish();
+        let stream_deadline = Instant::now() + state.timing.teardown_settle;
         loop {
             tokio::select! {
                 received = link.recv() => {

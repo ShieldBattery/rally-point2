@@ -100,6 +100,7 @@ mod send;
 mod session;
 mod state;
 mod teardown;
+mod wire;
 
 #[cfg(test)]
 mod tests;
