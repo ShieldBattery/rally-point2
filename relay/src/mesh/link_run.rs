@@ -165,10 +165,10 @@ pub(super) fn defer_flush_after_send(
 /// Session ids are unique only *within* a tenant, so the driver keys its
 /// per-session state by `SessionKey` (tenant + session) — never the bare id —
 /// and a `SessionId -> SessionState` map demultiplexes a received datagram to
-/// the right session. The collision guard runs on every `Join`: a caller that
-/// skips [`join_sessions`](super::join_sessions) still can't silently cross-wire two tenants
-/// sharing a session id — the second is logged and dropped, never overwrites
-/// the first. This is fail-closed, not fail-open.
+/// the right session. The collision guard runs on every `Join`, so two tenants
+/// sharing a session id can never be silently cross-wired — the second is
+/// logged and dropped, never overwrites the first. This is fail-closed, not
+/// fail-open.
 pub async fn run_mesh_link(
     link: rally_point_transport::MeshLink,
     link_io: MeshLinkIo,

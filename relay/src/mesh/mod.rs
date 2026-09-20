@@ -60,7 +60,6 @@ pub use forward::forward_client_turn;
 pub(crate) use frames::{
     FINALIZE_OUTCOME_FINALIZED, FINALIZE_OUTCOME_REJECTED_LIVE, FINALIZE_OUTCOME_REJECTED_NO_CURSOR,
 };
-pub use join::{SessionIdCollision, join_sessions};
 pub use link_run::{MeshCommand, MeshControlIo, MeshLinkHandle, MeshLinkIo, run_mesh_link};
 pub(crate) use links::{CurrentMeshLinks, command_channel, register_mesh_link, rtt_us};
 pub use links::{

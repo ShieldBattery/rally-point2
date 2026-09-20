@@ -1,7 +1,6 @@
 //! What a freshly registered link replays to converge: the leave, slot,
-//! started-report and resume-cursor re-sends a Join enqueues, the presence
-//! push that carries a session's live-player count, and the batch
-//! session-id collision guard.
+//! started-report and resume-cursor re-sends a Join enqueues, and the presence
+//! push that carries a session's live-player count.
 
 use std::collections::HashMap;
 
@@ -11,7 +10,7 @@ use crate::routing::{self, SessionKey};
 
 use super::conditions::ConditionsRegistry;
 use super::frames::*;
-use super::links::{MeshControlTx, MeshLinks};
+use super::links::MeshControlTx;
 use super::seen::{SeenRegistries, has_resumable_state, resume_cursor_snapshot};
 
 /// Re-sends this relay's known leave state for `key` down a freshly registered
@@ -168,46 +167,4 @@ pub(super) async fn push_presence_updates(
         presence_sent.insert(session_id, live);
     }
     Ok(())
-}
-
-/// Validates a list of sessions for a mesh link, refusing if two tenants share
-/// the same session id — the wire's bare `session: u64` can't disambiguate them,
-/// so the second is refused rather than overwriting the first.
-///
-/// A batch pre-validation helper: a caller that collected a session list before
-/// driving the link can refuse the whole batch at once. `run_mesh_link` runs the
-/// same check on every `Join`, so a caller that sends sessions one at a time —
-/// or skips this helper — still can't silently cross-wire tenants.
-pub fn join_sessions(links: &MeshLinks, keys: &[SessionKey]) -> Result<(), SessionIdCollision> {
-    let mut roster = links.lock();
-    let mut seen: HashMap<
-        rally_point_proto::ids::SessionId,
-        &rally_point_proto::control::TenantId,
-    > = HashMap::new();
-    for key in keys {
-        if let Some(existing_tenant) = seen.get(&key.session)
-            && **existing_tenant != key.tenant
-        {
-            return Err(SessionIdCollision {
-                session: key.session,
-                existing_tenant: (*existing_tenant).clone(),
-                new_tenant: key.tenant.clone(),
-            });
-        }
-        seen.insert(key.session, &key.tenant);
-        roster.entry(key.clone()).or_default();
-    }
-    Ok(())
-}
-
-/// A session id collision: the wire's bare `session: u64` can't disambiguate
-/// two tenants that both assigned the same number. The second join is refused.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "session id {session} collision: already joined by tenant {existing_tenant:?}, refused for {new_tenant:?}"
-)]
-pub struct SessionIdCollision {
-    pub session: rally_point_proto::ids::SessionId,
-    pub existing_tenant: rally_point_proto::control::TenantId,
-    pub new_tenant: rally_point_proto::control::TenantId,
 }

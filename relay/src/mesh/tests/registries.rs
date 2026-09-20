@@ -1,5 +1,4 @@
-//! The conditions registry's publish/snapshot/unpublish epoch contract, and
-//! the batch session-id collision guard.
+//! The conditions registry's publish/snapshot/unpublish epoch contract.
 
 use super::*;
 
@@ -94,31 +93,4 @@ fn old_connection_cannot_publish_over_or_unpublish_its_replacement() {
         !publish_conditions(&registry, &key, SlotId(0), sample(22, 40_000)),
         "only activation may recreate an unpublished slot",
     );
-}
-
-#[test]
-fn join_sessions_refuses_a_colliding_session_id_across_tenants() {
-    // The wire carries a bare session id with no tenant. Two tenants that
-    // both assigned session id 1 can't be told apart on recv, so the second
-    // join is refused rather than overwriting the first.
-    let links = new_mesh_links();
-    let tenant_a = rally_point_proto::control::TenantId("tenant-a".to_owned());
-    let tenant_b = rally_point_proto::control::TenantId("tenant-b".to_owned());
-    let key_a = SessionKey {
-        tenant: tenant_a.clone(),
-        session: rally_point_proto::ids::SessionId(1),
-    };
-    let key_b = SessionKey {
-        tenant: tenant_b.clone(),
-        session: rally_point_proto::ids::SessionId(1),
-    };
-
-    // Same tenant, same session id: not a collision (the game rejoins).
-    join_sessions(&links, std::slice::from_ref(&key_a)).expect("same tenant is fine");
-
-    // Different tenant, same session id: collision — refuse.
-    let err = join_sessions(&links, &[key_a.clone(), key_b]).unwrap_err();
-    assert_eq!(err.session, rally_point_proto::ids::SessionId(1));
-    assert_eq!(err.existing_tenant, tenant_a);
-    assert_eq!(err.new_tenant, tenant_b);
 }
