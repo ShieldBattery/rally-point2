@@ -1,8 +1,8 @@
 //! The state a session runs on: the reconnect tuning constants, the driver's
-//! half of the game seam, the per-session state that must survive a reconnect,
-//! and the connectivity-epoch fence.
+//! half of the game seam, and the per-session state that must survive a
+//! reconnect.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -15,6 +15,7 @@ use tokio::time::Instant;
 use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
 
+use super::connectivity::ConnectivityFence;
 use super::reorder::SlotReorder;
 use super::retention::RetentionRing;
 
@@ -265,16 +266,10 @@ pub(super) struct LoopState {
     /// stream it opens on the new connection — the same divert path an
     /// oversize turn takes when first sent — and it empties on each drain.
     pub(super) pending_control_redivert: Vec<Payload>,
-    /// Relay-stamped physical connection lifecycle per member. Kept across this
-    /// client's own reconnect so a delayed connectivity frame from another
-    /// member's superseded link cannot regress the game's display.
-    /// Missing entries retain rolling-upgrade compatibility with relays that do
-    /// not stamp epochs; once present, an epoch-less frame cannot downgrade it.
-    pub(super) connectivity_states: ConnectivityEpochStates,
-    /// Slots for which a final synced leave has reached this client. A leave is
-    /// terminal game state, so no later physical-link generation may make its
-    /// subject appear connected again. Kept across this client's reconnects.
-    pub(super) terminal_connectivity_slots: HashSet<SlotId>,
+    /// Which relay-stamped connectivity changes may still move the game's
+    /// display of a member, and whose departure is already final. Kept across
+    /// this client's own reconnects.
+    pub(super) connectivity: ConnectivityFence,
     /// The send-phase delay this client is applying under the relay's
     /// `PhaseDirective`s: the newest commanded target and the applied value
     /// slewing toward it. Persisted across a reconnect — the delay is part of
@@ -306,74 +301,10 @@ impl LoopState {
             game_started: false,
             retention: RetentionRing::default(),
             pending_control_redivert: Vec::new(),
-            connectivity_states: ConnectivityEpochStates::default(),
-            terminal_connectivity_slots: HashSet::new(),
+            connectivity: ConnectivityFence::default(),
             phase_slew: PhaseSlew::new(Instant::now()),
             held: VecDeque::new(),
             timing,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ConnectivityState {
-    pub(super) epoch: u64,
-    pub(super) connected: bool,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct ConnectivityEpochStates {
-    pub(super) current: HashMap<SlotId, ConnectivityState>,
-    /// Superseded random epochs are retained for the whole session. They cannot
-    /// be bounded safely: epochs have equality semantics, and a delayed reliable
-    /// frame has no age after which it becomes safe to accept again.
-    pub(super) retired: HashSet<(SlotId, u64)>,
-}
-
-/// Applies the same lifecycle fence the relays use to connectivity changes.
-/// Down(E) is terminal, a previously unseen level=true epoch opens a replacement,
-/// and epoch-less compatibility ends permanently once an epoch is observed.
-pub(super) fn admit_connectivity_epoch(
-    states: &mut ConnectivityEpochStates,
-    terminal_slots: &HashSet<SlotId>,
-    slot: SlotId,
-    connected: bool,
-    observed: Option<u64>,
-) -> bool {
-    if terminal_slots.contains(&slot) {
-        return false;
-    }
-    if observed.is_some_and(|epoch| states.retired.contains(&(slot, epoch))) {
-        return false;
-    }
-    match (states.current.get(&slot).copied(), observed) {
-        (Some(current), Some(epoch)) if current.epoch == epoch => {
-            if !current.connected && connected {
-                return false;
-            }
-            states
-                .current
-                .insert(slot, ConnectivityState { epoch, connected });
-            true
-        }
-        (Some(current), Some(epoch)) if connected => {
-            states.retired.insert((slot, current.epoch));
-            states.current.insert(
-                slot,
-                ConnectivityState {
-                    epoch,
-                    connected: true,
-                },
-            );
-            true
-        }
-        (Some(_), _) => false,
-        (None, Some(epoch)) => {
-            states
-                .current
-                .insert(slot, ConnectivityState { epoch, connected });
-            true
-        }
-        (None, None) => true,
     }
 }

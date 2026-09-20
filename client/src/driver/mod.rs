@@ -89,6 +89,7 @@ use state::GameSeam;
 
 mod backoff;
 mod channels;
+mod connectivity;
 mod inbound;
 mod outbound;
 mod reconnect;

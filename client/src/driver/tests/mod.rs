@@ -6,7 +6,6 @@
 //! The topic modules below inherit all of it, plus the driver's own private
 //! items, through their `use super::*;`.
 
-use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use rally_point_proto::beacon;
@@ -18,6 +17,7 @@ use rally_point_transport::test_util::{Edge, loopback};
 use tokio::sync::mpsc;
 
 use super::backoff::*;
+use super::connectivity::*;
 use super::reconnect::*;
 use super::reorder::*;
 use super::retention::*;

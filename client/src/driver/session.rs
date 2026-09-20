@@ -74,8 +74,7 @@ impl LinkDriver {
             game_started,
             retention,
             pending_control_redivert,
-            connectivity_states,
-            terminal_connectivity_slots,
+            connectivity: connectivity_fence,
             phase_slew,
             held,
             timing,
@@ -343,8 +342,7 @@ impl LinkDriver {
                         game_started_announced,
                         game_started_out,
                         &mut game_started_on_stream,
-                        connectivity_states,
-                        terminal_connectivity_slots,
+                        connectivity_fence,
                     )
                     .await
                     {

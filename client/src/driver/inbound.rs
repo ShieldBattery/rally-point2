@@ -3,7 +3,7 @@
 //! through one ordered per-slot release, so a turn is delivered the same way
 //! whichever path brought it.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{LeaveDirective, Payload};
@@ -20,10 +20,10 @@ use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
 
 use super::backoff::{GamePush, push_to_game};
+use super::connectivity::ConnectivityFence;
 use super::reorder::{Release, SlotReorder};
 use super::send::{flush_delivered_cursors, window_cap_error};
 use super::session::ArmFlow;
-use super::state::{ConnectivityEpochStates, admit_connectivity_epoch};
 use super::{ChatOut, DriverError};
 
 /// Buffers a received packet's fresh turns into their slots' reorder queues and
@@ -145,8 +145,7 @@ pub(super) async fn on_control_frame(
     game_started_announced: &mut bool,
     game_started_out: &mut mpsc::Receiver<()>,
     game_started_on_stream: &mut bool,
-    connectivity_states: &mut ConnectivityEpochStates,
-    terminal_connectivity_slots: &mut HashSet<SlotId>,
+    connectivity_fence: &mut ConnectivityFence,
 ) -> ArmFlow {
     match received {
         // A relay-pushed synced leave: hand it to the game's leave
@@ -167,7 +166,7 @@ pub(super) async fn on_control_frame(
                 );
                 return ArmFlow::Serve;
             };
-            terminal_connectivity_slots.insert(SlotId(slot_id));
+            connectivity_fence.mark_terminal(SlotId(slot_id));
             match push_to_game(leaves, leave) {
                 GamePush::Sent => {}
                 GamePush::Full => {
@@ -323,13 +322,7 @@ pub(super) async fn on_control_frame(
                 return ArmFlow::Serve;
             };
             let subject = SlotId(slot_id);
-            if !admit_connectivity_epoch(
-                connectivity_states,
-                terminal_connectivity_slots,
-                subject,
-                change.connected,
-                change.connection_epoch,
-            ) {
+            if !connectivity_fence.admit(subject, change.connected, change.connection_epoch) {
                 return ArmFlow::Serve;
             }
             match push_to_game(connectivity, (subject, change.connected)) {
