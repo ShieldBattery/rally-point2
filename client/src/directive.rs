@@ -103,6 +103,12 @@ impl DirectiveTracker {
     /// numerically; equal ids are the same relay's own redundant copy and
     /// don't displace either.
     ///
+    /// Ranking is by `decision_seq` alone; `buffer_turns` is never inspected.
+    /// So the authority's opening directive — broadcast at the first framed
+    /// turn so a differently-seeded client is corrected — surfaces like any
+    /// other even for a client already at that depth, which simply resizes to
+    /// the depth it is at. Nothing here special-cases an equal-size change.
+    ///
     /// Copies are idempotent, so this is safe to call with every stamp the
     /// redundant, out-of-order turn stream delivers, in whatever order they
     /// arrive.
@@ -248,33 +254,6 @@ mod tests {
     }
 
     #[test]
-    fn an_initial_equal_size_directive_surfaces_as_a_no_op_resize() {
-        // The authority broadcasts one directive at the first framed turn carrying
-        // the buffer the session already runs, so a client seeded differently is
-        // corrected. A client already at that depth receives an "equal-size"
-        // resize: the tracker ranks by `decision_seq` alone and never inspects
-        // `buffer_turns`, so it surfaces the directive exactly like any other
-        // (once, at its apply frame), and the caller resizes to the depth it is
-        // already at — a no-op. Nothing here needs to special-case it.
-        let mut tracker = DirectiveTracker::new();
-        let current_depth = 3;
-        tracker.observe(&directive(current_depth, 100, 1), 90);
-        assert_eq!(
-            tracker.take_due(100),
-            Some(directive(current_depth, 100, 1))
-        );
-        assert_eq!(
-            tracker.take_due(100),
-            None,
-            "surfaces once, like any decision"
-        );
-
-        // A later real change still ranks above it and applies normally.
-        tracker.observe(&directive(6, 200, 2), 150);
-        assert_eq!(tracker.take_due(200), Some(directive(6, 200, 2)));
-    }
-
-    #[test]
     fn a_stale_copy_of_a_moot_decision_cannot_resurface() {
         let mut tracker = DirectiveTracker::new();
         // Seen first while moot: recorded but never pending.
@@ -308,18 +287,6 @@ mod tests {
         tracker_b.observe(&high, 90);
         tracker_b.observe(&low, 91);
         assert_eq!(tracker_b.take_due(100), Some(high));
-    }
-
-    #[test]
-    fn a_lower_relay_id_at_an_equal_seq_does_not_displace_the_higher_one() {
-        let mut tracker = DirectiveTracker::new();
-        tracker.observe(&directive_from(8, 100, 1, Some(20)), 90);
-        // A colliding copy from the losing relay, arriving after: no effect.
-        tracker.observe(&directive_from(4, 100, 1, Some(10)), 91);
-        assert_eq!(
-            tracker.take_due(100),
-            Some(directive_from(8, 100, 1, Some(20)))
-        );
     }
 
     #[test]

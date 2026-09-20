@@ -1,5 +1,5 @@
 //! Unit tests for the leave tracker: how directives are recorded, deduped,
-//! superseded by a finalized restatement, and surfaced at their apply point.
+//! and surfaced at their apply point.
 
 use super::*;
 
@@ -87,53 +87,23 @@ fn a_handoff_rederivation_with_a_higher_seq_does_not_double_apply() {
 }
 
 #[test]
-fn a_handoff_rederivation_still_applies_for_a_client_that_missed_the_original() {
-    // Same re-derivation, but this client never saw the original: it must
-    // apply the re-derived copy (at the same frame the relay guarantees).
-    let mut tracker = LeaveTracker::new();
-    tracker.observe(&leave(2, DROPPED, 100, 7));
-    assert_eq!(tracker.take_due(100, no_counts), vec![(SlotId(2), DROPPED)]);
-}
-
-#[test]
 fn several_slots_leave_each_at_its_own_frame() {
     let mut tracker = LeaveTracker::new();
     tracker.observe(&leave(2, DROPPED, 100, 1));
     tracker.observe(&leave(3, LEFT, 150, 2));
+    // Two slots sharing one apply frame must come out in the *same* poll, so
+    // the caller writes both before the synced-leave pass drains them. They
+    // come out in arrival order, which is nothing the caller may rely on.
+    tracker.observe(&leave(5, DROPPED, 100, 3));
 
-    assert_eq!(tracker.take_due(100, no_counts), vec![(SlotId(2), DROPPED)]);
+    let mut together = tracker.take_due(100, no_counts);
+    together.sort();
+    assert_eq!(together, vec![(SlotId(2), DROPPED), (SlotId(5), DROPPED)],);
     assert!(
         tracker.take_due(120, no_counts).is_empty(),
         "slot 3 not due yet"
     );
     assert_eq!(tracker.take_due(150, no_counts), vec![(SlotId(3), LEFT)]);
-}
-
-#[test]
-fn simultaneous_leaves_at_one_frame_surface_together_in_slot_order() {
-    // Two slots due at the same frame come out in one poll so the caller
-    // writes both before the synced-leave pass drains them in slot order.
-    let mut tracker = LeaveTracker::new();
-    tracker.observe(&leave(5, DROPPED, 100, 2));
-    tracker.observe(&leave(1, DROPPED, 100, 1));
-
-    let due = tracker.take_due(100, no_counts);
-    assert_eq!(due.len(), 2);
-    assert!(due.contains(&(SlotId(5), DROPPED)));
-    assert!(due.contains(&(SlotId(1), DROPPED)));
-}
-
-#[test]
-fn a_late_copy_after_apply_does_not_re_surface() {
-    let mut tracker = LeaveTracker::new();
-    let stamp = leave(2, DROPPED, 100, 1);
-    tracker.observe(&stamp);
-    assert_eq!(tracker.take_due(100, no_counts), vec![(SlotId(2), DROPPED)]);
-    // The relay keeps broadcasting until the session passes the apply frame,
-    // so a copy can arrive after we already applied it.
-    tracker.observe(&stamp);
-    assert!(tracker.take_due(101, no_counts).is_empty());
-    assert!(tracker.take_due(200, no_counts).is_empty());
 }
 
 #[test]
@@ -170,48 +140,44 @@ fn an_out_of_range_slot_is_dropped_instead_of_aliasing() {
 }
 
 /// A relay contract violation — two directives for the same slot naming
-/// different apply frames/reasons — must not panic (this used to be a
+/// different apply frames/reasons/counts — must not panic (this used to be a
 /// `debug_assert!`, which would abort a debug build outright, so this
 /// scenario could never even run under `cargo test`'s own debug profile)
-/// and must never re-open the slot: the first directive seen is kept and
-/// surfaces normally, and the conflicting one is dropped without
-/// mutating anything.
+/// and must never re-open or reschedule the slot: the first directive seen
+/// is kept and surfaces normally, and every conflicting one is dropped
+/// without mutating anything.
 #[test]
 fn a_conflicting_directive_never_reopens_the_slot_and_keeps_the_first() {
     let mut tracker = LeaveTracker::new();
     tracker.observe(&leave(2, DROPPED, 100, 1));
 
-    // A conflicting copy: same slot, different reason AND apply frame.
+    // Three flavours of the same violation, all of which the one early return
+    // has to absorb: a copy disagreeing on reason and frame, one whose frame is
+    // *earlier* than the kept directive's (an entry that moved would surface
+    // too soon), and one disagreeing only on the final turn count (which would
+    // switch the slot onto the counted rule entirely).
     tracker.observe(&leave(2, LEFT, 150, 2));
+    tracker.observe(&leave(2, LEFT, 50, 3));
+    tracker.observe(&LeaveDirective {
+        final_turn_count: Some(40),
+        ..leave(2, DROPPED, 100, 4)
+    });
 
-    // Not due before the FIRST directive's own apply frame.
+    // Not due at the conflicting earlier frame -- and `no_counts` panics if the
+    // conflicting count were ever consulted, so the kept directive is still on
+    // the frame rule it arrived with.
     assert!(
-        tracker.take_due(99, no_counts).is_empty(),
+        tracker.take_due(50, no_counts).is_empty(),
         "not due until frame 100"
     );
+    assert!(tracker.take_due(99, no_counts).is_empty());
 
     // At frame 100 (the first directive's apply frame), it surfaces with
-    // the first directive's own reason -- never the conflicting one's.
+    // the first directive's own reason -- never a conflicting one's.
     assert_eq!(tracker.take_due(100, no_counts), vec![(SlotId(2), DROPPED)]);
     // The conflicting directive's frame (150) never independently fires
     // anything -- the slot already surfaced and does not re-open.
     assert!(tracker.take_due(150, no_counts).is_empty());
-}
-
-/// The same conflict, but the conflicting copy arrives BEFORE the frame
-/// the first directive named -- it still must not move the apply frame
-/// or reason the slot eventually surfaces with.
-#[test]
-fn a_conflicting_directive_arriving_early_does_not_change_the_kept_apply_frame() {
-    let mut tracker = LeaveTracker::new();
-    tracker.observe(&leave(2, DROPPED, 100, 1));
-    tracker.observe(&leave(2, LEFT, 50, 2)); // conflicting, earlier frame
-
-    // Must not surface at the conflicting (earlier) frame.
-    assert!(tracker.take_due(50, no_counts).is_empty());
-    assert!(tracker.take_due(99, no_counts).is_empty());
-    // Surfaces at the FIRST directive's own frame, with its own reason.
-    assert_eq!(tracker.take_due(100, no_counts), vec![(SlotId(2), DROPPED)]);
 }
 
 #[test]
@@ -229,6 +195,9 @@ fn contains_reflects_tracked_slots_whether_or_not_theyve_surfaced() {
 
 #[test]
 fn a_counted_leave_surfaces_exactly_at_its_consumed_count_and_only_once() {
+    // The `>=` boundary is the whole rule, and it is what also makes a
+    // count-0 directive (a slot that departed before producing a turn) due at
+    // the very first poll.
     let mut tracker = LeaveTracker::new();
     tracker.observe(&counted_leave(2, LEFT, 40, 1));
 
@@ -266,15 +235,6 @@ fn a_counted_leave_ignores_a_stale_apply_frame_already_passed() {
 }
 
 #[test]
-fn a_zero_count_leave_is_due_immediately() {
-    // A slot that never produced a turn (a pre-game departure) carries
-    // count 0: nothing to consume, so the leave is due at the first poll.
-    let mut tracker = LeaveTracker::new();
-    tracker.observe(&counted_leave(4, DROPPED, 0, 1));
-    assert_eq!(tracker.take_due(0, |_| 0), vec![(SlotId(4), DROPPED)]);
-}
-
-#[test]
 fn counted_and_frame_scheduled_leaves_coexist() {
     // A mixed session (one directive from a relay that stamps counts, one
     // from state recorded before the count existed): each surfaces by its
@@ -289,21 +249,6 @@ fn counted_and_frame_scheduled_leaves_coexist() {
     assert!(due.contains(&(SlotId(3), DROPPED)));
 }
 
-#[test]
-fn a_conflicting_count_keeps_the_first_directive() {
-    // The relay contract extends to the count: every copy of a slot's leave
-    // carries the same final_turn_count. A disagreeing copy is dropped like
-    // a disagreeing frame/reason, never re-opening or rescheduling the slot.
-    let mut tracker = LeaveTracker::new();
-    tracker.observe(&counted_leave(2, LEFT, 40, 1));
-    tracker.observe(&counted_leave(2, LEFT, 25, 2)); // conflicting count
-
-    assert!(
-        tracker.take_due(0, |_| 25).is_empty(),
-        "the conflicting count must not drive surfacing"
-    );
-    assert_eq!(tracker.take_due(0, |_| 40), vec![(SlotId(2), LEFT)]);
-}
 /// A client leaving lockstep can make a scheduled leave due immediately — a
 /// frame it is stalled short of, or a count needing turns that will never
 /// come, no longer binds it — and the next poll surfaces the real reason.

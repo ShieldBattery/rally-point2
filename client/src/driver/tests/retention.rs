@@ -120,22 +120,17 @@ async fn same_relay_resume_redivers_only_the_oversize_retained_turns() {
     );
 }
 
-/// End-to-end proof that a same-relay resume actually redelivers a
-/// retained oversize turn: drives a real session that sends one, then
-/// simulates the resume path directly (mirroring what `reconnect_link`
-/// does on `Ok(fresh)`) and confirms the peer receives it on the fresh
-/// connection's control stream — a drop between the local `write_all`
-/// and the relay's own processing is now recovered rather than silently
-/// losing the turn.
 #[tokio::test]
-async fn a_same_relay_resume_redelivers_an_oversize_turn_the_relay_never_got() {
+async fn a_driver_that_sent_an_oversize_turn_retains_it_for_a_resume() {
+    // The premise the same-relay redeliver rests on: an oversize turn rides the
+    // control stream once and is never acked, so unless the driver keeps it in
+    // the retention ring there is nothing left for a resume to re-stage — and a
+    // drop between the local write succeeding and the relay processing it would
+    // silently lose the turn, stalling every peer on its seq forever. (What the
+    // resume then does with it is the redivert tests above.)
     let (link_a, _link_b, _ea, _eb) = connected_links().await;
     let (driver_a, chan_a) = test_driver(link_a);
 
-    // The oversize turn is sent once (mirroring the driver's own one-time
-    // control-stream write) and retained, but — simulating a drop right
-    // after that write — never actually reaches a peer control reader on
-    // the original connection (none is spawned for it here).
     let oversize = turn(0, &vec![0x42; 4096]);
     chan_a.outbound.send(oversize.clone()).await.unwrap();
     drop(chan_a.outbound);
@@ -143,43 +138,13 @@ async fn a_same_relay_resume_redelivers_an_oversize_turn_the_relay_never_got() {
     LinkDriver::session(&mut link, &mut seam, &mut state, SlotId(0))
         .await
         .expect("session stops cleanly once the outbound seam closes");
+
     assert_eq!(
         state.retention.len(),
         1,
         "the oversize turn was retained when it was first sent",
     );
-
-    // The same-relay resume: rebind (a fresh connection to keep the test
-    // self-contained; a real same-relay resume rebinds the SAME relay's
-    // address, but the mechanics under test — retention staging and the
-    // control-stream redeliver — don't depend on which address it is),
-    // then redivert.
-    let (fresh_a, fresh_b, _fea, _feb) = connected_links().await;
-    link.rebind(fresh_a.connection().clone());
-    redivert_oversize_retention_on_same_relay_resume(&link, &mut state);
-    assert_eq!(state.pending_control_redivert.len(), 1);
-
-    // `session`'s own top-of-function drain (the existing
-    // `redivert_pending_control` call) is what a real resume relies on;
-    // exercise it directly here to prove the staged turn actually crosses
-    // the wire.
-    let mut control_rx = spawn_control_reader(fresh_b.connection().clone());
-    let (mut control_send, _recv) = link.connection().open_bi().await.unwrap();
-    redivert_pending_control(&mut control_send, &mut state.pending_control_redivert)
-        .await
-        .unwrap();
-
-    let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
-        .await
-        .expect("the retained oversize turn never crossed the resumed control stream")
-        .expect("control reader closed early");
-    match delivered {
-        ControlInbound::OversizeTurn(payload) => {
-            assert_eq!(payload.seq, oversize.seq);
-            assert_eq!(payload.commands.len(), 4096);
-        }
-        other => panic!("expected an oversize turn on the control stream, got {other:?}"),
-    }
+    assert_eq!(state.retention[0].commands.len(), 4096);
 }
 
 #[tokio::test]
@@ -187,9 +152,12 @@ async fn driver_sends_key_the_unacked_window_under_the_authorized_slot() {
     // The embedder leaves every outbound turn's slot at 0; the driver stamps its
     // own authorized slot at send. Without that stamp a client on slot 1 keys its
     // in-flight turns under a phantom slot 0, so `oldest_replayable_seq(SlotId(1))`
-    // (what a same-relay resume anchors on) sees nothing. Stamped, the unacked
-    // window keys under slot 1 and the anchor query finds the in-flight seqs.
-    let (link, state, _peer, _ea, _eb) =
+    // (what a same-relay resume anchors on) sees nothing, and the relay's
+    // ack-beacon — which names the authorized slot — prunes nothing either, so the
+    // window grows unbounded on beacon retirement alone. Stamped, the window keys
+    // under slot 1, the anchor query finds the in-flight seqs, the stamp is what
+    // actually rides the datagram, and a beacon under slot 1 retires.
+    let (mut link, state, mut peer, _ea, _eb) =
         drive_unacked_session(SlotId(1), &[&[0x01], &[0x02], &[0x03]]).await;
 
     assert_eq!(state.next_outbound_seq, 3, "three turns were produced");
@@ -204,28 +172,41 @@ async fn driver_sends_key_the_unacked_window_under_the_authorized_slot() {
         "nothing is stranded under the wire-claim slot 0",
     );
     assert_eq!(link.payloads_in_flight(), 3);
-}
 
-#[tokio::test]
-async fn outbound_turns_carry_the_authorized_slot_on_the_wire() {
-    // The end-to-end counterpart to the keying unit: the stamped slot rides the
-    // datagram, so an undriven peer reading the raw link sees the authorized slot
-    // on the turn, not the embedder's 0.
-    let (link, _state, mut peer, _ea, _eb) = drive_unacked_session(SlotId(1), &[&[0xAB]]).await;
-    // Hold the sending link so the connection stays up for the peer's read.
-    let _keep_alive = link;
-
-    let received = loop {
-        let received = tokio::time::timeout(Duration::from_secs(5), peer.recv())
-            .await
-            .expect("the stamped turn never reached the peer")
-            .expect("peer link errored");
-        if !received.fresh.is_empty() {
-            break received;
+    // The same stamp rides the wire: an undriven peer reading the raw link sees
+    // the authorized slot on each turn, not the embedder's 0.
+    let mut seen = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while seen.len() < 3 {
+            let received = peer.recv().await.expect("peer link errored");
+            for payload in received.fresh {
+                assert_eq!(payload.slot, 1, "the wire turn carries slot 1");
+                seen.push((payload.seq, payload.commands[0]));
+            }
         }
-    };
-    assert_eq!(received.fresh[0].slot, 1, "the wire turn carries slot 1");
-    assert_eq!(received.fresh[0].commands[0], 0xAB);
+    })
+    .await
+    .expect("the stamped turns never reached the peer");
+    seen.sort();
+    assert_eq!(seen, vec![(0, 0x01), (1, 0x02), (2, 0x03)]);
+
+    // A beacon naming the wire-claim slot 0 prunes nothing — the turns aren't
+    // keyed there.
+    assert_eq!(
+        link.retire_through(SlotId(0), 2),
+        0,
+        "no driver-sent turn is keyed under slot 0",
+    );
+
+    // A beacon naming the authorized slot retires the confirmed prefix (seqs 0
+    // and 1), leaving only seq 2 in flight.
+    assert_eq!(
+        link.retire_through(SlotId(1), 1),
+        2,
+        "the authorized-slot cursor retires the driver's confirmed turns",
+    );
+    assert_eq!(link.oldest_replayable_seq(SlotId(1)), Some(2));
+    assert_eq!(link.payloads_in_flight(), 1);
 }
 
 #[tokio::test]
@@ -297,36 +278,6 @@ fn same_relay_cursor_anchors_below_a_restaged_oversize_turn() {
         same_relay_resume_cursors(&[], Some(2), Some(7), own_slot, 9),
         vec![(own_slot, 2)],
     );
-}
-
-#[tokio::test]
-async fn beacon_retirement_prunes_driver_sends_for_a_nonzero_slot() {
-    // The relay's ack-beacon names the authorized slot. Retiring under it must
-    // actually prune this client's driver-sent turns — which only holds once the
-    // send path keys the unacked window under that same slot. Under the old
-    // slot-0 keying `retire_through(own_slot, ..)` matched nothing and the window
-    // grew unbounded on beacon retirement alone.
-    let (mut link, _state, _peer, _ea, _eb) =
-        drive_unacked_session(SlotId(1), &[&[0x01], &[0x02], &[0x03]]).await;
-    assert_eq!(link.payloads_in_flight(), 3);
-
-    // A beacon naming the wire-claim slot 0 prunes nothing — the turns aren't
-    // keyed there.
-    assert_eq!(
-        link.retire_through(SlotId(0), 2),
-        0,
-        "no driver-sent turn is keyed under slot 0",
-    );
-
-    // A beacon naming the authorized slot retires the confirmed prefix (seqs 0
-    // and 1), leaving only seq 2 in flight.
-    assert_eq!(
-        link.retire_through(SlotId(1), 1),
-        2,
-        "the authorized-slot cursor retires the driver's confirmed turns",
-    );
-    assert_eq!(link.oldest_replayable_seq(SlotId(1)), Some(2));
-    assert_eq!(link.payloads_in_flight(), 1);
 }
 
 #[tokio::test]

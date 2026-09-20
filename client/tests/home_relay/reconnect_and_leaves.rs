@@ -7,22 +7,18 @@
 use std::time::Duration;
 
 use rally_point_client::{ClientEndpoint, DialError};
-use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_transport::noq;
 
 use super::helpers::{
     KID, TENANT, client_endpoint, identity_for, make_tenant, recv_turn, registry_for,
-    start_relay_with_mesh, wait_connectivity,
+    seed_session_authority, start_relay_with_mesh, started_session_relay, wait_connectivity,
 };
 
 #[tokio::test]
 async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once() {
     use rally_point_client::{LinkDriver, Reconnect};
-    use rally_point_proto::control::BufferBounds;
-    use rally_point_relay::consensus::{self, Authority};
-    use rally_point_relay::routing::SessionKey;
 
     // The full reconnect path against a real relay: a client's link drops mid-game,
     // its driver re-dials itself while its drop is still held (undecided) presenting
@@ -33,24 +29,9 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
     let tenant = make_tenant(KID, TENANT);
     let session = SessionId(70);
 
-    // Seed the session as started with the two expected slots, so the relay records
-    // forwarded turns in its replay ring.
-    let mesh = rally_point_relay::mesh::new_mesh_state();
-    let makers = mesh.decision_makers.clone();
-    let key = SessionKey {
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-    };
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
-
-    let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
+    // Seeding the session with its two expected slots is what makes the relay
+    // record forwarded turns in the replay ring this test resumes from.
+    let (addr, ca) = started_session_relay(&tenant, session, &[SlotId(0), SlotId(1)]);
     let endpoint = client_endpoint(&ca);
 
     let id0 = identity_for(&tenant, session, SlotId(0));
@@ -139,9 +120,6 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
 #[tokio::test]
 async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
     use rally_point_client::LinkDriver;
-    use rally_point_proto::control::BufferBounds;
-    use rally_point_relay::consensus::{self, Authority};
-    use rally_point_relay::routing::SessionKey;
 
     // The full manual-drop path against a real relay: one client's link dies, and
     // the surviving client asks the relay to drop it. Before the unlock floor the
@@ -152,24 +130,12 @@ async fn a_survivor_manually_drops_a_disconnected_peer_past_the_unlock() {
     let tenant = make_tenant(KID, TENANT);
     let session = SessionId(71);
 
-    // A tiny drop-unlock floor so the test can cross it quickly. Seed this relay as
-    // the authority over an expected {0, 1} set so the session starts and a decided
-    // leave is real.
+    // A tiny drop-unlock floor so the test can cross it quickly. Seeding the
+    // authority over an expected {0, 1} set is what makes the session start, so
+    // a decided leave is real.
     let unlock = Duration::from_millis(300);
     let mesh = rally_point_relay::mesh::new_mesh_state_with_drop_unlock(unlock);
-    let makers = mesh.decision_makers.clone();
-    let key = SessionKey {
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-    };
-    let _ = consensus::sync_maker(
-        &makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    seed_session_authority(&mesh, &tenant, session, &[SlotId(0), SlotId(1)]);
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);
     let endpoint = client_endpoint(&ca);

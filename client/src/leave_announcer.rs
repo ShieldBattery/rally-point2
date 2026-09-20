@@ -165,6 +165,15 @@ impl LeaveAnnouncer {
         Ok(())
     }
 
+    /// The announced-state transition on its own, without the frame that
+    /// normally carries it — so a test can reach the post-announce behavior
+    /// (the cleared deadline, the swallowed link close) without a live stream
+    /// to write down.
+    #[cfg(test)]
+    pub(crate) fn mark_sent(&mut self) {
+        self.state = LeaveState::Sent;
+    }
+
     /// Classifies a send/link failure once the departure state is known: after
     /// the intent is announced, the relay closing the link (or the control
     /// stream) out from under an in-flight send is the expected confirmation it
@@ -213,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn armed_but_undrained_holds() {
+    fn an_armed_announcement_holds_until_the_link_has_drained() {
         let mut ann = announcer();
         ann.arm(Duration::from_secs(2));
         assert!(
@@ -224,12 +233,7 @@ mod tests {
         assert!(!ann.ready_to_send(false, 0));
         // In flight: hold.
         assert!(!ann.ready_to_send(true, 3));
-    }
-
-    #[test]
-    fn armed_and_drained_is_ready() {
-        let mut ann = announcer();
-        ann.arm(Duration::from_secs(2));
+        // Drained on both counts, with no result expected: fire.
         assert!(
             ann.ready_to_send(true, 0),
             "a signaled departure with a drained link is ready to announce"
@@ -254,25 +258,13 @@ mod tests {
     }
 
     #[test]
-    fn a_result_not_expected_does_not_hold() {
-        // The flag is false, so even without a result the drain condition alone
-        // releases the announcement.
-        let mut ann = announcer();
-        ann.arm(Duration::from_secs(2));
-        assert!(ann.ready_to_send(true, 0));
-    }
-
-    #[test]
     fn absorb_link_close_swallows_only_after_the_intent_is_sent() {
         let mut ann = announcer();
         ann.arm(Duration::from_secs(2));
         // Before the intent is sent, an error is a genuine failure.
         assert!(ann.absorb_link_close::<()>(Err(())).is_err());
 
-        // Simulate the frame going out via the gate transition path.
-        // (force_send would do this over a real stream; drive the state directly
-        // for a pure unit test.)
-        ann.state = LeaveState::Sent;
+        ann.mark_sent();
         assert!(ann.sent());
         assert!(
             ann.absorb_link_close::<()>(Err(())).is_ok(),
@@ -280,19 +272,13 @@ mod tests {
         );
         // Ok always stays Ok.
         assert!(ann.absorb_link_close::<()>(Ok(())).is_ok());
-    }
 
-    #[test]
-    fn deadline_clears_once_sent() {
-        let mut ann = announcer();
-        ann.arm(Duration::from_secs(2));
-        assert!(ann.deadline().is_some());
-        ann.state = LeaveState::Sent;
+        // And an announced departure arms no more safety timeouts, nor fires
+        // the gate a second time.
         assert!(
             ann.deadline().is_none(),
             "a sent announcer arms no more safety timeouts"
         );
-        // And a ready check no longer fires (not Pending).
         assert!(!ann.ready_to_send(true, 0));
     }
 }

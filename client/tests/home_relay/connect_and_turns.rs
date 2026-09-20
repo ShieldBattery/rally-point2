@@ -7,7 +7,6 @@ use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use rally_point_client::{ClientEndpoint, DialError, Identity};
-use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_proto::token::PUBLIC_KEY_LEN;
@@ -16,9 +15,11 @@ use rally_point_transport::{noq, rustls};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
+use rally_point_transport::test_util::self_signed;
+
 use super::helpers::{
-    KID, TENANT, client_endpoint, identity_for, make_tenant, mint_token, registry_for, self_signed,
-    start_relay, start_relay_on, start_relay_with_mesh,
+    KID, TENANT, client_endpoint, identity_for, make_tenant, mint_token, registry_for,
+    seed_session_authority, start_relay, start_relay_on, start_relay_with_mesh,
 };
 
 #[tokio::test]
@@ -144,12 +145,15 @@ async fn connect_fails_when_the_signing_key_does_not_match_the_token() {
     let identity = Identity::from_pkcs8(token, other_pkcs8.as_ref()).unwrap();
 
     // The relay rejects the challenge response and closes the connection, so the
-    // client never reads an acknowledgement.
+    // client never reads an acknowledgement. Map the link away so the outcome is
+    // `Debug` for the assertion message.
+    let outcome = endpoint
+        .connect(addr, "localhost", &identity)
+        .await
+        .map(|_link| ());
     assert!(
-        endpoint
-            .connect(addr, "localhost", &identity)
-            .await
-            .is_err()
+        matches!(outcome, Err(DialError::Read(_))),
+        "the refusal must surface as the unread acknowledgement, got {outcome:?}",
     );
 }
 
@@ -164,11 +168,17 @@ async fn connect_fails_against_an_untrusted_relay_certificate() {
     let endpoint = client_endpoint(&unrelated_ca);
     let identity = identity_for(&tenant, SessionId(1), SlotId(0));
 
+    let outcome = endpoint
+        .connect(addr, "localhost", &identity)
+        .await
+        .map(|_link| ());
+    // The failure is the QUIC handshake itself, before any authorization —
+    // which is also the shape `is_cert_rejection` classifies to escalate a
+    // re-home immediately instead of waiting out the timed window (unit-tested
+    // against that classifier in the driver's own reconnect tests).
     assert!(
-        endpoint
-            .connect(addr, "localhost", &identity)
-            .await
-            .is_err()
+        matches!(outcome, Err(DialError::Connection(_))),
+        "an untrusted certificate fails the handshake, got {outcome:?}",
     );
 }
 
@@ -210,37 +220,11 @@ async fn connect_times_out_when_the_peer_stalls_during_authorization() {
 }
 
 #[tokio::test]
-async fn bind_builds_a_usable_endpoint() {
-    // The convenience constructor binds a real local socket even with no trusted
-    // roots; trust only matters once it dials a relay.
-    let endpoint = ClientEndpoint::bind(rustls::RootCertStore::empty()).unwrap();
-    assert!(endpoint.endpoint().local_addr().is_ok());
-}
-
-#[tokio::test]
-async fn bind_dials_an_ipv6_relay() {
-    // The deployment is IPv6-primary, so the dual-stack default endpoint must reach
-    // a relay listening on IPv6 — the case an IPv4-only endpoint would reject.
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay_on((Ipv6Addr::LOCALHOST, 0).into(), registry_for(&[&tenant]));
-
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(ca).unwrap();
-    let endpoint = ClientEndpoint::bind(roots).unwrap();
-    let identity = identity_for(&tenant, SessionId(7), SlotId(0));
-
-    let outcome = endpoint
-        .connect(addr, "localhost", &identity)
-        .await
-        .map(|_link| ());
-    assert!(
-        outcome.is_ok(),
-        "dual-stack bind failed to dial IPv6 relay: {outcome:?}"
-    );
-}
-
-#[tokio::test]
 async fn wildcard_relay_accepts_ipv4_and_ipv6_clients() {
+    // The deployment is IPv6-primary and dual-stack, so a wildcard-bound relay
+    // must accept both families and the default dual-stack client endpoint must
+    // reach it either way — including the plain IPv6 dial an IPv4-only endpoint
+    // would reject outright.
     let tenant = make_tenant(KID, TENANT);
     let (addr, ca) = start_relay_on((Ipv6Addr::UNSPECIFIED, 0).into(), registry_for(&[&tenant]));
     let mut roots = rustls::RootCertStore::empty();
@@ -251,8 +235,23 @@ async fn wildcard_relay_accepts_ipv4_and_ipv6_clients() {
     let ipv6 = (Ipv6Addr::LOCALHOST, addr.port()).into();
     let id0 = identity_for(&tenant, SessionId(8), SlotId(0));
     let id1 = identity_for(&tenant, SessionId(8), SlotId(1));
-    let _link0 = endpoint.connect(ipv4, "localhost", &id0).await.unwrap();
-    let _link1 = endpoint.connect(ipv6, "localhost", &id1).await.unwrap();
+
+    let over_ipv4 = endpoint
+        .connect(ipv4, "localhost", &id0)
+        .await
+        .map(|_link| ());
+    assert!(
+        over_ipv4.is_ok(),
+        "dual-stack bind failed to dial the wildcard relay over IPv4: {over_ipv4:?}"
+    );
+    let over_ipv6 = endpoint
+        .connect(ipv6, "localhost", &id1)
+        .await
+        .map(|_link| ());
+    assert!(
+        over_ipv6.is_ok(),
+        "dual-stack bind failed to dial the wildcard relay over IPv6: {over_ipv6:?}"
+    );
 }
 
 /// The relay-computed initial buffer depth stamped onto SessionStart reaches the
@@ -261,16 +260,10 @@ async fn wildcard_relay_accepts_ipv4_and_ipv6_clients() {
 #[tokio::test]
 async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_channel() {
     use rally_point_client::LinkDriver;
-    use rally_point_proto::control::BufferBounds;
-    use rally_point_relay::consensus::{self, Authority};
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::consensus;
 
     let tenant = make_tenant(KID, TENANT);
     let session = SessionId(71);
-    let key = SessionKey {
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-    };
 
     // Seed the authority over the two expected slots, then feed it a large one-way
     // latency hint (400ms) and the multi-relay flag, so the initial-depth
@@ -279,14 +272,7 @@ async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_chann
     // max(observed, 10) + 1 hop cushion = 11 (the localhost handshake RTT stays
     // far below the hint).
     let mesh = rally_point_relay::mesh::new_mesh_state();
-    let _ = consensus::sync_maker(
-        &mesh.decision_makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    let key = seed_session_authority(&mesh, &tenant, session, &[SlotId(0), SlotId(1)]);
     consensus::set_session_shape(&mesh.decision_makers, &key, Some(400), false);
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);

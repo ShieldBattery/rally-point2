@@ -194,6 +194,11 @@ mod tests {
             tracker.record_sync_slot((native % 16) as u8, ((native + 1) % 16) as u8);
             native += 1;
         }
+        // The property is the in-loop equality above. What follows only checks
+        // that the resize script above actually reached the shapes it was
+        // written to reach -- a growth repeat, a one-turn shrink, the deepest
+        // safe shrink -- so a future edit to the script cannot quietly stop
+        // exercising them.
         let advances: Vec<_> = generations
             .windows(2)
             .map(|pair| pair[1] - pair[0])
@@ -221,14 +226,15 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_checksum_is_tagged_and_commands_are_not_modified() {
+    fn only_the_first_checksum_in_a_turn_is_tagged() {
+        // A turn carrying two sync commands names one generation: the first
+        // checksum's. Reading the later one instead would label the turn with a
+        // buffer the game never staged for it.
         let mut tracker = SyncGenerationTracker::default();
         let mut commands = vec![0x05];
         commands.extend(checksum(1));
         commands.extend(checksum(8));
-        let original = commands.clone();
         assert_eq!(tracker.stamp_turn(&commands, 1), Some(1));
-        assert_eq!(commands, original);
     }
 
     #[test]

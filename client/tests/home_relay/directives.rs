@@ -1,7 +1,7 @@
 //! The control-stream broadcasts alongside the turn path: lobby setup
-//! commands, in-game chat (including its size cap and rate cap), and cosmetic
-//! skin blobs. Each is relay-stamped with the authenticated author's slot and,
-//! for lobby and skins, replayed to a client that joins after the fact.
+//! commands, in-game chat, and cosmetic skin blobs. Each is relay-stamped with
+//! the authenticated author's slot and, for lobby and skins, replayed to a
+//! client that joins after the fact.
 
 use std::time::Duration;
 
@@ -188,13 +188,13 @@ async fn a_game_chat_message_reaches_other_members_with_the_relay_stamped_slot()
 }
 
 #[tokio::test]
-async fn an_oversize_game_chat_message_is_dropped_but_the_session_keeps_working() {
+async fn a_session_survives_an_over_cap_chat_message_the_relay_refuses() {
     use rally_point_client::{ChatOut, LinkDriver};
 
-    // The relay's size cap drops an over-cap chat message without closing the
-    // connection — the client driver enforces no cap of its own, so this proves
-    // the relay is the one refusing it, and that a well-formed message right
-    // after still gets through.
+    // The cap itself is the relay's, and its own tests cover it. What only a
+    // real client can show is the half this asserts: an over-cap frame does not
+    // cost the sender its control stream or its connection — the message is
+    // dropped and a well-formed one right behind it still gets through.
     let tenant = make_tenant(KID, TENANT);
     let (addr, ca) = start_relay(registry_for(&[&tenant]));
     let endpoint = client_endpoint(&ca);
@@ -248,86 +248,6 @@ async fn an_oversize_game_chat_message_is_dropped_but_the_session_keeps_working(
             .is_err(),
         "the oversize message must never have been delivered"
     );
-
-    drop(chan0.outbound);
-    drop(chan1.outbound);
-    let _ = task0.await;
-    let _ = task1.await;
-}
-
-#[tokio::test]
-async fn a_burst_of_game_chat_past_the_rate_cap_is_dropped_then_recovers() {
-    use rally_point_client::{ChatOut, LinkDriver};
-
-    // The relay's per-slot rate cap allows a burst of 8, then drops further
-    // messages until the token bucket refills (one token per 500ms) — proving
-    // both the drop and the later recovery, with the session staying up
-    // throughout.
-    let tenant = make_tenant(KID, TENANT);
-    let (addr, ca) = start_relay(registry_for(&[&tenant]));
-    let endpoint = client_endpoint(&ca);
-    let session = SessionId(62);
-
-    let id0 = identity_for(&tenant, session, SlotId(0));
-    let id1 = identity_for(&tenant, session, SlotId(1));
-    let link0 = endpoint.connect(addr, "localhost", &id0).await.unwrap();
-    let link1 = endpoint.connect(addr, "localhost", &id1).await.unwrap();
-    let (driver0, chan0) = LinkDriver::new(link0);
-    let (driver1, mut chan1) = LinkDriver::new(link1);
-    let task0 = tokio::spawn(driver0.run());
-    let task1 = tokio::spawn(driver1.run());
-
-    let send = |text: &str| {
-        let text = text.to_owned();
-        let sender = chan0.chat_out.clone();
-        async move {
-            sender
-                .send(ChatOut {
-                    target_kind: 0,
-                    target_slot: 0,
-                    text,
-                })
-                .await
-                .unwrap();
-        }
-    };
-
-    // A burst of 9: the cap's burst size (8) plus one over.
-    for i in 0..9u32 {
-        send(&format!("msg{i}")).await;
-    }
-
-    // Exactly 8 arrive — the 9th was dropped by the relay's rate cap.
-    let mut got = Vec::new();
-    for _ in 0..8 {
-        let (author, msg) = tokio::time::timeout(Duration::from_secs(5), chan1.chat_in.recv())
-            .await
-            .expect("expected message never arrived")
-            .expect("driver 1 closed early");
-        assert_eq!(author, SlotId(0));
-        got.push(msg.text);
-    }
-    assert_eq!(
-        got,
-        (0..8).map(|i| format!("msg{i}")).collect::<Vec<_>>(),
-        "only the first 8 of the burst were admitted"
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), chan1.chat_in.recv())
-            .await
-            .is_err(),
-        "the 9th message must have been dropped by the rate cap"
-    );
-
-    // After the refill interval (500ms/token) passes, the slot has budget again.
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    send("recovered").await;
-    let (author, msg) = tokio::time::timeout(Duration::from_secs(5), chan1.chat_in.recv())
-        .await
-        .expect("the post-refill message never arrived")
-        .expect("driver 1 closed early");
-    assert_eq!(author, SlotId(0));
-    assert_eq!(msg.text, "recovered");
 
     drop(chan0.outbound);
     drop(chan1.outbound);

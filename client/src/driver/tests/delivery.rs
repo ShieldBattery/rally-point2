@@ -4,39 +4,13 @@
 use super::*;
 
 #[tokio::test]
-async fn carries_turns_from_one_driver_to_the_other() {
-    let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
-    let (driver_b, chan_b) = test_driver(link_b);
-    let task_a = tokio::spawn(driver_a.run());
-    let task_b = tokio::spawn(driver_b.run());
-
-    // Three turns pushed into A's seam arrive in order, bytes intact, on B's.
-    for i in 0..3u8 {
-        chan_a.outbound.send(turn(0, &[i])).await.unwrap();
-    }
-    let mut inbound_b = chan_b.inbound;
-    let mut got = Vec::new();
-    while got.len() < 3 {
-        got.push(inbound_b.recv().await.unwrap());
-    }
-    let bytes: Vec<u8> = got.iter().map(|p| p.commands[0]).collect();
-    assert_eq!(bytes, vec![0, 1, 2]);
-
-    // Dropping both senders stops both drivers cleanly.
-    drop(chan_a.outbound);
-    drop(chan_b.outbound);
-    assert!(task_a.await.unwrap().is_ok());
-    assert!(task_b.await.unwrap().is_ok());
-}
-
-#[tokio::test]
 async fn an_over_mtu_turn_is_delivered_via_the_control_stream() {
-    // A turn far larger than any datagram can never ride the datagram path
-    // — no bundle could carry it, and no redundancy could recover it. The
-    // driver must divert it to the reliable control stream, and the peer's
-    // driver must fold it back into the ordered turn stream, interleaved
-    // correctly with ordinary datagram turns around it.
+    // The ordinary path and the oversize one are one stream. A turn far larger
+    // than any datagram can never ride the datagram path — no bundle could
+    // carry it, and no redundancy could recover it — so the driver diverts it
+    // to the reliable control stream, and the peer's driver folds it back into
+    // the ordered turn stream, interleaved correctly with the ordinary
+    // datagram turns around it: bytes intact, seqs contiguous.
     let (link_a, link_b, _ea, _eb) = connected_links().await;
     let (driver_a, chan_a) = test_driver(link_a);
     let (driver_b, chan_b) = test_driver(link_b);
@@ -77,10 +51,11 @@ async fn an_over_mtu_turn_is_delivered_via_the_control_stream() {
         "one ordered stream regardless of delivery path",
     );
 
+    // Dropping both senders stops both drivers cleanly.
     drop(chan_a.outbound);
     drop(chan_b.outbound);
-    let _ = task_a.await;
-    let _ = task_b.await;
+    assert!(task_a.await.unwrap().is_ok());
+    assert!(task_b.await.unwrap().is_ok());
 }
 
 #[tokio::test]
@@ -117,9 +92,9 @@ async fn a_dead_control_stream_reader_surfaces_as_a_link_failure_while_the_conne
     // The connection itself was never closed by `session` -- proof this is
     // a control-stream-only death, not a whole-link failure in disguise.
     // The close is the caller's job, after classification:
-    // `run_reconnecting` closes it before re-dialing (see the test below),
-    // and closing it in here instead would destroy the very distinction
-    // this asserts.
+    // `run_reconnecting` closes it before re-dialing (see the reconnect
+    // tests), and closing it in here instead would destroy the very
+    // distinction this asserts.
     assert!(
         link.connection().close_reason().is_none(),
         "the underlying connection must stay alive; only the control stream died",
@@ -136,10 +111,7 @@ async fn delivers_reordered_payloads_to_the_game_in_seq_order() {
     use prost::Message;
     use rally_point_proto::messages::Packet;
 
-    let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
-    let task = tokio::spawn(driver_a.run());
-    let mut inbound = chan_a.inbound;
+    let mut fixture = DriverFixture::new().await;
 
     // Hand-build two single-payload packets and deliver the higher payload seq
     // first; the driver must hold it until the lower seq arrives.
@@ -157,26 +129,32 @@ async fn delivers_reordered_payloads_to_the_game_in_seq_order() {
         }
         .encode_to_vec()
     };
-    let conn = link_b.connection();
-    conn.send_datagram(raw(0, 1, 0xB1).into()).unwrap();
+    fixture
+        .peer
+        .connection()
+        .send_datagram(raw(0, 1, 0xB1).into())
+        .unwrap();
 
     // Seq 1 must be held while seq 0 is missing — nothing reaches the game yet.
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), inbound.recv())
+        tokio::time::timeout(Duration::from_millis(200), fixture.chan.inbound.recv())
             .await
             .is_err(),
         "seq 1 was delivered before the missing seq 0"
     );
 
     // Once seq 0 arrives, both drain in seq order.
-    conn.send_datagram(raw(1, 0, 0xB0).into()).unwrap();
-    let first = inbound.recv().await.unwrap();
-    let second = inbound.recv().await.unwrap();
+    fixture
+        .peer
+        .connection()
+        .send_datagram(raw(1, 0, 0xB0).into())
+        .unwrap();
+    let first = fixture.chan.inbound.recv().await.unwrap();
+    let second = fixture.chan.inbound.recv().await.unwrap();
     assert_eq!((first.seq, first.commands[0]), (0, 0xB0));
     assert_eq!((second.seq, second.commands[0]), (1, 0xB1));
 
-    drop(chan_a.outbound);
-    let _ = task.await;
+    fixture.finish().await;
 }
 
 #[tokio::test]
@@ -189,10 +167,7 @@ async fn a_datagram_turn_with_an_out_of_range_slot_ends_the_link_as_a_failure() 
     // stream. The transport layer refuses the whole packet rather than risk
     // that aliasing, which surfaces here as a link failure -- reconnect-
     // eligible, not a turn silently dropped while the link limps on.
-    let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
-    let task = tokio::spawn(driver_a.run());
-    let mut inbound = chan_a.inbound;
+    let mut fixture = DriverFixture::new().await;
 
     let raw = Packet {
         seq: 0,
@@ -206,19 +181,19 @@ async fn a_datagram_turn_with_an_out_of_range_slot_ends_the_link_as_a_failure() 
         }],
     }
     .encode_to_vec();
-    link_b.connection().send_datagram(raw.into()).unwrap();
+    fixture.peer.connection().send_datagram(raw.into()).unwrap();
 
     // Nothing is ever delivered to the game...
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), inbound.recv())
+        tokio::time::timeout(Duration::from_millis(300), fixture.chan.inbound.recv())
             .await
             .unwrap()
             .is_none(),
         "an out-of-range inbound slot must not be delivered to the game",
     );
     // ...because the link itself ended as a failure, not a clean stop.
-    match task.await.unwrap() {
-        Err(DriverError::Link(_)) => {}
+    match fixture.finish_err().await {
+        DriverError::Link(_) => {}
         other => panic!("expected a link failure, got {other:?}"),
     }
 }
@@ -230,14 +205,10 @@ async fn an_oversize_turn_with_an_out_of_range_slot_is_dropped() {
     // way is already past `Link`'s dedup (this stream carries no dedup key
     // of its own), so the driver itself must reject an out-of-range slot
     // here rather than alias it onto a different player's turn stream.
-    let (link_a, link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
-    let task = tokio::spawn(driver_a.run());
-    let mut inbound = chan_a.inbound;
+    let mut fixture = DriverFixture::new().await;
 
-    let (mut control_send, _recv) = link_b.connection().open_bi().await.unwrap();
     send_control_turn(
-        &mut control_send,
+        &mut fixture.peer_control,
         Payload {
             seq: 0,
             slot: 256,
@@ -249,24 +220,20 @@ async fn an_oversize_turn_with_an_out_of_range_slot_is_dropped() {
     .unwrap();
 
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), inbound.recv())
+        tokio::time::timeout(Duration::from_millis(300), fixture.chan.inbound.recv())
             .await
             .is_err(),
         "an out-of-range oversize-turn slot must not be delivered to the game",
     );
 
-    drop(chan_a.outbound);
-    let _ = task.await;
+    fixture.finish().await;
 }
 
 #[tokio::test]
 async fn envelope_metadata_survives_delivery_to_the_game() {
     use rally_point_proto::messages::BufferDirective;
 
-    let (link_a, mut link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
-    let task = tokio::spawn(driver_a.run());
-    let mut inbound = chan_a.inbound;
+    let mut fixture = DriverFixture::new().await;
 
     // A relay-forwarded turn carries more than its command bytes: the frame
     // annotation and any latency-buffer directive the authority stamped ride
@@ -288,11 +255,10 @@ async fn envelope_metadata_survives_delivery_to_the_game() {
             authority_relay_id: None,
         }),
     };
-    link_b.send(Some(stamped.clone())).unwrap();
+    fixture.peer.send(Some(stamped.clone())).unwrap();
 
-    let delivered = inbound.recv().await.unwrap();
+    let delivered = fixture.chan.inbound.recv().await.unwrap();
     assert_eq!(delivered, stamped);
 
-    drop(chan_a.outbound);
-    let _ = task.await;
+    fixture.finish().await;
 }

@@ -3,8 +3,13 @@
 
 use super::*;
 
+/// The fence's whole lifecycle on one slot: `Down(E)` is terminal inside its
+/// own epoch, a previously unseen `level=true` epoch opens a replacement, and
+/// every epoch the replacement supersedes stays retired for good — a delayed
+/// frame from one can never regress the game's display, and nothing evicts a
+/// retired token as further replacements arrive.
 #[test]
-fn connectivity_epoch_fence_makes_down_terminal_until_a_new_epoch_opens() {
+fn a_replacement_epoch_retires_every_superseded_one_for_the_session() {
     let slot = SlotId(3);
     let mut states = ConnectivityEpochStates::default();
     let terminal = HashSet::new();
@@ -23,61 +28,13 @@ fn connectivity_epoch_fence_makes_down_terminal_until_a_new_epoch_opens() {
         false,
         Some(11),
     ));
+    // Down is terminal within its own epoch: nothing reopens E1 but a
+    // replacement.
     assert!(!admit_connectivity_epoch(
         &mut states,
         &terminal,
         slot,
         true,
-        Some(11),
-    ));
-    assert!(admit_connectivity_epoch(
-        &mut states,
-        &terminal,
-        slot,
-        true,
-        Some(22),
-    ));
-    assert!(!admit_connectivity_epoch(
-        &mut states,
-        &terminal,
-        slot,
-        false,
-        Some(11),
-    ));
-    assert!(!admit_connectivity_epoch(
-        &mut states,
-        &terminal,
-        slot,
-        false,
-        None,
-    ));
-    assert!(admit_connectivity_epoch(
-        &mut states,
-        &terminal,
-        slot,
-        false,
-        Some(22),
-    ));
-}
-
-#[test]
-fn delayed_retired_true_cannot_replace_the_live_client_epoch() {
-    let slot = SlotId(3);
-    let mut states = ConnectivityEpochStates::default();
-    let terminal = HashSet::new();
-
-    assert!(admit_connectivity_epoch(
-        &mut states,
-        &terminal,
-        slot,
-        true,
-        Some(11),
-    ));
-    assert!(admit_connectivity_epoch(
-        &mut states,
-        &terminal,
-        slot,
-        false,
         Some(11),
     ));
     assert!(admit_connectivity_epoch(
@@ -103,6 +60,23 @@ fn delayed_retired_true_cannot_replace_the_live_client_epoch() {
         }),
         "a delayed true(E1) must not replace live E2 in the game display",
     );
+    // A delayed down from the retired epoch is refused too, and so is an
+    // epoch-less frame: admission of those ended the moment an epoch appeared.
+    assert!(!admit_connectivity_epoch(
+        &mut states,
+        &terminal,
+        slot,
+        false,
+        Some(11),
+    ));
+    assert!(!admit_connectivity_epoch(
+        &mut states,
+        &terminal,
+        slot,
+        false,
+        None,
+    ));
+    // The live epoch keeps being admitted, in both directions.
     assert!(admit_connectivity_epoch(
         &mut states,
         &terminal,
@@ -110,9 +84,6 @@ fn delayed_retired_true_cannot_replace_the_live_client_epoch() {
         true,
         Some(22),
     ));
-
-    // A second replacement does not evict E1: every superseded token stays
-    // fenced for the full client-session lifetime.
     assert!(admit_connectivity_epoch(
         &mut states,
         &terminal,
@@ -120,6 +91,9 @@ fn delayed_retired_true_cannot_replace_the_live_client_epoch() {
         false,
         Some(22),
     ));
+
+    // A second replacement does not evict E1: every superseded token stays
+    // fenced for the full client-session lifetime.
     assert!(admit_connectivity_epoch(
         &mut states,
         &terminal,

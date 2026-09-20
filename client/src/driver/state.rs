@@ -88,23 +88,141 @@ pub(super) const REHOME_PROVIDER_DEADLINE: Duration = Duration::from_secs(20);
 /// exchange turns and control with the game thread. Bundled so a session runs over
 /// them by reference and they outlive a reconnect that swaps the underlying link.
 pub(super) struct GameSeam {
+    /// Turns from the game thread to send to the relay.
     pub(super) outbound: mpsc::Receiver<Payload>,
+    /// Turns received from the relay to hand to the game thread.
     pub(super) inbound: mpsc::Sender<Payload>,
+    /// Synced player-leaves the relay pushed down the control stream, to hand to
+    /// the game thread's leave tracker.
     pub(super) leaves: mpsc::Sender<LeaveDirective>,
+    /// The game thread's signal that it is departing intentionally.
     pub(super) leave_intent: mpsc::Receiver<()>,
+    /// The game thread's end-of-game result report, to send up the control
+    /// stream as soon as it arrives.
     pub(super) result: mpsc::Receiver<Vec<u8>>,
+    /// The game thread's signal that its loop has begun running, to announce up
+    /// the control stream once.
     pub(super) game_started: mpsc::Receiver<()>,
+    /// Lobby commands the game authored, to send up the control stream.
     pub(super) lobby_out: mpsc::Receiver<Vec<u8>>,
+    /// Lobby commands other members authored (relay-stamped with their author
+    /// slot), to hand to the game thread.
     pub(super) lobby_in: mpsc::Sender<(SlotId, Vec<u8>)>,
+    /// Chat messages the game authored, to send up the control stream.
     pub(super) chat_out: mpsc::Receiver<ChatOut>,
+    /// Chat messages other members authored (relay-stamped with their author
+    /// slot), to hand to the game thread.
     pub(super) chat_in: mpsc::Sender<(SlotId, ChatOut)>,
+    /// The game's own cosmetic-skin blob, to send up the control stream.
     pub(super) skin_out: mpsc::Receiver<Vec<u8>>,
+    /// Skin blobs other members authored (relay-stamped with their author slot),
+    /// to hand to the game thread.
     pub(super) skin_in: mpsc::Sender<(SlotId, Vec<u8>)>,
+    /// Manual drop requests the game authored, to send up the control stream as
+    /// `RequestDrop` frames.
     pub(super) request_drop: mpsc::Receiver<SlotId>,
+    /// The relay-driven session-start directive, to hand to the game thread when
+    /// the relay pushes a `SessionStart` down the control stream. Carries the
+    /// session's computed initial latency-buffer depth (`None` when the authoring
+    /// relay sized none).
     pub(super) session_start: mpsc::Sender<Option<u32>>,
+    /// Slot-connectivity changes, to hand to the game thread when the relay
+    /// pushes a `SlotConnectivity` down the control stream.
     pub(super) connectivity: mpsc::Sender<(SlotId, bool)>,
+    /// The session's relay → region labels, to hand to the game thread when the
+    /// relay releases a `RegionLabels` down the control stream.
     pub(super) region_labels: mpsc::Sender<Vec<(u64, String)>>,
+    /// The send-phase state to publish to the game thread as directives arrive
+    /// and the applied delay slews (see [`TurnChannels::phase_status`]).
     pub(super) phase_status: watch::Sender<PhaseStatus>,
+}
+
+impl GameSeam {
+    /// Wires both halves of the game seam — the driver's and the game thread's
+    /// — with `capacity` on each turn channel, handing back the result-expected
+    /// flag they share. The one place the channels are paired up, so one added
+    /// here cannot reach a half and not the other.
+    ///
+    /// Nothing about the seam needs a connection, so a test exercising only the
+    /// waits that keep servicing it builds one without standing up a link.
+    pub(super) fn with_capacity(capacity: usize) -> (Self, TurnChannels, Arc<AtomicBool>) {
+        let (outbound_tx, outbound_rx) = mpsc::channel(capacity);
+        let (inbound_tx, inbound_rx) = mpsc::channel(capacity);
+        // Leaves are rare (one per departing peer); a small channel is ample.
+        let (leaves_tx, leaves_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
+        // The game signals its own departure at most once.
+        let (leave_intent_tx, leave_intent_rx) = mpsc::channel(LEAVE_INTENT_CHANNEL_CAPACITY);
+        // The game hands over its result report at most once.
+        let (result_tx, result_rx) = mpsc::channel(RESULT_CHANNEL_CAPACITY);
+        let result_expected = Arc::new(AtomicBool::new(false));
+        // The game announces its loop starting at most once.
+        let (game_started_tx, game_started_rx) = mpsc::channel(GAME_STARTED_CHANNEL_CAPACITY);
+        // Lobby commands flow in both directions during pre-game setup.
+        let (lobby_out_tx, lobby_out_rx) = mpsc::channel(LOBBY_CHANNEL_CAPACITY);
+        let (lobby_in_tx, lobby_in_rx) = mpsc::channel(LOBBY_CHANNEL_CAPACITY);
+        // Chat flows in both directions for the whole game, unlike lobby.
+        let (chat_out_tx, chat_out_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
+        let (chat_in_tx, chat_in_rx) = mpsc::channel(CHAT_CHANNEL_CAPACITY);
+        // Skin blobs flow in both directions near game start (and again on the
+        // relay's reconnect replays), like chat.
+        let (skin_out_tx, skin_out_rx) = mpsc::channel(SKIN_CHANNEL_CAPACITY);
+        let (skin_in_tx, skin_in_rx) = mpsc::channel(SKIN_CHANNEL_CAPACITY);
+        // Manual drop requests flow game → driver only, for the whole game.
+        let (request_drop_tx, request_drop_rx) = mpsc::channel(REQUEST_DROP_CHANNEL_CAPACITY);
+        // The session-start directive arrives at most a handful of times (the
+        // fire, plus any re-push on late register or authority handoff).
+        let (session_start_tx, session_start_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
+        // Connectivity changes are rare (a slot flips a small number of times over
+        // a game); the leave-sized channel is ample.
+        let (connectivity_tx, connectivity_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
+        // Region labels arrive at most a handful of times (the release, plus any
+        // re-send on reconnect or a re-home that changes the map); the leave-sized
+        // channel is ample.
+        let (region_labels_tx, region_labels_rx) = mpsc::channel(LEAVE_CHANNEL_CAPACITY);
+        // Send-phase state is latest-wins display information; a watch cell
+        // holds exactly the newest value with nothing to drain.
+        let (phase_status_tx, phase_status_rx) = watch::channel(PhaseStatus::default());
+        let seam = Self {
+            outbound: outbound_rx,
+            inbound: inbound_tx,
+            leaves: leaves_tx,
+            leave_intent: leave_intent_rx,
+            result: result_rx,
+            game_started: game_started_rx,
+            lobby_out: lobby_out_rx,
+            lobby_in: lobby_in_tx,
+            chat_out: chat_out_rx,
+            chat_in: chat_in_tx,
+            skin_out: skin_out_rx,
+            skin_in: skin_in_tx,
+            request_drop: request_drop_rx,
+            session_start: session_start_tx,
+            connectivity: connectivity_tx,
+            region_labels: region_labels_tx,
+            phase_status: phase_status_tx,
+        };
+        let channels = TurnChannels {
+            outbound: outbound_tx,
+            inbound: inbound_rx,
+            leaves: leaves_rx,
+            leave_intent: leave_intent_tx,
+            result: result_tx,
+            result_expected: Arc::clone(&result_expected),
+            game_started: game_started_tx,
+            lobby_out: lobby_out_tx,
+            lobby_in: lobby_in_rx,
+            chat_out: chat_out_tx,
+            chat_in: chat_in_rx,
+            skin_out: skin_out_tx,
+            skin_in: skin_in_rx,
+            request_drop: request_drop_tx,
+            session_start: session_start_rx,
+            connectivity: connectivity_rx,
+            region_labels: region_labels_rx,
+            phase_status: phase_status_rx,
+        };
+        (seam, channels, result_expected)
+    }
 }
 
 /// The driver state that must persist across a reconnect so a re-dialed session

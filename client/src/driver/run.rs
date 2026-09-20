@@ -14,51 +14,15 @@ use super::*;
 impl LinkDriver {
     /// Splits a driver into the three pieces a session actually runs on: the
     /// link, the driver's half of the game seam, and the state that outlives any
-    /// one connection. Every entry point starts here, so the seam is assembled
-    /// in exactly one place and a channel added to the driver cannot be
-    /// silently dropped on one path but not the other.
+    /// one connection. Every entry point starts here, so a session is assembled
+    /// in exactly one place.
     pub(super) fn into_parts(self) -> (Link, GameSeam, LoopState) {
         let LinkDriver {
             link,
-            outbound,
-            inbound,
-            leaves,
-            leave_intent,
-            result,
+            seam,
             result_expected,
-            game_started,
-            lobby_out,
-            lobby_in,
-            chat_out,
-            chat_in,
-            skin_out,
-            skin_in,
-            request_drop,
-            session_start,
-            connectivity,
-            region_labels,
-            phase_status,
             timing,
         } = self;
-        let seam = GameSeam {
-            outbound,
-            inbound,
-            leaves,
-            leave_intent,
-            result,
-            game_started,
-            lobby_out,
-            lobby_in,
-            chat_out,
-            chat_in,
-            skin_out,
-            skin_in,
-            request_drop,
-            session_start,
-            connectivity,
-            region_labels,
-            phase_status,
-        };
         (link, seam, LoopState::new(result_expected, timing))
     }
 

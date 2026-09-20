@@ -8,7 +8,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
 use rally_point_transport::noq;
@@ -16,7 +15,7 @@ use rally_point_transport::rustls::pki_types::CertificateDer;
 
 use super::helpers::{
     KID, TENANT, client_endpoint, identity_for, make_tenant, recv_turn, registry_for,
-    start_relay_killable, start_relay_with_mesh, wait_connectivity,
+    seed_session_authority, start_relay_killable, start_relay_with_mesh, wait_connectivity,
 };
 
 /// A re-home provider that always hands back a fixed replacement relay's target,
@@ -56,9 +55,7 @@ impl rally_point_client::RehomeProvider for FixedTarget {
 #[tokio::test]
 async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     use rally_point_client::{LinkDriver, Reconnect};
-    use rally_point_proto::control::BufferBounds;
-    use rally_point_relay::consensus::{self, Authority};
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::consensus;
 
     // The full coordinator-mediated failover path against two real relays: both
     // slots home on relay A; A dies; each driver escalates to its re-home provider,
@@ -69,35 +66,18 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     // the re-home flows over B.
     let tenant = make_tenant(KID, TENANT);
     let session = SessionId(80);
-    let key = SessionKey {
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-    };
+    let slots = [SlotId(0), SlotId(1)];
 
-    // Relay A (the home). Seed its maker started with the two expected slots so it
-    // records forwarded turns and fires session-start.
+    // Relay A (the home). Seeding its maker with the two expected slots is what
+    // makes it record forwarded turns and fire session-start.
     let mesh_a = rally_point_relay::mesh::new_mesh_state();
-    let _ = consensus::sync_maker(
-        &mesh_a.decision_makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    seed_session_authority(&mesh_a, &tenant, session, &slots);
     let (addr_a, ca_a, endpoint_a) = start_relay_killable(registry_for(&[&tenant]), mesh_a);
 
     // Relay B (the replacement). Seed it as a resumed session (already started), as a
     // rehome descriptor from the coordinator would.
     let mesh_b = rally_point_relay::mesh::new_mesh_state();
-    let _ = consensus::sync_maker(
-        &mesh_b.decision_makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    let key = seed_session_authority(&mesh_b, &tenant, session, &slots);
     consensus::mark_session_started(&mesh_b.decision_makers, &key);
     let (addr_b, ca_b, _endpoint_b) = start_relay_killable(registry_for(&[&tenant]), mesh_b);
 
@@ -199,9 +179,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
 
 #[tokio::test]
 async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
-    use rally_point_proto::control::BufferBounds;
-    use rally_point_relay::consensus::{self, Authority};
-    use rally_point_relay::routing::SessionKey;
+    use rally_point_relay::consensus;
 
     // Regression for the re-home receive-window bug (the confirmed-disconnect-tier
     // failure). A client re-homing onto a fresh relay resumes its own slot's seq
@@ -224,18 +202,7 @@ async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
     // Seed the relay as a resumed, already-started session over {0, 1}, standing in
     // for the replacement relay the coordinator pushed a `resumed` descriptor to.
     let mesh = rally_point_relay::mesh::new_mesh_state();
-    let key = SessionKey {
-        tenant: TenantId(TENANT.to_owned()),
-        session,
-    };
-    let _ = consensus::sync_maker(
-        &mesh.decision_makers,
-        &key,
-        consensus::MakerSync {
-            expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
-            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
-        },
-    );
+    let key = seed_session_authority(&mesh, &tenant, session, &[SlotId(0), SlotId(1)]);
     consensus::mark_session_started(&mesh.decision_makers, &key);
 
     let (addr, ca) = start_relay_with_mesh(registry_for(&[&tenant]), mesh);

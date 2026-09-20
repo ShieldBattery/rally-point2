@@ -1,14 +1,16 @@
 //! Shared fixtures for the `home_relay` suite: a trusted tenant + signed
 //! tokens, a real relay bound on loopback (plain, mesh-seeded, or killable),
-//! and the client-side endpoint/identity helpers every topic file dials
-//! through. Also holds the two small receive helpers (`recv_turn`,
-//! `wait_connectivity`) shared by the reconnect and rehome tests.
+//! the mesh seeding that makes a session started, and the client-side
+//! endpoint/identity helpers every topic file dials through. Also holds the
+//! two small receive helpers (`recv_turn`, `wait_connectivity`) shared by the
+//! reconnect and rehome tests.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rally_point_client::{ClientEndpoint, Identity};
+use rally_point_proto::control::BufferBounds;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
@@ -17,9 +19,13 @@ use rally_point_proto::token::{
     TokenClaims,
 };
 use rally_point_relay::auth::Registry;
+use rally_point_relay::consensus::{self, Authority};
+use rally_point_relay::mesh::MeshState;
+use rally_point_relay::routing::SessionKey;
 use rally_point_relay::server;
 use rally_point_transport::quic::{client_config, server_config};
-use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rally_point_transport::rustls::pki_types::CertificateDer;
+use rally_point_transport::test_util::self_signed;
 use rally_point_transport::{noq, rustls};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
@@ -74,19 +80,6 @@ pub(super) fn mint_token(
     token.signed_message(&mut message).unwrap();
     token.signature = Signature(tenant.key.sign(&message).as_ref().try_into().unwrap());
     token
-}
-
-/// A self-signed cert + key for the relay, plus the cert alone to seed a client's
-/// trust roots.
-pub(super) fn self_signed() -> (
-    Vec<CertificateDer<'static>>,
-    PrivateKeyDer<'static>,
-    CertificateDer<'static>,
-) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
-    let cert_der = cert.cert.der().clone();
-    let key = PrivateKeyDer::try_from(cert.signing_key.serialize_der()).unwrap();
-    (vec![cert_der.clone()], key, cert_der)
 }
 
 /// Binds a relay endpoint on `bind` serving `registry`, returning its actual
@@ -157,6 +150,47 @@ pub(super) fn start_relay_killable(
         None,
     ));
     (addr, ca, endpoint)
+}
+
+/// Seeds `mesh`'s decision maker for `session` as this relay's own authority
+/// over `slots`, marking the session's expected roster — what a coordinator
+/// descriptor does in production, and what makes the relay fire session-start
+/// and record forwarded turns in its per-session replay ring. Returns the key
+/// the caller needs for any further consensus call.
+///
+/// Wraps the one `MakerSync` construction the whole suite needs: a positional
+/// shape that is long, identical everywhere, and easy to get subtly wrong.
+pub(super) fn seed_session_authority(
+    mesh: &MeshState,
+    tenant: &Tenant,
+    session: SessionId,
+    slots: &[SlotId],
+) -> SessionKey {
+    let key = SessionKey {
+        tenant: TenantId(tenant.name.clone()),
+        session,
+    };
+    let _ = consensus::sync_maker(
+        &mesh.decision_makers,
+        &key,
+        consensus::MakerSync {
+            expected_slots: slots.iter().copied().collect(),
+            ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
+    );
+    key
+}
+
+/// [`seed_session_authority`] plus a relay serving that mesh — the plain case,
+/// for a test that needs nothing further from the mesh state itself.
+pub(super) fn started_session_relay(
+    tenant: &Tenant,
+    session: SessionId,
+    slots: &[SlotId],
+) -> (SocketAddr, CertificateDer<'static>) {
+    let mesh = rally_point_relay::mesh::new_mesh_state();
+    seed_session_authority(&mesh, tenant, session, slots);
+    start_relay_with_mesh(registry_for(&[tenant]), mesh)
 }
 
 /// A registry trusting each of `tenants`.

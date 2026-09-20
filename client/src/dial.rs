@@ -384,7 +384,10 @@ mod tests {
 
     #[tokio::test]
     async fn bind_on_port_uses_the_requested_port() {
-        // Find a port the OS considers free, then request it explicitly.
+        // Find a port the OS considers free, then request it explicitly. The
+        // window between releasing the probe and binding it again is a real (if
+        // tiny) chance for something else on the machine to take the port; a
+        // failure here is that race, not a regression in the explicit-port bind.
         let probe = std::net::UdpSocket::bind("[::]:0").unwrap();
         let port = probe.local_addr().unwrap().port();
         drop(probe);

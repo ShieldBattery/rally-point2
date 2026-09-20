@@ -1,8 +1,12 @@
 //! Re-dialing: how a classified link failure leaves the old connection, how a
-//! hung re-home provider is bounded, the outage buffer's cap, the resume
-//! cursors a re-dial presents, and the backoff schedule.
+//! hung re-home provider is bounded, what each re-home answer does to the
+//! escalation window, the outage buffer's cap, the resume cursors a re-dial
+//! presents, and the backoff schedule.
 
 use std::net::Ipv4Addr;
+use std::sync::atomic::AtomicUsize;
+
+use crate::dial::DialError;
 
 use super::*;
 
@@ -55,9 +59,7 @@ async fn a_classified_link_failure_closes_the_old_connection_before_the_re_dial(
 
 #[tokio::test]
 async fn a_hung_provider_ask_times_out_and_is_treated_as_unavailable() {
-    let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
-    let (_link, mut seam, mut state) = driver_a.into_parts();
+    let (mut seam, chan_a, mut state) = seam_only();
     let (provider, _asked) = HangingProvider::new();
     let provider: Arc<dyn RehomeProvider> = provider;
 
@@ -82,16 +84,14 @@ async fn a_hung_provider_ask_times_out_and_is_treated_as_unavailable() {
 
 #[tokio::test]
 async fn game_teardown_is_observed_while_a_provider_ask_is_pending() {
-    let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
-    let (_link, mut seam, mut state) = driver_a.into_parts();
+    let (mut seam, chan_a, mut state) = seam_only();
     let (provider, _asked) = HangingProvider::new();
     let provider: Arc<dyn RehomeProvider> = provider;
 
     // The game tears down mid-ask: drop its half of the seam shortly after
     // the await starts.
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         drop(chan_a);
     });
     let waited = tokio::time::timeout(
@@ -106,6 +106,132 @@ async fn game_teardown_is_observed_while_a_provider_ask_is_pending() {
     );
 }
 
+/// Drives `run_reconnecting` to the point where it escalates, handing back the
+/// driver task and the game's channels. The peer plays the relay just long
+/// enough to start the game — escalation is gated on the relay's `SessionStart`
+/// reaching the driver — and then its connection dies; every same-relay re-dial
+/// after that fails immediately against a deliberately invalid address, so the
+/// loop reaches `provider` on the windows given rather than resuming.
+async fn escalating_driver(
+    provider: Arc<dyn RehomeProvider>,
+    escalate_after: Duration,
+    escalate_retry: Duration,
+) -> (
+    tokio::task::JoinHandle<Result<(), DriverError>>,
+    TurnChannels,
+) {
+    use rally_point_transport::control::send_control_session_start;
+
+    let (link_a, link_b, ea, _eb) = connected_links().await;
+    let (driver_a, mut chan_a) = test_driver(link_a);
+    let reconnect = Reconnect {
+        endpoint: crate::dial::ClientEndpoint::from_endpoint(ea.clone()),
+        // Port 0 is not a dialable remote, so every re-dial fails before it
+        // touches the network: the loop's cadence is its backoff alone, with no
+        // connection attempt's own duration blurring it.
+        relay_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+        server_name: "localhost".to_owned(),
+        relay_id: 7,
+        identity: fake_identity(SlotId(0)),
+        rehome: Some(provider),
+        escalate_after: Some(escalate_after),
+        escalate_retry: Some(escalate_retry),
+    };
+    let task = tokio::spawn(driver_a.run_reconnecting(reconnect));
+
+    let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
+    send_control_session_start(&mut peer_control_send, None)
+        .await
+        .unwrap();
+    // Wait for the directive to actually reach the driver rather than guessing
+    // at a delay: escalation is gated on it, so killing the link first would
+    // leave the loop retrying the same relay forever.
+    tokio::time::timeout(Duration::from_secs(5), chan_a.session_start.recv())
+        .await
+        .expect("the session-start directive never reached the driver")
+        .expect("the session-start channel stays open");
+    link_b.connection().close(0u32.into(), b"relay died");
+    (task, chan_a)
+}
+
+/// A provider that answers every ask the same way — the coordinator saying
+/// "stay where you are" or "no relay can take you yet" — counting the asks so a
+/// test can see when the loop escalated again.
+struct FixedAnswer {
+    stay: bool,
+    asks: Arc<AtomicUsize>,
+}
+
+impl RehomeProvider for FixedAnswer {
+    fn rehome(&self, _dead_relay_id: u64) -> RehomeFuture<'_> {
+        self.asks.fetch_add(1, Ordering::Relaxed);
+        let outcome = if self.stay {
+            RehomeOutcome::Stay
+        } else {
+            RehomeOutcome::Unavailable
+        };
+        Box::pin(std::future::ready(outcome))
+    }
+}
+
+/// How many times a driver escalating on a zero-length window asks a provider
+/// answering `stay`, within `window` of its first ask. With `escalate_after`
+/// zero and `escalate_retry` long, the two answers separate cleanly: `Stay`
+/// puts a full (zero) `escalate_after` between asks, so the next failed dial
+/// escalates again, while `Unavailable` holds off for the whole
+/// `escalate_retry`.
+async fn asks_within(stay: bool, escalate_retry: Duration, window: Duration) -> usize {
+    let asks = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(FixedAnswer {
+        stay,
+        asks: Arc::clone(&asks),
+    });
+    let (task, chan) = escalating_driver(provider, Duration::ZERO, escalate_retry).await;
+
+    // Start the window at the first ask, not at the driver's start: how long
+    // the loop takes to reach its first escalation is the backoff's business.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while asks.load(Ordering::Relaxed) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the loop never escalated to the provider at all",
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(window).await;
+    let counted = asks.load(Ordering::Relaxed);
+
+    drop(chan);
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    counted
+}
+
+#[tokio::test]
+async fn a_stay_answer_re_escalates_on_the_next_failed_dial() {
+    // `Stay` means the relay is live after all, so the loop resumes same-relay
+    // retries with a fresh `escalate_after` window — zero here, so the next
+    // failed dial escalates again. Reading `escalate_retry` instead (the long
+    // window below) would leave this at one ask.
+    let asks = asks_within(true, Duration::from_secs(4), Duration::from_millis(1_500)).await;
+    assert!(
+        asks >= 2,
+        "a Stay answer must reset the window to escalate_after, got {asks} asks",
+    );
+}
+
+#[tokio::test]
+async fn an_unavailable_answer_holds_off_for_the_retry_cadence() {
+    // `Unavailable` means there is nothing to re-home *to* yet, so the loop
+    // waits out `escalate_retry` before asking again rather than hammering the
+    // coordinator on every failed dial. Reading `escalate_after` instead (zero
+    // here) would re-ask within the window below.
+    let asks = asks_within(false, Duration::from_secs(4), Duration::from_millis(1_500)).await;
+    assert_eq!(
+        asks, 1,
+        "an Unavailable answer must hold off for escalate_retry",
+    );
+}
+
 #[tokio::test]
 async fn a_hung_rehome_provider_does_not_freeze_the_reconnect_loop() {
     // End to end through `run_reconnecting`: the home relay dies mid-game,
@@ -113,34 +239,9 @@ async fn a_hung_rehome_provider_does_not_freeze_the_reconnect_loop() {
     // tears down. The driver must end cleanly — observing the teardown
     // through the pending ask — instead of parking on the embedder's
     // future forever.
-    use rally_point_transport::control::send_control_session_start;
-
-    let (link_a, link_b, ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
     let (provider, asked) = HangingProvider::new();
-
-    let reconnect = Reconnect {
-        endpoint: crate::dial::ClientEndpoint::from_endpoint(ea.clone()),
-        // Unreachable: every same-relay re-dial fails, so escalation is
-        // reached on the first attempt (the zero window below).
-        relay_addr: (Ipv4Addr::LOCALHOST, 1).into(),
-        server_name: "localhost".to_owned(),
-        relay_id: 7,
-        identity: fake_identity(SlotId(0)),
-        rehome: Some(provider),
-        escalate_after: Some(Duration::ZERO),
-        escalate_retry: Some(Duration::from_millis(100)),
-    };
-    let task = tokio::spawn(driver_a.run_reconnecting(reconnect));
-
-    // The peer plays the relay far enough to start the game (escalation is
-    // gated on `SessionStart`), then its connection dies — a link failure.
-    let (mut peer_control_send, _peer_recv) = link_b.connection().open_bi().await.unwrap();
-    send_control_session_start(&mut peer_control_send, None)
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    link_b.connection().close(0u32.into(), b"relay died");
+    let (task, chan_a) =
+        escalating_driver(provider, Duration::ZERO, Duration::from_millis(100)).await;
 
     // Wait until the driver is actually parked on the provider, then tear
     // the game down. Without the seam staying serviced through the ask,
@@ -161,6 +262,77 @@ async fn a_hung_rehome_provider_does_not_freeze_the_reconnect_loop() {
     );
 }
 
+#[tokio::test]
+async fn an_untrusted_relay_certificate_is_classified_as_a_cert_rejection() {
+    // The classifier that lets a cert/pin rejection escalate immediately rather
+    // than wait out the timed window: a relay that restarted with a fresh
+    // keypair can never be reached by a same-relay retry, and the escalation
+    // budget is sized against BW's native stall-drop. It matches on the text
+    // noq/rustls surfaces, so only a real rejection proves it still fires.
+    use rally_point_transport::quic::{client_config, server_config};
+    use rally_point_transport::rustls;
+    use rally_point_transport::test_util::self_signed;
+
+    let (chain, key, _ca) = self_signed();
+    let peer = noq::Endpoint::server(
+        server_config(chain, key).unwrap(),
+        (Ipv4Addr::LOCALHOST, 0).into(),
+    )
+    .unwrap();
+    let addr = peer.local_addr().unwrap();
+    tokio::spawn(async move {
+        // Presenting the certificate is all this peer has to do; the client
+        // refuses it from there.
+        if let Some(incoming) = peer.accept().await {
+            let _ = incoming.await;
+        }
+    });
+
+    // A client trusting an unrelated CA: the certificate the peer presents
+    // cannot chain to it.
+    let (_chain, _key, unrelated_ca) = self_signed();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(unrelated_ca).unwrap();
+    let endpoint = noq::Endpoint::client((Ipv4Addr::LOCALHOST, 0).into()).unwrap();
+    endpoint.set_default_client_config(client_config(roots).unwrap());
+    let endpoint = crate::dial::ClientEndpoint::from_endpoint(endpoint);
+
+    let error = endpoint
+        .connect(addr, "localhost", &fake_identity(SlotId(0)))
+        .await
+        // Map the link away so the outcome is `Debug` for the assertions.
+        .map(|_link| ())
+        .expect_err("an untrusted certificate must fail the dial");
+    assert!(
+        matches!(error, DialError::Connection(_)),
+        "a refused certificate fails the QUIC handshake itself, got {error:?}",
+    );
+    assert!(
+        is_cert_rejection(&error),
+        "the escalation fast path must recognise it: {error}",
+    );
+}
+
+#[test]
+fn a_token_is_expired_from_its_expiry_instant_onward() {
+    // The reconnect loop stops before wasting a dial no relay could authorize,
+    // on the same boundary the relay applies: the expiry instant itself already
+    // counts as expired.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        !token_expired(&identity_expiring_at(SlotId(0), now + 60)),
+        "a token still inside its window authorizes a re-dial",
+    );
+    assert!(
+        token_expired(&identity_expiring_at(SlotId(0), now)),
+        "the expiry instant itself counts as expired",
+    );
+    assert!(token_expired(&identity_expiring_at(SlotId(0), 0)));
+}
+
 /// A turn produced past [`OUTAGE_OUTBOUND_BUFFER_CAP`] during an outage
 /// must not be silently dropped: `wait_backoff` surfaces
 /// `WaitOutcome::BufferExhausted` the moment the buffer crosses the cap,
@@ -168,9 +340,7 @@ async fn a_hung_rehome_provider_does_not_freeze_the_reconnect_loop() {
 /// in `state.outbound_buffer` (nothing discarded on the way).
 #[tokio::test]
 async fn wait_backoff_reports_buffer_exhausted_once_the_outage_buffer_overflows() {
-    let (link_a, _link_b, _ea, _eb) = connected_links().await;
-    let (driver_a, chan_a) = test_driver(link_a);
-    let (_link, mut seam, mut state) = driver_a.into_parts();
+    let (mut seam, chan_a, mut state) = seam_only();
     let mut backoff = Backoff::new();
 
     // Fill to exactly the cap, then one more to tip it over. `wait_backoff`
@@ -201,28 +371,39 @@ async fn wait_backoff_reports_buffer_exhausted_once_the_outage_buffer_overflows(
 #[tokio::test]
 async fn resume_cursor_is_the_contiguous_high_water_and_absorbs_replayed_turns() {
     // The reconnect path derives its resume cursor from `next_seq` — the top of
-    // the contiguous run delivered to the game, per slot. Drive the driver's
-    // exact inbound ingest and confirm the cursor tracks that high-water and
-    // that a replayed already-delivered turn neither advances it nor re-reaches
-    // the game (the reorder buffer dedups the overlap a replay carries).
+    // the contiguous run delivered to the game, per slot. Drive the driver's own
+    // inbound ingest (the same call its datagram arm makes) and confirm the
+    // cursor tracks that high-water and that a replayed already-delivered turn
+    // neither advances it nor re-reaches the game.
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Payload>(64);
     let mut next_seq: HashMap<SlotId, u64> = HashMap::new();
     let mut pending: HashMap<SlotId, BTreeMap<u64, Payload>> = HashMap::new();
     let slot = SlotId(0);
 
-    ingest_turn(slot, 0, &mut next_seq, &mut pending, &inbound_tx);
-    ingest_turn(slot, 1, &mut next_seq, &mut pending, &inbound_tx);
+    fn ingest(
+        seq: u64,
+        next_seq: &mut HashMap<SlotId, u64>,
+        pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
+        inbound: &mpsc::Sender<Payload>,
+    ) {
+        let released =
+            ingest_fresh_turns(vec![turn(seq, &[seq as u8])], next_seq, pending, inbound);
+        assert!(matches!(released, Release::Delivered));
+    }
+
+    ingest(0, &mut next_seq, &mut pending, &inbound_tx);
+    ingest(1, &mut next_seq, &mut pending, &inbound_tx);
     // A gap at 2: seq 3 is held, so the cursor stays at the next-needed 2.
-    ingest_turn(slot, 3, &mut next_seq, &mut pending, &inbound_tx);
+    ingest(3, &mut next_seq, &mut pending, &inbound_tx);
     assert_eq!(resume_cursors(&next_seq), vec![(slot, 2)]);
 
     // A replay of an already-delivered turn (seq 1 < cursor 2) is dropped: the
     // cursor is unchanged and nothing new reaches the game.
-    ingest_turn(slot, 1, &mut next_seq, &mut pending, &inbound_tx);
+    ingest(1, &mut next_seq, &mut pending, &inbound_tx);
     assert_eq!(resume_cursors(&next_seq), vec![(slot, 2)]);
 
     // Seq 2 fills the gap: 2 and the held 3 both release, the cursor jumps to 4.
-    ingest_turn(slot, 2, &mut next_seq, &mut pending, &inbound_tx);
+    ingest(2, &mut next_seq, &mut pending, &inbound_tx);
     assert_eq!(resume_cursors(&next_seq), vec![(slot, 4)]);
 
     // The game saw 0,1,2,3 once each, in order — no duplicate from the replay.
@@ -231,20 +412,6 @@ async fn resume_cursor_is_the_contiguous_high_water_and_absorbs_replayed_turns()
         delivered.push((payload.seq, payload.commands[0]));
     }
     assert_eq!(delivered, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
-}
-
-#[test]
-fn resume_cursors_map_every_received_peer_slot_to_its_next_needed_seq() {
-    let mut next_seq = HashMap::new();
-    next_seq.insert(SlotId(0), 5);
-    next_seq.insert(SlotId(2), 0);
-    let mut cursors = resume_cursors(&next_seq);
-    cursors.sort();
-    assert_eq!(cursors, vec![(SlotId(0), 5), (SlotId(2), 0)]);
-
-    // No peer turns received yet → no cursors → the relay replays nothing, the
-    // same as a fresh dial.
-    assert!(resume_cursors(&HashMap::new()).is_empty());
 }
 
 #[test]

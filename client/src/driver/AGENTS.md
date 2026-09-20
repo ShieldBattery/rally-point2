@@ -10,7 +10,8 @@
 - `session.rs` — one connection's setup, the `select!` loop, and `ArmFlow`.
 - `inbound.rs` / `outbound.rs` — the extracted `select!` arm bodies (relay → game, game → relay).
 - `send.rs` — one turn's wire handoff, packet send, ordered release to the game.
-- `state.rs` — `GameSeam`, `LoopState`, the connectivity-epoch fence, retention bookkeeping.
+- `state.rs` — `GameSeam` (and the one place both halves of the seam's channels are wired),
+  `LoopState`, the connectivity-epoch fence, retention bookkeeping.
 - `reconnect.rs` / `retention.rs` — re-dial + escalation; what a resume re-sends and how it anchors.
 - `backoff.rs` — non-blocking game pushes, the waits that keep servicing the seam, jittered backoff.
 - `teardown.rs` — the post-loop drain and the two delivery fences.
@@ -40,10 +41,14 @@
 ## Tests
 
 `cargo test -p rally-point-client --lib driver::` (or a topic, `driver::tests::recovery::`).
-Fixtures in `tests/mod.rs`: `connected_links()` is a real QUIC pair (the shared
-`rally_point_transport::test_util` loopback), `test_driver` builds a driver on the shortened
-`TEST_TIMING`, `LinkDriver::into_parts` opens a bare `session` without `run`, `spawn_session` +
-`next_control_frame` read the control stream one frame at a time. A test never waits out a real
-window: the teardown fences, the leave-intent safety timeout and the maintenance flush come from
-`DriverTiming`, and the escalation window from `Reconnect::escalate_after`/`escalate_retry`. A test
-that asserts a window actually elapsed asserts against the injected value, never the default.
+Fixtures in `tests/mod.rs`: `DriverFixture` is the default starting point — a driver running over
+a loopback QUIC pair with the peer's link, a control-frame reader and the peer's control stream
+already wired, and the endpoints owned so nothing has to be kept alive by hand; `finish()` is the
+drop-the-seam-and-await epilogue. `ReconnectSessions` drives two consecutive sessions across a
+simulated outage, `seam_only()` builds the game seam with no connection at all (for the waits that
+only service it), `drive_unacked_session` leaves a known in-flight window behind, and
+`connected_links()`/`test_driver` are the raw pieces for a test that needs `into_parts`. A test
+never waits out a real window: the teardown fences, the leave-intent safety timeout and the
+maintenance flush come from `DriverTiming`, and the escalation window from
+`Reconnect::escalate_after`/`escalate_retry`. A test that asserts a window actually elapsed asserts
+against the injected value, never the default.

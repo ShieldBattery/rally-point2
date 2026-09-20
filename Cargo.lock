@@ -2794,7 +2794,6 @@ dependencies = [
  "rally-point-proto",
  "rally-point-relay",
  "rally-point-transport",
- "rcgen 0.14.10",
  "ring",
  "socket2",
  "thiserror 2.0.20",

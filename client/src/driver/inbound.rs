@@ -25,6 +25,42 @@ use super::session::ArmFlow;
 use super::state::{ConnectivityEpochStates, admit_connectivity_epoch};
 use super::*;
 
+/// Buffers a received packet's fresh turns into their slots' reorder queues and
+/// releases each slot's contiguous prefix to the game — the whole datagram-path
+/// ingest step, and the bookkeeping a resume cursor is read back from.
+///
+/// A turn whose slot id is past `u8` range names no real slot; a truncating cast
+/// would alias it onto `slot % 256` and corrupt another player's turn stream, so
+/// it is dropped (defensive — the wire values are validated upstream). A turn
+/// below its slot's next-needed seq has already been handed to the game: a
+/// resume replays turns the relay cannot know arrived, and re-buffering one
+/// would deliver it twice.
+pub(super) fn ingest_fresh_turns(
+    fresh: Vec<Payload>,
+    next_seq: &mut HashMap<SlotId, u64>,
+    pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
+    inbound: &mpsc::Sender<Payload>,
+) -> Release {
+    for payload in fresh {
+        let Ok(slot_id) = u8::try_from(payload.slot) else {
+            tracing::warn!(
+                slot = payload.slot,
+                "received turn names a slot id out of range; dropping it",
+            );
+            continue;
+        };
+        let slot = SlotId(slot_id);
+        let slot_next = next_seq.entry(slot).or_insert(0);
+        if payload.seq >= *slot_next {
+            pending
+                .entry(slot)
+                .or_default()
+                .insert(payload.seq, payload);
+        }
+    }
+    release_ready(next_seq, pending, inbound)
+}
+
 /// One packet the link received: fold its acks in, buffer its fresh turns by
 /// transport seq, release the contiguous prefix to the game, push the peer our
 /// delivered-through cursors, and check the unacked-window cap. The link dedups
@@ -61,28 +97,7 @@ pub(super) async fn on_received(
     if received.carried_payloads {
         *acks_owed = true;
     }
-    for payload in received.fresh {
-        // A slot id past `u8` range names no real slot; a
-        // truncating cast would alias it onto `slot % 256` and
-        // corrupt another player's turn stream. Drop it (defensive
-        // — the wire values are validated upstream).
-        let Ok(slot_id) = u8::try_from(payload.slot) else {
-            tracing::warn!(
-                slot = payload.slot,
-                "received turn names a slot id out of range; dropping it",
-            );
-            continue;
-        };
-        let slot = SlotId(slot_id);
-        let slot_next = next_seq.entry(slot).or_insert(0);
-        if payload.seq >= *slot_next {
-            pending
-                .entry(slot)
-                .or_default()
-                .insert(payload.seq, payload);
-        }
-    }
-    match release_ready(next_seq, pending, inbound) {
+    match ingest_fresh_turns(received.fresh, next_seq, pending, inbound) {
         Release::Delivered => {}
         Release::GameClosed => return ArmFlow::Teardown,
         Release::GameStalled => return ArmFlow::End(Err(DriverError::GameStalled)),
