@@ -416,15 +416,6 @@ pub fn entry(registry: &RelayRegistry, id: RelayId) -> Option<RelayEntry> {
     registry.relays.lock().get(&id).map(|r| r.entry.clone())
 }
 
-/// The certificate fingerprint of the *live* entry for `id`, if the registry
-/// holds one — the enroll-time duplicate-id check's comparison point. `None`
-/// when no relay is currently registered under `id` (a fresh id, or one whose
-/// prior entry already aged out), which the caller treats as nothing to
-/// compare against: any (proof-of-possession-verified) `Hello` may enroll.
-pub fn live_cert_fingerprint(registry: &RelayRegistry, id: RelayId) -> Option<[u8; 32]> {
-    registry.relays.lock().get(&id).map(|r| r.cert_fingerprint)
-}
-
 /// All registered relays' full entries, in an unspecified order — draining ones
 /// included. Callers that must reach *every* enrolled relay (e.g. a re-home
 /// last-resort fallback picking any live relay) use this; assignment of a *new*

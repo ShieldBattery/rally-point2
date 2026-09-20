@@ -140,12 +140,7 @@ fn prefix_for(pinned: bool) -> &'static str {
 /// `.zst` marks the zstd-compressed-JSON encoding the relay uploads). `relay_id` is the
 /// coordinator's own enrolled id for the requesting connection, never a relay-supplied
 /// value.
-pub fn object_key(
-    pinned: bool,
-    tenant: &TenantId,
-    session: SessionId,
-    relay_id: RelayId,
-) -> String {
+fn object_key(pinned: bool, tenant: &TenantId, session: SessionId, relay_id: RelayId) -> String {
     format!(
         "{}/{}/{}/{}.json.zst",
         prefix_for(pinned),
@@ -159,7 +154,7 @@ pub fn object_key(
 /// retention class — the argument to [`FlightStore::list`] when enumerating a
 /// session's blobs. Trailing slash included so it matches only that session's keys,
 /// never a sibling session whose id shares a numeric prefix.
-pub fn session_prefix(pinned: bool, tenant: &TenantId, session: SessionId) -> String {
+fn session_prefix(pinned: bool, tenant: &TenantId, session: SessionId) -> String {
     format!("{}/{}/{}/", prefix_for(pinned), tenant.as_ref(), session.0,)
 }
 
@@ -182,7 +177,7 @@ fn relay_id_from_key(key: &str) -> Option<u64> {
 /// boundary). The store therefore **refuses** an id it cannot embed verbatim rather
 /// than reshaping it: substitution could collide two distinct ids into one key space,
 /// which is worse than storing nothing.
-pub fn tenant_key_safe(tenant: &TenantId) -> bool {
+fn tenant_key_safe(tenant: &TenantId) -> bool {
     !tenant.as_ref().is_empty()
         && tenant
             .as_ref()
@@ -199,7 +194,9 @@ pub enum FlightDrop {
     /// The notice names a tenant the coordinator does not hold enrolled.
     UnknownTenant,
     /// The tenant's id cannot be embedded verbatim as an object-key path segment
-    /// (see [`tenant_key_safe`]) — such a tenant's recordings are never stored.
+    /// — it holds something outside ASCII alphanumerics, `.`, `_` and `-`, and a
+    /// stray `/` would alias another tenant's key space. Such a tenant's
+    /// recordings are never stored.
     TenantIdNotKeySafe,
     /// The payload exceeds [`MAX_FLIGHT_BLOB_BYTES`].
     TooLarge,

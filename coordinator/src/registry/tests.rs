@@ -284,26 +284,6 @@ fn a_subscriber_re_syncs_the_current_set_and_wakes_on_membership_change() {
 }
 
 #[test]
-fn live_cert_fingerprint_tracks_the_current_entry() {
-    let reg = new_registry();
-    assert_eq!(
-        live_cert_fingerprint(&reg, RelayId(1)),
-        None,
-        "an unenrolled id has nothing to compare against",
-    );
-
-    enroll(&reg, hello(1, 14900));
-    assert_eq!(
-        live_cert_fingerprint(&reg, RelayId(1)),
-        Some(cert_fingerprint(&[1u8; 4])),
-    );
-
-    // Deregistering clears it.
-    remove(&reg, RelayId(1));
-    assert_eq!(live_cert_fingerprint(&reg, RelayId(1)), None);
-}
-
-#[test]
 fn try_enroll_refuses_a_live_id_bound_to_a_different_certificate() {
     let reg = new_registry();
     enroll(&reg, hello(1, 14900)); // cert [1u8; 4]
@@ -315,7 +295,7 @@ fn try_enroll_refuses_a_live_id_bound_to_a_different_certificate() {
     let refused = try_enroll(&reg, hello_with_cert(1, 15000, vec![0xAA; 4]));
     assert_eq!(refused, Err(EnrollConflict));
     assert_eq!(
-        live_cert_fingerprint(&reg, RelayId(1)),
+        entry(&reg, RelayId(1)).map(|e| cert_fingerprint(&e.cert_der)),
         Some(cert_fingerprint(&[1u8; 4])),
         "the refused enroll must not displace the live entry",
     );

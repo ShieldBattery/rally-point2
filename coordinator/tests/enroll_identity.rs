@@ -142,7 +142,8 @@ async fn a_downgrade_hello_is_refused_at_negotiation_and_does_not_displace_a_liv
         connect_and_send_hello(&served.base_url, hello_at_current(5, 14904, cert_der)).await;
     prove_identity(&mut live, &key).await;
     assert!(wait_for_enrollment(served.registry(), RelayId(5)).await);
-    let live_fingerprint = registry::live_cert_fingerprint(served.registry(), RelayId(5));
+    let live_fingerprint = registry::entry(served.registry(), RelayId(5))
+        .map(|entry| registry::cert_fingerprint(&entry.cert_der));
     assert!(live_fingerprint.is_some());
 
     // The downgrade attempt claims the same id, advertising a version below the
@@ -164,7 +165,8 @@ async fn a_downgrade_hello_is_refused_at_negotiation_and_does_not_displace_a_liv
         "the live entry survives the refused downgrade",
     );
     assert_eq!(
-        registry::live_cert_fingerprint(served.registry(), RelayId(5)),
+        registry::entry(served.registry(), RelayId(5))
+            .map(|entry| registry::cert_fingerprint(&entry.cert_der)),
         live_fingerprint,
         "the downgrade attempt did not displace the live relay's certificate",
     );
@@ -177,7 +179,7 @@ async fn a_duplicate_id_under_a_different_certificate_is_refused_while_the_first
     // Relay 1 enrolls first and holds the connection open (a live entry).
     let (cert_a, key_a) = self_signed();
     let mut socket_a =
-        connect_and_send_hello(&served.base_url, hello_at_current(1, 14900, cert_a)).await;
+        connect_and_send_hello(&served.base_url, hello_at_current(1, 14900, cert_a.clone())).await;
     prove_identity(&mut socket_a, &key_a).await;
     assert!(wait_for_enrollment(served.registry(), RelayId(1)).await);
 
@@ -197,8 +199,8 @@ async fn a_duplicate_id_under_a_different_certificate_is_refused_while_the_first
     );
     let entry = registry::entry(served.registry(), RelayId(1)).unwrap();
     assert_eq!(
-        registry::live_cert_fingerprint(served.registry(), RelayId(1)),
-        Some(registry::cert_fingerprint(&entry.cert_der)),
+        registry::cert_fingerprint(&entry.cert_der),
+        registry::cert_fingerprint(&cert_a),
         "the registry still records relay 1's own certificate",
     );
 }

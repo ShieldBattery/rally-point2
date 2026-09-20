@@ -150,16 +150,6 @@ impl SessionSetup {
     /// Creates a session-setup context from the coordinator's registries, with the
     /// production re-home rate limiter ([`RehomeLimiter::default`]).
     pub fn new(registry: RelayRegistry, tenants: TenantStore) -> Self {
-        Self::with_rehome_limiter(registry, tenants, RehomeLimiter::default())
-    }
-
-    /// Like [`new`](Self::new) but with an explicit re-home rate limiter, so a test
-    /// can inject one with a shorter refill or smaller burst than production's.
-    pub fn with_rehome_limiter(
-        registry: RelayRegistry,
-        tenants: TenantStore,
-        rehome_limiter: RehomeLimiter,
-    ) -> Self {
         Self {
             registry,
             tenants,
@@ -171,7 +161,7 @@ impl SessionSetup {
             presence: crate::presence::new_store(),
             next_session: Arc::new(AtomicU64::new(first_session_id())),
             rehomes: Arc::new(Mutex::new(HashMap::new())),
-            rehome_limiter,
+            rehome_limiter: RehomeLimiter::default(),
             load_state_limiter: LoadStateLimiter::default(),
             assignment_lock: Arc::new(Mutex::new(())),
             create_idempotency: Arc::new(Mutex::new(HashMap::new())),

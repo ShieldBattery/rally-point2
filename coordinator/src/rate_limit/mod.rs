@@ -127,8 +127,10 @@ impl<K: Eq + Hash + Clone> KeyedTokenBuckets<K> {
         self.buckets.lock().retain(|key, _| !predicate(key));
     }
 
-    /// The number of live buckets — the hook a test asserts the map's bounds with.
-    pub fn bucket_count(&self) -> usize {
+    /// The number of live buckets — the hook the tests assert the map's bounds
+    /// with, and nothing else reads.
+    #[cfg(test)]
+    pub(crate) fn bucket_count(&self) -> usize {
         self.buckets.lock().len()
     }
 }
