@@ -11,7 +11,7 @@ use rally_point_proto::control::{RegionId, SessionRequest, SessionResponse};
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::token::ClientPublicKey;
 
-use crate::provision::WarmTargets;
+use crate::provision::{CoverageStatus, WarmTargets};
 
 use super::DEFAULT_WARM_TTL;
 
@@ -109,11 +109,14 @@ pub(super) struct CachedCreate {
     pub(super) response: SessionResponse,
 }
 
-/// The provisioning knobs and the shared warm-demand store the coordinator
-/// consults when a session names a region with no live relay.
+/// The provisioning knobs and the shared stores the coordinator and its
+/// reconcile loop pass between them: warm demand in, coverage phase out.
 ///
 /// The `warm` store is written by `POST /regions/warm` and by a hold-until-ready
 /// create, and read by the reconcile loop, which holds a clone of the same map.
+/// `coverage` runs the other way — the loop publishes each region's
+/// coverage-bootstrap phase into it so a metrics scrape can read state that is
+/// otherwise loop-local.
 /// `create_hold` is `Some` only on a coordinator whose provisioning loop is
 /// running — that presence is what turns on hold-until-ready create. A
 /// coordinator with no loop holds a **dormant** gate: an orphan warm store the
@@ -123,6 +126,10 @@ pub(super) struct CachedCreate {
 pub struct ProvisionGate {
     /// Per-region warm demand, shared with the reconcile loop.
     pub(super) warm: WarmTargets,
+    /// Which regions the reconcile loop's coverage bootstrap is backing off,
+    /// published by the loop and read at scrape time. Empty — and never written
+    /// — on a coordinator with no loop.
+    pub(super) coverage: CoverageStatus,
     /// How long each warm keeps a region warm.
     pub(super) warm_ttl: Duration,
     /// The per-create hold cap: how long a create naming an unlit region is held
@@ -140,6 +147,7 @@ impl ProvisionGate {
     pub fn provisioning(warm: WarmTargets, warm_ttl: Duration, create_hold: Duration) -> Self {
         Self {
             warm,
+            coverage: CoverageStatus::new(),
             warm_ttl,
             create_hold: Some(create_hold),
         }
@@ -150,6 +158,7 @@ impl ProvisionGate {
     pub(super) fn dormant() -> Self {
         Self {
             warm: WarmTargets::new(),
+            coverage: CoverageStatus::new(),
             warm_ttl: DEFAULT_WARM_TTL,
             create_hold: None,
         }
@@ -159,6 +168,12 @@ impl ProvisionGate {
     /// reconcile loop reads.
     pub fn warm(&self) -> &WarmTargets {
         &self.warm
+    }
+
+    /// The coverage-bootstrap phase the reconcile loop publishes — which regions
+    /// it is currently backing off.
+    pub fn coverage(&self) -> &CoverageStatus {
+        &self.coverage
     }
 
     /// How long each warm keeps a region warm.

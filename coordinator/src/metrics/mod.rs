@@ -31,14 +31,11 @@
 //! `render_*`/`write_*` helpers live in the private `render` submodule and the
 //! rendering entry point is re-exported from here as `render`.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::{
     Router, extract::State, http::header::CONTENT_TYPE, response::IntoResponse, routing::get,
 };
-use parking_lot::Mutex;
 use rally_point_proto::control::{RegionId, TenantId};
 
 use crate::api::CoordinatorState;
@@ -99,15 +96,6 @@ static CONTROL_CONNECTION_ENDS: LabeledCounter<String> = LabeledCounter::new();
 static DESCRIPTOR_DELTAS_SENT: AtomicU64 = AtomicU64::new(0);
 static DESCRIPTOR_FULL_SETS_SENT: AtomicU64 = AtomicU64::new(0);
 static DESCRIPTOR_DELTA_ENTRIES_SENT: AtomicU64 = AtomicU64::new(0);
-
-/// Whether the coverage bootstrap is currently backing off each region, published
-/// by the reconcile loop as its coverage phase changes (the phase is otherwise
-/// loop-local). A region absent from the map is not backing off.
-static BEACON_BACKOFF: OnceLock<Mutex<HashMap<RegionId, bool>>> = OnceLock::new();
-
-fn beacon_backoff_map() -> &'static Mutex<HashMap<RegionId, bool>> {
-    BEACON_BACKOFF.get_or_init(|| Mutex::new(HashMap::new()))
-}
 
 // ---------------------------------------------------------------------------
 // Increment functions — one line at each event site
@@ -245,12 +233,4 @@ pub(crate) fn descriptor_delta_sent(upserts: usize, removals: usize) {
 /// version), so the delta-vs-full ratio reflects steady-state pushes alone.
 pub(crate) fn descriptor_full_set_sent() {
     DESCRIPTOR_FULL_SETS_SENT.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Publishes whether the coverage bootstrap is backing off `region`, so the
-/// `rp2_beacon_backoff` gauge can read the loop-local coverage phase.
-pub(crate) fn set_beacon_backoff(region: &RegionId, backing_off: bool) {
-    beacon_backoff_map()
-        .lock()
-        .insert(region.clone(), backing_off);
 }

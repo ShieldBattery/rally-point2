@@ -74,7 +74,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
         if have >= total {
             // Every pair covered (or no pairs at all): nothing to bootstrap.
             self.coverage.remove(region);
-            crate::metrics::set_beacon_backoff(region, false);
+            self.setup.provision().coverage().publish(region, false);
             return 0;
         }
         let state = self
@@ -129,7 +129,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
         };
         // Publish the resulting phase so the beacon-backoff gauge reflects the
         // loop-local coverage state.
-        crate::metrics::set_beacon_backoff(
+        self.setup.provision().coverage().publish(
             region,
             matches!(state.phase, CoveragePhase::BackingOff { .. }),
         );

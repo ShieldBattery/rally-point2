@@ -9,6 +9,10 @@
   fleet-wide cleanups).
 - `warm.rs` — `WarmTargets`: per-region warm demand with a TTL deadline.
   Independent of `reconcile`.
+- `coverage.rs` — `CoverageStatus`: the coverage phase the loop publishes out,
+  so a scrape can read state that is otherwise loop-local. Independent of
+  `reconcile`, and the mirror of `warm.rs` — demand travels in through the
+  provision gate, phase travels out through it.
 - `ecs/` — the Fargate `Provisioner`. `mod.rs` holds config, errors, and the
   substrate-independent `EcsCore` mapping; `api.rs` holds the `EcsApi` trait
   + its real (SDK) impl, split so the mapping is testable against a fake.
@@ -27,7 +31,9 @@ A region demands one relay per uncovered pair for `COVERAGE_HOLD_SECS`; still
 uncovered when that lapses is a failed attempt, doubling the backoff
 (`coverage_backoff_secs`, capped). Any rise in covered-pair count resets
 `attempts` to 0. State (`ProvisionLoop.coverage`) is loop-local, dropped once
-a region is fully covered.
+a region is fully covered; the loop republishes the resulting phase into the
+gate's `CoverageStatus` every tick it derives one, so the published bit is
+level-triggered and never has to be cleared by hand.
 
 ## `Provisioner` contract
 Every method must be safe to retry, with no memory of a prior failure — the

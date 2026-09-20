@@ -14,7 +14,7 @@ use super::{
     FLIGHT_RECORDINGS_PINNED, REAP_DIRECTIVES_SENT, REAP_NUDGES_COALESCED, RELAY_COLD_START,
     RELAY_DRAINS, RELAY_ENROLLS, RELAY_LAUNCH_FAILURES, RELAY_LAUNCHES, RELAY_REAPED,
     SESSION_HOLDS, SESSION_REAPS, SESSIONS_CLOSED, SESSIONS_CREATED, WEBHOOK_ATTEMPT_FAILURES,
-    WEBHOOK_DELIVERIES, beacon_backoff_map,
+    WEBHOOK_DELIVERIES,
 };
 use crate::api::CoordinatorState;
 use crate::{lifecycle, registry, tenant};
@@ -397,7 +397,7 @@ fn render_backbone_rtt(out: &mut String, state: &CoordinatorState) {
 }
 
 fn render_beacon_backoff(out: &mut String, state: &CoordinatorState) {
-    let map = beacon_backoff_map().lock();
+    let backing_off = state.setup.provision().coverage().census();
     write_meta(
         out,
         "rp2_beacon_backoff",
@@ -405,12 +405,11 @@ fn render_beacon_backoff(out: &mut String, state: &CoordinatorState) {
         "gauge",
     );
     for region in state.regions.regions() {
-        let backing_off = map.get(&region.id).copied().unwrap_or(false);
         write_series(
             out,
             "rp2_beacon_backoff",
             &[("region", region.id.as_ref())],
-            u64::from(backing_off),
+            u64::from(backing_off.get(&region.id).copied().unwrap_or(false)),
         );
     }
 }

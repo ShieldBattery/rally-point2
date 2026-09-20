@@ -22,11 +22,13 @@ use std::net::{IpAddr, SocketAddr};
 use rally_point_proto::control::RegionId;
 use rally_point_proto::ids::RelayId;
 
+mod coverage;
 mod ecs;
 mod process;
 mod reconcile;
 mod warm;
 
+pub use coverage::CoverageStatus;
 pub use ecs::{EcsConfig, EcsConfigError, EcsProvisioner};
 pub use process::{ProcessConfig, ProcessProvisioner};
 pub use reconcile::{ProvisionConfig, ProvisionLoop};
