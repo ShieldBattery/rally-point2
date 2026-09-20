@@ -6,8 +6,10 @@
 //! buffer-size change. The [`DecisionMaker`] itself is pure and synchronous: no
 //! I/O, no async, no locks of its own. It is fed conditions and game-frame
 //! observations by its caller and returns a [`Decision`] describing what (if
-//! anything) to broadcast; the registry-level helpers at the bottom of this
-//! module add the locking and logging the turn path needs.
+//! anything) to broadcast. [`DecisionMakers`] is the handle the turn path
+//! actually holds: the locked per-session map of makers, and the methods that
+//! add the locking, the logging, the coordinator notices and the flight
+//! events a bare maker does not.
 //!
 //! The broadcast rides the turn stream as envelope metadata: a decision queues
 //! a directive that [`active_directive`](DecisionMaker::active_directive) hands

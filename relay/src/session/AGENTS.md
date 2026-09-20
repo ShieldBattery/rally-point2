@@ -16,7 +16,10 @@ module's teardown).
   sites. `retire` is terminal and sweeps everything, side channels included:
   a session retired with members still connected never reaches
   `close_emptied` (its gate refuses the later teardowns), so nothing else
-  would.
+  would. It also owns the operations that span two of its stores rather than
+  belonging to either: `admit_reconnect`, which resolves one reliable
+  connection-up event against the drop holds and the decision-makers together,
+  in that lock order.
 - `presence.rs` — own + peer live-player counts and the buffer-authority
   verdict (first still-live relay in the coordinator's priority order).
 - `side_channel/` — the reliable non-turn traffic members exchange over their

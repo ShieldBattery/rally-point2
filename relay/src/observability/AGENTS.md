@@ -1,9 +1,16 @@
 # observability/
 
 ## File map
+- `events.rs` — the record/sample/blob shapes plus the two-call `FlightEvents`
+  sink trait. Pure data, and a **leaf**: it depends on nothing else in the
+  relay, which is what lets a module that only emits events (consensus's
+  decision paths, routing's teardowns) name it instead of the recorder, whose
+  own job needs `mesh::ConditionsRegistry` and `session::gate::SessionGates`.
+  `flight_recorder` re-exports the shapes, so `flight_recorder::FlightEvent`
+  paths still resolve. Keep it dependency-free.
 - `flight_recorder/`: `mod.rs` (`FlightRecorder` handle, create-on-first-
-  touch, close-seal lifecycle, `run_sampler`) · `events.rs` (record/sample/
-  blob shapes, pure data) · `sinks.rs` (`FlightSink`, `FileSink`,
+  touch, close-seal lifecycle, `run_sampler`, the `FlightEvents` impl) ·
+  `sinks.rs` (`FlightSink`, `FileSink`,
   `CoordinatorSink`/`FlightShipment`, shipping constants) · `recording.rs`
   (`SessionRecording` rings + hot-path `SlotCounters`, `RelayWorkSnapshot`,
   `FlushOutcome`) · `flush.rs` (2nd `impl FlightRecorder`: `take_blob`/

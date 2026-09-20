@@ -16,6 +16,11 @@
   `maintenance.rs`/`teardown.rs` one arm or phase each.
 - `departure.rs`, `drops.rs`, `close.rs` — who left, who decides it, and what
   this relay tears down once its last local slot is gone.
+- `silence.rs` — the relay-wide silent-slot watch: a timer that takes each
+  session's verdict from the decision-makers (`claim_silent_slots`) and closes
+  the named slot's link. The verdict is consensus's and stays there; the
+  actuation is here, behind a `SilenceCloser` the roster implements, so the
+  loop is testable with a fake closer.
 
 ## Easy to break
 
@@ -37,6 +42,9 @@
 - A *drop* is only ever held; an honored `RequestDrop` (or the abandon timer)
   decides it, and in finalized-drop sessions only the slot's home may seal the
   count. A *clean leave* decides immediately, at the home.
+- A slot the silence watch named is already marked evicted by the claim that
+  named it, so the close is owed exactly once — don't re-derive the verdict
+  here, and don't let a failed close silently un-name it.
 
 ## Slot-link context
 
