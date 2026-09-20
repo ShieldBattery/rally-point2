@@ -60,14 +60,15 @@ pub(super) fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPrese
     let mut live: HashMap<SessionKey, _> = crate::routing::live_slots(&sources.sessions)
         .into_iter()
         .collect();
-    let mut roster: Vec<SessionPresence> =
-        crate::consensus::retained_load_states(&sources.decision_makers)
-            .into_iter()
-            .map(|(key, load)| {
-                let slots = live.remove(&key).unwrap_or_default();
-                presence_entry(key, slots, load)
-            })
-            .collect();
+    let mut roster: Vec<SessionPresence> = sources
+        .decision_makers
+        .retained_load_states()
+        .into_iter()
+        .map(|(key, load)| {
+            let slots = live.remove(&key).unwrap_or_default();
+            presence_entry(key, slots, load)
+        })
+        .collect();
     roster.extend(
         live.into_iter()
             .map(|(key, slots)| presence_entry(key, slots, RetainedLoadState::default())),
@@ -100,7 +101,7 @@ pub(super) fn session_load_snapshot(
     key: SessionKey,
 ) -> (SessionPresence, Vec<(SlotId, u64)>) {
     let links = crate::routing::live_session_slot_epochs(sessions, &key);
-    let load = crate::consensus::retained_load_state(decision_makers, &key);
+    let load = decision_makers.retained_load_state(&key);
     (
         presence_entry(key, links.iter().map(|(slot, _)| *slot).collect(), load),
         links,
@@ -236,7 +237,8 @@ pub(super) async fn fenced_load_state_snapshot(
     fence: &crate::coordinator::load_fence::LoadStateFence,
     key: SessionKey,
 ) -> (SessionPresence, bool) {
-    let started: HashSet<SlotId> = crate::consensus::retained_load_state(decision_makers, &key)
+    let started: HashSet<SlotId> = decision_makers
+        .retained_load_state(&key)
         .started
         .into_iter()
         .collect();

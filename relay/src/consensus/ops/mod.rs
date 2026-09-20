@@ -10,8 +10,6 @@ use super::*;
 mod departure;
 mod leave;
 mod session_start;
-mod silence;
-mod sync_coverage;
 
 pub use departure::{
     FinalizeOutcome, activate_connection_epoch, claim_close_report, connection_epoch_matches,
@@ -31,10 +29,6 @@ pub use session_start::{
     session_initial_buffer_turns, session_started, set_session_shape, slot_has_started,
     started_home_slots, started_session_slot_count,
 };
-pub use silence::{
-    claim_silent_slots, note_forward_advance, retained_load_state, retained_load_states,
-};
-pub use sync_coverage::sync_coverage;
 
 pub(crate) use departure::{
     mark_connection_down, record_departure_for_epoch_outcome, resolve_reconnect,

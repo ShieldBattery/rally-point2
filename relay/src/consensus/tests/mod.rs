@@ -630,7 +630,8 @@ fn authority_margin() -> u64 {
 /// snapshot every heartbeat is built from. Default for a session with no
 /// maker, which the snapshot never names.
 fn load_state_of(registry: &DecisionMakers, key: &SessionKey) -> RetainedLoadState {
-    retained_load_states(registry)
+    registry
+        .retained_load_states()
         .into_iter()
         .find(|(k, _)| k == key)
         .map(|(_, load)| load)

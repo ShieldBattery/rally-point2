@@ -14,6 +14,8 @@ mod authority;
 mod buffer;
 mod homing;
 mod phase;
+mod silence;
+mod sync_coverage;
 
 pub use authority::{FrameRegression, MakerSync};
 

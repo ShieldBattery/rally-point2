@@ -82,7 +82,7 @@ fn evict_silent_slots(
     close_silent_slots(
         makers.flight_recorder(),
         closer,
-        crate::consensus::claim_silent_slots(makers, now, window),
+        makers.claim_silent_slots(now, window),
     );
 }
 

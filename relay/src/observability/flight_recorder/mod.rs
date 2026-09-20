@@ -535,7 +535,7 @@ pub async fn run_sampler(
         recorder.sample_now(
             &conditions,
             |key| makers.delivery_view(key),
-            |key| crate::consensus::sync_coverage(&makers, key),
+            |key| makers.sync_coverage(key),
         );
     }
 }

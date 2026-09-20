@@ -205,7 +205,7 @@ pub(super) fn deliver_turn_to_locals(
         // turn itself because a client picks what it sends and when, so any
         // count or stamp it supplies can be padded; only the turns it actually
         // produced move this prefix.
-        crate::consensus::note_forward_advance(decision_makers, key, slot);
+        decision_makers.note_forward_advance(key, slot);
     }
     // The frame observation's one and only feed point, right after the
     // `mark_seen` dedup, for the same reason as the desync comparator just
