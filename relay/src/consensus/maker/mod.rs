@@ -12,9 +12,11 @@ mod authority;
 mod buffer;
 mod connection;
 mod departure;
+mod homing;
 mod leave;
+mod phase;
+mod session_start;
 mod silence;
-mod start;
 mod sync;
 
 pub use departure::{DepartureStamps, RecordedDeparture};

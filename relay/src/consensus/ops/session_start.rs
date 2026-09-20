@@ -1,6 +1,7 @@
-//! Session-lifecycle entry points: slot presence and connection reports, the
-//! start latch, session shape, region-label release, and arrival-phase
-//! commands.
+//! Session-start entry points: the slot connection and game-loop reports that
+//! go up the coordinator connection, the presence coverage that latches a
+//! session started, and the session shape and initial buffer depth that latch
+//! sizes from.
 
 use super::*;
 
@@ -226,96 +227,6 @@ pub fn session_initial_buffer_turns(registry: &DecisionMakers, key: &SessionKey)
         .lock()
         .get(key)
         .and_then(DecisionMaker::initial_buffer_turns)
-}
-
-/// Records `key`'s relay → region labels from a coordinator descriptor, returning
-/// the map to (re)send to this relay's local slots when the release gate is
-/// already open and the map changed (see
-/// [`DecisionMaker::set_region_labels`]). `None` when no maker exists — a session
-/// with no maker has no gate, and therefore nothing that may be released.
-#[must_use]
-pub fn set_region_labels(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    labels: Vec<RegionLabel>,
-) -> Option<Vec<RegionLabel>> {
-    registry.lock().get_mut(key)?.set_region_labels(labels)
-}
-
-/// Evaluates `key`'s region-label release gate against this relay's clock,
-/// returning the map to fan out on the single call that opens it (see
-/// [`DecisionMaker::maybe_release_region_labels`]). `None` on every other call,
-/// and when no maker exists. The delay comes from the registry, so every session
-/// on a relay is gated by the same one.
-#[must_use]
-pub fn maybe_release_region_labels(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-) -> Option<Vec<RegionLabel>> {
-    let delay = registry.region_release_delay();
-    registry
-        .lock()
-        .get_mut(key)?
-        .maybe_release_region_labels(delay)
-}
-
-/// `key`'s relay → region labels when its release gate is already open, for the
-/// direct push a slot gets on connecting after the gate opened. `None` when the
-/// gate is shut, when there are no labels, or when no maker exists.
-pub fn released_region_labels(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-) -> Option<Vec<RegionLabel>> {
-    registry.lock().get(key)?.released_region_labels()
-}
-
-/// Folds one client-edge arrival into `key`'s send-phase controller and runs a
-/// control iteration if one is due, returning the slots whose commanded delay
-/// changed — for the caller to fan out as `PhaseDirective`s (see
-/// [`DecisionMaker::ingest_arrival_phase`]). Empty on almost every call: the
-/// controller evaluates on its own sparse schedule, before the session starts
-/// nothing is recorded, and when no maker exists there is nothing to do.
-/// `received_at` is the instant the caller pulled the packet off the socket —
-/// stamped there, not here, so validation, fan-out, and this registry's own
-/// lock contention never leak into the measured arrival phase.
-#[must_use]
-pub fn ingest_arrival_phase(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    slot: SlotId,
-    seq: u64,
-    received_at: Instant,
-) -> Vec<(SlotId, u32)> {
-    match registry.lock().get_mut(key) {
-        Some(maker) => maker.ingest_arrival_phase(slot, seq, received_at),
-        None => Vec::new(),
-    }
-}
-
-/// The send-phase delay `key`'s controller last commanded for `slot`, for the
-/// direct re-push a slot gets on (re)connecting after corrections were issued.
-/// `None` when none was ever issued, or when no maker exists.
-pub fn commanded_phase_delay(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    slot: SlotId,
-) -> Option<u32> {
-    registry.lock().get(key)?.commanded_phase_delay(slot)
-}
-
-/// Releases `slot`'s send-phase command fence on the client's acknowledgement
-/// that it adopted `delay_us` (see [`DecisionMaker::note_phase_applied`]). A
-/// no-op when the echo is stale or no maker exists.
-pub fn note_phase_applied(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    slot: SlotId,
-    delay_us: u32,
-) {
-    let now = Instant::now();
-    if let Some(maker) = registry.lock().get_mut(key) {
-        maker.note_phase_applied(slot, delay_us, now);
-    }
 }
 
 /// Adopts an authority's mesh `SessionStart` onto a peer relay's maker: latches

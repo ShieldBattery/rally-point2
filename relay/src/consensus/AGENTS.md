@@ -12,8 +12,9 @@
   map, notices, `log_*`. `phase/`, `delivery.rs`, and `buffer_law_sim/` also live here.
 - `maker/` is one `impl DecisionMaker` block per concern — `authority` frames +
   handoff, `connection` ingest + epochs, `buffer` the control law, `leave`,
-  `departure`, `start` (roster/shape/region labels/phase), `silence`, `sync`. `ops/`
-  mirrors those names with the `&DecisionMakers` free functions.
+  `departure`, `session_start` (presence coverage, shape, initial depth),
+  `homing` (observer/expected/homed sets, region labels), `phase`, `silence`,
+  `sync`. `ops/` mirrors those names with the `&DecisionMakers` free functions.
 
 ## Reads like a bug, is deliberate
 

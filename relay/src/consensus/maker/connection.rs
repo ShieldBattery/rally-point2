@@ -397,4 +397,12 @@ impl DecisionMaker {
             _ => false,
         }
     }
+
+    /// Whether `slot` currently has a live (Up) connection generation.
+    pub(in crate::consensus) fn connection_is_up(&self, slot: SlotId) -> bool {
+        matches!(
+            self.connection_states.get(&slot),
+            Some(ConnectionState::Up(_))
+        )
+    }
 }
