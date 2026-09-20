@@ -365,12 +365,81 @@ impl SessionSetup {
         taken
     }
 
-    /// Retires a closed session's membership maps, discarding the taken serving set
-    /// — the value-free form of [`take_session_membership`](Self::take_session_membership)
-    /// for callers that only need the retirement, not the snapshot (the close paths
-    /// use the take so they can remove each serving relay's descriptor).
-    pub fn forget_session_membership(&self, tenant: &TenantId, session: SessionId) {
-        self.take_session_membership(tenant, session);
+    /// Retires every trace of a session that is gone, in the one order that is
+    /// safe, and returns the serving relays it took (the set whose descriptors it
+    /// dropped). Both close paths — the all-relays-closed terminal close and the
+    /// idle webhook-only reap — run exactly this, so neither can drift from the
+    /// other or leave a map behind.
+    ///
+    /// The steps, in order:
+    ///
+    /// 1. Retire the session's pending reap directives, so none is replayed to a
+    ///    relay that reconnects after this. A directive already delivered stays
+    ///    applied — a closed link does not reopen.
+    /// 2. **Take** (remove-and-return) the session's relay membership, atomically
+    ///    with the serving-set snapshot.
+    /// 3. Drop each taken relay's descriptor for the session.
+    /// 4. Clear the recorded re-home decisions.
+    /// 5. Drop the session's re-home rate-limit bucket.
+    ///
+    /// **The take must come first.** Ordering matters against a concurrent
+    /// [`rehome`](fn@crate::session::rehome), which re-validates membership under
+    /// the same `session_relays` lock the take acquires:
+    ///
+    /// - Once the membership is gone (after the take), any racing rehome fails its
+    ///   under-lock re-validation: it can neither push a descriptor nor record a
+    ///   rehome, so there is nothing of its left to clean up.
+    /// - A rehome that completed *before* the take had already added its target
+    ///   relay to the membership, so that relay is in the taken set — the
+    ///   descriptor removal therefore covers the resumed descriptor it pushed, and
+    ///   the rehome clear (run after the take) drops the idempotency entry it
+    ///   recorded.
+    ///
+    /// Every interleaving is thus covered. Removing the descriptor also stops a
+    /// relay reconnecting after the close from being re-synced the dead session's
+    /// stale descriptor and re-applying it — the relay-side reconciler only ends
+    /// sessions ABSENT from the pushed set, so a present-but-dead descriptor would
+    /// otherwise resurrect the session on that relay. Retiring the membership is
+    /// also what makes every subsequent re-home ask honestly answer `Unavailable`
+    /// (the empty serving set trips `session::rehome`'s guard), and dropping the
+    /// rate-limit bucket keeps that map bounded by live sessions.
+    ///
+    /// A session with no recorded membership — one this coordinator lifetime never
+    /// created, so only a webhook-only state ever existed for it — retires
+    /// harmlessly: the take returns an empty set, the descriptor loop is empty, and
+    /// the remaining steps are no-ops.
+    pub fn retire_session(&self, tenant: &TenantId, session: SessionId) -> Vec<RelayId> {
+        self.reaps.retire(tenant, session);
+        let serving = self.take_session_membership(tenant, session);
+        for relay_id in &serving {
+            self.descriptors.remove(*relay_id, tenant, session);
+        }
+        self.forget_rehomes(tenant, session);
+        self.rehome_limiter.forget(tenant, session);
+        serving
+    }
+
+    /// Forgets every per-relay shell this setup holds for `relay`: its descriptor
+    /// outbox, its reap outbox, its load-state attestation channel, and the
+    /// registry's remembered process identity for the id.
+    ///
+    /// Reserved for a relay id that has been **permanently** retired — one the
+    /// ledger has tombstoned, so it can never enroll again. A relay that merely
+    /// lost its connection may legitimately reconnect under the same id and must
+    /// keep its state. Without this the per-relay maps grow one shell per relay id
+    /// for the coordinator's entire uptime — every launched task mints a fresh id,
+    /// so a long-running coordinator under steady scale-to-zero churn accumulates a
+    /// shell per task ever launched, and session cleanup that scans every relay's
+    /// state pays for all of that history on every session close.
+    ///
+    /// Presence is deliberately not cleared here: a presence entry is scoped to the
+    /// relay's control-connection generation and is dropped when that connection
+    /// ends, which necessarily precedes the id's retirement.
+    pub fn forget_relay(&self, relay: RelayId) {
+        self.descriptors.forget(relay);
+        self.reaps.forget(relay);
+        self.attest.forget(relay);
+        crate::registry::forget_boot_id(&self.registry, relay);
     }
 
     /// The per-session re-home rate limiter, so the api handler can charge a token

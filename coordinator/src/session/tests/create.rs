@@ -50,7 +50,7 @@ fn the_session_ceiling_refuses_fresh_creates_and_frees_on_close() {
     assert!(retry.replayed);
 
     // Closing the live session frees the capacity.
-    setup.forget_session_membership(&tid(), first.response.session);
+    setup.retire_session(&tid(), first.response.session);
     create_session(&setup, game("game-2"), ExpiresAt(u64::MAX)).unwrap();
 }
 
@@ -81,10 +81,10 @@ fn session_count_for_relay_counts_serving_memberships() {
     );
     assert_eq!(setup.session_count_for_relay(RelayId(2)), 0);
 
-    // Closing one session's membership drops relay 1's count.
-    setup.take_session_membership(&tid(), first.session);
+    // Closing one session drops relay 1's count.
+    setup.retire_session(&tid(), first.session);
     assert_eq!(setup.session_count_for_relay(RelayId(1)), 1);
-    setup.take_session_membership(&tid(), second.session);
+    setup.retire_session(&tid(), second.session);
     assert_eq!(setup.session_count_for_relay(RelayId(1)), 0);
 
     // A session served by two relays counts once against each home, not just

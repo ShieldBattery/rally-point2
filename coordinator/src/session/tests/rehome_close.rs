@@ -88,7 +88,7 @@ fn rehome_unavailable_when_the_named_relay_does_not_serve_the_session() {
 }
 
 #[test]
-fn forget_session_membership_retires_maps_and_refuses_rehome() {
+fn retiring_a_session_empties_its_maps_and_refuses_rehome() {
     // Retiring a closed session's membership must empty both `session_relays`
     // and `session_refs`, and — with no serving set left — turn any further
     // re-home ask into `Unavailable`, so a straggler cannot resurrect the game.
@@ -115,8 +115,7 @@ fn forget_session_membership_retires_maps_and_refuses_rehome() {
         RehomeOutcome::NewTarget(_),
     ));
 
-    setup.forget_session_membership(&tid(), resp.session);
-    setup.forget_rehomes(&tid(), resp.session);
+    setup.retire_session(&tid(), resp.session);
 
     assert!(
         setup.serving_relays(&tid(), resp.session).is_empty(),
@@ -204,10 +203,10 @@ fn a_rehome_racing_a_full_close_bails_without_recording_or_pushing() {
         Vec::new,
         || {
             // The concurrent full close clears the session's membership between the
-            // snapshot and the mutation (its forget_rehomes would block on the
-            // rehomes lock this rehome holds, so only membership is cleared here —
-            // faithfully modeling the race window).
-            setup.forget_session_membership(&tid(), resp.session);
+            // snapshot and the mutation. Only the membership take is run here: a
+            // full `retire_session` would block on the rehomes lock this rehome
+            // holds, and the take is the step that opens the race window anyway.
+            setup.take_session_membership(&tid(), resp.session);
         },
         |_| {},
     );
@@ -260,19 +259,14 @@ fn a_full_close_after_a_completed_rehome_clears_the_new_relays_descriptor_and_re
         "the completed rehome recorded an idempotency entry",
     );
 
-    // A full close, in the coordinator's take-first order: take the membership
-    // snapshot (it now includes relay 2), remove each taken relay's descriptor,
-    // then forget the recorded rehomes.
-    let taken = setup.take_session_membership(&tid(), resp.session);
+    // The real close path, which takes the membership snapshot first (it now
+    // includes relay 2), removes each taken relay's descriptor, and then clears
+    // the recorded rehomes.
     assert_eq!(
-        taken,
+        setup.retire_session(&tid(), resp.session),
         vec![RelayId(2)],
         "the taken snapshot includes the relay the completed rehome added",
     );
-    for relay_id in taken {
-        setup.descriptors().remove(relay_id, &tid(), resp.session);
-    }
-    setup.forget_rehomes(&tid(), resp.session);
 
     // The new relay's descriptor for the closed session is gone from its outbox,
     // and a relay resubscribing after the close is not re-synced it.

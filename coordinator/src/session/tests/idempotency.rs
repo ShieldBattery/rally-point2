@@ -94,7 +94,7 @@ fn a_closed_sessions_external_id_can_be_reused() {
 
     // The same retirement path a full close uses: membership (and, with
     // it, the idempotency entry) is taken.
-    setup.forget_session_membership(&tid(), first.session);
+    setup.retire_session(&tid(), first.session);
     assert!(
         !setup
             .create_idempotency

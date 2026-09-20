@@ -56,23 +56,12 @@ impl Lifecycle {
         // buffered job, then exits.
         drop(state);
         self.prune_dedup(&tenant, session);
-        // Retire any pending reap directives for the removed session (a webhook-only
-        // state normally has none, but this keeps the pending set bounded either way).
-        self.inner.setup.reaps().retire(&tenant, session);
         // A webhook-only state has no relay membership (this coordinator lifetime
-        // never created the session), so the take returns an empty serving set, the
-        // removal loop is empty, and forget_rehomes a harmless no-op. The steps run
-        // anyway in the same take-first order as `on_session_closed` above, so the two
-        // close paths stay uniform (see that path for why the take must come first).
-        let serving = self.inner.setup.take_session_membership(&tenant, session);
-        for relay_id in serving {
-            self.inner
-                .setup
-                .descriptors()
-                .remove(relay_id, &tenant, session);
-        }
-        self.inner.setup.forget_rehomes(&tenant, session);
-        self.inner.setup.rehome_limiter().forget(&tenant, session);
+        // never created the session), so the retirement finds nothing to take and
+        // every one of its steps is a no-op bar the pending-directive sweep. It runs
+        // anyway so both close paths retire through one implementation rather than
+        // two that can drift apart.
+        self.inner.setup.retire_session(&tenant, session);
         tracing::debug!(
             tenant = tenant.as_ref(),
             session = session.0,

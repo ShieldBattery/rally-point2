@@ -134,42 +134,12 @@ impl Lifecycle {
         }
         abort_timers(&state);
         // The session is done: drop its dedup entries so they don't accumulate for
-        // the process lifetime, and retire any pending reap directives so they are
-        // not replayed to a relay that reconnects after this.
+        // the process lifetime, then retire every map that still names the session —
+        // pending reap directives, membership, descriptors, recorded rehomes, and
+        // the re-home rate-limit bucket — in the one take-first order that is safe
+        // against a concurrent rehome (see `SessionSetup::retire_session`).
         self.prune_dedup(&tenant, session);
-        self.inner.setup.reaps().retire(&tenant, session);
-        // Take (remove-and-return) the session's relay membership FIRST, atomically
-        // with the serving-set snapshot, then drop each serving relay's descriptor
-        // and only afterward clear the recorded rehomes. Ordering matters against a
-        // concurrent `session::rehome`, which re-validates membership under the same
-        // `session_relays` lock this take acquires:
-        //
-        // - Once the membership is gone (after this take), any racing rehome fails
-        //   its under-lock re-validation: it can neither push a descriptor nor record
-        //   a rehome, so there is nothing of its left to clean up.
-        // - A rehome that completed BEFORE this take had already added its target
-        //   relay to the membership, so that relay is in `serving` here — the
-        //   descriptor removal below therefore covers the resumed descriptor it
-        //   pushed, and `forget_rehomes` (run after the take) clears the idempotency
-        //   entry it recorded.
-        //
-        // Every interleaving is thus covered. Removing the descriptor also stops a
-        // relay reconnecting after the close from being re-synced the dead session's
-        // stale descriptor and re-applying it — the relay-side reconciler only ends
-        // sessions ABSENT from the pushed set, so a present-but-dead descriptor would
-        // otherwise resurrect the session on that relay. Retiring the membership is
-        // also what makes every subsequent re-home ask honestly answer `Unavailable`
-        // (the empty serving set trips `session::rehome`'s guard), and dropping the
-        // rate-limit bucket keeps that map bounded by live sessions.
-        let serving = self.inner.setup.take_session_membership(&tenant, session);
-        for relay_id in serving {
-            self.inner
-                .setup
-                .descriptors()
-                .remove(relay_id, &tenant, session);
-        }
-        self.inner.setup.forget_rehomes(&tenant, session);
-        self.inner.setup.rehome_limiter().forget(&tenant, session);
+        self.inner.setup.retire_session(&tenant, session);
     }
 
     /// Enqueues a webhook onto the session's ordered dispatch queue, creating a

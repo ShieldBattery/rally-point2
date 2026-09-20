@@ -5,8 +5,9 @@
 - `mod.rs` — public surface + shared types (`SessionRefs`, `CreatedSession`,
   `CreateOutcome`, `RehomeOutcome`, `MAX_SLOT`). Everything else is a private
   submodule re-exported here, so `crate::session::X` paths never move.
-- `setup.rs` — `SessionSetup`: the registries, the per-session maps, and the
-  locking discipline every other file relies on.
+- `setup.rs` — `SessionSetup`: the registries, the per-session maps, the
+  locking discipline every other file relies on, and the two retirement
+  operations (`retire_session`, `forget_relay`).
 - `gate.rs` — create fingerprinting + the provisioning gate (warm store, hold cap).
 - `create.rs` / `placement.rs` — the create body and where each slot homes.
 - `rehome.rs` — failover off a relay, and the resumed-descriptor refresh.
@@ -18,6 +19,12 @@
   terminal close all take it, and every fine lock (`session_relays`, registry,
   descriptor outbox, `rehomes`) nests under it. Never take it while holding one
   of those, and never hold it across an await.
+- `retire_session` is the only way a session's state goes away: pending reap
+  directives, membership, descriptors, recorded rehomes, and the re-home bucket,
+  in that order. The membership **take** must stay first — it is what a racing
+  `rehome` re-validates against. Both lifecycle close paths call it, so a new map
+  keyed by session belongs inside it, not at a call site. `forget_relay` is its
+  per-relay twin and is only safe for a ledger-tombstoned id.
 - `rehome_inner` re-validates membership *under the `session_relays` lock* after
   picking a replacement. Drop that re-read and a close racing mid-rehome leaves a
   recorded rehome or a resumed descriptor for a dead session.

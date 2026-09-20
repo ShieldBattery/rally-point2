@@ -207,28 +207,18 @@ impl<P: Provisioner> ProvisionLoop<P> {
     }
 
     /// Retires `relay_id` in the ledger — the tombstone that refuses the id from
-    /// ever enrolling again — and, only once that succeeds, forgets its descriptor
-    /// and reap outbox shells too.
+    /// ever enrolling again — and, only once that succeeds, forgets every per-relay
+    /// shell the setup still holds for it.
     ///
     /// The ledger tombstone is what makes the forget safe: every one of this
     /// method's callers reaches it only for an id that will never enroll again (a
     /// drained, expired, or vanished relay), never for a live relay that merely
-    /// lost its connection and might reconnect under the same id. Without this, the
-    /// two outboxes grow one shell per relay id for the coordinator's entire
-    /// uptime — every Fargate task launched mints a fresh id, so a long-running
-    /// coordinator under steady scale-to-zero churn accumulates a shell per task
-    /// ever launched, and session cleanup that scans every relay's state
-    /// (`RelayReaps::retire`) pays for all of that history on every session close.
-    /// The registry's remembered process identity for the id is bounded the same
-    /// way and by the same argument. Skipped when the ledger write itself fails: an
-    /// untombstoned id might still legitimately enroll, so its state must stay live
-    /// for that possibility.
+    /// lost its connection and might reconnect under the same id. Skipped when the
+    /// ledger write itself fails: an untombstoned id might still legitimately
+    /// enroll, so its state must stay live for that possibility.
     pub(super) fn retire_relay(&self, relay_id: RelayId) -> Result<(), crate::ledger::LedgerError> {
         self.ledger.retire(relay_id)?;
-        self.setup.descriptors().forget(relay_id);
-        self.setup.reaps().forget(relay_id);
-        self.setup.attest().forget(relay_id);
-        registry::forget_boot_id(self.setup.registry(), relay_id);
+        self.setup.forget_relay(relay_id);
         Ok(())
     }
 }
