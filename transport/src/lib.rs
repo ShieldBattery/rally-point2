@@ -30,7 +30,7 @@
 //! that latency is the trade.
 //!
 //! The redundancy/ack logic is ported from the proven implementation in
-//! `shieldbattery/game/src/netcode/`: [`sequence_buffer`] carries over essentially
+//! `shieldbattery/game/src/netcode/`: `sequence_buffer` carries over essentially
 //! verbatim, while [`ack_manager`] is *re-derived* for our message shapes. It
 //! keeps the original's independent per-payload `seq` as the dedup/ack key —
 //! `game_frame_count` rides inside each payload as the consensus coordinate
@@ -45,7 +45,7 @@ pub mod ack_manager;
 pub mod link;
 pub mod mesh_link;
 pub mod quic;
-pub mod sequence_buffer;
+pub(crate) mod sequence_buffer;
 
 pub use ack_manager::{AckError, AckManager, GUARANTEED_DATAGRAM_BUDGET};
 pub use link::{Link, LinkError, RECEIVE_WINDOW, Received};
