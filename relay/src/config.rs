@@ -97,7 +97,7 @@ fn read_pem_input(input: &str, label: &str) -> color_eyre::Result<Vec<u8>> {
 
 /// A tenant verifying key registered on the relay, plus (when generated) the
 /// PKCS#8 private key a client can use to mint tokens for loopback.
-pub struct TenantKey {
+pub struct TenantKeyMaterial {
     /// The kid naming this key in the registry.
     pub kid: KeyId,
     /// The tenant id bound to this key.
@@ -117,13 +117,13 @@ pub fn tenant_key_from_pubkey(
     kid: String,
     tenant: String,
     pubkey_hex: &str,
-) -> color_eyre::Result<TenantKey> {
+) -> color_eyre::Result<TenantKeyMaterial> {
     let bytes = hex::decode(pubkey_hex)
         .map_err(|e| color_eyre::eyre::eyre!("decoding tenant pubkey hex: {e}"))?;
     let verifying_key: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
         color_eyre::eyre::eyre!("tenant pubkey must be 32 bytes, got {}", bytes.len())
     })?;
-    Ok(TenantKey {
+    Ok(TenantKeyMaterial {
         kid: KeyId(kid),
         tenant: TenantId::new(tenant)
             .map_err(|e| color_eyre::eyre::eyre!("tenant id too long (max 255 bytes): {e}"))?,
@@ -135,7 +135,10 @@ pub fn tenant_key_from_pubkey(
 /// Generates a dev tenant keypair: registers the public key, and returns the
 /// PKCS#8 private key so a client can mint tokens for loopback. The
 /// relay itself only keeps the public half.
-pub fn generate_dev_tenant_key(kid: String, tenant: String) -> color_eyre::Result<TenantKey> {
+pub fn generate_dev_tenant_key(
+    kid: String,
+    tenant: String,
+) -> color_eyre::Result<TenantKeyMaterial> {
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng)
         .map_err(|e| color_eyre::eyre::eyre!("generating tenant key: {e}"))?;
@@ -143,7 +146,7 @@ pub fn generate_dev_tenant_key(kid: String, tenant: String) -> color_eyre::Resul
         .map_err(|e| color_eyre::eyre::eyre!("loading generated tenant key: {e}"))?;
     let verifying_key: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
 
-    Ok(TenantKey {
+    Ok(TenantKeyMaterial {
         kid: KeyId(kid),
         tenant: TenantId::new(tenant)
             .map_err(|e| color_eyre::eyre::eyre!("tenant id too long (max 255 bytes): {e}"))?,
@@ -153,7 +156,7 @@ pub fn generate_dev_tenant_key(kid: String, tenant: String) -> color_eyre::Resul
 }
 
 /// Builds a `Registry` from a tenant verifying key.
-pub fn registry_from_tenant_key(key: &TenantKey) -> Registry {
+pub fn registry_from_tenant_key(key: &TenantKeyMaterial) -> Registry {
     let mut registry = Registry::new();
     registry.insert(key.kid.clone(), key.tenant.clone(), key.verifying_key);
     registry
