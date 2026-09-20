@@ -12,13 +12,13 @@ use crate::consensus::MAX_GAME_RESULT_PAYLOAD_LEN;
 /// The channel sink delivering payloads to one slot's link task.
 type ForwardTx = mpsc::Sender<Payload>;
 
-/// The bytes a queued payload counts against a slot's resident forward budget.
-/// Only the command stream varies in size; the envelope's fixed fields are
-/// negligible and constant, so — like the per-turn oversize cap — the measure is
-/// the command length. The enqueue reservation and the drain release share this
-/// one definition so they can never disagree on a payload's cost.
+/// The bytes a queued payload counts against a slot's resident forward budget:
+/// the same command-length measure every turn bound on this relay uses (see
+/// [`crate::session::payload_command_bytes`]), charged with no envelope
+/// allowance. The enqueue reservation and the drain release both go through
+/// here, so they can never disagree on a payload's cost.
 fn forward_bytes(payload: &Payload) -> usize {
-    payload.commands.len()
+    crate::session::payload_command_bytes(payload)
 }
 
 /// The outcome of offering a payload to a slot's [`ForwardSink`].

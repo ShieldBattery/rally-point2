@@ -253,12 +253,22 @@ const AGGREGATE_TURN_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 /// the journal's worst-case footprint near 100 MiB, finite by construction.
 const MAX_JOURNALED_SESSIONS: usize = 4096;
 
-/// The accounting size of one journaled entry: a turn's command bytes plus a
-/// flat allowance for the envelope; departures (tiny, per-slot-deduped)
-/// count nothing — see [`ProvisionalTurnPen::hold`] for why they are exempt.
+/// The flat per-turn allowance the journal adds to a payload's command bytes.
+/// Unlike the forward queue and the replay ring, the journal retains a whole
+/// ingress record — the payload plus its routing envelope — and holds it for as
+/// long as a descriptor takes to arrive, so it charges for that wrapper too. A
+/// generous round number rather than a measurement of the encoding: the point
+/// is that a flood of empty turns cannot look free.
+const JOURNAL_ENVELOPE_BYTES: usize = 64;
+
+/// The accounting size of one journaled entry: the shared command-byte measure
+/// plus [`JOURNAL_ENVELOPE_BYTES`]; departures (tiny, per-slot-deduped) count
+/// nothing — see [`ProvisionalTurnPen::hold`] for why they are exempt.
 fn entry_turn_bytes(entry: &PennedIngress) -> usize {
     match entry {
-        PennedIngress::Turn(_, payload) => payload.commands.len() + 64,
+        PennedIngress::Turn(_, payload) => {
+            super::payload_command_bytes(payload) + JOURNAL_ENVELOPE_BYTES
+        }
         PennedIngress::Departure { .. } => 0,
     }
 }

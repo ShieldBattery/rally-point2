@@ -185,10 +185,11 @@ struct SessionRing {
 }
 
 impl SessionRing {
-    /// The command-byte cost the ring charges for one turn — the payload's command
-    /// length, the only part that varies materially in size.
+    /// The cost the ring charges for one turn: the shared command-byte measure
+    /// (see [`super::payload_command_bytes`]), with no envelope allowance — the
+    /// ring holds the payload itself and nothing around it.
     fn cost(payload: &Payload) -> usize {
-        payload.commands.len()
+        super::payload_command_bytes(payload)
     }
 
     /// Records `payload` (tagged with where it came from), re-derives the bounds
