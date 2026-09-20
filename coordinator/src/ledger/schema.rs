@@ -1,12 +1,12 @@
 //! Schema versioning and migration, plus the small storage-adjacent helpers
-//! every ledger method leans on: row parsing, the fail-closed clock read, the
-//! token digest/compare, and the SQLite `INTEGER` <-> `u64` reinterpretation.
+//! every ledger method leans on: row parsing, the token digest/compare, and the
+//! SQLite `INTEGER` <-> `u64` reinterpretation.
 //! Grouped here because none of it is enrollment *policy* — `mod.rs` decides
 //! what an enroll means; this file is just how a row gets in and out of SQLite.
 
 use std::net::IpAddr;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::RegionId;
@@ -165,17 +165,6 @@ pub(super) fn parse_expected_ips(stored: Option<&str>) -> Result<Vec<IpAddr>, Le
         .map(|s| s.parse::<IpAddr>())
         .collect::<Result<Vec<_>, _>>()?;
     Ok(ips)
-}
-
-/// The current Unix time in seconds, **failing closed**: a pre-epoch or errored
-/// system clock yields `u64::MAX`, so any expiry comparison against it reads as
-/// "expired" and refuses rather than admitting a token whose age cannot be
-/// trusted.
-pub(super) fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX)
 }
 
 /// The SHA-256 digest of `bytes` — the form the ledger stores a token in and

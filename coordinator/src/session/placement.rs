@@ -113,17 +113,6 @@ pub(super) fn hold_pending_create(
     }
 }
 
-/// The current Unix time in seconds, **failing closed**: a pre-epoch or errored
-/// clock yields `u64::MAX`, which the hold logic treats as an unusable clock and
-/// declines to hold on, so a broken clock releases a create to fallback instead of
-/// wedging it.
-pub(super) fn now_unix_secs_fail_closed() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX)
-}
-
 /// Region-aware placement: home each slot on a live relay in the region it
 /// requested, falling back to the region-blind pick (the lowest-id available
 /// relay overall) for a slot that named no region, or whose region has no live

@@ -4,12 +4,13 @@
 //! sources, the descriptor delta/full-set decision, reap coalescing, and the
 //! per-send stall bound that tears down a relay which reads nothing.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::ws::Message;
 use futures_util::SinkExt;
 use rally_point_proto::control::{CoordinatorToRelay, DescriptorKey, SessionDescriptor};
 use rally_point_proto::ids::RelayId;
+use rally_point_proto::time::unix_millis;
 use rally_point_proto::version::ProtocolVersion;
 
 use crate::descriptors::SlotClose;
@@ -310,15 +311,6 @@ fn control_frame(message: &CoordinatorToRelay) -> Message {
     Message::Text(json.into())
 }
 
-/// Wall clock as unix epoch milliseconds — the staging stamp a descriptor push
-/// carries so the relay can measure its apply lag.
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 /// Builds a `Descriptors` control frame, stamping the coordinator's wall-clock at
 /// the moment the set snapshot leaves the outbox so the relay can measure how far
 /// its apply lags staging. Called at each `borrow_and_update` site — the
@@ -327,7 +319,7 @@ fn now_unix_ms() -> u64 {
 fn descriptors_frame(descriptors: Vec<SessionDescriptor>) -> Message {
     control_frame(&CoordinatorToRelay::Descriptors {
         descriptors,
-        staged_at_unix_ms: Some(now_unix_ms()),
+        staged_at_unix_ms: Some(unix_millis()),
     })
 }
 
@@ -377,7 +369,7 @@ async fn send_descriptor_change(
     let upsert_count = upserts.len();
     let removal_count = removals.len();
     let frame = control_frame(&CoordinatorToRelay::DescriptorDelta {
-        staged_at_unix_ms: Some(now_unix_ms()),
+        staged_at_unix_ms: Some(unix_millis()),
         upserts,
         removals,
     });

@@ -4,13 +4,14 @@
 //! delivered (or gives up), reusing [`super::WEBHOOK_CLIENT`] and
 //! [`super::DISPATCH_PERMITS`] across every notice kind and every tenant.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use rally_point_proto::control::TenantId;
+use rally_point_proto::time::unix_millis;
 
 use super::*;
 use crate::tenant::{self, NotifyConfig, TenantStore};
@@ -204,10 +205,7 @@ fn build_request(
     config: &NotifyConfig,
     body: Bytes,
 ) -> Result<Option<hyper::Request<Full<Bytes>>>, hyper::http::Error> {
-    let timestamp_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
+    let timestamp_ms = unix_millis();
     let timestamp = timestamp_ms.to_string();
 
     let mut message =

@@ -3,9 +3,9 @@
 //! `render_*`/`write_*`/`escape_*` helper below does one piece of that formatting.
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rally_point_proto::control::{RegionId, TenantId};
+use rally_point_proto::time::unix_secs_fail_closed;
 
 use super::instruments::LabeledCounter;
 use super::{
@@ -22,7 +22,9 @@ use std::sync::atomic::Ordering;
 
 /// Renders the full metrics exposition for `state`.
 pub fn render(state: &CoordinatorState) -> String {
-    let now = unix_now();
+    // `u64::MAX` on an unusable clock — the sentinel the launching-relay count is
+    // skipped on, matching the ledger's own fail-closed clock convention.
+    let now = unix_secs_fail_closed();
     let census = state.lifecycle.metrics_census();
     let mut out = String::new();
 
@@ -544,14 +546,4 @@ pub(super) fn escape_label_value_into(out: &mut String, value: &str) {
             other => out.push(other),
         }
     }
-}
-
-/// The current Unix time in seconds, `u64::MAX` on a pre-epoch or errored clock —
-/// the sentinel the launching-relay count is skipped on, matching the ledger's own
-/// fail-closed clock convention.
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX)
 }

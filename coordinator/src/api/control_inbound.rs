@@ -5,7 +5,7 @@
 //! heartbeat's vectors are bounded against, the backbone-RTT ingest, and the
 //! serving-set check that stops one relay reporting in another's name.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use axum::extract::ws::Message;
 use futures_util::StreamExt;
@@ -13,6 +13,7 @@ use rally_point_proto::control::{
     CoordinatorToRelay, RegionId, RegionRttReport, RelayToCoordinator, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::time::unix_secs_fail_open;
 
 use crate::ledger::RelayLedger;
 use crate::notify;
@@ -133,10 +134,7 @@ pub(super) fn ingest_region_rtts(
         }
         return;
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = unix_secs_fail_open();
     for report in reports {
         if !rtt.regions.contains(&report.region) {
             tracing::debug!(

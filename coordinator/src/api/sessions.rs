@@ -5,8 +5,6 @@
 //! holds live state for. Grouped because all three operate on the coordinator's
 //! session assignment + lifecycle accounting rather than on read-only views.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use axum::{
     Json,
     body::Bytes,
@@ -18,6 +16,7 @@ use rally_point_proto::control::{
     RegionId, RelayEndpoint, SessionRequest, SessionResponse, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::time::unix_secs_fail_open;
 use serde::{Deserialize, Serialize};
 
 use crate::registry;
@@ -88,10 +87,10 @@ pub(super) async fn create_session(
         .map(|p| p.slot)
         .collect();
 
-    let now_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // A pre-epoch clock reads as `0` here, which mints a token that is already
+    // expired — the refusing direction. Reading `u64::MAX` instead would saturate
+    // the expiry and hand out a token that never expires.
+    let now_unix = unix_secs_fail_open();
     let expires_at = rally_point_proto::token::ExpiresAt(
         now_unix.saturating_add(state.player_token_lifetime.as_secs()),
     );

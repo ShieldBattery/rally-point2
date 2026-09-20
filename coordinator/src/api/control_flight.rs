@@ -7,10 +7,11 @@
 //! connection, alongside the snapshot fold that resolves a pending read.
 
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use rally_point_proto::control::{CoordinatorToRelay, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::time::unix_secs_fail_open;
 
 use crate::flight_store::{self, S3FlightStore};
 use crate::notify;
@@ -349,10 +350,9 @@ pub(super) fn handle_load_state_snapshot(
 /// store config should see it, without one log line per dropped recording. A racing pair
 /// of warns is harmless (the store/load is best-effort, not a lock).
 fn warn_no_flight_store(relay_id: RelayId) {
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    // `0` on a pre-epoch clock, which merely suppresses this one warn; reading
+    // `u64::MAX` would latch the stored stamp and silence the warning for good.
+    let now_secs = unix_secs_fail_open();
     let last = LAST_NO_STORE_WARN_SECS.load(std::sync::atomic::Ordering::Relaxed);
     if now_secs.saturating_sub(last) < NO_STORE_WARN_INTERVAL_SECS {
         return;

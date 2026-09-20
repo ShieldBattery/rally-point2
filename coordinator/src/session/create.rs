@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 
 use rally_point_proto::control::{PlayerToken, SessionRequest, SessionResponse};
 use rally_point_proto::ids::SessionId;
+use rally_point_proto::time::unix_secs_fail_closed;
 use rally_point_proto::token::ExpiresAt;
 
 use crate::registry::SessionSetupError;
@@ -14,10 +15,7 @@ use crate::tenant;
 
 use super::descriptor::{descriptor_for, relay_region_labels};
 use super::gate::{CachedCreate, CreateFingerprint};
-use super::placement::{
-    Placement, hold_pending_create, now_unix_secs_fail_closed, place_by_region,
-    unlit_requested_regions,
-};
+use super::placement::{Placement, hold_pending_create, place_by_region, unlit_requested_regions};
 use super::setup::SessionSetup;
 use super::{CreateOutcome, CreatePolicy, CreatedSession, MAX_SLOT, SessionRefs};
 
@@ -118,7 +116,9 @@ pub fn create_or_provision_session(
     request: SessionRequest,
     expires_at: ExpiresAt,
 ) -> Result<CreateOutcome, SessionSetupError> {
-    create_or_provision_session_at(setup, request, expires_at, now_unix_secs_fail_closed())
+    // A `u64::MAX` clock read is what the hold logic treats as unusable: it declines
+    // to hold, releasing the create to fallback instead of wedging it.
+    create_or_provision_session_at(setup, request, expires_at, unix_secs_fail_closed())
 }
 
 /// [`create_or_provision_session`] with the hold-cap clock supplied, so a test can

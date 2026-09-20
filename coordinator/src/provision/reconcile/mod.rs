@@ -40,10 +40,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rally_point_proto::control::RegionId;
 use rally_point_proto::ids::RelayId;
+use rally_point_proto::time::unix_secs_fail_closed;
 
 use super::{LaunchSpec, Provisioner, TaskId, TaskState, WarmTargets};
 use crate::ledger::RelayLedger;
@@ -247,7 +248,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
-            let now = now_unix_secs();
+            let now = unix_secs_fail_closed();
             if now == u64::MAX {
                 tracing::warn!("system clock is unusable; skipping this provisioning tick");
                 continue;
@@ -295,13 +296,6 @@ impl<P: Provisioner> ProvisionLoop<P> {
         self.vanished_task_sweep().await;
         self.orphan_sweep().await;
     }
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(u64::MAX)
 }
 
 mod scaling;

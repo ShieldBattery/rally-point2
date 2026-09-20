@@ -49,6 +49,7 @@ use base64::Engine as _;
 use parking_lot::Mutex;
 use rally_point_proto::control::RegionId;
 use rally_point_proto::ids::RelayId;
+use rally_point_proto::time::unix_secs_fail_closed;
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -58,7 +59,7 @@ mod schema;
 
 use schema::{
     LedgerRow, TOKEN_BYTES, as_i64, as_u64, constant_time_eq, parse_expected_ips,
-    row_to_provisioned_task, sha256, unix_now,
+    row_to_provisioned_task, sha256,
 };
 // Test-only: not needed by this file's own code, only by `tests`' `use
 // super::*;` picking them up the same way it would if this were still one
@@ -193,14 +194,14 @@ impl RelayLedger {
         region: Option<&RegionId>,
         token_ttl: Duration,
     ) -> Result<Minted, LedgerError> {
-        self.mint_at(unix_now(), region, token_ttl)
+        self.mint_at(unix_secs_fail_closed(), region, token_ttl)
     }
 
     /// [`mint`](Self::mint) with the launch instant supplied, so tests can pin
     /// the token's expiry deterministically.
     ///
     /// Fails closed on an unusable clock: `now` of `u64::MAX` (what
-    /// [`unix_now`] yields pre-epoch or on error) would store an expiry that
+    /// [`unix_secs_fail_closed`] yields pre-epoch or on error) would store an expiry that
     /// reads back as "never expires" — a token minted from a clock that cannot
     /// be trusted must not outlive every deadline, so it is not minted at all.
     pub(crate) fn mint_at(
@@ -253,7 +254,13 @@ impl RelayLedger {
         token: Option<&str>,
         peer_ip: Option<IpAddr>,
     ) -> Result<Authorized, EnrollRefusal> {
-        self.authorize_enroll_at(unix_now(), relay_id, cert_fingerprint, token, peer_ip)
+        self.authorize_enroll_at(
+            unix_secs_fail_closed(),
+            relay_id,
+            cert_fingerprint,
+            token,
+            peer_ip,
+        )
     }
 
     /// [`authorize_enroll`](Self::authorize_enroll) with the current time
@@ -323,7 +330,8 @@ impl RelayLedger {
                 let Some(token) = token else {
                     return Err(EnrollRefusal::TokenRequired);
                 };
-                // Fail closed on a broken clock: `unix_now` is `u64::MAX` on a
+                // Fail closed on a broken clock: the caller's clock read is
+                // `u64::MAX` on a
                 // pre-epoch or errored system clock, so a token whose age cannot
                 // be trusted is refused rather than read as still valid.
                 if now > as_u64(row.token_expires_at) {
@@ -369,7 +377,7 @@ impl RelayLedger {
     /// Idempotent: retiring an already-retired (or unknown) id is a harmless
     /// no-op that leaves the original tombstone in place.
     pub fn retire(&self, relay_id: RelayId) -> Result<(), LedgerError> {
-        let now = unix_now();
+        let now = unix_secs_fail_closed();
         let conn = self.conn.lock();
         conn.execute(
             "UPDATE provisioned_relays SET retired_at = ?1

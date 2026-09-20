@@ -5,11 +5,10 @@
 //! call, so a tenant-authenticated endpoint cannot be wired up without choosing
 //! which tenant states may reach it.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header::AUTHORIZATION};
 use rally_point_proto::control::TenantId;
 use rally_point_proto::request_auth;
+use rally_point_proto::time::unix_secs_fail_closed;
 use ring::signature::{ED25519, UnparsedPublicKey};
 
 use crate::session::SessionSetup;
@@ -136,10 +135,7 @@ pub(super) fn verify_tenant_request(
         .and_then(|value| value.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let ts_secs: u64 = timestamp.parse().map_err(|_| StatusCode::UNAUTHORIZED)?;
-    let now_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now_secs = unix_secs_fail_closed();
     if now_secs.abs_diff(ts_secs) > REQUEST_TIMESTAMP_WINDOW_SECS {
         return Err(StatusCode::UNAUTHORIZED);
     }

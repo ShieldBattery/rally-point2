@@ -14,10 +14,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::RegionId;
+use rally_point_proto::time::unix_secs_fail_open;
 
 /// The relay count a region demands while it is warm. Warm demand is binary
 /// today — a region is warm or it is not — so warming a region asks for one relay;
@@ -51,7 +52,7 @@ impl WarmTargets {
     /// (Re-)warms `region`: sets its demand and extends its deadline to `ttl` from
     /// now. Called again before the TTL elapses to hold a region warm.
     pub fn warm(&self, region: RegionId, ttl: Duration) {
-        self.warm_at(region, ttl, now_unix_secs());
+        self.warm_at(region, ttl, unix_secs_fail_open());
     }
 
     /// [`warm`](Self::warm) with the current time supplied, so a test can pin the
@@ -71,7 +72,7 @@ impl WarmTargets {
     /// demand is live, or `0` once the deadline has passed (or the region was
     /// never warmed).
     pub fn target(&self, region: &RegionId) -> u32 {
-        self.target_at(region, now_unix_secs())
+        self.target_at(region, unix_secs_fail_open())
     }
 
     /// [`target`](Self::target) with the current time supplied, so a tick can be
@@ -82,18 +83,6 @@ impl WarmTargets {
             _ => 0,
         }
     }
-}
-
-/// The current Unix time in seconds — the store's clock for warm deadlines. A
-/// pre-epoch or errored clock yields `0`, which makes every stored deadline read
-/// as still in the future; warm demand erring toward *keeping* a relay is the
-/// safe direction (it never strands players on a clock fault), and the reconcile
-/// loop skips its tick outright on an unusable clock anyway.
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
