@@ -2,7 +2,7 @@
 //! driver's half of the game seam, the per-session state that must survive a
 //! reconnect, the connectivity-epoch fence, and the retention ring's bookkeeping.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -14,6 +14,8 @@ use tokio::time::Instant;
 
 use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
+
+use super::reorder::SlotReorder;
 
 use super::{
     CHAT_CHANNEL_CAPACITY, ChatOut, DriverTiming, GAME_STARTED_CHANNEL_CAPACITY,
@@ -232,17 +234,11 @@ impl GameSeam {
 /// The driver state that must persist across a reconnect so a re-dialed session
 /// resumes rather than restarts.
 pub(super) struct LoopState {
-    /// Per peer slot, the lowest seq not yet handed to the game — the reorder
-    /// cursor. This *is* the authoritative per-slot delivery high-water mark: it is
-    /// the top of the contiguous run delivered to the game, and thus the "next
-    /// needed" seq presented as the resume cursor on a reconnect, so the relay
-    /// replays exactly the turns missed and the reorder buffer/dedup absorb any
-    /// overlap the replay carries.
-    pub(super) next_seq: HashMap<SlotId, u64>,
-    /// Per peer slot, turns that arrived ahead of `next_seq`, held until the gap
-    /// below them fills. Preserved across a reconnect so turns received but not yet
-    /// released aren't re-asked-for or lost.
-    pub(super) pending: HashMap<SlotId, BTreeMap<u64, Payload>>,
+    /// Turns received but not yet handed to the game, held per slot until they
+    /// can be released in seq order, and the per-slot delivery cursor a resume
+    /// is read back from. Preserved across a reconnect so turns received but
+    /// not yet released aren't re-asked-for or lost.
+    pub(super) reorder: SlotReorder,
     /// The client's own outbound payload seq counter. An origin identity every hop
     /// honors, so it is monotonic across reconnects and never rewinds.
     pub(super) next_outbound_seq: u64,
@@ -319,8 +315,7 @@ pub(super) struct LoopState {
 impl LoopState {
     pub(super) fn new(result_expected: Arc<AtomicBool>, timing: DriverTiming) -> Self {
         Self {
-            next_seq: HashMap::new(),
-            pending: HashMap::new(),
+            reorder: SlotReorder::default(),
             next_outbound_seq: 0,
             announcer: LeaveAnnouncer::new(result_expected),
             outbound_buffer: VecDeque::new(),

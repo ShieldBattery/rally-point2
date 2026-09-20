@@ -66,8 +66,7 @@ impl LinkDriver {
         // and any turns buffered during a prior outage all persist across a
         // reconnect, so they come from the caller's state, not fresh locals.
         let LoopState {
-            next_seq,
-            pending,
+            reorder,
             next_outbound_seq,
             announcer,
             outbound_buffer,
@@ -311,8 +310,7 @@ impl LinkDriver {
                         &mut beacon_send,
                         &mut beacon_writer,
                         &mut acks_owed,
-                        next_seq,
-                        pending,
+                        reorder,
                         inbound,
                         outbound,
                         announcer,
@@ -332,8 +330,7 @@ impl LinkDriver {
                         &mut control_send,
                         &mut beacon_send,
                         &mut beacon_writer,
-                        next_seq,
-                        pending,
+                        reorder,
                         inbound,
                         leaves,
                         lobby_in,

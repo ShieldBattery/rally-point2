@@ -3,7 +3,7 @@
 //! through one ordered per-slot release, so a turn is delivered the same way
 //! whichever path brought it.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{LeaveDirective, Payload};
@@ -20,7 +20,8 @@ use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
 
 use super::backoff::{GamePush, push_to_game};
-use super::send::{Release, flush_delivered_cursors, release_ready, window_cap_error};
+use super::reorder::{Release, SlotReorder};
+use super::send::{flush_delivered_cursors, window_cap_error};
 use super::session::ArmFlow;
 use super::state::{ConnectivityEpochStates, admit_connectivity_epoch};
 use super::{ChatOut, DriverError};
@@ -37,8 +38,7 @@ use super::{ChatOut, DriverError};
 /// would deliver it twice.
 pub(super) fn ingest_fresh_turns(
     fresh: Vec<Payload>,
-    next_seq: &mut HashMap<SlotId, u64>,
-    pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
+    reorder: &mut SlotReorder,
     inbound: &mpsc::Sender<Payload>,
 ) -> Release {
     for payload in fresh {
@@ -49,16 +49,9 @@ pub(super) fn ingest_fresh_turns(
             );
             continue;
         };
-        let slot = SlotId(slot_id);
-        let slot_next = next_seq.entry(slot).or_insert(0);
-        if payload.seq >= *slot_next {
-            pending
-                .entry(slot)
-                .or_default()
-                .insert(payload.seq, payload);
-        }
+        reorder.observe(SlotId(slot_id), payload);
     }
-    release_ready(next_seq, pending, inbound)
+    reorder.release_into(inbound)
 }
 
 /// One packet the link received: fold its acks in, buffer its fresh turns by
@@ -74,8 +67,7 @@ pub(super) async fn on_received(
     beacon_send: &mut noq::SendStream,
     beacon_writer: &mut BeaconWriter,
     acks_owed: &mut bool,
-    next_seq: &mut HashMap<SlotId, u64>,
-    pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
+    reorder: &mut SlotReorder,
     inbound: &mpsc::Sender<Payload>,
     outbound: &mpsc::Receiver<Payload>,
     announcer: &mut LeaveAnnouncer,
@@ -97,12 +89,12 @@ pub(super) async fn on_received(
     if received.carried_payloads {
         *acks_owed = true;
     }
-    match ingest_fresh_turns(received.fresh, next_seq, pending, inbound) {
+    match ingest_fresh_turns(received.fresh, reorder, inbound) {
         Release::Delivered => {}
         Release::GameClosed => return ArmFlow::Teardown,
         Release::GameStalled => return ArmFlow::End(Err(DriverError::GameStalled)),
     }
-    flush_delivered_cursors(link, beacon_send, beacon_writer, next_seq).await;
+    flush_delivered_cursors(link, beacon_send, beacon_writer, reorder).await;
     if let Some(error) = window_cap_error(link) {
         return ArmFlow::End(Err(error));
     }
@@ -137,8 +129,7 @@ pub(super) async fn on_control_frame(
     control_send: &mut noq::SendStream,
     beacon_send: &mut noq::SendStream,
     beacon_writer: &mut BeaconWriter,
-    next_seq: &mut HashMap<SlotId, u64>,
-    pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
+    reorder: &mut SlotReorder,
     inbound: &mpsc::Sender<Payload>,
     leaves: &mpsc::Sender<LeaveDirective>,
     lobby_in: &mpsc::Sender<(SlotId, Vec<u8>)>,
@@ -470,17 +461,13 @@ pub(super) async fn on_control_frame(
                 Err(error) => return ArmFlow::End(Err(DriverError::from(error))),
             };
             if fresh {
-                next_seq.entry(slot).or_insert(0);
-                pending
-                    .entry(slot)
-                    .or_default()
-                    .insert(payload.seq, payload);
-                match release_ready(next_seq, pending, inbound) {
+                reorder.observe(slot, payload);
+                match reorder.release_into(inbound) {
                     Release::Delivered => {}
                     Release::GameClosed => return ArmFlow::Teardown,
                     Release::GameStalled => return ArmFlow::End(Err(DriverError::GameStalled)),
                 }
-                flush_delivered_cursors(link, beacon_send, beacon_writer, next_seq).await;
+                flush_delivered_cursors(link, beacon_send, beacon_writer, reorder).await;
             }
         }
         // The reader task ended: a one-sided stream reset, an

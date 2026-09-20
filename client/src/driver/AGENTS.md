@@ -9,7 +9,9 @@
   `run` / `run_reconnecting` / `session`: who owns closing the connection.
 - `session.rs` — one connection's setup, the `select!` loop, and `ArmFlow`.
 - `inbound.rs` / `outbound.rs` — the extracted `select!` arm bodies (relay → game, game → relay).
-- `send.rs` — one turn's wire handoff, packet send, ordered release to the game.
+- `send.rs` — one turn's wire handoff, packet send, the delivered-through cursor push.
+- `reorder.rs` — `SlotReorder`: the per-slot ordered-release buffer and the delivery
+  cursor a resume is read back from.
 - `state.rs` — `GameSeam` (and the one place both halves of the seam's channels are wired),
   `LoopState`, the connectivity-epoch fence, retention bookkeeping.
 - `reconnect.rs` / `retention.rs` — re-dial + escalation; what a resume re-sends and how it anchors.

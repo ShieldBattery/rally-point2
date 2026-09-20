@@ -3,14 +3,12 @@
 //! with, and the loop that retries the same relay and escalates to
 //! coordinator-mediated failover when it stays unreachable.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rally_point_proto::ids::SlotId;
 use rally_point_transport::Link;
 use tokio::time::Instant;
 
@@ -152,18 +150,6 @@ pub(super) struct ReconnectDriver {
     pub(super) escalate_retry: Duration,
 }
 
-/// The per-slot resume cursors to present on a reconnect: for each peer slot the
-/// driver has received from, the seq it next needs (`next_seq`). The relay replays
-/// every recorded turn at or past the cursor and nothing below it, and the client's
-/// dedup absorbs any overlap. A peer this driver has never received a turn from has
-/// no cursor to state, so it is simply absent — and the relay replays such a slot
-/// from the start of what it still holds, which is what un-wedges a client that
-/// dropped before a peer's first turn ever reached it. The dedup absorbs that
-/// overlap the same way, so an empty map is a valid ask, not a request for nothing.
-pub(super) fn resume_cursors(next_seq: &HashMap<SlotId, u64>) -> Vec<(SlotId, u64)> {
-    next_seq.iter().map(|(&slot, &next)| (slot, next)).collect()
-}
-
 /// Whether a session ended on a link/stream failure the reconnect loop should
 /// re-dial through, as opposed to a terminal condition (a stalled game, an
 /// exhausted window, a relay refusal) reconnecting cannot fix.
@@ -249,7 +235,7 @@ pub(super) async fn reconnect_link(
                 });
             }
         }
-        let cursors = resume_cursors(&state.next_seq);
+        let cursors = state.reorder.cursors();
         // The relay builds a brand-new receive dedup on *every* re-dial (a fresh
         // `Link` per connection), so a same-relay resume must anchor our own slot's
         // window too — otherwise a game past ~4096 turns re-dials into an

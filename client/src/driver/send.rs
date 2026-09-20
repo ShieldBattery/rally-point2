@@ -1,20 +1,20 @@
 //! One turn's wire handoff and the small primitives around it: assigning a
 //! turn its origin identity and choosing the datagram or control-stream path,
-//! sending a packet, releasing received turns to the game in seq order,
-//! pushing delivered-through cursors, and the unacked-window cap check.
+//! sending a packet, pushing delivered-through cursors, and the unacked-window
+//! cap check.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::VecDeque;
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::Payload;
 use rally_point_transport::beacon::BeaconWriter;
 use rally_point_transport::control::send_control_turn;
 use rally_point_transport::{Link, LinkError, noq};
-use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::leave_announcer::LeaveAnnouncer;
 
+use super::reorder::SlotReorder;
 use super::state::retain_sent;
 use super::{DriverError, DriverTiming, UNACKED_WINDOW_CAP};
 
@@ -127,46 +127,6 @@ pub(super) fn send_packet(link: &mut Link, payload: Option<Payload>) -> Result<b
     }
 }
 
-/// What [`release_ready`] observed while handing released turns to the game.
-pub(super) enum Release {
-    /// Every releasable turn was handed off (possibly none).
-    Delivered,
-    /// The game dropped its receiver: a clean stop.
-    GameClosed,
-    /// The game stopped draining and the inbound buffer filled.
-    GameStalled,
-}
-
-/// Releases each slot's contiguous run of pending turns to the game, holding
-/// the rest. Hands off without ever awaiting: blocking on a full channel would
-/// park the whole driver — no acks, no outbound turns, no link-failure
-/// detection — behind a stalled consumer. Shared by the datagram and
-/// control-stream delivery paths, so a turn is released the same way no matter
-/// which path delivered it.
-pub(super) fn release_ready(
-    next_seq: &mut HashMap<SlotId, u64>,
-    pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
-    inbound: &mpsc::Sender<Payload>,
-) -> Release {
-    for (slot, slot_next) in next_seq.iter_mut() {
-        let Some(slot_pending) = pending.get_mut(slot) else {
-            continue;
-        };
-        while let Some(payload) = slot_pending.remove(slot_next) {
-            match inbound.try_send(payload) {
-                Ok(()) => *slot_next += 1,
-                Err(mpsc::error::TrySendError::Full(payload)) => {
-                    // Put the held turn back before surfacing the stall.
-                    slot_pending.insert(*slot_next, payload);
-                    return Release::GameStalled;
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => return Release::GameClosed,
-            }
-        }
-    }
-    Release::Delivered
-}
-
 /// Pushes each slot's delivered-through cursor to the peer so it can
 /// force-advance its unacked window past turns it now knows we received.
 /// `BeaconWriter` pushes only cursors that advanced past its last-sent state, so a
@@ -175,14 +135,14 @@ pub(super) async fn flush_delivered_cursors(
     link: &Link,
     beacon_send: &mut noq::SendStream,
     beacon_writer: &mut BeaconWriter,
-    next_seq: &HashMap<SlotId, u64>,
+    reorder: &SlotReorder,
 ) {
     beacon_writer
         .flush(
             beacon_send,
-            next_seq
-                .keys()
-                .filter_map(|&slot| link.delivered_through(slot).map(|c| (slot, c))),
+            reorder
+                .slots()
+                .filter_map(|slot| link.delivered_through(slot).map(|c| (slot, c))),
         )
         .await;
 }

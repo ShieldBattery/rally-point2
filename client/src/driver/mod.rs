@@ -92,6 +92,7 @@ mod channels;
 mod inbound;
 mod outbound;
 mod reconnect;
+mod reorder;
 mod retention;
 mod run;
 mod send;

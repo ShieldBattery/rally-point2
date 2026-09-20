@@ -368,52 +368,6 @@ async fn wait_backoff_reports_buffer_exhausted_once_the_outage_buffer_overflows(
     );
 }
 
-#[tokio::test]
-async fn resume_cursor_is_the_contiguous_high_water_and_absorbs_replayed_turns() {
-    // The reconnect path derives its resume cursor from `next_seq` — the top of
-    // the contiguous run delivered to the game, per slot. Drive the driver's own
-    // inbound ingest (the same call its datagram arm makes) and confirm the
-    // cursor tracks that high-water and that a replayed already-delivered turn
-    // neither advances it nor re-reaches the game.
-    let (inbound_tx, mut inbound_rx) = mpsc::channel::<Payload>(64);
-    let mut next_seq: HashMap<SlotId, u64> = HashMap::new();
-    let mut pending: HashMap<SlotId, BTreeMap<u64, Payload>> = HashMap::new();
-    let slot = SlotId(0);
-
-    fn ingest(
-        seq: u64,
-        next_seq: &mut HashMap<SlotId, u64>,
-        pending: &mut HashMap<SlotId, BTreeMap<u64, Payload>>,
-        inbound: &mpsc::Sender<Payload>,
-    ) {
-        let released =
-            ingest_fresh_turns(vec![turn(seq, &[seq as u8])], next_seq, pending, inbound);
-        assert!(matches!(released, Release::Delivered));
-    }
-
-    ingest(0, &mut next_seq, &mut pending, &inbound_tx);
-    ingest(1, &mut next_seq, &mut pending, &inbound_tx);
-    // A gap at 2: seq 3 is held, so the cursor stays at the next-needed 2.
-    ingest(3, &mut next_seq, &mut pending, &inbound_tx);
-    assert_eq!(resume_cursors(&next_seq), vec![(slot, 2)]);
-
-    // A replay of an already-delivered turn (seq 1 < cursor 2) is dropped: the
-    // cursor is unchanged and nothing new reaches the game.
-    ingest(1, &mut next_seq, &mut pending, &inbound_tx);
-    assert_eq!(resume_cursors(&next_seq), vec![(slot, 2)]);
-
-    // Seq 2 fills the gap: 2 and the held 3 both release, the cursor jumps to 4.
-    ingest(2, &mut next_seq, &mut pending, &inbound_tx);
-    assert_eq!(resume_cursors(&next_seq), vec![(slot, 4)]);
-
-    // The game saw 0,1,2,3 once each, in order — no duplicate from the replay.
-    let mut delivered = Vec::new();
-    while let Ok(payload) = inbound_rx.try_recv() {
-        delivered.push((payload.seq, payload.commands[0]));
-    }
-    assert_eq!(delivered, vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
-}
-
 #[test]
 fn backoff_base_schedule_doubles_from_the_initial_delay_then_caps() {
     assert_eq!(Backoff::base_delay(0), RECONNECT_BACKOFF_INITIAL);
