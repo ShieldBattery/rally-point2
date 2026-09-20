@@ -1,14 +1,15 @@
-//! Renders a full metrics snapshot as Prometheus text exposition: [`render`] walks
-//! the coordinator's live state and the metric statics in [`super`], and every
-//! `render_*`/`write_*`/`escape_*` helper below does one piece of that formatting.
+//! Formatting: a census and the counter statics in, Prometheus exposition text
+//! out. Every `render_*`/`write_*`/`escape_*` helper below does one piece of
+//! that, and none of them can reach the coordinator's state — whatever a series
+//! reports was already read for them by `census`.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 use rally_point_proto::control::{RegionId, TenantId};
-use rally_point_proto::time::unix_secs_fail_closed;
 
-use super::instruments::LabeledCounter;
-use super::{
+use super::census::CoordinatorCensus;
+use super::counters::{
     CONTROL_CONNECTION_ENDS, CONTROL_SEND_DURATION, DESCRIPTOR_DELTA_ENTRIES_SENT,
     DESCRIPTOR_DELTAS_SENT, DESCRIPTOR_FULL_SETS_SENT, DESYNCS, FLIGHT_RECORDINGS,
     FLIGHT_RECORDINGS_PINNED, REAP_DIRECTIVES_SENT, REAP_NUDGES_COALESCED, RELAY_COLD_START,
@@ -16,16 +17,12 @@ use super::{
     SESSION_HOLDS, SESSION_REAPS, SESSIONS_CLOSED, SESSIONS_CREATED, WEBHOOK_ATTEMPT_FAILURES,
     WEBHOOK_DELIVERIES,
 };
-use crate::api::CoordinatorState;
-use crate::{lifecycle, registry, tenant};
-use std::sync::atomic::Ordering;
+use super::instruments::LabeledCounter;
+use crate::lifecycle::{LifecycleMetrics, SessionCensus};
+use crate::tenant::TenantStateCounts;
 
-/// Renders the full metrics exposition for `state`.
-pub fn render(state: &CoordinatorState) -> String {
-    // `u64::MAX` on an unusable clock — the sentinel the launching-relay count is
-    // skipped on, matching the ledger's own fail-closed clock convention.
-    let now = unix_secs_fail_closed();
-    let census = state.lifecycle.metrics_census();
+/// Renders the full metrics exposition from one scrape's census.
+pub(super) fn exposition(census: &CoordinatorCensus) -> String {
     let mut out = String::new();
 
     write_meta(
@@ -41,12 +38,12 @@ pub fn render(state: &CoordinatorState) -> String {
         1,
     );
 
-    render_relays(&mut out, state, now);
-    render_sessions_active(&mut out, &census);
-    render_warm_target(&mut out, state);
-    render_backbone_rtt(&mut out, state);
-    render_beacon_backoff(&mut out, state);
-    render_notices_pending(&mut out, &census);
+    render_relays(&mut out, &census.relays);
+    render_sessions_active(&mut out, &census.lifecycle);
+    render_warm_target(&mut out, &census.warm);
+    render_backbone_rtt(&mut out, &census.backbone);
+    render_beacon_backoff(&mut out, &census.beacon_backoff);
+    render_notices_pending(&mut out, &census.lifecycle);
 
     write_meta(
         &mut out,
@@ -58,10 +55,10 @@ pub fn render(state: &CoordinatorState) -> String {
         &mut out,
         "rp2_flight_store_configured",
         &[],
-        u64::from(state.flight_store.is_some()),
+        u64::from(census.flight_store_configured),
     );
 
-    render_tenants(&mut out, state);
+    render_tenants(&mut out, &census.tenants);
 
     render_counter_1(
         &mut out,
@@ -161,7 +158,7 @@ pub fn render(state: &CoordinatorState) -> String {
         &mut out,
         "rp2_webhook_notices_dropped_total",
         &[],
-        lifecycle::dropped_notice_count(),
+        census.dropped_notices,
     );
 
     render_counter_1(
@@ -265,39 +262,14 @@ pub fn render(state: &CoordinatorState) -> String {
     out
 }
 
-fn render_relays(out: &mut String, state: &CoordinatorState, now: u64) {
-    let mut counts: BTreeMap<(String, String), u64> = BTreeMap::new();
-    for relay in registry::enrolled_relays(state.setup.registry()) {
-        let key = (
-            region_label(relay.region.as_ref()),
-            if relay.draining { "draining" } else { "live" }.to_owned(),
-        );
-        *counts.entry(key).or_default() += 1;
-    }
-    // Launching relays live only in the ledger (they have not enrolled yet), so
-    // they are counted per configured region there. Skip on an unusable clock, the
-    // same guard the ledger's own expiry comparisons use.
-    if let Some(ledger) = &state.ledger
-        && now != u64::MAX
-    {
-        for region in state.regions.regions() {
-            if let Ok(count) = ledger.count_launching(Some(&region.id), now)
-                && count > 0
-            {
-                counts.insert(
-                    (region.id.as_ref().to_owned(), "launching".to_owned()),
-                    count as u64,
-                );
-            }
-        }
-    }
+fn render_relays(out: &mut String, counts: &BTreeMap<(String, String), u64>) {
     write_meta(
         out,
         "rp2_relays",
         "Relays known to the coordinator, by region and lifecycle state.",
         "gauge",
     );
-    for ((region, relay_state), value) in &counts {
+    for ((region, relay_state), value) in counts {
         write_series(
             out,
             "rp2_relays",
@@ -307,14 +279,14 @@ fn render_relays(out: &mut String, state: &CoordinatorState, now: u64) {
     }
 }
 
-fn render_sessions_active(out: &mut String, census: &lifecycle::LifecycleMetrics) {
+fn render_sessions_active(out: &mut String, census: &LifecycleMetrics) {
     write_meta(
         out,
         "rp2_sessions_active",
         "Sessions with an assigned serving relay, by tenant and lifecycle state.",
         "gauge",
     );
-    let mut rows: Vec<(&TenantId, &lifecycle::SessionCensus)> = census.sessions.iter().collect();
+    let mut rows: Vec<(&TenantId, &SessionCensus)> = census.sessions.iter().collect();
     rows.sort_by(|left, right| left.0.as_ref().cmp(right.0.as_ref()));
     for (tenant, counts) in rows {
         if counts.loading > 0 {
@@ -344,49 +316,31 @@ fn render_sessions_active(out: &mut String, census: &lifecycle::LifecycleMetrics
     }
 }
 
-fn render_warm_target(out: &mut String, state: &CoordinatorState) {
+fn render_warm_target(out: &mut String, warm: &[(RegionId, u64)]) {
     write_meta(
         out,
         "rp2_warm_target",
         "The relay count each region is currently kept warm for.",
         "gauge",
     );
-    let warm = state.setup.provision().warm();
-    for region in state.regions.regions() {
+    for (region, target) in warm {
         write_series(
             out,
             "rp2_warm_target",
-            &[("region", region.id.as_ref())],
-            u64::from(warm.target(&region.id)),
+            &[("region", region.as_ref())],
+            *target,
         );
     }
 }
 
-fn render_backbone_rtt(out: &mut String, state: &CoordinatorState) {
-    let mut series: Vec<(String, String, u64)> = state
-        .pair_rtts
-        .direction_snapshot()
-        .into_iter()
-        .map(|row| {
-            // The origin is one end of the canonical pair; the target is the other.
-            let target = if row.origin == row.a { &row.b } else { &row.a };
-            (
-                row.origin.0.clone(),
-                target.0.clone(),
-                u64::from(row.rtt_ms),
-            )
-        })
-        .collect();
-    series.sort_by(|left, right| {
-        (left.0.as_str(), left.1.as_str()).cmp(&(right.0.as_str(), right.1.as_str()))
-    });
+fn render_backbone_rtt(out: &mut String, series: &[(String, String, u64)]) {
     write_meta(
         out,
         "rp2_backbone_rtt_ms",
         "Measured backbone round-trip per direction, in milliseconds.",
         "gauge",
     );
-    for (origin, target, rtt) in &series {
+    for (origin, target, rtt) in series {
         write_series(
             out,
             "rp2_backbone_rtt_ms",
@@ -396,25 +350,24 @@ fn render_backbone_rtt(out: &mut String, state: &CoordinatorState) {
     }
 }
 
-fn render_beacon_backoff(out: &mut String, state: &CoordinatorState) {
-    let backing_off = state.setup.provision().coverage().census();
+fn render_beacon_backoff(out: &mut String, backing_off: &[(RegionId, bool)]) {
     write_meta(
         out,
         "rp2_beacon_backoff",
         "1 while the coverage bootstrap is backing off a region, else 0.",
         "gauge",
     );
-    for region in state.regions.regions() {
+    for (region, backing_off) in backing_off {
         write_series(
             out,
             "rp2_beacon_backoff",
-            &[("region", region.id.as_ref())],
-            u64::from(backing_off.get(&region.id).copied().unwrap_or(false)),
+            &[("region", region.as_ref())],
+            u64::from(*backing_off),
         );
     }
 }
 
-fn render_notices_pending(out: &mut String, census: &lifecycle::LifecycleMetrics) {
+fn render_notices_pending(out: &mut String, census: &LifecycleMetrics) {
     write_meta(
         out,
         "rp2_webhook_notices_pending",
@@ -433,8 +386,7 @@ fn render_notices_pending(out: &mut String, census: &lifecycle::LifecycleMetrics
     }
 }
 
-fn render_tenants(out: &mut String, state: &CoordinatorState) {
-    let counts = tenant::state_counts(state.setup.tenants());
+fn render_tenants(out: &mut String, counts: &TenantStateCounts) {
     write_meta(
         out,
         "rp2_tenants",
@@ -482,15 +434,6 @@ fn render_counter_2(
             value,
         );
     }
-}
-
-/// The label value for an optional region: the region id, or `none` for an
-/// untagged relay.
-///
-/// `pub(super)`: the parent `metrics` module's increment functions (e.g.
-/// `relay_enrolled`) also label by region and share this helper.
-pub(super) fn region_label(region: Option<&RegionId>) -> String {
-    region.map_or_else(|| "none".to_owned(), |r| r.as_ref().to_owned())
 }
 
 /// Writes a metric family's `# HELP` and `# TYPE` header lines.

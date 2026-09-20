@@ -273,6 +273,26 @@ impl PairRttStore {
     /// [`snapshot`](Self::snapshot), which averages a pair's two directions into
     /// one served value, this keeps the directions apart — one row per measured
     /// direction — so a caller can expose each direction separately.
+    /// A scrape-time census of the measured directions: `(origin, target,
+    /// milliseconds)`, sorted by origin then target so an exposition built from
+    /// it is deterministic. The origin is one end of the stored canonical pair
+    /// and the target is the other — the direction, flattened, which is what a
+    /// per-direction series needs.
+    pub fn metrics_census(&self) -> Vec<(RegionId, RegionId, u32)> {
+        let mut rows: Vec<(RegionId, RegionId, u32)> = self
+            .direction_snapshot()
+            .into_iter()
+            .map(|row| {
+                let target = if row.origin == row.a { row.b } else { row.a };
+                (row.origin, target, row.rtt_ms)
+            })
+            .collect();
+        rows.sort_by(|left, right| {
+            (left.0.as_ref(), left.1.as_ref()).cmp(&(right.0.as_ref(), right.1.as_ref()))
+        });
+        rows
+    }
+
     pub fn direction_snapshot(&self) -> Vec<DirectionRttRow> {
         let pairs = self.pairs.lock();
         let mut rows = Vec::new();

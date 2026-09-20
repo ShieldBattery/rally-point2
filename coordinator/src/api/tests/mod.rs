@@ -454,18 +454,6 @@ fn presence_body(tenant: &str, users: &[&str]) -> Vec<u8> {
 
 // --- Warm endpoint + hold-until-ready create ---
 
-/// A region config listing each of `ids` (with placeholder display/ping fields
-/// the endpoint does not exercise).
-fn regions_config(ids: &[&str]) -> RegionsConfig {
-    let entries: Vec<String> = ids
-        .iter()
-        .map(|id| {
-            format!(r#"{{"id":"{id}","display_name":"{id}","beacon":"h:1","fallback":"h:2"}}"#)
-        })
-        .collect();
-    RegionsConfig::from_json(&format!(r#"{{"regions":[{}]}}"#, entries.join(","))).unwrap()
-}
-
 async fn body_json(resp: axum::http::Response<axum::body::Body>) -> serde_json::Value {
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await

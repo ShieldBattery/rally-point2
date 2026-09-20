@@ -422,8 +422,8 @@ pub struct TenantStateCounts {
     pub revoked: u64,
 }
 
-/// Counts the enrolled tenants by operational state.
-pub fn state_counts(store: &TenantStore) -> TenantStateCounts {
+/// Counts the enrolled tenants by operational state, for the metrics exposition.
+pub fn metrics_census(store: &TenantStore) -> TenantStateCounts {
     let mut counts = TenantStateCounts::default();
     for entry in store.tenants.lock().values() {
         match entry.state {

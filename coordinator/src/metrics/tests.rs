@@ -3,15 +3,30 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use rally_point_proto::control::{BufferBounds, RelayHello, TenantId};
+use rally_point_proto::control::{BufferBounds, RegionId, RelayHello, TenantId};
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::token::KeyId;
 use rally_point_proto::version::ProtocolVersion;
 use tower::ServiceExt;
 
+use super::instruments::{ColdStartHistogram, SendDurationHistogram};
 use super::*;
 use crate::api::ControlAuth;
+use crate::session::ProvisionGate;
+use crate::test_support::regions_config;
 use crate::{registry, session, tenant};
+
+/// A hello for a relay tagged with `region`, so the registry census has
+/// something other than the untagged bucket to count.
+fn tagged_hello(id: RelayId, port: u16, region: &str) -> RelayHello {
+    RelayHello::new(
+        id,
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+        ProtocolVersion::CURRENT,
+        vec![0xC1; 4],
+    )
+    .with_region(RegionId(region.to_owned()))
+}
 
 /// A coordinator state with one enrolled (untagged) relay and one active
 /// tenant, with no ledger or flight store — enough for the gauges to render.
@@ -195,4 +210,65 @@ fn labeled_counter_increments_by_a_delta() {
     )
     .expect("the series exists after an increment");
     assert_eq!(after - before, 1);
+}
+
+#[test]
+fn the_gauge_census_reads_each_subsystem_that_owns_a_value() {
+    // One census, assembled from four different owners: the registry's drain
+    // split, the provision gate's warm demand and published coverage phase, and
+    // the tenant store's state counts. Each is asserted through the exposition,
+    // which is the only thing a scrape ever sees.
+    let reg = registry::RelayRegistry::new();
+    let live = registry::enroll(&reg, tagged_hello(RelayId(1), 14901, "region-a"));
+    let draining = registry::enroll(&reg, tagged_hello(RelayId(2), 14902, "region-a"));
+    assert!(
+        registry::mark_draining(&reg, RelayId(2), draining),
+        "the second relay is marked draining",
+    );
+    let _ = live;
+
+    let warm = crate::provision::WarmTargets::new();
+    warm.warm(RegionId("region-a".to_owned()), Duration::from_secs(600));
+    let gate = ProvisionGate::provisioning(warm, Duration::from_secs(600), Duration::from_secs(30));
+    gate.coverage()
+        .publish(&RegionId("region-a".to_owned()), true);
+    gate.coverage()
+        .publish(&RegionId("region-b".to_owned()), false);
+
+    let setup =
+        session::SessionSetup::new(reg, tenant::TenantStore::new()).with_provision_gate(gate);
+    let state = CoordinatorState {
+        regions: regions_config(&["region-a", "region-b"]),
+        ..CoordinatorState::new(setup, ControlAuth::Open)
+    };
+
+    let text = render(&state);
+    assert!(
+        text.contains("rp2_relays{region=\"region-a\",state=\"live\"} 1"),
+        "the registry census separates the live relay: {text}",
+    );
+    assert!(
+        text.contains("rp2_relays{region=\"region-a\",state=\"draining\"} 1"),
+        "...from the draining one: {text}",
+    );
+    assert!(
+        text.contains("rp2_warm_target{region=\"region-a\"} 1"),
+        "the warmed region reports its demand: {text}",
+    );
+    assert!(
+        text.contains("rp2_warm_target{region=\"region-b\"} 0"),
+        "a configured but cold region still reports a zero: {text}",
+    );
+    assert!(
+        text.contains("rp2_beacon_backoff{region=\"region-a\"} 1"),
+        "the region the loop published a backoff for reports it: {text}",
+    );
+    assert!(
+        text.contains("rp2_beacon_backoff{region=\"region-b\"} 0"),
+        "a region not backing off reports a zero: {text}",
+    );
+    assert!(
+        text.contains("rp2_tenants{state=\"active\"} 0"),
+        "the tenant census reports an empty store as zeros: {text}",
+    );
 }

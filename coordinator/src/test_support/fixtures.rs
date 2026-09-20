@@ -16,6 +16,7 @@ use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, KeyId};
 use rally_point_proto::version::ProtocolVersion;
 
+use crate::regions::RegionsConfig;
 use crate::registry::{self, RelayRegistry};
 use crate::session::SessionSetup;
 use crate::tenant::{self, TenantStore};
@@ -178,4 +179,16 @@ pub(crate) fn descriptor(tenant: TenantId, session: u64) -> SessionDescriptor {
         latency_estimate_ms: None,
         relay_regions: Vec::new(),
     }
+}
+
+/// A region config listing each of `ids`, with placeholder display and beacon
+/// fields — enough for the region-aware paths that only read the id list.
+pub(crate) fn regions_config(ids: &[&str]) -> RegionsConfig {
+    let entries: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            format!(r#"{{"id":"{id}","display_name":"{id}","beacon":"h:1","fallback":"h:2"}}"#)
+        })
+        .collect();
+    RegionsConfig::from_json(&format!(r#"{{"regions":[{}]}}"#, entries.join(","))).unwrap()
 }

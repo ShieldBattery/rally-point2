@@ -368,6 +368,33 @@ pub struct EnrolledRelay {
     pub draining: bool,
 }
 
+/// A scrape-time census of the registry: how many enrolled relays each region
+/// holds, split by whether they have been marked draining. Keyed on the optional
+/// region a relay is tagged with, so untagged relays (the dev posture) are
+/// counted under `None` rather than dropped.
+#[derive(Debug, Default)]
+pub struct RegistryCensus {
+    /// Enrolled relays eligible for new assignments.
+    pub live: HashMap<Option<rally_point_proto::control::RegionId>, u64>,
+    /// Enrolled relays marked draining, which take no new assignments.
+    pub draining: HashMap<Option<rally_point_proto::control::RegionId>, u64>,
+}
+
+/// Counts the enrolled relays by region and drain state, for the metrics
+/// exposition. One lock acquisition, so the two counts describe the same instant.
+pub fn metrics_census(registry: &RelayRegistry) -> RegistryCensus {
+    let mut census = RegistryCensus::default();
+    for relay in registry.relays.lock().values() {
+        let bucket = if relay.draining {
+            &mut census.draining
+        } else {
+            &mut census.live
+        };
+        *bucket.entry(relay.entry.region.clone()).or_default() += 1;
+    }
+    census
+}
+
 /// A snapshot of every enrolled relay, in an unspecified order. One lock
 /// acquisition yields the reconcile loop its whole per-region view: live counts
 /// (all enrolled relays, draining included) and drain candidates (the
