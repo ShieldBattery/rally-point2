@@ -9,7 +9,6 @@ use super::*;
 
 mod departure;
 mod leave;
-mod phase;
 mod session_start;
 mod silence;
 mod sync_coverage;
@@ -26,7 +25,6 @@ pub use leave::{
     normalize_observed_leave, observe_leave, reachable_frame, reinstate_slot, session_closed,
     slot_departed, slot_homed, slot_leave_decided, slot_strictly_homed,
 };
-pub use phase::{commanded_phase_delay, ingest_arrival_phase, note_phase_applied};
 pub use session_start::{
     adopt_session_start, mark_session_started, note_slot_present, record_peer_slot_started,
     record_slot_connected, record_slot_started, reevaluate_session_start,

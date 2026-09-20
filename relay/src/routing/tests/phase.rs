@@ -85,14 +85,8 @@ fn phase_corrections_fan_to_the_corrected_slot_and_survive_for_repush() {
 
     // The commanded value survives on the maker for the connect-time
     // re-push a reconnecting slot gets.
-    assert_eq!(
-        consensus::commanded_phase_delay(&makers, &k, SlotId(0)),
-        Some(delay_us),
-    );
-    assert_eq!(
-        consensus::commanded_phase_delay(&makers, &k, SlotId(1)),
-        None
-    );
+    assert_eq!(makers.commanded_phase_delay(&k, SlotId(0)), Some(delay_us),);
+    assert_eq!(makers.commanded_phase_delay(&k, SlotId(1)), None);
     deliver_phase_directive_to_slot(
         &sessions,
         &k,

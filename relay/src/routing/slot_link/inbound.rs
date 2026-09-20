@@ -116,13 +116,9 @@ pub(super) async fn handle_received(
     // so this almost always returns nothing; when it does issue
     // corrections, each named slot gets its own directive.
     if let Some(seq) = solo_fresh_seq {
-        let corrections = consensus::ingest_arrival_phase(
-            &ctx.decision_makers,
-            &ctx.key,
-            ctx.slot,
-            seq,
-            received_at,
-        );
+        let corrections =
+            ctx.decision_makers
+                .ingest_arrival_phase(&ctx.key, ctx.slot, seq, received_at);
         if !corrections.is_empty() {
             fan_out_phase_directives(&ctx.sessions, &ctx.key, &corrections);
         }

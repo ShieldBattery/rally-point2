@@ -79,7 +79,8 @@ pub(super) fn handle_control_frame(
         // only that slot's own command fence, so this is a
         // client-asserted input with strictly self-scoped effect.
         Some(ControlInbound::PhaseApplied(delay_us)) => {
-            consensus::note_phase_applied(&ctx.decision_makers, &ctx.key, ctx.slot, delay_us);
+            ctx.decision_makers
+                .note_phase_applied(&ctx.key, ctx.slot, delay_us);
         }
         // The client announcing its own clean departure. The
         // client already flushed its outstanding turns and waited

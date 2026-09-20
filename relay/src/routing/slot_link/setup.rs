@@ -110,7 +110,7 @@ pub(super) fn push_connect_time_state(
     // picks that delay back up, so a reconnecting client resumes the send
     // phase its peers' alignment was computed against instead of snapping back
     // to its natural one. A slot never corrected gets nothing.
-    if let Some(delay_us) = consensus::commanded_phase_delay(decision_makers, key, slot) {
+    if let Some(delay_us) = decision_makers.commanded_phase_delay(key, slot) {
         deliver_phase_directive_to_slot(
             sessions,
             key,
