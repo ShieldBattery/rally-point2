@@ -102,8 +102,7 @@ fn a_second_divergence_fires_again_at_its_own_ordinal() {
 fn an_observer_slot_is_excluded_from_comparison_however_the_set_arrived() {
     let registry = new_decision_makers();
     // One descriptor push naming slot 2 an observer, with no maker yet.
-    let leaves = sync_maker(
-        &registry,
+    let leaves = registry.sync_maker(
         &key(),
         MakerSync {
             observers: HashSet::from([SlotId(2)]),
@@ -192,24 +191,21 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
     );
 
     // 0,1 agree, 2 diverges, all at ordinal 0.
-    observe_sync(
-        &registry,
+    registry.observe_sync(
         &k,
         SlotId(0),
         0,
         Some(500),
         &sync_command(0, expected_kind_for_ordinal(0), SYNC_A),
     );
-    observe_sync(
-        &registry,
+    registry.observe_sync(
         &k,
         SlotId(1),
         0,
         Some(500),
         &sync_command(0, expected_kind_for_ordinal(0), SYNC_A),
     );
-    observe_sync(
-        &registry,
+    registry.observe_sync(
         &k,
         SlotId(2),
         0,
@@ -220,8 +216,7 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
 
     // Slot 0 alone races ahead to clear the margin.
     for ordinal in 1u8..(sync_eval_margin(6) as u8) {
-        observe_sync(
-            &registry,
+        registry.observe_sync(
             &k,
             SlotId(0),
             u64::from(ordinal),

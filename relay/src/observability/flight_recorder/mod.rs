@@ -534,7 +534,7 @@ pub async fn run_sampler(
         tick.tick().await;
         recorder.sample_now(
             &conditions,
-            |key| crate::consensus::session_e2e(&makers, key),
+            |key| makers.delivery_view(key),
             |key| crate::consensus::sync_coverage(&makers, key),
         );
     }

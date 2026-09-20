@@ -71,7 +71,7 @@ async fn stamps_a_pending_buffer_directive_onto_a_forwarded_turn() {
     // A framed turn was observed at frame 1, then a 150ms RTT sample -> target
     // 4 turns, raised from the min of 0, so the pending directive names buffer
     // 4 applied a horizon past frame 1.
-    consensus::observe_frame(&makers, &key, SlotId(0), GameFrameCount(1));
+    makers.observe_frame(&key, SlotId(0), GameFrameCount(1));
     let seed = LinkConditions {
         slots: vec![SlotConditions {
             slot: 0,

@@ -225,8 +225,7 @@ fn finalize_refuses_a_home_gained_by_a_rehome() {
     let k = key();
     // The rehome push: slot 1's home moves onto this relay; slot 0's stays.
     let departed: [DepartedSlot; 0] = [];
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             homed_slots: [SlotId(0), SlotId(1)].into_iter().collect(),
@@ -267,8 +266,7 @@ fn finalize_refuses_every_home_of_a_resumed_created_maker() {
     let registry = new_decision_makers();
     let k = key();
     let departed: [DepartedSlot; 0] = [];
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             homed_slots: [SlotId(1)].into_iter().collect(),
@@ -326,8 +324,7 @@ fn finalize_rejects_a_request_naming_a_stale_generation() {
 fn finalize_refuses_a_pre_frame_drop_without_sealing() {
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             homed_slots: [SlotId(1)].into_iter().collect(),

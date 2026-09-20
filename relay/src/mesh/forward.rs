@@ -218,8 +218,7 @@ pub(super) fn deliver_turn_to_locals(
     // was validated at its ingress client edge (the mesh never re-validates),
     // so only validated turns feed the coordinate.
     if let Some(frame) = payload.game_frame_count {
-        crate::consensus::observe_turn_frame(
-            decision_makers,
+        decision_makers.observe_turn_frame(
             key,
             slot,
             payload.seq,
@@ -246,8 +245,7 @@ pub(super) fn deliver_turn_to_locals(
     // after the `mark_seen` dedup above. Every relay retains sequence-ordered
     // checksum metadata from each distinct origin turn; only the authority
     // compares. This observer never holds gameplay fan-out waiting for a gap.
-    crate::consensus::observe_sync_with_generation(
-        decision_makers,
+    decision_makers.observe_sync_with_generation(
         key,
         slot,
         payload.seq,

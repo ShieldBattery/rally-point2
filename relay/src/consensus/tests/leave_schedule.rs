@@ -123,9 +123,9 @@ fn a_frame_regression_is_recorded_as_a_flight_event() {
     let k = key();
     makers.lock().insert(k.clone(), maker_with(bounds(0, 6)));
     let home = crate::consensus::delivery::DeliveryHome::Local;
-    observe_turn_frame(&makers, &k, SlotId(2), 0, GameFrameCount(126), home);
-    observe_turn_frame(&makers, &k, SlotId(2), 1, GameFrameCount(0), home);
-    observe_turn_frame(&makers, &k, SlotId(2), 2, GameFrameCount(1), home);
+    makers.observe_turn_frame(&k, SlotId(2), 0, GameFrameCount(126), home);
+    makers.observe_turn_frame(&k, SlotId(2), 1, GameFrameCount(0), home);
+    makers.observe_turn_frame(&k, SlotId(2), 2, GameFrameCount(1), home);
 
     let events: Vec<_> = makers
         .flight_recorder()

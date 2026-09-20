@@ -11,8 +11,7 @@ fn retained_load_state_outlives_the_links_it_was_recorded_from() {
     let registry = new_decision_makers();
     let k = key();
     let expected: HashSet<SlotId> = [SlotId(1), SlotId(2)].into_iter().collect();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             expected_slots: expected,
@@ -80,8 +79,7 @@ fn a_peer_adopting_the_start_directive_stands_in_its_own_start_instant() {
     let registry = new_decision_makers();
     let k = key();
     let expected: HashSet<SlotId> = [SlotId(0)].into_iter().collect();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             expected_slots: expected,

@@ -501,8 +501,7 @@ fn dispatch_mesh_control_frame(
                 let Ok(origin) = u8::try_from(cursor.origin_slot).map(SlotId) else {
                     continue;
                 };
-                crate::consensus::observe_delivery(
-                    &mesh.session.decision_makers,
+                mesh.session.decision_makers.observe_delivery(
                     &key,
                     dest,
                     origin,

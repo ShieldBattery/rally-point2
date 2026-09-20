@@ -249,8 +249,7 @@ pub(super) fn handle_beacon_cursor(
     // through `cursor`. Fold it locally and — throttled —
     // re-share it to the session's mesh peers so a
     // peer-homed authority can fold it too.
-    consensus::observe_delivery(
-        &ctx.decision_makers,
+    ctx.decision_makers.observe_delivery(
         &ctx.key,
         ctx.slot,
         beacon_slot,

@@ -27,8 +27,7 @@ fn an_empty_homed_set_is_unenforced_for_admission_and_fail_closed_for_finalizing
     for homed in [Vec::new(), vec![SlotId(0), SlotId(2)]] {
         let enforced = !homed.is_empty();
         let registry = new_decision_makers();
-        let _ = sync_maker(
-            &registry,
+        let _ = registry.sync_maker(
             &key(),
             MakerSync {
                 homed_slots: homed.iter().copied().collect(),
@@ -74,8 +73,7 @@ fn an_empty_homed_set_is_unenforced_for_admission_and_fail_closed_for_finalizing
 fn a_reconnectable_departure_requires_homed_held_and_undecided() {
     let registry = new_decision_makers();
     let k = key();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             homed_slots: [SlotId(0)].into_iter().collect(),
@@ -209,8 +207,7 @@ fn claim_close_report_latches_once_until_reopened() {
 #[test]
 fn slot_homed_follows_a_later_descriptors_reassignment() {
     let registry = new_decision_makers();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &key(),
         MakerSync {
             homed_slots: [SlotId(0)].into_iter().collect(),
@@ -222,8 +219,7 @@ fn slot_homed_follows_a_later_descriptors_reassignment() {
 
     // A later push (e.g. a rehome) moves slot 1 onto this relay and slot 0
     // off it.
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &key(),
         MakerSync {
             homed_slots: [SlotId(1)].into_iter().collect(),

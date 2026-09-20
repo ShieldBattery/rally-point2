@@ -65,12 +65,9 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
     };
     crate::mesh::activate_conditions(&mesh.conditions, &k, SlotId(0), replacement);
     let _ = consensus::ingest_local_condition(&mesh.session.decision_makers, &k, &replacement);
-    consensus::observe_frame(
-        &mesh.session.decision_makers,
-        &k,
-        SlotId(0),
-        GameFrameCount(40),
-    );
+    mesh.session
+        .decision_makers
+        .observe_frame(&k, SlotId(0), GameFrameCount(40));
 
     // The old task has already freed its roster seat and is finishing its
     // cleanup after the replacement published epoch 22.
@@ -80,7 +77,7 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
         .expect("replacement conditions survive stale teardown");
     assert_eq!(published.slots[0].connection_epoch, Some(22));
     assert_eq!(
-        consensus::slot_frame(&mesh.session.decision_makers, &k, SlotId(0)),
+        mesh.session.decision_makers.slot_frame(&k, SlotId(0)),
         Some(GameFrameCount(40)),
     );
     assert!(!consensus::slot_departed(
@@ -118,8 +115,8 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
 
     // A started single-relay session of two framed slots, this relay authority.
     seed_maker(&makers, &k, Authority::SelfRelay, &[0, 1], &[]);
-    consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
-    consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
+    makers.observe_frame(&k, SlotId(0), GameFrameCount(50));
+    makers.observe_frame(&k, SlotId(1), GameFrameCount(50));
     presence::set_order(&presence, &k, vec![Candidate::SelfRelay]);
 
     let _i0 = registered(&sessions, &k, SlotId(0));

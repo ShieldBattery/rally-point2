@@ -214,7 +214,6 @@ async fn refuses_connections_beyond_the_handshake_limit() {
 
 #[tokio::test]
 async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
-    use rally_point_relay::consensus;
     use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::send_control_leave_intent;
 
@@ -242,7 +241,7 @@ async fn a_reconnect_after_the_leave_is_decided_is_refused_terminally() {
     // the eventual close, not a stray pending datagram.
     slot1.send(Some(build_turn(1, 0, Some(10)))).unwrap();
     wait_until("the relay never observed the leaver's turn", || {
-        consensus::slot_frame(&makers, &key, SlotId(1)).is_some()
+        makers.slot_frame(&key, SlotId(1)).is_some()
     })
     .await;
 

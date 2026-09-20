@@ -170,8 +170,7 @@ pub(super) fn seed_session_authority(
         tenant: TenantId(tenant.name.clone()),
         session,
     };
-    let _ = consensus::sync_maker(
-        &mesh.session.decision_makers,
+    let _ = mesh.session.decision_makers.sync_maker(
         &key,
         consensus::MakerSync {
             expected_slots: slots.iter().copied().collect(),

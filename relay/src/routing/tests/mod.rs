@@ -126,8 +126,7 @@ pub(super) fn drop_hold_harness(
     let mesh_links = crate::mesh::new_mesh_links();
     let makers = Arc::new(consensus::new_decision_makers());
     let seen = crate::mesh::new_seen_registries();
-    let _ = consensus::sync_maker(
-        &makers,
+    let _ = makers.sync_maker(
         key,
         consensus::MakerSync {
             homed_slots: finalized_homes
@@ -141,18 +140,8 @@ pub(super) fn drop_hold_harness(
     );
     // Both slots have framed history: the survivor pins a session frame and the
     // departing slot gives the leave its apply-frame basis.
-    consensus::observe_frame(
-        &makers,
-        key,
-        survivor,
-        rally_point_proto::ids::GameFrameCount(40),
-    );
-    consensus::observe_frame(
-        &makers,
-        key,
-        departing,
-        rally_point_proto::ids::GameFrameCount(50),
-    );
+    makers.observe_frame(key, survivor, rally_point_proto::ids::GameFrameCount(40));
+    makers.observe_frame(key, departing, rally_point_proto::ids::GameFrameCount(50));
 
     let (mut guard, inbox) = register(&sessions, key, survivor, 1).expect("survivor registers");
     guard.disarm();
@@ -217,8 +206,8 @@ pub(super) fn abandoned_harness() -> (
     let presence = Arc::new(crate::session::presence::new_presence_registry());
     seed_maker(&makers, &k, Authority::SelfRelay, &[0, 1], &[]);
     consensus::mark_session_started(&makers, &k);
-    consensus::observe_frame(&makers, &k, SlotId(0), GameFrameCount(50));
-    consensus::observe_frame(&makers, &k, SlotId(1), GameFrameCount(50));
+    makers.observe_frame(&k, SlotId(0), GameFrameCount(50));
+    makers.observe_frame(&k, SlotId(1), GameFrameCount(50));
     crate::session::presence::set_order(&presence, &k, vec![Candidate::SelfRelay]);
     crate::session::presence::record_own(&presence, &k, 1);
     (presence, sessions, mesh_links, makers, k)

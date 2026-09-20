@@ -42,10 +42,7 @@ fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
 
     // The remote slot's frame fed the consensus coordinate, exactly as a
     // datagram-delivered turn's would.
-    assert_eq!(
-        crate::consensus::slot_frame(&makers, &key, SlotId(0)),
-        Some(GameFrameCount(7)),
-    );
+    assert_eq!(makers.slot_frame(&key, SlotId(0)), Some(GameFrameCount(7)),);
     // The turn was marked in the session-level gate: an overlapping copy is
     // a duplicate now.
     assert_eq!(

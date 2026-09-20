@@ -85,8 +85,7 @@ fn decode(message: Message) -> RelayToCoordinator {
 fn fence_fixture() -> (Sessions, Arc<crate::consensus::DecisionMakers>) {
     let sessions: Sessions = Arc::default();
     let decision_makers = Arc::new(crate::consensus::new_decision_makers());
-    let _ = crate::consensus::sync_maker(
-        &decision_makers,
+    let _ = decision_makers.sync_maker(
         &key(7),
         crate::consensus::MakerSync::new(
             BufferBounds { min: 1, max: 6 },

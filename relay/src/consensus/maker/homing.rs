@@ -40,6 +40,31 @@ impl DecisionMaker {
         self.homed_slots = homed;
     }
 
+    /// [`set_homed_slots`](Self::set_homed_slots) for a maker that already
+    /// exists, which is where a home can be *gained* mid-session.
+    ///
+    /// A home this push adds is a home this relay was not the slot's single
+    /// ingress for over the slot's whole history, so its forward-gate cursor
+    /// can never soundly seal the slot's final turn count (see
+    /// `rehomed_homes`). The gained homes are recorded before the wholesale
+    /// replace, which is what makes "added" observable at all.
+    pub fn rehome_homed_slots(&mut self, homed: HashSet<SlotId>) {
+        let gained: Vec<SlotId> = homed.difference(&self.homed_slots).copied().collect();
+        self.rehomed_homes.extend(gained);
+        self.set_homed_slots(homed);
+    }
+
+    /// Marks every home this maker currently holds as gained mid-session.
+    ///
+    /// A maker created by a RESUMED descriptor is a relay pulled into (or
+    /// restarted into) a session that already has history this relay's forward
+    /// gate never carried — even if a stale seen registry answers with a
+    /// prefix, it is not the slot's whole ingress history. Every home it starts
+    /// with is therefore cursor-broken for finalization purposes.
+    pub fn mark_homes_rehomed(&mut self) {
+        self.rehomed_homes = self.homed_slots.clone();
+    }
+
     /// Records this relay's own id, stamped onto every `BufferDirective` this
     /// maker queues from here on (see `queue_directive`).
     /// Idempotent — the caller's own id never changes for a running relay

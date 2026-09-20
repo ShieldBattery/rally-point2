@@ -242,7 +242,7 @@ pub fn recompute(
     held_slots: &std::collections::HashSet<rally_point_proto::ids::SlotId>,
 ) -> Vec<rally_point_proto::messages::LeaveDirective> {
     match verdict(registry, key) {
-        Some(authority) => crate::consensus::set_authority(makers, key, authority, held_slots),
+        Some(authority) => makers.set_authority(key, authority, held_slots),
         None => Vec::new(),
     }
 }

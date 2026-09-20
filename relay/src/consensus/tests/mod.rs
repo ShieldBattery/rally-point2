@@ -123,7 +123,7 @@ fn sync_default(
     bounds: BufferBounds,
     authority: Authority,
 ) -> Vec<LeaveDirective> {
-    sync_maker(registry, key, MakerSync::new(bounds, authority))
+    registry.sync_maker(key, MakerSync::new(bounds, authority))
 }
 
 /// The departure a slot that stopped at `frame` leaves behind: a last frame
@@ -360,8 +360,7 @@ fn maker_with_labels(labels: &[(u64, &str)]) -> DecisionMaker {
 /// a decide has a basis.
 fn finalized_drop_registry(k: &SessionKey, homed: &[u8]) -> DecisionMakers {
     let registry = new_decision_makers();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         k,
         MakerSync {
             homed_slots: homed.iter().map(|&s| SlotId(s)).collect(),
@@ -369,8 +368,8 @@ fn finalized_drop_registry(k: &SessionKey, homed: &[u8]) -> DecisionMakers {
             ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
         },
     );
-    observe_frame(&registry, k, SlotId(0), GameFrameCount(40));
-    observe_frame(&registry, k, SlotId(1), GameFrameCount(50));
+    registry.observe_frame(k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(k, SlotId(1), GameFrameCount(50));
     registry
 }
 

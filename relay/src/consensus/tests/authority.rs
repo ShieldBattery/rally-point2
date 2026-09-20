@@ -49,8 +49,7 @@ fn sync_maker_promotion_skips_a_held_departure() {
     // caller (standing in for `MeshControl::apply_descriptor`, which reads
     // the real drop-hold registry) passes the held set in.
     let held_slots = HashSet::from([SlotId(1)]);
-    let leaves = sync_maker(
-        &registry,
+    let leaves = registry.sync_maker(
         &k,
         MakerSync {
             held_slots,

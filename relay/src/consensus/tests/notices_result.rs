@@ -23,8 +23,8 @@ fn record_result_fires_one_notice_per_slot() {
     // Framed turns give the notice a session/slot frame basis: the session
     // coordinate is the slowest slot's frame (40), the reporting slot's own
     // is its newest (52).
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-    observe_frame(&registry, &k, SlotId(1), GameFrameCount(52));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(1), GameFrameCount(52));
 
     record_result(&registry, &k, SlotId(1), vec![0xDE, 0xAD]);
     let notice = recv_result(&mut rx);
@@ -101,7 +101,7 @@ fn record_departure_rejects_an_oversize_mesh_folded_result() {
     let k = key();
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
 
     let folded = ResultEcho {
         payload: vec![0u8; MAX_GAME_RESULT_PAYLOAD_LEN + 1],
@@ -140,8 +140,8 @@ fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
     let k = key();
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-    observe_frame(&registry, &k, SlotId(1), GameFrameCount(52));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(1), GameFrameCount(52));
 
     // Slot 1 reports its result: the standalone result notice fires, and the
     // echo is retained.
@@ -181,7 +181,7 @@ fn a_departure_without_a_reported_result_embeds_none() {
     let k = key();
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
     assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
 
     let departure = recv_departure(&mut rx);
@@ -200,7 +200,7 @@ fn an_embedded_result_folds_first_non_none_wins() {
     let registry = new_decision_makers();
     let k = key();
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::Peer);
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
 
     // A peer's `SlotDeparted` carries the home-authored result first.
     let first = ResultEcho {

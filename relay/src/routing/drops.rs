@@ -126,7 +126,7 @@ pub(crate) fn honor_drop_request(
     let decision_makers = &mesh.session.decision_makers;
     let mesh_links = &mesh.links;
     let seen = &mesh.seen;
-    if !consensus::is_authority(decision_makers, key) {
+    if !decision_makers.is_authority(key) {
         // Not the authority — the authority is among the broadcast's receivers and
         // will act. Nothing to do, and the hold stays for a possible promotion.
         return;

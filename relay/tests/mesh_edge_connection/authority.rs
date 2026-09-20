@@ -128,8 +128,6 @@ async fn authority_hands_off_over_mesh_presence_when_players_leave() -> Result<(
 #[tokio::test]
 async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
 -> Result<(), AnyError> {
-    use rally_point_relay::consensus;
-
     let tenant = make_default_tenant();
     let session = SessionId(1);
     let key = SessionKey {
@@ -217,7 +215,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     // relay hops.
     let mut view = (None, None);
     for _ in 0..150 {
-        view = consensus::session_e2e(&relay_a.mesh.session.decision_makers, &key);
+        view = relay_a.mesh.session.decision_makers.delivery_view(&key);
         if matches!(view, (Some(lag), Some(2)) if lag <= 1) {
             break;
         }
@@ -236,7 +234,7 @@ async fn the_authority_folds_cross_relay_delivery_and_sees_a_parked_beacon_lag()
     }
     let mut lag = 0;
     for _ in 0..150 {
-        if let (Some(l), _) = consensus::session_e2e(&relay_a.mesh.session.decision_makers, &key) {
+        if let (Some(l), _) = relay_a.mesh.session.decision_makers.delivery_view(&key) {
             lag = l;
             if lag >= 20 {
                 break;

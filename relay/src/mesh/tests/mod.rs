@@ -166,8 +166,7 @@ pub(super) fn finalize_fixture(
     let key = control_key();
     let mesh = test_mesh_state();
     let sessions: routing::Sessions = Arc::default();
-    let _ = crate::consensus::sync_maker(
-        &mesh.session.decision_makers,
+    let _ = mesh.session.decision_makers.sync_maker(
         &key,
         crate::consensus::MakerSync {
             homed_slots: homed.iter().map(|&slot| SlotId(slot)).collect(),

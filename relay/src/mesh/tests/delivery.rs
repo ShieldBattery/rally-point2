@@ -33,8 +33,7 @@ fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
     let mesh = MeshState::default();
     let decision_makers = mesh.session.decision_makers.clone();
     let key = control_key();
-    let _ = consensus::sync_maker(
-        &decision_makers,
+    let _ = decision_makers.sync_maker(
         &key,
         consensus::MakerSync {
             expected_slots: [SlotId(0), SlotId(1)].into(),
@@ -94,8 +93,7 @@ fn delivery_relay(
     ));
     let decision_makers = mesh.session.decision_makers.clone();
     let key = control_key();
-    let _ = consensus::sync_maker(
-        &decision_makers,
+    let _ = decision_makers.sync_maker(
         &key,
         consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay),
     );
@@ -260,8 +258,7 @@ fn duplicate_turn_delivery_does_not_double_count_the_desync_comparator() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     decision_makers.set_notice_notifier(tx);
     let key = control_key();
-    let _ = consensus::sync_maker(
-        &decision_makers,
+    let _ = decision_makers.sync_maker(
         &key,
         consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay),
     );
@@ -352,8 +349,7 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
     let mesh = MeshState::default();
     let decision_makers = mesh.session.decision_makers.clone();
     let key = control_key();
-    let _ = consensus::sync_maker(
-        &decision_makers,
+    let _ = decision_makers.sync_maker(
         &key,
         consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::Peer),
     );

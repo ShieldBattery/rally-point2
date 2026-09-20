@@ -3,9 +3,16 @@
 //! the retained per-session load state.
 //!
 //! Everything here adds locking, logging and notice plumbing around the pure
-//! [`DecisionMaker`]; the free functions callers use live in `ops`.
+//! [`DecisionMaker`]. The entry points callers reach for are split across
+//! sibling files by the same concerns `maker/` uses, each contributing its own
+//! `impl DecisionMakers` block, so a caller-facing method sits beside the
+//! maker method it drives.
 
 use super::*;
+
+mod authority;
+
+pub use authority::{FrameRegression, MakerSync};
 
 /// The per-session decision-maker map behind [`DecisionMakers`]. A plain
 /// (non-async) mutex mirrors `MeshLinks` and `routing::Sessions`: every critical
@@ -206,6 +213,32 @@ impl DecisionMakers {
     /// as a descriptor that carried none.
     pub(in crate::consensus) fn session_refs(&self, key: &SessionKey) -> SessionExternalRefs {
         self.refs.lock().get(key).cloned().unwrap_or_default()
+    }
+
+    /// Records a decided leave into the session's flight recording — the decision's
+    /// observability shadow, fired at the same once-per-slot points the departure
+    /// notice is (the maker's internal dedup guarantees the once).
+    pub(in crate::consensus) fn record_leave_event(
+        &self,
+        key: &SessionKey,
+        directive: &LeaveDirective,
+    ) {
+        self.record_event(
+            key,
+            FlightEvent::LeaveDecided {
+                slot: directive.slot as u8,
+                kind: if directive.reason == LEAVE_REASON_DROPPED {
+                    DepartureKind::Dropped
+                } else {
+                    DepartureKind::Left
+                },
+                reason: directive.reason,
+                apply_frame: directive.apply_at_frame,
+                leave_seq: directive.leave_seq,
+                finalized: directive.finalized,
+                final_turn_count: directive.final_turn_count,
+            },
+        );
     }
 
     /// How long this relay withholds a session's region labels after latching it

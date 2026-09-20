@@ -148,7 +148,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     );
     // The blip must come after the relay has validated that turn.
     wait_until("the relay never observed the slot's turn", || {
-        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+        makers.slot_frame(&key, SlotId(0)).is_some()
     })
     .await;
 
@@ -265,8 +265,7 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
     slot1.send(Some(build_turn(1, 0, Some(10)))).unwrap();
     wait_until("the relay never observed both slots' turns", || {
-        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
-            && consensus::slot_frame(&makers, &key, SlotId(1)).is_some()
+        makers.slot_frame(&key, SlotId(0)).is_some() && makers.slot_frame(&key, SlotId(1)).is_some()
     })
     .await;
 

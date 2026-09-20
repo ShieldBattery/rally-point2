@@ -428,7 +428,7 @@ pub fn decide_abandoned_departures(
     };
     for directive in &decided {
         log_leave(key, directive);
-        record_leave_event(registry, key, directive);
+        registry.record_leave_event(key, directive);
         registry.emit_notice(RelayNotice::Departure(departure_notice(
             registry, key, directive,
         )));

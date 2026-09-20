@@ -92,8 +92,7 @@ fn a_resumed_sync_installs_the_latch_and_returns_the_seeds() {
         kind: DepartureKind::Left,
         final_turn_count: Some(41),
     }];
-    let leaves = sync_maker(
-        &registry,
+    let leaves = registry.sync_maker(
         &k,
         MakerSync {
             resumed_departed: Some(&departed),
@@ -118,8 +117,7 @@ fn a_resumed_sync_installs_the_latch_and_returns_the_seeds() {
 
     // A replayed resumed descriptor (an idempotent coordinator re-push)
     // reconciles the existing maker and has nothing new to broadcast.
-    let replayed = sync_maker(
-        &registry,
+    let replayed = registry.sync_maker(
         &k,
         MakerSync {
             resumed_departed: Some(&departed),
@@ -149,8 +147,7 @@ fn a_resumed_repush_seeds_into_an_existing_maker() {
         kind: DepartureKind::Dropped,
         final_turn_count: None,
     }];
-    let leaves = sync_maker(
-        &registry,
+    let leaves = registry.sync_maker(
         &k,
         MakerSync {
             resumed_departed: Some(&departed),

@@ -339,8 +339,7 @@ impl SeedAuthority<'_> {
 
     /// Applies the sync, creating the maker.
     pub fn apply(self) {
-        let _ = consensus::sync_maker(
-            self.makers,
+        let _ = self.makers.sync_maker(
             self.key,
             consensus::MakerSync {
                 expected_slots: self.expected,

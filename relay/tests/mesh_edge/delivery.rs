@@ -4,7 +4,7 @@
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::Payload;
-use rally_point_relay::consensus::{self, Authority, LEAVE_REASON_LEFT};
+use rally_point_relay::consensus::{Authority, LEAVE_REASON_LEFT};
 use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh;
 
@@ -124,7 +124,12 @@ async fn a_leave_decided_at_the_authority_reaches_the_peer_relays_client() -> Re
     // departure against — without one the leave would be held, not decided.
     leaver.send(Some(build_turn(0, 0, Some(10))))?;
     wait_until("the authority never observed the leaver's turn", || {
-        consensus::slot_frame(&relay_a.mesh.session.decision_makers, &key, SlotId(0)).is_some()
+        relay_a
+            .mesh
+            .session
+            .decision_makers
+            .slot_frame(&key, SlotId(0))
+            .is_some()
     })
     .await;
 

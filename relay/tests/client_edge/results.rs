@@ -10,7 +10,6 @@ use rally_point_proto::ids::{SessionId, SlotId};
 
 #[tokio::test]
 async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_alone() {
-    use rally_point_relay::consensus;
     // A client writes its result report then its leave intent on the one control
     // stream it opens. The relay processes that stream in order, so it fires the
     // result notice (stamped with the reporting slot, payload, and frames) before
@@ -47,7 +46,7 @@ async fn a_result_report_is_forwarded_before_the_departure_and_leaves_survivors_
     // `decide_leave` a basis to schedule against.
     slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
     wait_until("the relay never observed the reporter's turn", || {
-        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+        makers.slot_frame(&key, SlotId(0)).is_some()
     })
     .await;
 

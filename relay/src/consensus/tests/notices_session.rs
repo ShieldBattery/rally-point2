@@ -124,7 +124,7 @@ fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
         HashMap::from([(SlotId(1), "sb-user-new".to_owned())]),
     );
 
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
     assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
     let notice = recv_departure(&mut rx);
     assert_eq!(notice.external_id, Some("game-new".to_owned()));
@@ -136,7 +136,7 @@ fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
     deregister_maker(&registry, &k);
     assert!(!registry.lock().contains_key(&k));
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
     assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
     let notice2 = recv_departure(&mut rx);
     assert!(

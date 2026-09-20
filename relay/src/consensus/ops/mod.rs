@@ -7,7 +7,6 @@
 
 use super::*;
 
-mod authority;
 mod buffer;
 mod departure;
 mod homing;
@@ -17,11 +16,6 @@ mod session_start;
 mod silence;
 mod sync_coverage;
 
-pub use authority::{
-    FrameRegression, MakerSync, is_authority, observe_delivery, observe_frame, observe_sync,
-    observe_sync_with_generation, observe_turn_frame, session_e2e, set_authority, slot_frame,
-    sync_maker,
-};
 pub use buffer::{
     active_directive, ingest_local_condition, ingest_local_conditions, ingest_remote_conditions,
     observe_directive, set_own_relay_id,
@@ -50,8 +44,6 @@ pub use silence::{
     claim_silent_slots, note_forward_advance, retained_load_state, retained_load_states,
 };
 pub use sync_coverage::sync_coverage;
-
-pub(in crate::consensus) use leave::record_leave_event;
 
 pub(crate) use departure::{
     mark_connection_down, record_departure_for_epoch_outcome, resolve_reconnect,

@@ -17,8 +17,7 @@ fn phase_corrections_fan_to_the_corrected_slot_and_survive_for_repush() {
     let sessions: Sessions = Arc::default();
     let makers = Arc::new(consensus::new_decision_makers());
     let k = key();
-    let _ = consensus::sync_maker(
-        &makers,
+    let _ = makers.sync_maker(
         &k,
         consensus::MakerSync {
             ..consensus::MakerSync::new(

@@ -201,12 +201,9 @@ async fn an_undecided_drop_defers_the_emptied_session_close_until_decided() {
         &[],
     );
     consensus::mark_session_started(&mesh.session.decision_makers, &k);
-    consensus::observe_frame(
-        &mesh.session.decision_makers,
-        &k,
-        SlotId(0),
-        GameFrameCount(50),
-    );
+    mesh.session
+        .decision_makers
+        .observe_frame(&k, SlotId(0), GameFrameCount(50));
     crate::session::presence::set_order(&mesh.session.presence, &k, vec![Candidate::SelfRelay]);
 
     let _i0 = registered(&sessions, &k, SlotId(0));

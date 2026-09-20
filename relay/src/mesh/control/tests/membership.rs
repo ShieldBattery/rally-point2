@@ -268,8 +268,7 @@ fn apply_descriptor_stamps_correlation_ids_that_a_departure_notice_carries() {
     };
     control.apply_descriptor(&second);
 
-    consensus::observe_frame(
-        &makers,
+    makers.observe_frame(
         &key(1),
         SlotId(1),
         rally_point_proto::ids::GameFrameCount(10),

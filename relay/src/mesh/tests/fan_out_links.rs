@@ -287,7 +287,7 @@ fn mesh_turn_delivers_locally_and_never_reenters_the_mesh() {
     assert_eq!(delivered.seq, payload.seq);
     assert_eq!(delivered.commands, payload.commands);
     assert_eq!(
-        consensus::slot_frame(&makers, &key, SlotId(0)),
+        makers.slot_frame(&key, SlotId(0)),
         Some(GameFrameCount(77)),
         "mesh ingress still feeds consensus",
     );

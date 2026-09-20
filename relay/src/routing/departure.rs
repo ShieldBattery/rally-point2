@@ -154,7 +154,7 @@ pub(crate) fn announce_departure_recorded(
     // clamps to the identical apply frame and folds the identical result — see
     // `consensus::reachable_frame` / `consensus::result_for`.
     let stamps = consensus::DepartureStamps {
-        last_frame: consensus::slot_frame(decision_makers, key, slot),
+        last_frame: decision_makers.slot_frame(key, slot),
         reachable_frame: consensus::reachable_frame(decision_makers, key, slot),
         result: consensus::result_for(decision_makers, key, slot),
         final_turn_count,

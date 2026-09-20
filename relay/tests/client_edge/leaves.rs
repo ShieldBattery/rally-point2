@@ -46,7 +46,6 @@ async fn a_coordinator_reap_closes_the_connection_so_the_client_observes_it_end(
 
 #[tokio::test]
 async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
-    use rally_point_relay::consensus;
     use rally_point_relay::key::SessionKey;
     use rally_point_transport::control::{
         ControlInbound, send_control_leave_intent, spawn_control_reader,
@@ -80,7 +79,7 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
     slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
     // The intent must land on a relay that has already observed that frame.
     wait_until("the relay never observed the leaver's turn", || {
-        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+        makers.slot_frame(&key, SlotId(0)).is_some()
     })
     .await;
 
@@ -127,7 +126,6 @@ async fn a_leave_intent_broadcasts_reason_left_and_closes_the_sender() {
 
 #[tokio::test]
 async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
-    use rally_point_relay::consensus;
     // The same task that decides the leave from the intent also runs the
     // post-loop Trigger-A cleanup on its way out (deregister, decide_leave,
     // remove_slot, presence). This proves that follow-through doesn't produce
@@ -158,7 +156,7 @@ async fn an_intent_decided_leave_is_not_redecided_when_the_link_then_closes() {
 
     slot0.send(Some(build_turn(0, 0, Some(10)))).unwrap();
     wait_until("the relay never observed the leaver's turn", || {
-        consensus::slot_frame(&makers, &key, SlotId(0)).is_some()
+        makers.slot_frame(&key, SlotId(0)).is_some()
     })
     .await;
 

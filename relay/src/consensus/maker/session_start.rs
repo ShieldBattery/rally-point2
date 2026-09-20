@@ -5,6 +5,31 @@
 use super::*;
 
 impl DecisionMaker {
+    /// Latches whether this session runs the home-side drop-finalization
+    /// handshake, from the descriptor that created the maker.
+    ///
+    /// Immutable for the session's lifetime, which is why this is only ever
+    /// called at creation: every count-acceptance rule keys on the flag, so a
+    /// session must never change its mind mid-game.
+    pub fn latch_finalized_drops(&mut self, enabled: bool) {
+        self.finalized_drops_enabled = enabled;
+    }
+
+    /// Checks a later descriptor push's `finalized_drops` against the latched
+    /// value, warning when they disagree. The create-time value stands — see
+    /// [`latch_finalized_drops`](Self::latch_finalized_drops).
+    pub fn reconcile_finalized_drops(&self, pushed: bool) {
+        if self.finalized_drops_enabled != pushed {
+            tracing::warn!(
+                tenant = self.key.tenant.as_ref(),
+                session = self.key.session.0,
+                latched = self.finalized_drops_enabled,
+                pushed,
+                "descriptor re-push disagrees on finalized_drops; keeping the latched value",
+            );
+        }
+    }
+
     /// Records that `slot`'s link activated on this relay, into the ever-connected
     /// set the heartbeat restates. Idempotent: a reconnect re-inserts a slot the
     /// set already holds, and nothing ever removes one.

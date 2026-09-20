@@ -18,7 +18,7 @@ fn decide_leave_fires_one_departure_notice_on_the_authority() {
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
     // A framed turn from slot 0 gives decide_leave a basis to schedule.
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(50));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(50));
 
     let leave =
         decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).expect("a leave is decided");
@@ -121,7 +121,7 @@ fn promotion_re_derivation_fires_exactly_one_departure_notice() {
         Some("game-2".to_owned()),
         HashMap::from([(SlotId(1), "sb-user-9".to_owned())]),
     );
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
     record_departure(&registry, &k, SlotId(1), framed(50), 3);
     assert!(rx.try_recv().is_err(), "recording alone fires nothing");
 
@@ -129,7 +129,7 @@ fn promotion_re_derivation_fires_exactly_one_departure_notice() {
     // topology): the departure has no cached directive anywhere, so this
     // relay derives it fresh — a first insert into its cache — and must
     // fire the one notice for it.
-    let leaves = set_authority(&registry, &k, Authority::SelfRelay, &HashSet::new());
+    let leaves = registry.set_authority(&k, Authority::SelfRelay, &HashSet::new());
     assert_eq!(leaves.len(), 1, "the re-derived leave still broadcasts");
 
     let notice = recv_departure(&mut rx);
@@ -161,15 +161,15 @@ fn promotion_does_not_refire_an_already_cached_directive() {
 
     // Authored while the authority: decide_leave fires the one notice.
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
-    observe_frame(&registry, &k, SlotId(0), GameFrameCount(40));
-    observe_frame(&registry, &k, SlotId(1), GameFrameCount(50));
+    registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(&k, SlotId(1), GameFrameCount(50));
     assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
     assert!(rx.try_recv().is_ok(), "decide_leave fires the one notice");
 
     // Demoted, then re-promoted: the cached directive re-broadcasts
     // verbatim, not fresh — no second notice.
-    let _ = set_authority(&registry, &k, Authority::Peer, &HashSet::new());
-    let _ = set_authority(&registry, &k, Authority::SelfRelay, &HashSet::new());
+    let _ = registry.set_authority(&k, Authority::Peer, &HashSet::new());
+    let _ = registry.set_authority(&k, Authority::SelfRelay, &HashSet::new());
     assert!(
         rx.try_recv().is_err(),
         "a verbatim re-broadcast of an already-cached leave must not re-fire",

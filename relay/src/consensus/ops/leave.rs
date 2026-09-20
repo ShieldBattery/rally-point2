@@ -248,7 +248,7 @@ pub fn decide_leave(
 ) -> Option<LeaveDirective> {
     let directive = registry.lock().get_mut(key)?.decide_leave(slot, reason)?;
     log_leave(key, &directive);
-    record_leave_event(registry, key, &directive);
+    registry.record_leave_event(key, &directive);
     // `decide_leave` returns `Some` only on the authority's first decision for
     // the slot (it dedups internally), so this is the one departure notice the
     // authoring relay sends for it.
@@ -256,32 +256,6 @@ pub fn decide_leave(
         registry, key, &directive,
     )));
     Some(directive)
-}
-
-/// Records a decided leave into the session's flight recording — the decision's
-/// observability shadow, fired at the same once-per-slot points the departure
-/// notice is (the maker's internal dedup guarantees the once).
-pub(in crate::consensus) fn record_leave_event(
-    registry: &DecisionMakers,
-    key: &SessionKey,
-    directive: &LeaveDirective,
-) {
-    registry.record_event(
-        key,
-        FlightEvent::LeaveDecided {
-            slot: directive.slot as u8,
-            kind: if directive.reason == LEAVE_REASON_DROPPED {
-                DepartureKind::Dropped
-            } else {
-                DepartureKind::Left
-            },
-            reason: directive.reason,
-            apply_frame: directive.apply_at_frame,
-            leave_seq: directive.leave_seq,
-            finalized: directive.finalized,
-            final_turn_count: directive.final_turn_count,
-        },
-    );
 }
 
 /// Whether `key`'s decision-maker holds at least one recorded departure whose leave

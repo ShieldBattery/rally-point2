@@ -275,28 +275,25 @@ use sync::*;
 pub use law::ControlLaw;
 pub use maker::{DecisionMaker, DepartureStamps, RecordedDeparture, SilentSlot};
 pub use ops::{
-    FinalizeOutcome, FrameRegression, MakerSync, activate_connection_epoch, active_directive,
-    adopt_session_start, claim_close_report, claim_silent_slots, commanded_phase_delay,
-    connection_epoch_matches, decide_abandoned_departures, decide_leave, decided_slots,
-    departure_epoch, deregister_maker, finalize_drop, finalized_drops_enabled,
-    has_reconnectable_departure, has_undecided_departure, ingest_arrival_phase,
-    ingest_local_condition, ingest_local_conditions, ingest_remote_conditions, is_authority,
-    leave_reconcile, leave_schedulable, maker_exists, mark_session_started,
-    maybe_release_region_labels, normalize_observed_leave, note_forward_advance,
-    note_phase_applied, note_slot_present, observe_delivery, observe_directive, observe_frame,
-    observe_leave, observe_sync, observe_sync_with_generation, observe_turn_frame, reachable_frame,
-    record_departure, record_departure_for_epoch, record_peer_slot_started, record_result,
-    record_slot_connected, record_slot_started, reevaluate_session_start, reinstate_slot,
-    released_region_labels, remove_slot_for_epoch, reopen_close_report, result_for,
-    retained_load_state, retained_load_states, session_closed, session_e2e,
-    session_initial_buffer_turns, session_started, set_authority, set_own_relay_id,
-    set_region_labels, set_session_shape, slot_departed, slot_frame, slot_has_started, slot_homed,
-    slot_leave_decided, slot_strictly_homed, started_home_slots, started_session_slot_count,
-    sync_coverage, sync_maker,
+    FinalizeOutcome, activate_connection_epoch, active_directive, adopt_session_start,
+    claim_close_report, claim_silent_slots, commanded_phase_delay, connection_epoch_matches,
+    decide_abandoned_departures, decide_leave, decided_slots, departure_epoch, deregister_maker,
+    finalize_drop, finalized_drops_enabled, has_reconnectable_departure, has_undecided_departure,
+    ingest_arrival_phase, ingest_local_condition, ingest_local_conditions,
+    ingest_remote_conditions, leave_reconcile, leave_schedulable, maker_exists,
+    mark_session_started, maybe_release_region_labels, normalize_observed_leave,
+    note_forward_advance, note_phase_applied, note_slot_present, observe_directive, observe_leave,
+    reachable_frame, record_departure, record_departure_for_epoch, record_peer_slot_started,
+    record_result, record_slot_connected, record_slot_started, reevaluate_session_start,
+    reinstate_slot, released_region_labels, remove_slot_for_epoch, reopen_close_report, result_for,
+    retained_load_state, retained_load_states, session_closed, session_initial_buffer_turns,
+    session_started, set_own_relay_id, set_region_labels, set_session_shape, slot_departed,
+    slot_has_started, slot_homed, slot_leave_decided, slot_strictly_homed, started_home_slots,
+    started_session_slot_count, sync_coverage,
 };
 pub use registry::{
-    DecisionMakers, RelayNotice, RetainedLoadState, new_decision_makers,
-    new_decision_makers_with_region_delay,
+    DecisionMakers, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,
+    new_decision_makers, new_decision_makers_with_region_delay,
 };
 pub use sync::SyncDivergence;
 

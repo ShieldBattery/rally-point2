@@ -17,7 +17,7 @@ fn reconcile_leaves_on_join_re_announces_known_state() {
     test_maker(&makers, &key, crate::consensus::Authority::SelfRelay);
     // The authority decided one slot's leave (caches a directive and records a
     // departure), and separately recorded a bare departure for another slot.
-    crate::consensus::observe_frame(&makers, &key, SlotId(1), GameFrameCount(50));
+    makers.observe_frame(&key, SlotId(1), GameFrameCount(50));
     let leave = crate::consensus::decide_leave(&makers, &key, SlotId(1), 3)
         .expect("the authority decides slot 1's leave");
     crate::consensus::record_departure(

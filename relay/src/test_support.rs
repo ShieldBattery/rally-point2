@@ -10,7 +10,7 @@ use rally_point_proto::control::{BufferBounds, TenantId};
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::LeaveDirective;
 
-use crate::consensus::{Authority, DecisionMakers, MakerSync, sync_maker};
+use crate::consensus::{Authority, DecisionMakers, MakerSync};
 use crate::key::SessionKey;
 
 /// A session key under the shared test tenant.
@@ -36,8 +36,7 @@ pub(crate) fn seed_maker(
     expected: &[u8],
     homed: &[u8],
 ) -> Vec<LeaveDirective> {
-    sync_maker(
-        makers,
+    makers.sync_maker(
         key,
         MakerSync {
             expected_slots: expected.iter().map(|&s| SlotId(s)).collect(),

@@ -479,8 +479,7 @@ fn ordering_failures_record_once_per_origin_without_a_desync_notice() {
         let (registry, mut rx) = notifying_registry();
         let k = key();
         let _ = sync_default(&registry, &k, bounds(0, 6), authority);
-        observe_sync(
-            &registry,
+        registry.observe_sync(
             &k,
             SlotId(0),
             0,
@@ -489,16 +488,14 @@ fn ordering_failures_record_once_per_origin_without_a_desync_notice() {
         );
         // The malformed ring is queued before seq 1. Its diagnostic must name
         // seq 2, not the incoming seq 1 that finally permits it to be examined.
-        observe_sync(
-            &registry,
+        registry.observe_sync(
             &k,
             SlotId(0),
             2,
             Some(2),
             &sync_command(3, SYNC_KIND_HEADER, SYNC_A),
         );
-        observe_sync(
-            &registry,
+        registry.observe_sync(
             &k,
             SlotId(0),
             1,
@@ -512,8 +509,7 @@ fn ordering_failures_record_once_per_origin_without_a_desync_notice() {
             let _ = maker.set_authority(Authority::SelfRelay, &HashSet::new());
         }
         for seq in 1..5 {
-            observe_sync(
-                &registry,
+            registry.observe_sync(
                 &k,
                 SlotId(0),
                 seq,
@@ -521,8 +517,7 @@ fn ordering_failures_record_once_per_origin_without_a_desync_notice() {
                 &sync_command(2, SYNC_KIND_UNITS, SYNC_A),
             );
         }
-        observe_sync(
-            &registry,
+        registry.observe_sync(
             &k,
             SlotId(1),
             rally_point_transport::RECEIVE_WINDOW,

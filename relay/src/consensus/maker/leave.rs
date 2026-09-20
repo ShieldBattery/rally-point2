@@ -352,6 +352,25 @@ impl DecisionMaker {
     /// survivors, who otherwise perform their one leave reconciliation at
     /// registration and would never hear of a departure seeded afterward.
     /// `None` for a slot already decided (nothing new to deliver).
+    /// Applies a resumed (re-home) descriptor's departed slots: seeds each one
+    /// and returns the directives this call newly decided, for the caller to
+    /// fan out.
+    ///
+    /// Latches the session started, so a resumed relay never waits on the full
+    /// expected set (which still lists the departed slots that will never dial)
+    /// and never re-fires the session-start machinery session-wide; and latches
+    /// it resumed, so no leave it ever decides carries an exact final turn
+    /// count.
+    pub fn seed_resumed(&mut self, departed: &[DepartedSlot]) -> Vec<LeaveDirective> {
+        let seeded = departed
+            .iter()
+            .filter_map(|d| self.seed_departed(d.slot, d.kind, d.final_turn_count, d.finalized))
+            .collect();
+        self.mark_started();
+        self.resumed = true;
+        seeded
+    }
+
     pub fn seed_departed(
         &mut self,
         slot: SlotId,

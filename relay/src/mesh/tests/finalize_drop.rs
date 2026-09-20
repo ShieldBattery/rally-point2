@@ -58,14 +58,12 @@ fn the_home_answers_finalize_drop_with_the_sealed_count() {
 #[test]
 fn the_authority_decides_on_a_finalized_result() {
     let fixture = finalize_fixture(crate::consensus::Authority::SelfRelay, &[0], PeerDrop::Held);
-    crate::consensus::observe_frame(
-        &fixture.mesh.session.decision_makers,
+    fixture.mesh.session.decision_makers.observe_frame(
         &fixture.key,
         SlotId(0),
         rally_point_proto::ids::GameFrameCount(40),
     );
-    crate::consensus::observe_frame(
-        &fixture.mesh.session.decision_makers,
+    fixture.mesh.session.decision_makers.observe_frame(
         &fixture.key,
         SUBJECT,
         rally_point_proto::ids::GameFrameCount(50),
@@ -103,8 +101,7 @@ fn the_authority_ignores_a_stale_generation_finalize_result() {
         &[0],
         PeerDrop::Recorded(Some(7)),
     );
-    crate::consensus::observe_frame(
-        &fixture.mesh.session.decision_makers,
+    fixture.mesh.session.decision_makers.observe_frame(
         &fixture.key,
         SlotId(0),
         rally_point_proto::ids::GameFrameCount(40),
@@ -152,8 +149,7 @@ fn the_authority_refuses_a_finalized_count_its_own_prefix_exceeds() {
         &[0],
         PeerDrop::Recorded(None),
     );
-    crate::consensus::observe_frame(
-        &fixture.mesh.session.decision_makers,
+    fixture.mesh.session.decision_makers.observe_frame(
         &fixture.key,
         SlotId(0),
         rally_point_proto::ids::GameFrameCount(40),
@@ -214,8 +210,7 @@ fn a_pre_frame_finalized_result_keeps_the_hold_for_a_retry() {
         "the hold is kept for a later retry",
     );
 
-    crate::consensus::observe_frame(
-        &fixture.mesh.session.decision_makers,
+    fixture.mesh.session.decision_makers.observe_frame(
         &fixture.key,
         SlotId(0),
         rally_point_proto::ids::GameFrameCount(40),

@@ -134,8 +134,7 @@ impl MeshControl {
         // decided, so the broadcast below also reaches local clients admitted
         // before this descriptor (whose one registration-time leave
         // reconciliation predates the seed).
-        let leaves = consensus::sync_maker(
-            &self.mesh.session.decision_makers,
+        let leaves = self.mesh.session.decision_makers.sync_maker(
             &key,
             consensus::MakerSync::from_descriptor(descriptor, authority, held_slots),
         );

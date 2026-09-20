@@ -89,7 +89,7 @@ pub(super) fn dispatch_finalize_drop_result(
     // The home's answer. Only the session authority acts on it (the
     // broadcast reaches everyone; a non-authority has no decide to
     // make), and only in a handshake-enabled session.
-    if !crate::consensus::is_authority(&mesh.session.decision_makers, key)
+    if !mesh.session.decision_makers.is_authority(key)
         || !crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, key)
     {
         return;

@@ -9,8 +9,7 @@ fn session_start_fires_once_when_live_slots_cover_expected() {
     let registry = new_decision_makers();
     let k = key();
     let expected: HashSet<SlotId> = [SlotId(0), SlotId(1), SlotId(2)].into_iter().collect();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             expected_slots: expected,
@@ -58,8 +57,7 @@ fn a_non_authority_accumulates_presence_and_fires_on_promotion() {
     let registry = new_decision_makers();
     let k = key();
     let expected: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             expected_slots: expected,
@@ -74,7 +72,7 @@ fn a_non_authority_accumulates_presence_and_fires_on_promotion() {
 
     // Promote it: the accumulated live slots already cover the expected set,
     // so the re-evaluation fires now — and only once.
-    let _ = set_authority(&registry, &k, Authority::SelfRelay, &HashSet::new());
+    let _ = registry.set_authority(&k, Authority::SelfRelay, &HashSet::new());
     assert!(reevaluate_session_start(&registry, &k));
     assert!(session_started(&registry, &k));
     assert!(!reevaluate_session_start(&registry, &k));
@@ -87,8 +85,7 @@ fn a_departure_uncovers_a_not_yet_started_session() {
     let registry = new_decision_makers();
     let k = key();
     let expected: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             expected_slots: expected,
@@ -117,8 +114,7 @@ fn mark_session_started_latches_without_firing() {
     let registry = new_decision_makers();
     let k = key();
     let expected: HashSet<SlotId> = [SlotId(0), SlotId(1)].into_iter().collect();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             expected_slots: expected,
@@ -129,7 +125,7 @@ fn mark_session_started_latches_without_firing() {
     mark_session_started(&registry, &k);
     assert!(session_started(&registry, &k));
     // Even a later promotion never re-fires: the latch is already set.
-    let _ = set_authority(&registry, &k, Authority::SelfRelay, &HashSet::new());
+    let _ = registry.set_authority(&k, Authority::SelfRelay, &HashSet::new());
     assert!(!reevaluate_session_start(&registry, &k));
 }
 
@@ -142,8 +138,7 @@ fn mark_session_started_latches_without_firing() {
 fn a_peer_shared_start_report_is_recorded_without_a_coordinator_notice() {
     let (registry, mut rx) = notifying_registry();
     let k = key();
-    let _ = sync_maker(
-        &registry,
+    let _ = registry.sync_maker(
         &k,
         MakerSync {
             expected_slots: [SlotId(0), SlotId(1)].into_iter().collect(),

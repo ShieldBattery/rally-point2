@@ -182,8 +182,7 @@ fn a_leave_decision_lands_in_the_flight_recorder() {
     let makers = mesh.session.decision_makers.clone();
     control.apply_descriptor(&descriptor(1, &[])); // single relay: self-authority
 
-    consensus::observe_frame(
-        &makers,
+    makers.observe_frame(
         &key(1),
         SlotId(1),
         rally_point_proto::ids::GameFrameCount(10),
@@ -257,7 +256,7 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
         let makers = mesh.session.decision_makers.clone();
         control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6), SelfRelay
 
-        consensus::observe_frame(&makers, &key(1), SlotId(0), GameFrameCount(1));
+        makers.observe_frame(&key(1), SlotId(0), GameFrameCount(1));
         let decision = consensus::ingest_local_conditions(&makers, &key(1), &conditions)
             .expect("a raise fires on the first high-RTT sample");
         assert_eq!(
@@ -281,16 +280,14 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
     desc.bounds = BufferBounds::new(1, 20).unwrap();
     control.apply_descriptor(&desc);
 
-    consensus::observe_turn_frame(
-        &makers,
+    makers.observe_turn_frame(
         &key(1),
         SlotId(0),
         100_000, // the origin's newest seq, miles past the claimed cursor
         GameFrameCount(1),
         DeliveryHome::Local,
     );
-    consensus::observe_delivery(
-        &makers,
+    makers.observe_delivery(
         &key(1),
         SlotId(1),
         SlotId(0),
@@ -311,16 +308,14 @@ fn e2e_delivery_inputs_add_at_most_the_capped_cushion_and_respect_bounds() {
     let (control, mesh, _sessions) = control_over(1);
     let makers = mesh.session.decision_makers.clone();
     control.apply_descriptor(&descriptor(1, &[])); // bounds (1, 6)
-    consensus::observe_turn_frame(
-        &makers,
+    makers.observe_turn_frame(
         &key(1),
         SlotId(0),
         100_000,
         GameFrameCount(1),
         DeliveryHome::Local,
     );
-    consensus::observe_delivery(
-        &makers,
+    makers.observe_delivery(
         &key(1),
         SlotId(1),
         SlotId(0),
