@@ -52,13 +52,8 @@ struct FlightStoreConfigRaw {
 #[derive(Debug, thiserror::Error)]
 pub enum FlightStoreConfigError {
     /// The config file could not be read.
-    #[error("reading flight store config {path}: {source}")]
-    Read {
-        /// The path that failed to read.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Read(#[from] crate::config::ConfigReadError),
     /// The file was not valid JSON in the expected shape (a bad type, a missing
     /// required field, or an unknown field).
     #[error("parsing flight store config JSON")]
@@ -85,12 +80,7 @@ pub enum FlightStoreConfigError {
 /// reading any environment variable. [`FlightStoreConfig::resolve_secrets`] does the
 /// environment resolution.
 pub fn load(path: &Path) -> Result<FlightStoreConfig, FlightStoreConfigError> {
-    let contents =
-        std::fs::read_to_string(path).map_err(|source| FlightStoreConfigError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-    from_json(&contents)
+    crate::config::load_json(path, "flight store config", from_json)
 }
 
 /// Parses and validates a flight-store config from a JSON string — the testable core

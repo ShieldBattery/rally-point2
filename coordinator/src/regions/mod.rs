@@ -114,13 +114,8 @@ impl<'de> Deserialize<'de> for RegionsConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum RegionsError {
     /// The config file could not be read.
-    #[error("reading region config {path}: {source}")]
-    Read {
-        /// The path that failed to read.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Read(#[from] crate::config::ConfigReadError),
     /// The config file was not valid JSON in the expected shape.
     #[error("parsing region config JSON")]
     Parse(#[from] serde_json::Error),
@@ -150,11 +145,7 @@ pub enum RegionsError {
 impl RegionsConfig {
     /// Loads and validates a region config from a JSON file at `path`.
     pub fn load(path: &Path) -> Result<Self, RegionsError> {
-        let contents = std::fs::read_to_string(path).map_err(|source| RegionsError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::from_json(&contents)
+        crate::config::load_json(path, "region config", Self::from_json)
     }
 
     /// Parses and validates a region config from a JSON string — the testable

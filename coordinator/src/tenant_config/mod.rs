@@ -146,13 +146,8 @@ impl TenantsConfig {
 #[derive(Debug, thiserror::Error)]
 pub enum TenantConfigError {
     /// The registry file could not be read.
-    #[error("reading tenant registry {path}: {source}")]
-    Read {
-        /// The path that failed to read.
-        path: String,
-        /// The underlying I/O error.
-        source: std::io::Error,
-    },
+    #[error(transparent)]
+    Read(#[from] crate::config::ConfigReadError),
     /// The file was not valid JSON in the expected shape (a bad type, a missing
     /// required field, or an unknown field).
     #[error("parsing tenant registry JSON")]
@@ -277,11 +272,7 @@ pub enum TenantConfigError {
 /// reading any environment variable. [`enroll_all`] does the environment
 /// resolution and enrollment.
 pub fn load(path: &Path) -> Result<TenantsConfig, TenantConfigError> {
-    let contents = std::fs::read_to_string(path).map_err(|source| TenantConfigError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    from_json(&contents)
+    crate::config::load_json(path, "tenant registry", from_json)
 }
 
 /// Parses and validates a tenant registry from a JSON string — the testable core

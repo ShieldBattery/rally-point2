@@ -79,6 +79,7 @@
 pub mod acme;
 pub mod api;
 pub mod attest;
+pub mod config;
 pub mod descriptors;
 pub(crate) mod digest;
 pub mod flight_store;
