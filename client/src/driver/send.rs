@@ -16,7 +16,7 @@ use tokio::time::Instant;
 use crate::leave_announcer::LeaveAnnouncer;
 
 use super::state::retain_sent;
-use super::*;
+use super::{DriverError, DriverTiming, UNACKED_WINDOW_CAP};
 
 /// The outcome of one turn's wire handoff: sent (keep looping), or the session
 /// must end with the given result — an absorbed post-leave close (`Ok`) or a

@@ -12,7 +12,7 @@ use super::state::{
     GameSeam, LoopState, OUTAGE_OUTBOUND_BUFFER_CAP, RECONNECT_BACKOFF_CAP,
     RECONNECT_BACKOFF_INITIAL,
 };
-use super::*;
+use super::{RehomeOutcome, RehomeProvider};
 
 /// How a non-blocking driver → game push resolved. Every driver → game delivery
 /// besides the ordered turn stream goes through [`push_to_game`]: the driver's

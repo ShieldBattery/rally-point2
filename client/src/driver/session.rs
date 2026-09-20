@@ -17,9 +17,7 @@ use tokio::time::{Instant, sleep_until};
 use super::retention::redivert_pending_control;
 use super::send::{OutboundSend, send_game_turn, send_packet, window_cap_error};
 use super::state::{GameSeam, LoopState};
-use super::{inbound, outbound, teardown};
-
-use super::*;
+use super::{DriverError, LinkDriver, inbound, outbound, teardown};
 
 /// What one extracted `select!` arm asks the loop to do next.
 ///

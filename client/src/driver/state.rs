@@ -15,7 +15,11 @@ use tokio::time::Instant;
 use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
 
-use super::*;
+use super::{
+    CHAT_CHANNEL_CAPACITY, ChatOut, DriverTiming, GAME_STARTED_CHANNEL_CAPACITY,
+    LEAVE_CHANNEL_CAPACITY, LEAVE_INTENT_CHANNEL_CAPACITY, LOBBY_CHANNEL_CAPACITY,
+    REQUEST_DROP_CHANNEL_CAPACITY, RESULT_CHANNEL_CAPACITY, SKIN_CHANNEL_CAPACITY, TurnChannels,
+};
 
 /// The first reconnect backoff delay, doubled each attempt up to
 /// [`RECONNECT_BACKOFF_CAP`].

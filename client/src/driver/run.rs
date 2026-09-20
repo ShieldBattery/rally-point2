@@ -2,6 +2,7 @@
 //! share: run one connection until it ends, or keep the game seam alive across
 //! a drop by re-dialing the home relay from inside the driver.
 
+use rally_point_proto::ids::SlotId;
 use rally_point_transport::Link;
 
 use super::backoff::{Backoff, push_to_game};
@@ -9,7 +10,7 @@ use super::reconnect::{
     ReconnectDriver, ReconnectTarget, Reconnected, is_link_failure, reconnect_link,
 };
 use super::state::{ESCALATE_AFTER, ESCALATE_RETRY, GameSeam, LoopState};
-use super::*;
+use super::{DriverError, LinkDriver, Reconnect};
 
 impl LinkDriver {
     /// Splits a driver into the three pieces a session actually runs on: the

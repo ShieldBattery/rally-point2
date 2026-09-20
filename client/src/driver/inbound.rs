@@ -23,7 +23,7 @@ use super::backoff::{GamePush, push_to_game};
 use super::send::{Release, flush_delivered_cursors, release_ready, window_cap_error};
 use super::session::ArmFlow;
 use super::state::{ConnectivityEpochStates, admit_connectivity_epoch};
-use super::*;
+use super::{ChatOut, DriverError};
 
 /// Buffers a received packet's fresh turns into their slots' reorder queues and
 /// releases each slot's contiguous prefix to the game — the whole datagram-path

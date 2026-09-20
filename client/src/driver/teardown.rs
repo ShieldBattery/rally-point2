@@ -15,7 +15,7 @@ use tokio::time::{Instant, sleep_until};
 use crate::leave_announcer::LeaveAnnouncer;
 
 use super::send::{OutboundSend, send_game_turn, send_packet};
-use super::*;
+use super::{DriverError, DriverTiming};
 
 /// The game closed its seam. Everything it produced in its final
 /// moments must still reach the relay — lockstep stalls forever on a

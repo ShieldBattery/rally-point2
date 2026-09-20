@@ -2,7 +2,14 @@
 //! hands back, plus the chat message shape that rides one of those channels.
 //! Kept beside the driver that owns the other end of every channel here.
 
-use super::*;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use rally_point_proto::ids::SlotId;
+use rally_point_proto::messages::{LeaveDirective, Payload};
+use tokio::sync::{mpsc, watch};
+
+use crate::phase::PhaseStatus;
 
 /// One in-game chat message the game authored, to send up to the relay for the
 /// other members. Mirrors `GameChat`'s wire shape minus the author `slot` —

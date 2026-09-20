@@ -82,13 +82,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeaveDirective, Payload};
 use rally_point_transport::control::ControlSendError;
 use rally_point_transport::{Link, LinkError};
-use tokio::sync::{mpsc, watch};
 
-use crate::phase::PhaseStatus;
 use state::GameSeam;
 
 mod backoff;

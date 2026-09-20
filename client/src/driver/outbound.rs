@@ -22,7 +22,7 @@ use crate::phase::{PhaseSlew, PhaseStatus};
 
 use super::send::{OutboundSend, send_game_turn};
 use super::session::ArmFlow;
-use super::*;
+use super::{ChatOut, DriverError, DriverTiming, HELD_TURN_CAP};
 
 /// One turn the game produced. With no send-phase delay in effect it goes
 /// straight to the wire; under a delay it joins the hold queue, and once

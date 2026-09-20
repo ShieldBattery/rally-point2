@@ -10,9 +10,12 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::Ordering;
 
 use rally_point_proto::beacon;
+use rally_point_proto::ids::SlotId;
+use rally_point_proto::messages::{LeaveDirective, Payload};
 use rally_point_transport::control::{ControlInbound, send_control_turn, spawn_control_reader};
 use rally_point_transport::noq;
 use rally_point_transport::test_util::{Edge, loopback};
+use tokio::sync::mpsc;
 
 use super::backoff::*;
 use super::inbound::*;

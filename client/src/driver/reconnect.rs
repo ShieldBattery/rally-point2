@@ -8,6 +8,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
 use rally_point_transport::Link;
@@ -16,6 +17,7 @@ use tokio::time::Instant;
 use crate::dial::{ClientEndpoint, DialError};
 use crate::identity::Identity;
 
+use super::DriverError;
 use super::backoff::{Backoff, EscalationWait, WaitOutcome, await_rehome, wait_backoff};
 use super::retention::{
     oldest_restaged_oversize, redivert_oversize_retention_on_same_relay_resume,
@@ -25,7 +27,6 @@ use super::state::{
     GameSeam, LoopState, OUTAGE_OUTBOUND_BUFFER_CAP, RECONNECT_DIAL_TIMEOUT,
     REHOME_PROVIDER_DEADLINE,
 };
-use super::*;
 
 /// The embedder's answer to "where should this session re-home?" — the outcome a
 /// [`RehomeProvider`] returns when the driver escalates a dead home relay to
