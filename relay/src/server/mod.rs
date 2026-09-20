@@ -26,6 +26,13 @@ use crate::consensus;
 use crate::key::SessionKey;
 use crate::routing::{self, Sessions};
 
+mod admission;
+
+use admission::{
+    Admission, DEPARTED_AT_ADMISSION, PRE_REGISTER_GATES, PROVISIONAL_CAPACITY, SESSION_RETIRED,
+    SLOT_TAKEN, journal_seal_still_clear,
+};
+
 /// Maximum authorization handshakes in flight at once. A coarse admission backstop:
 /// connections that stall mid-handshake can only tie up this many slots of pre-auth
 /// state no matter how fast they arrive, so an unauthenticated flood can't grow
@@ -321,8 +328,19 @@ async fn serve_reader(
         });
     }
 }
+
 /// Authorizes one incoming client connection, wires it into routing, and serves
 /// its turns until it closes. The TLS handshake is already complete (the accept
+/// loop ran it and dispatched on the negotiated ALPN); what remains is the
+/// relay's own admission pipeline.
+///
+/// That pipeline is a sequence of gates, and **their order is load-bearing**.
+/// Each gate's own reasoning is written on it below; the two orderings worth
+/// naming up front are that the handshake ack is written before any hold or
+/// departure state is touched, and that the journal seal is re-checked after
+/// registration succeeds. Every refusal past authorization goes through the
+/// [`Admission`] guard, which owns the rollback each one has to run — see
+/// [`admission`]'s docs for that rule.
 async fn serve_connection(
     connection: noq::Connection,
     registry: &Registry,
@@ -330,16 +348,19 @@ async fn serve_connection(
     mesh: crate::mesh::MeshState,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), ConnError> {
-    // Refuse before any handshake or registration state exists: the
-    // transport's admission and replay invariants assume every connection's
-    // datagram budget meets the guaranteed floor, so a peer advertising less
-    // is an unsupported configuration — refused whole rather than partially
-    // served, mirroring the check the client dial runs on its own side.
+    // GATE: the datagram floor. Refuse before any handshake or registration
+    // state exists: the transport's admission and replay invariants assume
+    // every connection's datagram budget meets the guaranteed floor, so a peer
+    // advertising less is an unsupported configuration — refused whole rather
+    // than partially served, mirroring the check the client dial runs on its
+    // own side.
     if let Err(error) = rally_point_transport::quic::verify_datagram_budget(&connection) {
         connection.close(0u32.into(), b"datagram budget under guaranteed floor");
         return Err(ConnError::DatagramBudgetTooSmall(error));
     }
 
+    // GATE: the authorization handshake, and the deadline on it. Nothing below
+    // has a session to refuse against until this has named one.
     let handshake = auth::authenticate(&connection, registry, time::unix_secs_fail_closed());
     let (authorized, resume_cursors, connection_epoch, mut handshake_send) =
         match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
@@ -360,128 +381,49 @@ async fn serve_connection(
         session: authorized.session,
     };
 
-    // Home-relay binding gate: refuse a client whose authorized slot the
-    // coordinator did not assign to this relay. A token binds
-    // tenant/session/slot/key but not the relay itself, so without this a
-    // misrouted (or malicious) client could register the same slot on two
-    // relays in a true multi-relay session, feeding each a different turn at
-    // the same (slot, seq) -- a split the mesh's topological dedup only
-    // suppresses the symptom of, on each side, never detects or prevents.
-    //
-    // `slot_homed` admits (`true`) when no descriptor has arrived yet for
-    // this session, or one arrived with an empty homed set (legacy, dev-mode,
-    // a coordinator that predates the field) -- so this preserves today's
-    // descriptor-arrival-race behavior exactly: a client dialing before any
-    // descriptor exists for its session is admitted unconditionally, with no
-    // new wait or window introduced here. Enforcement only ever refuses once
-    // a non-empty homed set says this slot belongs to a different relay.
-    if !consensus::slot_homed(&mesh.session.decision_makers, &key, authorized.slot) {
-        connection.close(
-            VarInt::from_u32(close_codes::SLOT_NOT_HOMED),
-            b"slot not homed on this relay",
-        );
-        return Err(ConnError::SlotNotHomed {
-            tenant: key.tenant,
-            session: key.session,
-            slot: authorized.slot,
-        });
+    // The session and slot are known, so from here on a refusal could leave
+    // relay state behind. The guard takes custody: it closes the connection,
+    // frees the roster seat once there is one, and runs the rollback each
+    // refusal owes.
+    let mut admission = Admission::new(connection, key.clone(), authorized.slot, &sessions, &mesh);
+
+    // GATES: home-relay binding, then the decided-departure fast-fail, then
+    // the journaled clean-leave seal — in that order, and all three before the
+    // roster is touched, so a refusal here has nothing to undo. Each gate's
+    // reasoning is on its own predicate in `admission`.
+    for gate in PRE_REGISTER_GATES {
+        if let Some(refusal) = gate(&mesh.session, &key, authorized.slot) {
+            return Err(admission.refuse(refusal));
+        }
     }
 
-    // Cheap pre-register fast-fail against the slot's departure state, before
-    // touching the roster at all: a departure recorded with no hold pending means
-    // the leave was already decided (an honored drop request, or a clean leave),
-    // so the re-register is hopeless and can be refused before spending a roster
-    // slot on it. This is a snapshot — read before `register` below, and never
-    // reused after it — which is sound only because decided-ness is monotonic (a
-    // decided leave never becomes undecided again): if this snapshot is stale by
-    // the time it's checked, it can only be stale in the direction of a hold that
-    // has SINCE been claimed by a concurrent reconnect or decide, never the other
-    // way, so a "departed" read here is never a false positive. The real
-    // admission decision — the one this snapshot must never be reused for — is
-    // below, keyed on current state after `register` succeeds.
-    let departed = consensus::slot_departed(&mesh.session.decision_makers, &key, authorized.slot);
-    let hold_pending = mesh.session.drop_holds.is_pending(&key, authorized.slot);
-    if departed && !hold_pending {
-        connection.close(
-            VarInt::from_u32(close_codes::SLOT_DEPARTED),
-            b"slot already departed",
-        );
-        return Err(ConnError::SlotDeparted {
-            tenant: key.tenant,
-            session: key.session,
-            slot: authorized.slot,
-        });
-    }
-
-    // A clean leave journaled before the session's descriptor is terminal
-    // from the moment of the intent, exactly as a maker's decided leave is:
-    // without this, the same valid token could redial into the
-    // pre-descriptor window (where the permissive no-maker admission would
-    // wave it through), and its fresh generation would race the journaled
-    // leave's drained count with post-count turns. The seal outlives the
-    // journal's drain (the drained decided leave then refuses through the
-    // maker), so this check is monotone-safe read here before registration.
-    if mesh.session.provisional_turns.armed()
-        && mesh
-            .session
-            .provisional_turns
-            .slot_sealed(&key, authorized.slot)
-    {
-        connection.close(
-            VarInt::from_u32(close_codes::SLOT_DEPARTED),
-            b"slot already departed",
-        );
-        return Err(ConnError::SlotDeparted {
-            tenant: key.tenant,
-            session: key.session,
-            slot: authorized.slot,
-        });
-    }
-
-    // Admission is an ingress critical section on the session's gate: the
-    // retirement check and the roster registration happen atomically against
-    // a concurrent descriptor retirement, so a stale dial can neither slip in
-    // behind the sweep (recreating roster/seen state for a session with no
-    // lifecycle left) nor land between the check and the register.
-    let Some(registered) = mesh.session.gates.with_ingress(&key, || {
+    // GATE: the roster seat. Admission is an ingress critical section on the
+    // session's gate: the retirement check and the roster registration happen
+    // atomically against a concurrent descriptor retirement, so a stale dial
+    // can neither slip in behind the sweep (recreating roster/seen state for a
+    // session with no lifecycle left) nor land between the check and the
+    // register.
+    let registered = mesh.session.gates.with_ingress(&key, || {
         routing::register(&sessions, &key, authorized.slot, connection_epoch)
-    }) else {
-        connection.close(
-            VarInt::from_u32(close_codes::SESSION_RETIRED),
-            b"session retired",
-        );
-        return Err(ConnError::SessionRetired {
-            tenant: key.tenant,
-            session: key.session,
-            slot: authorized.slot,
-        });
+    });
+    let Some(registered) = registered else {
+        return Err(admission.refuse(SESSION_RETIRED));
     };
-    let Some((mut registration, inbox)) = registered else {
-        connection.close(
-            VarInt::from_u32(close_codes::SLOT_TAKEN),
-            b"slot already connected",
-        );
-        // The register attempt created the session's gate on first touch;
-        // if this session holds nothing else, don't leave that scaffolding
-        // behind (the live occupant's seat makes this a no-op here).
-        routing::abandon_refused_admission(&sessions, &mesh, &key);
-        return Err(ConnError::SlotTaken {
-            tenant: key.tenant,
-            session: key.session,
-            slot: authorized.slot,
-        });
+    let Some((registration, inbox)) = registered else {
+        return Err(admission.refuse(SLOT_TAKEN));
     };
+    admission.hold_seat(registration);
 
-    // Reserve the session's journal capacity BEFORE the handshake ack and
-    // BEFORE any hold/departure state is touched. Both orderings are
-    // load-bearing: `HANDSHAKE_OK` is the shared contract's "your slot is
-    // routable" — a client that reads it treats the link as up, so a
-    // capacity refusal after the ack could be observed as a success that
-    // then dies; and `admit_reconnect` can consume a drop hold or reinstate
-    // a departure, mutations a refused connection must never have made.
-    // Refusing here, the connection has been told nothing and changed
-    // nothing beyond its roster seat and possibly this reservation — both
-    // rolled back below.
+    // GATE: the provisional journal's session capacity. Reserved BEFORE the
+    // handshake ack and BEFORE any hold/departure state is touched. Both
+    // orderings are load-bearing: `HANDSHAKE_OK` is the shared contract's
+    // "your slot is routable" — a client that reads it treats the link as up,
+    // so a capacity refusal after the ack could be observed as a success that
+    // then dies; and `admit_reconnect` can consume a drop hold or reinstate a
+    // departure, mutations a refused connection must never have made. Refusing
+    // here, the connection has been told nothing and changed nothing beyond
+    // its roster seat and possibly this reservation — both rolled back by the
+    // refusal.
     if mesh.session.provisional_turns.armed() {
         let reserved = mesh.session.gates.with_ingress(&key, || {
             consensus::maker_exists(&mesh.session.decision_makers, &key)
@@ -489,131 +431,81 @@ async fn serve_connection(
         });
         match reserved {
             Some(true) => {}
-            Some(false) => {
-                connection.close(
-                    VarInt::from_u32(close_codes::PROVISIONAL_CAPACITY),
-                    b"provisional capacity exhausted",
-                );
-                drop(registration);
-                routing::abandon_refused_admission(&sessions, &mesh, &key);
-                return Err(ConnError::ProvisionalCapacity {
-                    tenant: key.tenant,
-                    session: key.session,
-                    slot: authorized.slot,
-                });
-            }
-            None => {
-                connection.close(
-                    VarInt::from_u32(close_codes::SESSION_RETIRED),
-                    b"session retired",
-                );
-                return Err(ConnError::SessionRetired {
-                    tenant: key.tenant,
-                    session: key.session,
-                    slot: authorized.slot,
-                });
-            }
+            Some(false) => return Err(admission.refuse(PROVISIONAL_CAPACITY)),
+            None => return Err(admission.refuse(SESSION_RETIRED)),
         }
     }
 
-    // Write the handshake ack BEFORE touching any hold/departure state. A
-    // write failure here rolls back everything this admission created — the
-    // roster seat (the registration guard's drop) and the session
+    // GATE: the handshake ack, written BEFORE touching any hold/departure
+    // state. A write failure here rolls back everything this admission created
+    // — the roster seat (the registration guard's drop) and the session
     // scaffolding when nothing else owns it (`abandon_refused_admission`,
     // which removes only an empty, un-drained journal reservation) — and
     // neither a hold nor a departure record was ever claimed or cleared, so
     // nothing is left inconsistent for a later retry to trip over. The old
-    // ordering used to release the hold and reinstate the slot first and
-    // write the ack after, so a write failure would leave the drop's hold
-    // gone and its departure record cleared with no client ever actually
-    // connected — unrecoverable, since nothing was left to decide against
-    // and no hold to admit a future retry's resume.
+    // ordering used to release the hold and reinstate the slot first and write
+    // the ack after, so a write failure would leave the drop's hold gone and
+    // its departure record cleared with no client ever actually connected —
+    // unrecoverable, since nothing was left to decide against and no hold to
+    // admit a future retry's resume.
     if let Err(error) = handshake_send.write_all(&[HANDSHAKE_OK]).await {
-        drop(registration);
-        routing::abandon_refused_admission(&sessions, &mesh, &key);
-        return Err(AuthError::from(error).into());
+        return Err(admission.refuse_unannounced(AuthError::from(error).into()));
     }
     let _ = handshake_send.finish();
 
-    // Resolve this slot against CURRENT hold, departure, final-leave, and epoch
-    // state. The holds lock stays stable while one decision-maker lock restores
-    // any suspended game-progress state and activates this generation. An old
-    // teardown therefore lands wholly before this transition (and is claimed)
-    // or wholly after it (and is stale); it cannot re-land between reinstatement
-    // and activation. The no-hold path uses the same maker critical section, so
-    // a departure that won immediately beforehand is observed rather than raced.
+    // GATE: the admission itself. Resolve this slot against CURRENT hold,
+    // departure, final-leave, and epoch state. The holds lock stays stable
+    // while one decision-maker lock restores any suspended game-progress state
+    // and activates this generation. An old teardown therefore lands wholly
+    // before this transition (and is claimed) or wholly after it (and is
+    // stale); it cannot re-land between reinstatement and activation. The
+    // no-hold path uses the same maker critical section, so a departure that
+    // won immediately beforehand is observed rather than raced.
     //
     // Run under the session's ingress gate: the handshake-ack write above is
-    // an await the register-time gate section could not span, so a
-    // retirement can land in between — sweeping the maker and holds — and
-    // this admission would then sail through the permissive no-maker path
-    // and start a link on a session the coordinator already ended. The gate
-    // re-check makes the sweep and this resolution mutually exclusive; a
-    // retirement that lands first refuses the admission here.
-    let Some(admission) = mesh.session.gates.with_ingress(&key, || {
-        // Re-check the journal seal now that registration succeeded: the
-        // pre-register check can race the sealing link itself — the old
-        // link's clean intent installs the seal and only then frees the
-        // roster seat, so a dial that read "not sealed" while the seat was
-        // still occupied can find it free moments later. Registration
-        // succeeding proves the old link deregistered, which proves its
-        // seal (if any) was already installed — so this post-register read
-        // is authoritative where the pre-register one was only a fast-fail.
-        if mesh.session.provisional_turns.armed()
-            && mesh
-                .session
-                .provisional_turns
-                .slot_sealed(&key, authorized.slot)
-        {
+    // an await the register-time gate section could not span, so a retirement
+    // can land in between — sweeping the maker and holds — and this admission
+    // would then sail through the permissive no-maker path and start a link on
+    // a session the coordinator already ended. The gate re-check makes the
+    // sweep and this resolution mutually exclusive; a retirement that lands
+    // first refuses the admission here.
+    let verdict = mesh.session.gates.with_ingress(&key, || {
+        // Re-check the journal seal now that registration succeeded — see
+        // `journal_seal_still_clear` for why the pre-register read
+        // was only a fast-fail and this one is authoritative.
+        if !journal_seal_still_clear(&mesh.session, &key, authorized.slot) {
             return consensus::ReconnectAdmission::Rejected;
         }
-        let admission = consensus::admit_reconnect(
+        let verdict = consensus::admit_reconnect(
             &mesh.session.decision_makers,
             &mesh.session.drop_holds,
             &key,
             authorized.slot,
             Some(connection_epoch),
         );
-        // Bound the admit-first race this connection just rode (`slot_homed`
-        // above, admitted because no descriptor names this session yet): if
-        // the coordinator's descriptor push never arrives, the
+        // Bound the admit-first race this connection just rode (the home-relay
+        // gate above, admitted because no descriptor names this session yet):
+        // if the coordinator's descriptor push never arrives, the
         // provisional-admission sweep tears this session down rather than
         // trusting it indefinitely. A session already covered by a descriptor
-        // — even one with an empty (unenforced) homed set — is left alone;
-        // see `crate::session::provisional::ProvisionalSessions::mark_if_undescribed`.
+        // — even one with an empty (unenforced) homed set — is left alone; see
+        // `crate::session::provisional::ProvisionalSessions::mark_if_undescribed`.
         // Inside the ingress section so the mark and the maker existence it
         // keys on are read atomically against a retirement sweep.
-        if matches!(admission, consensus::ReconnectAdmission::Admitted { .. }) {
+        if matches!(verdict, consensus::ReconnectAdmission::Admitted { .. }) {
             mesh.session
                 .provisional
                 .mark_if_undescribed(&mesh.session.decision_makers, &key);
         }
-        admission
-    }) else {
-        connection.close(
-            VarInt::from_u32(close_codes::SESSION_RETIRED),
-            b"session retired",
-        );
-        return Err(ConnError::SessionRetired {
-            tenant: key.tenant,
-            session: key.session,
-            slot: authorized.slot,
-        });
+        verdict
+    });
+    let Some(verdict) = verdict else {
+        return Err(admission.refuse(SESSION_RETIRED));
     };
-    let reinstated = match admission {
+    let reinstated = match verdict {
         consensus::ReconnectAdmission::Admitted { reinstated } => reinstated,
         consensus::ReconnectAdmission::Rejected => {
-            connection.close(
-                VarInt::from_u32(close_codes::SLOT_DEPARTED),
-                b"slot already departed",
-            );
-            drop(registration);
-            routing::abandon_refused_admission(&sessions, &mesh, &key);
-            return Err(ConnError::SlotDeparted {
-                tenant: key.tenant,
-                session: key.session,
-                slot: authorized.slot,
-            });
+            return Err(admission.refuse(DEPARTED_AT_ADMISSION));
         }
     };
     if reinstated {
@@ -625,6 +517,9 @@ async fn serve_connection(
         );
     }
 
+    // Every gate passed: the connection and its roster seat leave the guard,
+    // and the seat stops being this admission's to roll back.
+    let (connection, mut registration) = admission.into_serving();
     registration.disarm();
 
     tracing::info!(
