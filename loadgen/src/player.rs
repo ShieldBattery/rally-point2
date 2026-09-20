@@ -417,7 +417,7 @@ async fn pump_turns(
                 stats.turns_sent += 1;
                 ordinal += 1;
             }
-            maybe = channels.inbound.recv() => {
+            maybe = channels.recv_turn() => {
                 match maybe {
                     Some(payload) => record_inbound(
                         &payload,
@@ -430,11 +430,6 @@ async fn pump_turns(
                     None => return false,
                 }
             }
-            maybe = channels.leaves.recv() => if maybe.is_none() { return false },
-            maybe = channels.connectivity.recv() => if maybe.is_none() { return false },
-            maybe = channels.chat_in.recv() => if maybe.is_none() { return false },
-            maybe = channels.lobby_in.recv() => if maybe.is_none() { return false },
-            maybe = channels.skin_in.recv() => if maybe.is_none() { return false },
         }
     }
     true
@@ -465,7 +460,7 @@ async fn drain_delivery_phase(
             resolution = lifecycle.wait_for_drain_resolution(&mut lifecycle_changes) => {
                 return resolution;
             },
-            maybe = channels.inbound.recv() => {
+            maybe = channels.recv_turn() => {
                 match maybe {
                     Some(payload) => record_inbound(
                         &payload,
@@ -481,26 +476,6 @@ async fn drain_delivery_phase(
                     }
                 }
             }
-            maybe = channels.leaves.recv() => if maybe.is_none() {
-                lifecycle.abort();
-                return DrainResolution::Aborted;
-            },
-            maybe = channels.connectivity.recv() => if maybe.is_none() {
-                lifecycle.abort();
-                return DrainResolution::Aborted;
-            },
-            maybe = channels.chat_in.recv() => if maybe.is_none() {
-                lifecycle.abort();
-                return DrainResolution::Aborted;
-            },
-            maybe = channels.lobby_in.recv() => if maybe.is_none() {
-                lifecycle.abort();
-                return DrainResolution::Aborted;
-            },
-            maybe = channels.skin_in.recv() => if maybe.is_none() {
-                lifecycle.abort();
-                return DrainResolution::Aborted;
-            },
         }
     }
 }
@@ -517,7 +492,7 @@ async fn drain_until_driver_ends(
     deliveries: &mut DeliveryTracker,
 ) -> Ending {
     let deadline = TokioInstant::now() + TEARDOWN_TIMEOUT;
-    let mut inbound_alive = true;
+    let mut channels_alive = true;
     loop {
         tokio::select! {
             biased;
@@ -545,7 +520,7 @@ async fn drain_until_driver_ends(
                 );
                 return Ending::Errored;
             }
-            maybe = channels.inbound.recv(), if inbound_alive => {
+            maybe = channels.recv_turn(), if channels_alive => {
                 match maybe {
                     Some(payload) => record_inbound(
                         &payload,
@@ -555,14 +530,9 @@ async fn drain_until_driver_ends(
                         stats,
                         deliveries,
                     ),
-                    None => inbound_alive = false,
+                    None => channels_alive = false,
                 }
             }
-            maybe = channels.leaves.recv() => { let _ = maybe; }
-            maybe = channels.connectivity.recv() => { let _ = maybe; }
-            maybe = channels.chat_in.recv() => { let _ = maybe; }
-            maybe = channels.lobby_in.recv() => { let _ = maybe; }
-            maybe = channels.skin_in.recv() => { let _ = maybe; }
         }
     }
 }

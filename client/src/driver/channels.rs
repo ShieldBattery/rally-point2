@@ -206,3 +206,35 @@ pub struct TurnChannels {
     /// corrected).
     pub phase_status: watch::Receiver<PhaseStatus>,
 }
+
+impl TurnChannels {
+    /// Awaits the next peer turn on [`inbound`](Self::inbound), receiving and
+    /// **discarding** anything that arrives meanwhile on the best-effort
+    /// directive channels — [`leaves`](Self::leaves),
+    /// [`connectivity`](Self::connectivity), [`chat_in`](Self::chat_in),
+    /// [`lobby_in`](Self::lobby_in) and [`skin_in`](Self::skin_in). Returns
+    /// `None` once any of those channels has closed, which is how the driver
+    /// ending surfaces here.
+    ///
+    /// For an embedder that only plays turns — a load generator or a test
+    /// harness. A real game must read the directive channels itself: a
+    /// discarded `LeaveDirective` never clears the departed slot, and lockstep
+    /// stalls on it forever. Draining them is not optional either way, since a
+    /// directive channel left to fill backs up the driver's control-stream
+    /// dispatch.
+    ///
+    /// Cancel-safe, so it can sit in a `select!` arm: each underlying `recv` is
+    /// cancel-safe and a turn is only ever consumed by returning it.
+    pub async fn recv_turn(&mut self) -> Option<Payload> {
+        loop {
+            tokio::select! {
+                payload = self.inbound.recv() => return payload,
+                maybe = self.leaves.recv() => maybe.is_some().then_some(())?,
+                maybe = self.connectivity.recv() => maybe.is_some().then_some(())?,
+                maybe = self.chat_in.recv() => maybe.is_some().then_some(())?,
+                maybe = self.lobby_in.recv() => maybe.is_some().then_some(())?,
+                maybe = self.skin_in.recv() => maybe.is_some().then_some(())?,
+            }
+        }
+    }
+}
