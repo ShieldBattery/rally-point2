@@ -2,7 +2,7 @@
 //!
 //! When two relays establish a mesh connection, the lower-id side dials and the
 //! higher-id side accepts. Which side dials is a *pre-connect* local decision
-//! made from configured (later coordinator-pushed) topology — the dialer already
+//! made from coordinator-pushed or static topology — the dialer already
 //! knows whom it dialed. The acceptor does not: it sees only an inbound QUIC
 //! connection arriving from an ephemeral source port, with no way to tell *which*
 //! peer relay just connected. So immediately after the connection completes, the
@@ -11,10 +11,12 @@
 //!
 //! That label is what lets a relay target a session join to the specific link
 //! serving that session's peer, rather than broadcasting to every link it holds.
-//! This is purely a *labeling* exchange — it does not decide which side dials
-//! (that was already settled before connecting) and carries no authority; a
-//! peer's claimed id is trusted only as far as the connection's certificate
-//! already is (relay-to-relay authentication is a separate, later concern).
+//! This codec only frames the claimed identity. The relay's mesh acceptor
+//! verifies that claim against the connection's peer certificate and the
+//! coordinator's fleet-peer identity map before admitting the link.
+//! Coordinator-driven relays require that authentication from boot; static dev
+//! meshes can opt in to the same requirement. The hello itself neither
+//! authenticates the peer nor decides which side dials.
 //!
 //! The hello is a fixed [`MESH_HELLO_LEN`]-byte frame — an 8-byte little-endian
 //! relay id followed by a 2-byte little-endian protocol version — so the reader

@@ -18,11 +18,10 @@ use crate::key::SessionKey;
 /// [`LinkConditions`] sidecar on each forwarded datagram.
 ///
 /// Outgoing-only: the relay reports its *own* home clients' conditions. It does
-/// not store conditions received from peer relays — those ride the peer's own
-/// origin datagrams to the decision-maker, and storing them here would add a
-/// stale-conditions correctness surface for a consumer (the decision-maker) that
-/// is not yet built. The mesh-link driver traces incoming conditions
-/// for observability but does not persist them.
+/// not store conditions received from peer relays. The mesh-link driver feeds
+/// those directly into the decision-maker alongside the measured mesh RTT.
+/// Keeping them out of this registry ensures outgoing sidecars describe only
+/// the home-client links this relay observes itself.
 ///
 /// A plain (non-async) mutex mirrors [`MeshLinks`](super::MeshLinks) and [`crate::routing::Sessions`]:
 /// every critical section is a short, await-free slot edit or a snapshot clone,

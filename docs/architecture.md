@@ -1135,13 +1135,15 @@ control channel gains nothing from QUIC's congestion control or stream multiplex
 connection is plenty, and rides the server that already exists.
 
 **Declarative current-state.** The coordinator holds, per relay, that relay's *current* descriptor set
-(the descriptor for every session it should serve) behind a watch, and pushes the whole set — on connect
-(a re-sync) and again on every change. The relay applies each descriptor through its idempotent Join
-source, so re-pushing an unchanged set is a no-op and a reconnect converges rather than double-applies.
-The set is **not** a stream of deltas; the one thing a relay must do that a delta would carry explicitly
-is detect *removals* — a session gone from the set is one to leave — which it does by diffing against
-what it last applied, kept across reconnects so a session removed while the relay was briefly
-disconnected is left when the next connection's full set arrives without it.
+(the descriptor for every session it should serve) behind a watch. Every connection starts with a
+**full-set re-sync**. Subsequent changes go out as **descriptor deltas** — upserts and explicit removals
+relative to the last successfully sent set — when the negotiated protocol version supports them;
+older relays continue to receive full sets. Each upsert goes through the same idempotent Join source,
+and each removal ends that session's membership. A full set also removes sessions absent from it by
+diffing against the relay's last-applied state, kept across reconnects, so a session removed while the
+relay was disconnected is left when the re-sync arrives. The ordered control connection puts the full
+baseline before every delta, and reconnecting establishes a fresh baseline. The drain handshake also
+sends a full set before its acknowledgement, preserving the relay's post-drain membership view.
 
 **Auth.** The relay presents a coordinator-issued **bootstrap secret** (`Authorization: Bearer …`) on the
 upgrade; a mismatch is rejected before the socket opens (a constant-time compare, so the secret isn't

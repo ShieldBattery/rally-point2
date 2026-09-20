@@ -412,7 +412,8 @@ impl SessionSetup {
     /// 4. Clear the recorded re-home decisions.
     /// 5. Drop the session's re-home rate-limit bucket.
     ///
-    /// **The take must come first.** Ordering matters against a concurrent
+    /// **Take membership before clearing descriptors or recorded rehomes.**
+    /// Ordering matters against a concurrent
     /// [`rehome`](fn@crate::session::rehome), which re-validates membership under
     /// the same `session_relays` lock the take acquires:
     ///

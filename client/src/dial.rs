@@ -175,11 +175,11 @@ impl ClientEndpoint {
     /// acknowledged it as routable.
     ///
     /// `server_name` is the relay's TLS server name, checked against the
-    /// certificate it presents. The relay re-sequences each outbound link onto one
-    /// gapless transport-seq stream that muxes every slot, so the turns can be put
-    /// back in order from that single sequence — but the datagrams carrying them can
-    /// still arrive out of order, so doing that ordering is the job of the driver
-    /// above the link ([`LinkDriver`](crate::LinkDriver)), not of this dial.
+    /// certificate it presents. The relay preserves each origin slot's payload
+    /// sequence and forwards turns as they arrive. The driver above the link
+    /// ([`LinkDriver`](crate::LinkDriver)) restores game order independently per
+    /// slot, combining turns received through datagrams and the reliable control
+    /// stream. A packet's sequence is only a per-link acknowledgement handle.
     ///
     /// The whole dial is bounded by `CONNECT_TIMEOUT` so a relay that accepts the
     /// connection but then stalls cannot hang the caller; use

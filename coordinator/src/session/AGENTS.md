@@ -21,9 +21,10 @@
   of those, and never hold it across an await.
 - `retire_session` is the only way a session's state goes away: pending reap
   directives, membership, descriptors, recorded rehomes, and the re-home bucket,
-  in that order. The membership **take** must stay first — it is what a racing
-  `rehome` re-validates against. Both lifecycle close paths call it, so a new map
-  keyed by session belongs inside it, not at a call site. `forget_relay` is its
+  in that order. The membership **take** must precede descriptor and recorded
+  rehome cleanup — it is what a racing `rehome` re-validates against. Both
+  lifecycle close paths call it, so a new map keyed by session belongs inside
+  it, not at a call site. `forget_relay` is its
   per-relay twin and is only safe for a ledger-tombstoned id.
 - `rehome_inner` re-validates membership *under the `session_relays` lock* after
   picking a replacement. Drop that re-read and a close racing mid-rehome leaves a
