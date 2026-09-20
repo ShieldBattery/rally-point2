@@ -25,6 +25,7 @@ mod phase;
 mod reconnect_races;
 mod roster;
 mod session_close;
+mod silence;
 
 pub(super) use crate::test_support::{seed_maker, session_key};
 

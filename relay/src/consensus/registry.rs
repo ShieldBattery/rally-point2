@@ -140,9 +140,8 @@ impl DecisionMakers {
 
     /// The relay-wide flight recorder (see the field's doc for why it rides
     /// this registry). The rest of the relay reaches its recorder through here;
-    /// the decision paths in this module record through
-    /// [`record_event`](Self::record_event) instead, so they name only the
-    /// event vocabulary.
+    /// the decision paths in this module record through the module-private
+    /// `record_event` instead, so they name only the event vocabulary.
     pub fn flight_recorder(&self) -> &crate::observability::flight_recorder::FlightRecorder {
         &self.flight
     }

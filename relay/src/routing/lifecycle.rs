@@ -98,7 +98,7 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
 
 /// Closes the links of `slots` in the `key` routing group because their clients
 /// stopped producing turns while the session advanced past them (see
-/// [`crate::consensus::run_silence_watch`]). Identical to [`close_slots`] but for
+/// [`crate::routing::run_silence_watch`]). Identical to [`close_slots`] but for
 /// the reason it stamps, which is what makes the closed connection carry
 /// [`close_codes::SILENT_SLOT`] instead of the generic close: a client whose game thread
 /// hung has a perfectly healthy link, and its log should say so.

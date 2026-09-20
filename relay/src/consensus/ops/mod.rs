@@ -47,8 +47,7 @@ pub use session_start::{
     started_home_slots, started_session_slot_count,
 };
 pub use silence::{
-    SILENCE_CHECK_INTERVAL, note_forward_advance, retained_load_state, retained_load_states,
-    run_silence_watch,
+    claim_silent_slots, note_forward_advance, retained_load_state, retained_load_states,
 };
 pub use sync_coverage::sync_coverage;
 

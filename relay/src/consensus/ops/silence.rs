@@ -1,5 +1,5 @@
-//! The relay-wide silence watch task and the retained load state it reads
-//! alongside.
+//! The silence watch's registry half — the per-tick verdict sweep — and the
+//! retained load state read alongside it.
 
 use super::*;
 
@@ -48,82 +48,31 @@ pub fn note_forward_advance(registry: &DecisionMakers, key: &SessionKey, slot: S
     }
 }
 
-/// How often the silence watch re-examines every live session. Short relative to
-/// any sensible silence window, so a stalled session is released within a couple
-/// of seconds of the window closing, and cheap: one registry lock plus a walk of
-/// each session's slots, with no per-slot work between ticks.
-pub const SILENCE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
-
-/// The relay-wide silent-slot watch: every `interval`, closes the link of the
-/// slot this relay homes whose turns stopped reaching local clients at least
-/// `window` ago and strictly before every other participant its session still
-/// requires (see [`DecisionMaker::silent_slot`]). One task per relay, spawned by
-/// the binary; never returns.
+/// Every session whose decision-maker names a slot that has gone silent, with
+/// that verdict marked so the same slot is not named again on a later tick.
 ///
-/// A lockstep session cannot outrun its slowest slot, so a client whose game
-/// thread hung — or whose process a player suspended — holds every other player
-/// still for as long as its QUIC link keeps answering keepalives. Nothing else
-/// resolves that: the survivors' drop machinery only ever fires for a slot the
-/// relay saw *disconnect*. Closing the link here manufactures exactly that
-/// disconnect, and the ordinary link-death path (departure record, drop hold,
-/// survivors' countdown, synced leave) takes it from there.
+/// The verdict itself is [`DecisionMaker::silent_slot`]: complete knowledge of
+/// the session or no verdict at all, and only ever the slot that stopped
+/// strictly earliest. What a caller does with a named slot — closing its link,
+/// so the ordinary link-death path resolves it — belongs to the layer that
+/// owns the links, which is why this hands the names back rather than acting
+/// on them.
 ///
-/// A verdict needs complete knowledge of the session, so most ticks produce
-/// none: the participants compared are the descriptor's expected roster, a
-/// roster slot this relay holds no state for blocks every verdict rather than
-/// counting for nothing, a decided leave stays in the comparison until every
-/// live participant has forwarded something after the decision, a resumed
-/// session stands the watch down outright, and a participant with no game-started
-/// report is unknown too — a client's pre-loop seed payloads advance its
-/// forwarded prefix before it has simulated anything, so that prefix is not
-/// simulation progress. Only a slot's home receives that
-/// report, so the home shares it across the mesh (`SlotStarted`) and every relay
-/// serving the session answers from the same set.
-pub async fn run_silence_watch(
-    makers: std::sync::Arc<DecisionMakers>,
-    sessions: crate::routing::Sessions,
+/// The whole sweep runs under one acquisition of the registry lock, and the
+/// mark is taken inside it: acting on a name takes other locks, and a slot
+/// already marked is out of the comparison regardless of how long the acting
+/// takes.
+pub fn claim_silent_slots(
+    registry: &DecisionMakers,
+    now: Instant,
     window: Duration,
-    interval: Duration,
-) {
-    let mut tick = tokio::time::interval(interval);
-    // The first tick fires immediately; skip it so no session is judged before
-    // it has had a chance to run.
-    tick.tick().await;
-    loop {
-        tick.tick().await;
-        // Marked under one registry lock, acted on outside it: closing a link and
-        // recording an event both take other locks, and the mark is what keeps a
-        // slot from being reported again on the next tick regardless.
-        let evicted: Vec<(SessionKey, SilentSlot)> = {
-            let now = Instant::now();
-            let mut evicted = Vec::new();
-            let mut registry = makers.lock();
-            for (key, maker) in registry.iter_mut() {
-                if let Some(found) = maker.silent_slot(now, window) {
-                    maker.mark_silence_evicted(found.slot);
-                    evicted.push((key.clone(), found));
-                }
-            }
-            evicted
-        };
-        for (key, found) in evicted {
-            tracing::warn!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                slot = found.slot.0,
-                silent_ms = found.silent_for.as_millis() as u64,
-                lead_ms = found.lead.as_millis() as u64,
-                "slot's turns stopped reaching its peers before any other slot's did; closing its link so the survivors can drop it",
-            );
-            makers.record_event(
-                &key,
-                FlightEvent::SlotEvictedSilent {
-                    slot: found.slot.0,
-                    silent_ms: found.silent_for.as_millis() as u64,
-                    lead_ms: found.lead.as_millis() as u64,
-                },
-            );
-            crate::routing::close_slots_for_silence(&sessions, &key, &[found.slot]);
+) -> Vec<(SessionKey, SilentSlot)> {
+    let mut claimed = Vec::new();
+    for (key, maker) in registry.lock().iter_mut() {
+        if let Some(found) = maker.silent_slot(now, window) {
+            maker.mark_silence_evicted(found.slot);
+            claimed.push((key.clone(), found));
         }
     }
+    claimed
 }

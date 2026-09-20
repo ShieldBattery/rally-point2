@@ -218,11 +218,11 @@ async fn main() -> Result<()> {
         ),
         secs => {
             tracing::info!(window_secs = secs, "silent-slot eviction enabled");
-            tokio::spawn(rally_point_relay::consensus::run_silence_watch(
+            tokio::spawn(rally_point_relay::routing::run_silence_watch(
                 Arc::clone(&mesh_state.session.decision_makers),
                 Arc::clone(&sessions),
                 Duration::from_secs(secs),
-                rally_point_relay::consensus::SILENCE_CHECK_INTERVAL,
+                rally_point_relay::routing::SILENCE_CHECK_INTERVAL,
             ));
         }
     }

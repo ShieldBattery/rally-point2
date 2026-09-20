@@ -394,11 +394,11 @@ pub struct SampleRecord {
 }
 
 /// One session's flushed recording: the versioned, self-describing envelope a
-/// [`FlightSink`](super::sinks::FlightSink) persists. Everything an investigation needs to key on rides
+/// [`FlightSink`](crate::observability::flight_recorder::FlightSink) persists. Everything an investigation needs to key on rides
 /// the header, so a blob is meaningful with no context beyond itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FlightBlob {
-    /// Envelope version ([`super::BLOB_VERSION`]); bumped on any breaking shape change.
+    /// Envelope version ([`crate::observability::flight_recorder::BLOB_VERSION`]); bumped on any breaking shape change.
     pub version: u32,
     /// The tenant the session belongs to.
     pub tenant: String,

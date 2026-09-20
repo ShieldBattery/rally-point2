@@ -71,6 +71,7 @@ mod fan_out;
 mod forward;
 mod lifecycle;
 mod registry;
+mod silence;
 mod slot_link;
 
 #[cfg(test)]
@@ -83,6 +84,7 @@ pub use registry::{
     SlotRegistration, holds_any_slots, live_session_slot_epochs, live_slots, register,
     session_count,
 };
+pub use silence::{SILENCE_CHECK_INTERVAL, SilenceCloser, run_silence_watch};
 pub use slot_link::run_slot_link;
 
 pub(crate) use close::maybe_close_emptied_session;
