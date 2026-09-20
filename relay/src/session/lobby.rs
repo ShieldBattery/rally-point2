@@ -71,7 +71,7 @@ const LOBBY_LOG_MAX_COMMANDS: usize = 1024;
 const LOBBY_LOG_MAX_BYTES: usize = 256 * 1024;
 
 /// The lobby rate cap's burst size, mirroring [`crate::session::chat`]'s
-/// [`TokenBucket`]-based admission but sized for lobby traffic rather than
+/// `TokenBucket`-based admission but sized for lobby traffic rather than
 /// chat's human-typing cadence. Setup is a burst authored by one slot (almost
 /// always the host): a full 8-player lobby's slot, color, race, and team
 /// assignments plus the game-init that seeds the synced RNG is on the order

@@ -285,7 +285,7 @@ async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_chann
     let (driver0, mut chan0) = LinkDriver::new(link0);
     let task0 = tokio::spawn(driver0.run());
     let link1 = endpoint.connect(addr, "localhost", &id1).await.unwrap();
-    let (driver1, _chan1) = LinkDriver::new(link1);
+    let (driver1, chan1) = LinkDriver::new(link1);
     let task1 = tokio::spawn(driver1.run());
 
     // Both connected: session-start fires, and the driver surfaces the stamped
@@ -300,7 +300,10 @@ async fn the_driver_surfaces_the_initial_buffer_depth_on_the_session_start_chann
         "the driver surfaces the relay-computed initial buffer depth",
     );
 
+    // Close both seams so both drivers stop on their own; holding slot 1's
+    // channels open would leave its driver running until the timeout below.
     drop(chan0);
+    drop(chan1);
     let _ = tokio::time::timeout(Duration::from_secs(5), task0).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), task1).await;
 }
