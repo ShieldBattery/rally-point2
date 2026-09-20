@@ -53,6 +53,9 @@
 ## Tests
 
 `cargo test -p rally-point-client --lib driver::` (or a topic, `driver::tests::recovery::`).
+`SlotReorder`, `RetentionRing` and `ConnectivityFence` are pure state, so `tests/reorder.rs`,
+`tests/connectivity.rs` and the ring cases in `tests/retention.rs` drive them synchronously — a
+new rule of theirs belongs there, with a QUIC-level test only to prove the wiring reaches them.
 Fixtures in `tests/mod.rs`: `DriverFixture` is the default starting point — a driver running over
 a loopback QUIC pair with the peer's link, a control-frame reader and the peer's control stream
 already wired, and the endpoints owned so nothing has to be kept alive by hand; `finish()` is the
