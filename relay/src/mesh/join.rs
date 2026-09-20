@@ -27,7 +27,7 @@ pub(super) fn reconcile_leaves_on_join(
     control_tx: &MeshControlTx,
     key: &SessionKey,
 ) {
-    let (departures, directives) = crate::consensus::leave_reconcile(decision_makers, key);
+    let (departures, directives) = decision_makers.leave_reconcile(key);
     // Unbounded send only fails on a closed channel; the driver we are
     // registering into is alive here, so these always enqueue.
     for (slot, stamps, reason, connection_epoch) in departures {

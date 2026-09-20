@@ -111,7 +111,7 @@ async fn all_players_dropping_decides_every_departure_after_the_abandon_timeout(
     // The session goes empty session-wide.
     crate::session::presence::record_own(&presence, &k, 0);
 
-    assert!(crate::consensus::has_undecided_departure(&makers, &k));
+    assert!(makers.has_undecided_departure(&k));
     reconcile_abandon(
         &sessions,
         &mesh_with(&holds, &makers, &mesh_links, &presence),
@@ -125,7 +125,7 @@ async fn all_players_dropping_decides_every_departure_after_the_abandon_timeout(
     // Past the window, every departure is decided — nothing is left held.
     elapse_the_abandon_window().await;
     assert!(
-        !crate::consensus::has_undecided_departure(&makers, &k),
+        !makers.has_undecided_departure(&k),
         "the abandoned session's departures are all decided",
     );
     assert!(!holds.abandon_armed(&k), "the fired timer removed itself");
@@ -159,13 +159,7 @@ async fn a_re_register_inside_the_window_cancels_the_timer_and_decides_nothing()
     // Slot 0 re-registers: claim its hold and reinstate its departure
     // atomically, and report the roster live again — the server's
     // re-register path — then reconcile.
-    assert!(
-        holds.take_if_pending(&k, SlotId(0), || crate::consensus::reinstate_slot(
-            &makers,
-            &k,
-            SlotId(0)
-        ))
-    );
+    assert!(holds.take_if_pending(&k, SlotId(0), || makers.reinstate_slot(&k, SlotId(0))));
     let _inbox = registered(&sessions, &k, SlotId(0));
     crate::session::presence::record_own(&presence, &k, 1);
     reconcile_abandon(
@@ -181,7 +175,7 @@ async fn a_re_register_inside_the_window_cancels_the_timer_and_decides_nothing()
     // Past the original window, nothing was decided.
     elapse_the_abandon_window().await;
     assert!(
-        !crate::consensus::slot_departed(&makers, &k, SlotId(0)),
+        !makers.has_departure(&k, SlotId(0)),
         "the reconnected slot is reinstated",
     );
     assert!(
@@ -189,7 +183,7 @@ async fn a_re_register_inside_the_window_cancels_the_timer_and_decides_nothing()
         "the other slot's drop is still held, undecided",
     );
     assert!(
-        crate::consensus::has_undecided_departure(&makers, &k),
+        makers.has_undecided_departure(&k),
         "no departure was decided",
     );
 }
@@ -212,13 +206,7 @@ fn an_expiry_that_lost_the_cancel_race_stands_down_when_a_slot_is_live_again() {
     crate::session::presence::record_own(&presence, &k, 0);
 
     // Slot 0 re-registers exactly as the server's re-register path does...
-    assert!(
-        holds.take_if_pending(&k, SlotId(0), || crate::consensus::reinstate_slot(
-            &makers,
-            &k,
-            SlotId(0)
-        ))
-    );
+    assert!(holds.take_if_pending(&k, SlotId(0), || makers.reinstate_slot(&k, SlotId(0))));
     let _inbox = registered(&sessions, &k, SlotId(0));
     crate::session::presence::record_own(&presence, &k, 1);
 
@@ -232,7 +220,7 @@ fn an_expiry_that_lost_the_cancel_race_stands_down_when_a_slot_is_live_again() {
     );
 
     assert!(
-        crate::consensus::has_undecided_departure(&makers, &k),
+        makers.has_undecided_departure(&k),
         "the raced expiry decided nothing",
     );
     assert!(
@@ -272,7 +260,7 @@ fn an_expiry_stands_down_when_a_peer_reports_a_live_slot() {
     );
 
     assert!(
-        crate::consensus::has_undecided_departure(&makers, &k),
+        makers.has_undecided_departure(&k),
         "a peer's live slot keeps the departures held",
     );
     assert_eq!(closes_reported(&mut rx), 0, "no close was reported");
@@ -302,7 +290,7 @@ async fn the_timer_never_arms_while_a_slot_is_live() {
     // Well past the window, the still-held slot 1 is not decided.
     elapse_the_abandon_window().await;
     assert!(
-        crate::consensus::has_undecided_departure(&makers, &k),
+        makers.has_undecided_departure(&k),
         "no departure is decided while a slot remains live",
     );
 }
@@ -332,7 +320,7 @@ async fn duplicate_arm_and_expiry_decide_at_most_once() {
 
     elapse_the_abandon_window().await;
     assert!(
-        !crate::consensus::has_undecided_departure(&makers, &k),
+        !makers.has_undecided_departure(&k),
         "the departures decided once",
     );
 
@@ -406,7 +394,7 @@ async fn an_elapsed_window_reports_no_second_close_for_a_closed_session() {
     );
 
     // The coordinator retires the session and drops its descriptor.
-    crate::consensus::deregister_maker(&makers, &k);
+    makers.deregister_maker(&k);
 
     elapse_the_abandon_window().await;
     assert_eq!(
@@ -431,13 +419,13 @@ async fn an_elapsed_window_still_decides_departures_after_a_close() {
         &k,
     );
     assert!(
-        crate::consensus::has_undecided_departure(&makers, &k),
+        makers.has_undecided_departure(&k),
         "the close decided nothing on its own",
     );
 
     elapse_the_abandon_window().await;
     assert!(
-        !crate::consensus::has_undecided_departure(&makers, &k),
+        !makers.has_undecided_departure(&k),
         "the elapsed window decided the abandoned session's departures",
     );
     assert_eq!(

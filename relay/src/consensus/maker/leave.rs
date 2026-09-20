@@ -86,10 +86,10 @@ impl DecisionMaker {
     /// [`Authority::Peer`] on every relay — so an authority-gated decide would leave
     /// the departures undecided forever. There are no clients left to desync, so
     /// whichever relay's abandoned-session timer fires decides its own record; the
-    /// same per-slot dedup (`commit_leave` / [`observe_leave`] / the coordinator's
+    /// same per-slot dedup (`commit_leave` / [`DecisionMakers::observe_leave`] / the coordinator's
     /// notice dedup) that makes an ordinary decide idempotent makes this safe even
     /// when several relays' timers fire at once. Records the departure first, like
-    /// [`decide_leave`].
+    /// [`DecisionMakers::decide_leave`].
     pub fn force_decide_leave(&mut self, slot: SlotId, reason: u32) -> Option<LeaveDirective> {
         self.note_departure(slot, DepartureStamps::default(), reason, None);
         if let Some(directive) = self.commit_leave(slot, reason) {
@@ -151,7 +151,7 @@ impl DecisionMaker {
             .or_insert_with(Instant::now);
     }
 
-    /// The decision-and-cache step shared by [`decide_leave`] (behind the authority
+    /// The decision-and-cache step shared by [`DecisionMakers::decide_leave`] (behind the authority
     /// gate) and [`force_decide_leave`] (a fully-abandoned session, no authority).
     /// Dedups by slot — a `None` return means the slot's leave was already decided
     /// or cached, or no framed turn has been observed to schedule against yet.
@@ -227,6 +227,32 @@ impl DecisionMaker {
         self.decided_leaves.insert(slot, directive);
         self.note_leave_decided(slot);
         Some(directive)
+    }
+
+    /// Whether `slot`'s synced leave is already decided or cached here.
+    /// Terminal for the slot's participation: a decided leave refuses
+    /// readmission, so no turn the slot originates after this is part of the
+    /// game — the home-ingress turn fence keys on it.
+    pub(in crate::consensus) fn leave_decided(&self, slot: SlotId) -> bool {
+        self.decided_leaves.contains_key(&slot)
+    }
+
+    /// Whether `slot`'s leave, if decided right now, would actually commit: a
+    /// framed scheduling basis exists — a session frame, or a last frame on the
+    /// slot's own departure record — which is the same short-circuit
+    /// [`commit_leave`](Self::commit_leave) applies.
+    ///
+    /// Read before releasing a drop hold whose decide must not silently fail: a
+    /// released hold with no committed leave strands the departure with nothing
+    /// left to retry against. Monotone-safe as a check-then-act — frames only
+    /// accumulate, so a `true` here never becomes `false` by decide time.
+    pub(in crate::consensus) fn leave_schedulable(&self, slot: SlotId) -> bool {
+        self.session_frame().is_some()
+            || self
+                .departures
+                .get(&slot)
+                .and_then(|d| d.last_frame)
+                .is_some()
     }
 
     /// The `(slot, reason)` of every recorded departure that has not yet had its
@@ -420,7 +446,7 @@ impl DecisionMaker {
     /// the **first** report from the slot. A repeat returns `false` and keeps the
     /// first `echo`, so the caller fires at most one result notice per slot
     /// (anti-flooding, the same first-writer-wins posture as
-    /// [`observe_leave`](Self::observe_leave)). The full `echo` is retained so the
+    /// [`DecisionMakers::observe_leave`](Self::observe_leave)). The full `echo` is retained so the
     /// slot's departure record and `SlotDeparted` frame can embed it when the slot
     /// leaves. The report does not retire the slot's live state — a result is not
     /// a departure — so the caller's frame stamps still read the slot's framed

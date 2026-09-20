@@ -9,7 +9,7 @@ use super::*;
 #[test]
 fn slot_homed_admits_when_no_maker_exists() {
     let registry = new_decision_makers();
-    assert!(slot_homed(&registry, &key(), SlotId(0)));
+    assert!(registry.admits_slot(&key(), SlotId(0)));
 }
 
 /// The admission gate reads an empty homed set as unenforced and admits
@@ -35,31 +35,31 @@ fn an_empty_homed_set_is_unenforced_for_admission_and_fail_closed_for_finalizing
             },
         );
         assert!(
-            slot_homed(&registry, &key(), SlotId(0)),
+            registry.admits_slot(&key(), SlotId(0)),
             "slot 0 is admitted either way (enforced: {enforced})",
         );
         assert!(
-            slot_homed(&registry, &key(), SlotId(2)),
+            registry.admits_slot(&key(), SlotId(2)),
             "slot 2 is admitted either way (enforced: {enforced})",
         );
         assert_eq!(
-            slot_homed(&registry, &key(), SlotId(1)),
+            registry.admits_slot(&key(), SlotId(1)),
             !enforced,
             "slot 1 is admitted only where nothing is enforced",
         );
         assert_eq!(
-            slot_strictly_homed(&registry, &key(), SlotId(0)),
+            registry.strictly_homes(&key(), SlotId(0)),
             enforced,
             "strict homing never fails open on an empty set",
         );
         assert!(
-            !slot_strictly_homed(&registry, &key(), SlotId(1)),
+            !registry.strictly_homes(&key(), SlotId(1)),
             "and never names a slot the descriptor did not",
         );
     }
 
     assert!(
-        !slot_strictly_homed(&new_decision_makers(), &key(), SlotId(0)),
+        !new_decision_makers().strictly_homes(&key(), SlotId(0)),
         "nor for a session this relay holds no maker for",
     );
 }
@@ -91,8 +91,8 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
         DepartureStamps::default(),
         LEAVE_REASON_DROPPED,
     );
-    assert!(has_undecided_departure(&registry, &k));
-    assert!(!has_reconnectable_departure(&registry, &k, &held_both));
+    assert!(registry.has_undecided_departure(&k));
+    assert!(!registry.has_reconnectable_departure(&k, &held_both));
 
     // This relay's own homed slot drops: while held, the close must wait —
     // but with the hold gone (a clean leave releases it), nothing can be
@@ -104,20 +104,16 @@ fn a_reconnectable_departure_requires_homed_held_and_undecided() {
         DepartureStamps::default(),
         LEAVE_REASON_DROPPED,
     );
-    assert!(has_reconnectable_departure(&registry, &k, &held_both));
-    assert!(!has_reconnectable_departure(&registry, &k, &HashSet::new()));
+    assert!(registry.has_reconnectable_departure(&k, &held_both));
+    assert!(!registry.has_reconnectable_departure(&k, &HashSet::new()));
 
     // The homed slot's leave is decided (a peer authority's directive): a
     // reconnect is refused terminally now, so even a lingering hold defers
     // nothing.
-    assert!(observe_leave(
-        &registry,
-        &k,
-        &leave(0, LEAVE_REASON_DROPPED, 1, 1),
-    ));
-    assert!(!has_reconnectable_departure(&registry, &k, &held_both));
+    assert!(registry.observe_leave(&k, &leave(0, LEAVE_REASON_DROPPED, 1, 1)));
+    assert!(!registry.has_reconnectable_departure(&k, &held_both));
     assert!(
-        has_undecided_departure(&registry, &k),
+        registry.has_undecided_departure(&k),
         "the peer-homed drop is still undecided session-wide",
     );
 }
@@ -132,7 +128,7 @@ fn a_reconnectable_departure_counts_every_held_slot_when_the_homed_set_is_empty(
     let k = key();
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::Peer);
     let held: HashSet<SlotId> = [SlotId(3)].into_iter().collect();
-    assert!(!has_reconnectable_departure(&registry, &k, &held));
+    assert!(!registry.has_reconnectable_departure(&k, &held));
     record_departure(
         &registry,
         &k,
@@ -140,7 +136,7 @@ fn a_reconnectable_departure_counts_every_held_slot_when_the_homed_set_is_empty(
         DepartureStamps::default(),
         LEAVE_REASON_DROPPED,
     );
-    assert!(has_reconnectable_departure(&registry, &k, &held));
+    assert!(registry.has_reconnectable_departure(&k, &held));
 }
 
 /// The abandoned-session force-decide commits even before any framed turn
@@ -214,8 +210,8 @@ fn slot_homed_follows_a_later_descriptors_reassignment() {
             ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
         },
     );
-    assert!(slot_homed(&registry, &key(), SlotId(0)));
-    assert!(!slot_homed(&registry, &key(), SlotId(1)));
+    assert!(registry.admits_slot(&key(), SlotId(0)));
+    assert!(!registry.admits_slot(&key(), SlotId(1)));
 
     // A later push (e.g. a rehome) moves slot 1 onto this relay and slot 0
     // off it.
@@ -227,11 +223,11 @@ fn slot_homed_follows_a_later_descriptors_reassignment() {
         },
     );
     assert!(
-        !slot_homed(&registry, &key(), SlotId(0)),
+        !registry.admits_slot(&key(), SlotId(0)),
         "slot 0 moved off this relay",
     );
     assert!(
-        slot_homed(&registry, &key(), SlotId(1)),
+        registry.admits_slot(&key(), SlotId(1)),
         "slot 1 moved onto this relay",
     );
 }

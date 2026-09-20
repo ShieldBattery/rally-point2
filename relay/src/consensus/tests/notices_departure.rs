@@ -20,8 +20,9 @@ fn decide_leave_fires_one_departure_notice_on_the_authority() {
     // A framed turn from slot 0 gives decide_leave a basis to schedule.
     registry.observe_frame(&k, SlotId(0), GameFrameCount(50));
 
-    let leave =
-        decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).expect("a leave is decided");
+    let leave = registry
+        .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+        .expect("a leave is decided");
     let notice = recv_departure(&mut rx);
     assert_eq!(notice.tenant, k.tenant);
     assert_eq!(notice.session, k.session);
@@ -36,7 +37,7 @@ fn decide_leave_fires_one_departure_notice_on_the_authority() {
     // A duplicate departure signal for the slot decides nothing (already
     // cached), so no second notice fires.
     assert_eq!(
-        decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED),
+        registry.decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED),
         None
     );
     assert!(
@@ -50,7 +51,11 @@ fn decide_leave_fires_one_departure_notice_on_the_authority() {
         Some("game-99".to_owned()),
         HashMap::from([(SlotId(2), "sb-user-7".to_owned())]),
     );
-    assert!(decide_leave(&registry, &k, SlotId(2), LEAVE_REASON_DROPPED).is_some());
+    assert!(
+        registry
+            .decide_leave(&k, SlotId(2), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
     let notice = recv_departure(&mut rx);
     assert_eq!(notice.external_id, Some("game-99".to_owned()));
     assert_eq!(notice.external_ref, Some("sb-user-7".to_owned()));
@@ -73,7 +78,7 @@ fn observe_leave_fires_one_departure_notice_on_first_insert() {
 
     let leave = leave(2, 3, 90, 7);
     assert!(
-        observe_leave(&registry, &k, &leave),
+        registry.observe_leave(&k, &leave),
         "first insert for the slot",
     );
     let notice = recv_departure(&mut rx);
@@ -91,7 +96,7 @@ fn observe_leave_fires_one_departure_notice_on_first_insert() {
 
     // A redundant copy is not a first insert, so it fires nothing.
     assert!(
-        !observe_leave(&registry, &k, &leave),
+        !registry.observe_leave(&k, &leave),
         "a redundant copy is not a first insert",
     );
     assert!(rx.try_recv().is_err(), "no re-fire for a redundant copy");
@@ -163,7 +168,11 @@ fn promotion_does_not_refire_an_already_cached_directive() {
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
     registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
     registry.observe_frame(&k, SlotId(1), GameFrameCount(50));
-    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
+    assert!(
+        registry
+            .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
     assert!(rx.try_recv().is_ok(), "decide_leave fires the one notice");
 
     // Demoted, then re-promoted: the cached directive re-broadcasts

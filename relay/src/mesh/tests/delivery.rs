@@ -395,7 +395,7 @@ fn duplicate_turn_delivery_does_not_corrupt_the_leave_frame_clamp_history() {
     // everything at or below the threshold (leaving seqs 17..=21 twice) and
     // pushed the fallback to 117 — past what the survivor provably reached.
     assert_eq!(
-        consensus::reachable_frame(&decision_makers, &key, SlotId(1)),
+        decision_makers.reachable_frame(&key, SlotId(1)),
         Some(115),
         "the clamp ceiling reflects single-counted history",
     );

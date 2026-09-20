@@ -278,7 +278,7 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
         ReconnectAdmission::Admitted { reinstated: true }
     );
     assert!(!holds.is_pending(&session, SlotId(0)));
-    assert!(!slot_departed(&makers, &session, SlotId(0)));
+    assert!(!makers.has_departure(&session, SlotId(0)));
 
     // The reconnect linearizes first: a later E1 record is stale and cannot
     // install either a departure or an orphan hold against live E3.
@@ -298,7 +298,7 @@ fn dropped_departure_and_reconnect_have_two_safe_linearizations() {
         (recorded, recorded)
     }));
     assert!(!holds.is_pending(&session, SlotId(0)));
-    assert!(!slot_departed(&makers, &session, SlotId(0)));
+    assert!(!makers.has_departure(&session, SlotId(0)));
     assert!(connection_epoch_matches(
         &makers,
         &session,
@@ -366,7 +366,7 @@ fn stale_departure_cannot_interleave_between_reinstate_and_activation() {
         "the stale teardown ran against the reinstated epoch and was refused",
     );
     stale.join().unwrap();
-    assert!(!slot_departed(&makers, &session, SlotId(0)));
+    assert!(!makers.has_departure(&session, SlotId(0)));
     assert!(connection_epoch_matches(
         &makers,
         &session,

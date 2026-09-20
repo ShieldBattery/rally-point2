@@ -276,16 +276,13 @@ pub use law::ControlLaw;
 pub use maker::{DecisionMaker, DepartureStamps, RecordedDeparture, SilentSlot};
 pub use ops::{
     FinalizeOutcome, activate_connection_epoch, claim_close_report, connection_epoch_matches,
-    decide_abandoned_departures, decide_leave, decided_slots, departure_epoch, deregister_maker,
-    finalize_drop, finalized_drops_enabled, has_reconnectable_departure, has_undecided_departure,
-    leave_reconcile, leave_schedulable, maker_exists, normalize_observed_leave, observe_leave,
-    reachable_frame, record_departure, record_departure_for_epoch, record_result, reinstate_slot,
-    remove_slot_for_epoch, reopen_close_report, result_for, session_closed, slot_departed,
-    slot_homed, slot_leave_decided, slot_strictly_homed,
+    decide_abandoned_departures, departure_epoch, finalize_drop, maker_exists, record_departure,
+    record_departure_for_epoch, record_result, remove_slot_for_epoch, reopen_close_report,
+    result_for,
 };
 pub use registry::{
     DecisionMakers, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,
-    new_decision_makers, new_decision_makers_with_region_delay,
+    new_decision_makers, new_decision_makers_with_region_delay, normalize_observed_leave,
 };
 pub use sync::SyncDivergence;
 

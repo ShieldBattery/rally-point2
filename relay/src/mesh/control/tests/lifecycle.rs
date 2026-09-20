@@ -187,7 +187,11 @@ fn a_leave_decision_lands_in_the_flight_recorder() {
         SlotId(1),
         rally_point_proto::ids::GameFrameCount(10),
     );
-    assert!(consensus::decide_leave(&makers, &key(1), SlotId(0), 0x4000_0006).is_some());
+    assert!(
+        makers
+            .decide_leave(&key(1), SlotId(0), 0x4000_0006)
+            .is_some()
+    );
 
     let events: Vec<_> = makers
         .flight_recorder()

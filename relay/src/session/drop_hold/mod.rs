@@ -558,7 +558,7 @@ impl DropHolds {
     /// moment this fires — including the disconnect that just marked the hold this
     /// call would otherwise erase before anything ever decided it. `decided` is the
     /// caller's read of which slots' leaves are already committed (see
-    /// [`crate::consensus::decided_slots`]); a hold outside that set still gates an
+    /// [`DecisionMakers::decided_slots`](crate::consensus::DecisionMakers::decided_slots)); a hold outside that set still gates an
     /// undecided drop and must survive to keep serving as the reconnect-admission
     /// check and the unlock clock. See the module docs for why this is still
     /// memory-bounded rather than a leak.

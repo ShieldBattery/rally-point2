@@ -391,17 +391,17 @@ pub fn reopen_close_report(registry: &DecisionMakers, key: &SessionKey) {
 /// with zero live slots session-wide — bypassing the authority gate, and returns
 /// the freshly decided directives for the caller to broadcast. With every slot
 /// disconnected, presence names no authority (the verdict is [`Authority::Peer`]
-/// everywhere), so [`decide_leave`] would decide nothing; but there are no clients
+/// everywhere), so [`DecisionMakers::decide_leave`] would decide nothing; but there are no clients
 /// left to desync, so the departures must simply be committed to funnel the session
 /// into its normal close cascade (departure notices, coordinator lifecycle). Fires
-/// exactly one departure notice per freshly decided slot, like [`decide_leave`],
+/// exactly one departure notice per freshly decided slot, like [`DecisionMakers::decide_leave`],
 /// and dedups by slot, so a duplicate call — or several relays' abandoned-session
 /// timers firing at once — decides each slot at most once. A no-op (empty) when no
 /// maker exists or every departure is already decided.
 ///
 /// The read of every undecided departure and every one of the force-decides that
 /// follow all run inside one acquisition of `registry`'s lock, so a concurrent
-/// [`reinstate_slot`] for the same slot cannot interleave with this — it either
+/// [`DecisionMakers::reinstate_slot`] for the same slot cannot interleave with this — it either
 /// runs entirely before this call starts (nothing to decide is left out from under
 /// it) or entirely after (it finds the slot's leave already decided and, per
 /// [`DecisionMaker::reinstate_slot`]'s guard, no-ops instead of erasing a departure

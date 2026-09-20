@@ -13,12 +13,14 @@ use super::*;
 mod authority;
 mod buffer;
 mod homing;
+mod leave;
 mod phase;
 mod session_start;
 mod silence;
 mod sync_coverage;
 
 pub use authority::{FrameRegression, MakerSync};
+pub use leave::normalize_observed_leave;
 
 /// The per-session decision-maker map behind [`DecisionMakers`]. A plain
 /// (non-async) mutex mirrors `MeshLinks` and `routing::Sessions`: every critical
@@ -91,7 +93,7 @@ pub enum RelayNotice {
 ///
 /// It also owns an optional **notice notifier** — the sender half of an
 /// unbounded channel drained by the coordinator control connection. The leave
-/// sites ([`decide_leave`], [`observe_leave`], and the promotion re-derivation
+/// sites ([`DecisionMakers::decide_leave`], [`DecisionMakers::observe_leave`], and the promotion re-derivation
 /// in [`DecisionMakers::set_authority`]/[`DecisionMakers::sync_maker`]) fire a [`DepartureNotice`] onto it the
 /// moment a synced leave for a slot first enters this relay's cache, and the
 /// desync comparator ([`DecisionMakers::observe_sync`]) fires a [`DesyncNotice`] when it confirms

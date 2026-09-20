@@ -40,7 +40,7 @@ async fn a_disconnect_announcement_stands_down_when_the_slot_has_already_reconne
         "no hold was marked against the already-reconnected slot",
     );
     assert!(
-        !consensus::slot_departed(&h.makers, &k, SlotId(1)),
+        !h.makers.has_departure(&k, SlotId(1)),
         "no departure record was written against the already-reconnected slot -- \
          an orphaned record would wrongly refuse every later reconnect for the slot",
     );
@@ -83,11 +83,7 @@ fn old_link_teardown_cannot_erase_a_replacement_epoch() {
         mesh.session.decision_makers.slot_frame(&k, SlotId(0)),
         Some(GameFrameCount(40)),
     );
-    assert!(!consensus::slot_departed(
-        &mesh.session.decision_makers,
-        &k,
-        SlotId(0),
-    ));
+    assert!(!mesh.session.decision_makers.has_departure(&k, SlotId(0)));
     assert!(!mesh.session.drop_holds.is_pending(&k, SlotId(0)));
 }
 
@@ -183,11 +179,7 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     // re-promotes.
     let _ri0 = registered(&sessions, &k, SlotId(0));
     assert!(
-        holds.take_if_pending(&k, SlotId(0), || consensus::reinstate_slot(
-            &makers,
-            &k,
-            SlotId(0)
-        )),
+        holds.take_if_pending(&k, SlotId(0), || makers.reinstate_slot(&k, SlotId(0))),
         "the hold was pending and reinstate succeeded",
     );
     report_own_presence(
@@ -203,11 +195,7 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     // Slot 1 re-registers too.
     let _ri1 = registered(&sessions, &k, SlotId(1));
     assert!(
-        holds.take_if_pending(&k, SlotId(1), || consensus::reinstate_slot(
-            &makers,
-            &k,
-            SlotId(1)
-        )),
+        holds.take_if_pending(&k, SlotId(1), || makers.reinstate_slot(&k, SlotId(1))),
         "the hold was pending and reinstate succeeded",
     );
     report_own_presence(
@@ -217,7 +205,7 @@ async fn a_single_relay_flap_during_reconnect_decides_no_leave() {
     );
 
     // The whole flap decided no leave, and the session continues with both slots.
-    let (departures, directives) = consensus::leave_reconcile(&makers, &k);
+    let (departures, directives) = makers.leave_reconcile(&k);
     assert!(
         directives.is_empty(),
         "no leave was ever decided across the flap",

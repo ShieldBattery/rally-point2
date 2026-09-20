@@ -52,9 +52,7 @@ pub(super) fn handle_drop_request(
     // authority, which alone holds the unlock timer. A request for a slot this
     // relay sees as neither held nor departed is nonsense (a stale or hostile
     // client), so drop it before spending a mesh broadcast on it.
-    if !drop_holds.is_pending(key, target)
-        && !consensus::slot_departed(decision_makers, key, target)
-    {
+    if !drop_holds.is_pending(key, target) && !decision_makers.has_departure(key, target) {
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
@@ -141,8 +139,8 @@ pub(crate) fn honor_drop_request(
             // hold is NOT released up front — a rejected finalization (a
             // live reconnect, or no sealable cursor) leaves the drop held
             // and undecided, never frame-scheduled.
-            if consensus::finalized_drops_enabled(decision_makers, key) {
-                if consensus::slot_strictly_homed(decision_makers, key, target) {
+            if decision_makers.finalized_drops_enabled(key) {
+                if decision_makers.strictly_homes(key, target) {
                     let outcome = consensus::finalize_drop(
                         decision_makers,
                         key,
@@ -299,7 +297,7 @@ pub(crate) fn complete_finalized_drop(
     // the home's answer is idempotent, so a later honored drop request
     // completes once a framed turn exists. Safe as a check-then-act because
     // frames only accumulate — schedulable never reverts to unschedulable.
-    if !consensus::leave_schedulable(decision_makers, key, target) {
+    if !decision_makers.leave_schedulable(key, target) {
         tracing::warn!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,

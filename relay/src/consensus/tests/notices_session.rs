@@ -9,7 +9,7 @@ fn session_closed_fires_a_session_closed_notice() {
     let (registry, mut rx) = notifying_registry();
     let k = key();
 
-    session_closed(&registry, &k);
+    registry.session_closed(&k);
     match rx.try_recv().expect("a queued notice") {
         RelayNotice::SessionClosed { tenant, session } => {
             assert_eq!(tenant, k.tenant);
@@ -26,7 +26,7 @@ fn session_closed_does_not_begin_a_flight_recording() {
     let registry = new_decision_makers();
     let k = key();
 
-    session_closed(&registry, &k);
+    registry.session_closed(&k);
 
     assert!(
         registry.flight_recorder().recorded_sessions().is_empty(),
@@ -53,7 +53,7 @@ fn session_closed_without_a_maker_plants_no_seal() {
 
     // No tokio runtime here, so the flush (and its seal decision) runs
     // synchronously — deterministic for the assertion below.
-    session_closed(&registry, &k);
+    registry.session_closed(&k);
     assert!(
         registry.flight_recorder().recorded_sessions().is_empty(),
         "the close flushed the recording",
@@ -89,7 +89,7 @@ fn session_closed_with_a_maker_still_seals() {
         },
     );
 
-    session_closed(&registry, &k);
+    registry.session_closed(&k);
     registry.record_event(
         &k,
         FlightEvent::SlotConnected {
@@ -125,7 +125,11 @@ fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
     );
 
     registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
-    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
+    assert!(
+        registry
+            .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
     let notice = recv_departure(&mut rx);
     assert_eq!(notice.external_id, Some("game-new".to_owned()));
     assert_eq!(notice.external_ref, Some("sb-user-new".to_owned()));
@@ -133,11 +137,15 @@ fn set_session_refs_replaces_on_reapply_and_deregister_forgets() {
     // Deregistering removes the maker and forgets the refs: a later
     // decide_leave on a freshly re-created maker for the same key sees none.
     assert!(registry.lock().contains_key(&k));
-    deregister_maker(&registry, &k);
+    registry.deregister_maker(&k);
     assert!(!registry.lock().contains_key(&k));
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
     registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
-    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
+    assert!(
+        registry
+            .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
     let notice2 = recv_departure(&mut rx);
     assert!(
         notice2.external_id.is_none(),

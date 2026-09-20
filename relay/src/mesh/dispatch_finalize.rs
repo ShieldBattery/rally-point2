@@ -33,8 +33,8 @@ pub(super) fn dispatch_finalize_drop(request: FinalizeDrop, key: &SessionKey, me
     // different cursor), and only in a session whose descriptor runs
     // the handshake at all. Everyone else stays silent — the request
     // was broadcast, so the one home is among the receivers.
-    if !crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, key)
-        || !crate::consensus::slot_strictly_homed(&mesh.session.decision_makers, key, slot)
+    if !mesh.session.decision_makers.finalized_drops_enabled(key)
+        || !mesh.session.decision_makers.strictly_homes(key, slot)
     {
         return;
     }
@@ -90,7 +90,7 @@ pub(super) fn dispatch_finalize_drop_result(
     // broadcast reaches everyone; a non-authority has no decide to
     // make), and only in a handshake-enabled session.
     if !mesh.session.decision_makers.is_authority(key)
-        || !crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, key)
+        || !mesh.session.decision_makers.finalized_drops_enabled(key)
     {
         return;
     }

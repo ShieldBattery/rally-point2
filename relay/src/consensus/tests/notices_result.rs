@@ -121,7 +121,11 @@ fn record_departure_rejects_an_oversize_mesh_folded_result() {
         LEAVE_REASON_DROPPED,
     );
 
-    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
+    assert!(
+        registry
+            .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
     let departure = recv_departure(&mut rx);
     assert!(
         departure.result.is_none(),
@@ -163,7 +167,11 @@ fn a_reported_result_is_embedded_into_the_slots_departure_notice() {
         },
         LEAVE_REASON_DROPPED,
     );
-    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
+    assert!(
+        registry
+            .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
 
     let departure = recv_departure(&mut rx);
     let embedded = departure.result.expect("the departure carries the result");
@@ -182,7 +190,11 @@ fn a_departure_without_a_reported_result_embeds_none() {
     let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
 
     registry.observe_frame(&k, SlotId(0), GameFrameCount(40));
-    assert!(decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).is_some());
+    assert!(
+        registry
+            .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+            .is_some()
+    );
 
     let departure = recv_departure(&mut rx);
     assert!(

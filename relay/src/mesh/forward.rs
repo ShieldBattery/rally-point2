@@ -121,7 +121,7 @@ pub fn forward_client_turn(
     // NOT fenced ([`deliver_mesh_turn`]): a peer home forwarded them before
     // the decision reached it, and local survivors may still need them to
     // reach a clean leave's exact count.
-    if crate::consensus::slot_leave_decided(&mesh.session.decision_makers, key, slot) {
+    if mesh.session.decision_makers.leave_decided(key, slot) {
         tracing::debug!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,

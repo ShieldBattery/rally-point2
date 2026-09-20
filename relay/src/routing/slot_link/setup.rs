@@ -302,7 +302,7 @@ pub(super) async fn replay_to_reconnecting_client(
     // both skip this slot itself (a slot is never pushed its own departure —
     // and a reconnect for a slot whose own leave was decided was refused at
     // admission). Empty on a fresh dial: no session history, nothing missed.
-    let (departures, directives) = consensus::leave_reconcile(&ctx.decision_makers, &ctx.key);
+    let (departures, directives) = ctx.decision_makers.leave_reconcile(&ctx.key);
     for (departed, _, _, departed_epoch) in departures {
         if departed == ctx.slot {
             continue;

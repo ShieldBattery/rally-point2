@@ -39,7 +39,6 @@ use rally_point_proto::close_codes;
 use rally_point_proto::ids::SlotId;
 use rally_point_transport::noq::{self, VarInt};
 
-use crate::consensus;
 use crate::key::SessionKey;
 use crate::routing::{self, Sessions, SlotRegistration};
 use crate::session::SessionState;
@@ -215,7 +214,7 @@ pub(super) const PRE_REGISTER_GATES: &[Gate] =
 /// (slot, seq) -- a split the mesh's topological dedup only suppresses the
 /// symptom of, on each side, never detects or prevents.
 ///
-/// `slot_homed` admits (`true`) when no descriptor has arrived yet for this
+/// `admits_slot` admits (`true`) when no descriptor has arrived yet for this
 /// session, or one arrived with an empty homed set (legacy, dev-mode, a
 /// coordinator that predates the field) -- so this preserves the
 /// descriptor-arrival-race behavior exactly: a client dialing before any
@@ -223,7 +222,7 @@ pub(super) const PRE_REGISTER_GATES: &[Gate] =
 /// or window introduced here. Enforcement only ever refuses once a non-empty
 /// homed set says this slot belongs to a different relay.
 fn home_relay_binding(session: &SessionState, key: &SessionKey, slot: SlotId) -> Option<Refusal> {
-    if !consensus::slot_homed(&session.decision_makers, key, slot) {
+    if !session.decision_makers.admits_slot(key, slot) {
         return Some(NOT_HOMED);
     }
     None
@@ -242,7 +241,7 @@ fn home_relay_binding(session: &SessionState, key: &SessionKey, slot: SlotId) ->
 /// -- the one this snapshot must never be reused for -- runs after `register`
 /// succeeds, keyed on current state.
 fn decided_departure(session: &SessionState, key: &SessionKey, slot: SlotId) -> Option<Refusal> {
-    let departed = consensus::slot_departed(&session.decision_makers, key, slot);
+    let departed = session.decision_makers.has_departure(key, slot);
     let hold_pending = session.drop_holds.is_pending(key, slot);
     if departed && !hold_pending {
         return Some(ALREADY_DEPARTED);

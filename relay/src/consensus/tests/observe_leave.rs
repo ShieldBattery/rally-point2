@@ -131,11 +131,7 @@ fn terminal_departure_metadata_merges_without_weakening_the_epoch_fence() {
     makers.lock().insert(session.clone(), peer_maker());
     assert!(activate_connection_epoch(&makers, &session, SlotId(0), 11,));
     assert!(activate_connection_epoch(&makers, &session, SlotId(0), 22,));
-    assert!(observe_leave(
-        &makers,
-        &session,
-        &leave(0, LEAVE_REASON_DROPPED, 41, 1),
-    ));
+    assert!(makers.observe_leave(&session, &leave(0, LEAVE_REASON_DROPPED, 41, 1)));
 
     let result = ResultEcho {
         payload: vec![0xAA],

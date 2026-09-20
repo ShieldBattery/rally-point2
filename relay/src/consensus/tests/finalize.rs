@@ -34,7 +34,8 @@ fn finalize_drop_seals_stamps_and_the_leave_carries_the_count() {
         "the admission seal stays after a successful finalization",
     );
 
-    let leave = decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED)
+    let leave = registry
+        .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
         .expect("the authority decides");
     assert_eq!(
         leave.final_turn_count,
@@ -116,7 +117,9 @@ fn finalize_drop_is_idempotent_after_the_decide() {
         LEAVE_REASON_DROPPED,
     );
     let _ = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
-    let _ = decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).expect("decides");
+    let _ = registry
+        .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+        .expect("decides");
 
     assert_eq!(
         finalize_drop(&registry, &k, SlotId(1), None, || Some(999)),
@@ -209,7 +212,9 @@ fn a_finalized_count_survives_a_resumed_session() {
     );
     let _ = finalize_drop(&registry, &k, SlotId(1), None, || Some(42));
 
-    let leave = decide_leave(&registry, &k, SlotId(1), LEAVE_REASON_DROPPED).expect("decides");
+    let leave = registry
+        .decide_leave(&k, SlotId(1), LEAVE_REASON_DROPPED)
+        .expect("decides");
     assert_eq!(leave.final_turn_count, Some(42));
     assert!(leave.finalized);
 }

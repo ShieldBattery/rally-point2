@@ -169,7 +169,7 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
         })),
     };
     dispatch_mesh_control(stale_departure, RelayId(9), &joined, &sessions, &mesh_state);
-    assert!(!crate::consensus::slot_departed(&makers, &key, SlotId(0),));
+    assert!(!makers.has_departure(&key, SlotId(0)));
     assert!(!mesh_state.session.drop_holds.is_pending(&key, SlotId(0)));
 
     let current_down = MeshControlFrame {

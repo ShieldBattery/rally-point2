@@ -2,7 +2,7 @@
 //! descriptor yet is admitted onto any relay a client's token names --
 //! tolerating the create-response-to-client-dial race beating the
 //! coordinator's asynchronous descriptor push (see
-//! [`crate::consensus::slot_homed`]). Left unbounded, a stale or misrouted
+//! [`DecisionMakers::admits_slot`](crate::consensus::DecisionMakers::admits_slot)). Left unbounded, a stale or misrouted
 //! token could park a session open indefinitely on a relay no descriptor will
 //! ever name. This module marks such an admission provisional with a
 //! deadline, and the relay's periodic sweep tears it down if no descriptor

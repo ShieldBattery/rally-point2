@@ -101,7 +101,7 @@ fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
     // Retirement, as end_session performs it: close the gate first, then
     // the sweep — while this driver's joined map still lists the session.
     mesh_state.session.gates.retire(&key);
-    crate::consensus::deregister_maker(&makers, &key);
+    makers.deregister_maker(&key);
     mesh_state.session.drop_holds.end_session_terminal(&key);
 
     dispatch_mesh_control(departed(2), RelayId(9), &joined, &sessions, &mesh_state);
@@ -143,8 +143,7 @@ fn a_decided_slots_client_turn_is_fenced_at_its_home_only() {
     let (mut peer_rx, _peer_ctl_rx) = register_link_channels(&mesh_state.links, &key);
 
     // Slot 0's leave is decided (a peer authority's directive observed).
-    assert!(crate::consensus::observe_leave(
-        &makers,
+    assert!(makers.observe_leave(
         &key,
         &LeaveDirective {
             finalized: false,
@@ -153,7 +152,7 @@ fn a_decided_slots_client_turn_is_fenced_at_its_home_only() {
             apply_at_frame: 10,
             leave_seq: 1,
             final_turn_count: Some(9),
-        },
+        }
     ));
 
     let turn = |seq: u64| Payload {

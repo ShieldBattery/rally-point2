@@ -114,7 +114,7 @@ fn a_resumed_descriptor_latches_started_and_seeds_departures() {
             "the seeded departures are recorded as already decided",
         );
     }
-    let (_, directives) = consensus::leave_reconcile(&makers, &key(1));
+    let (_, directives) = makers.leave_reconcile(&key(1));
     assert!(
         directives
             .iter()
@@ -341,7 +341,7 @@ fn a_pre_descriptor_clean_leave_is_journaled_and_drained_with_its_count() {
         "nothing fanned before the descriptor",
     );
     assert!(
-        !consensus::slot_departed(&makers, &key(1), SlotId(1)),
+        !makers.has_departure(&key(1), SlotId(1)),
         "nothing recorded before the descriptor",
     );
 
@@ -361,7 +361,7 @@ fn a_pre_descriptor_clean_leave_is_journaled_and_drained_with_its_count() {
         Some(2),
         "the exact count is derived at the drain, over the drained turns",
     );
-    assert!(consensus::slot_departed(&makers, &key(1), SlotId(1)));
+    assert!(makers.has_departure(&key(1), SlotId(1)));
 }
 
 /// A journaled clean leave whose link (the session's only local one) is
@@ -405,8 +405,8 @@ fn a_journaled_leave_with_no_local_survivors_still_drains_and_decides() {
 
     control.apply_descriptor(&descriptor(1, &[]));
 
-    assert!(consensus::slot_departed(&makers, &key(1), SlotId(1)));
-    let (_, directives) = consensus::leave_reconcile(&makers, &key(1));
+    assert!(makers.has_departure(&key(1), SlotId(1)));
+    let (_, directives) = makers.leave_reconcile(&key(1));
     let leave = directives
         .iter()
         .find(|l| l.slot == 1)

@@ -274,7 +274,9 @@ fn apply_descriptor_stamps_correlation_ids_that_a_departure_notice_carries() {
         rally_point_proto::ids::GameFrameCount(10),
     );
     assert!(
-        consensus::decide_leave(&makers, &key(1), SlotId(0), 0x4000_0006).is_some(),
+        makers
+            .decide_leave(&key(1), SlotId(0), 0x4000_0006)
+            .is_some(),
         "single-relay session is its own authority, so decide_leave succeeds",
     );
 

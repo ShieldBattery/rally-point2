@@ -251,7 +251,7 @@ impl SessionState {
         // close) that hold is still the reconnect-admission token and unlock
         // clock for a drop nobody has decided yet. See
         // [`crate::session::drop_hold`] module docs.
-        let decided = crate::consensus::decided_slots(&self.decision_makers, key);
+        let decided = self.decision_makers.decided_slots(key);
         self.drop_holds.end_session(key, &decided);
         // The forwarded-turn replay ring and the forward-once seen state
         // (whose entry is created lazily on the first turn forwarded — there
@@ -274,11 +274,10 @@ impl SessionState {
         // departure defers this close entirely — but tying both stores to the
         // same token keeps the rule whole rather than shape-dependent.)
         let surviving_holds = self.drop_holds.pending_slots(key);
-        if !crate::consensus::has_reconnectable_departure(
-            &self.decision_makers,
-            key,
-            &surviving_holds,
-        ) {
+        if !self
+            .decision_makers
+            .has_reconnectable_departure(key, &surviving_holds)
+        {
             self.turn_ring.end_session(key);
             crate::mesh::deregister_seen(seen, key);
         }
@@ -340,7 +339,7 @@ impl SessionState {
     /// teardown as possible.
     pub(crate) fn retire(&self, key: &SessionKey, seen: &crate::mesh::SeenRegistries) {
         self.gates.retire(key);
-        crate::consensus::deregister_maker(&self.decision_makers, key);
+        self.decision_makers.deregister_maker(key);
         crate::session::presence::forget(&self.presence, key);
         // Discard any turns still penned for the session — with the maker gone
         // and the gate retired, no descriptor will ever drain them. The replay

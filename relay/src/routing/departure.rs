@@ -155,7 +155,7 @@ pub(crate) fn announce_departure_recorded(
     // `consensus::reachable_frame` / `consensus::result_for`.
     let stamps = consensus::DepartureStamps {
         last_frame: decision_makers.slot_frame(key, slot),
-        reachable_frame: consensus::reachable_frame(decision_makers, key, slot),
+        reachable_frame: decision_makers.reachable_frame(key, slot),
         result: consensus::result_for(decision_makers, key, slot),
         final_turn_count,
         // A link-death departure is never born finalized; the proof only ever
@@ -272,7 +272,7 @@ pub(super) fn decide_and_broadcast_leave(
     slot: SlotId,
     reason: u32,
 ) {
-    if let Some(leave) = consensus::decide_leave(decision_makers, key, slot, reason) {
+    if let Some(leave) = decision_makers.decide_leave(key, slot, reason) {
         fan_out_leave(sessions, key, slot, leave);
         crate::mesh::fan_out_leave_directive(mesh_links, key, leave);
     }
@@ -349,7 +349,7 @@ pub(crate) fn reconcile_abandon(
     let globally_empty = crate::session::presence::all_empty(&mesh.session.presence, key, own_live);
     let abandoned = session_started
         && globally_empty
-        && consensus::has_undecided_departure(&mesh.session.decision_makers, key);
+        && mesh.session.decision_makers.has_undecided_departure(key);
     if abandoned {
         // Owned clones for the timer task: it fires after the window with no
         // borrowed state, holding the shared registries by `Arc` (`MeshState`

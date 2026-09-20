@@ -26,7 +26,6 @@ use rally_point_relay::session::{SessionState, Tunables};
 /// reinstated, not refused.
 #[tokio::test]
 async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the_real_gate() {
-    use rally_point_relay::consensus;
     use rally_point_relay::key::SessionKey;
 
     let tenant = make_default_tenant();
@@ -59,10 +58,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
     // this through a control frame.
     wait_until(
         "the relay never recorded the disconnected slot's departure and hold",
-        || {
-            consensus::slot_departed(&makers, &key, SlotId(0))
-                && drop_holds.is_pending(&key, SlotId(0))
-        },
+        || makers.has_departure(&key, SlotId(0)) && drop_holds.is_pending(&key, SlotId(0)),
     )
     .await;
 
@@ -79,7 +75,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
 
     // And the slot is genuinely reinstated: no departure, no hold, either.
     assert!(
-        !consensus::slot_departed(&makers, &key, SlotId(0)),
+        !makers.has_departure(&key, SlotId(0)),
         "the reconnect reinstated the slot",
     );
     assert!(!drop_holds.is_pending(&key, SlotId(0)));
@@ -96,7 +92,7 @@ async fn a_last_local_slots_disconnect_still_reinstates_on_reconnect_through_the
 /// when the client later leaves cleanly.
 #[tokio::test]
 async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_state() {
-    use rally_point_relay::consensus::{self, RelayNotice};
+    use rally_point_relay::consensus::RelayNotice;
     use rally_point_relay::key::SessionKey;
     use rally_point_relay::session::presence::{self, Candidate};
     use rally_point_transport::control::{
@@ -153,10 +149,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
     drop(slot0);
     wait_until(
         "the relay never recorded the disconnected slot's departure and hold",
-        || {
-            consensus::slot_departed(&makers, &key, SlotId(0))
-                && drop_holds.is_pending(&key, SlotId(0))
-        },
+        || makers.has_departure(&key, SlotId(0)) && drop_holds.is_pending(&key, SlotId(0)),
     )
     .await;
 
@@ -219,7 +212,6 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
 #[tokio::test]
 async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_still_honor_a_request()
  {
-    use rally_point_relay::consensus;
     use rally_point_relay::key::SessionKey;
     use rally_point_relay::session::presence::{self, Candidate};
     use rally_point_transport::control::{
@@ -294,7 +286,7 @@ async fn a_reconnect_inside_the_abandon_window_cancels_it_and_the_other_holds_st
     )
     .await;
     assert!(
-        !consensus::slot_departed(&makers, &key, SlotId(0)),
+        !makers.has_departure(&key, SlotId(0)),
         "the reconnected slot is reinstated",
     );
     assert!(

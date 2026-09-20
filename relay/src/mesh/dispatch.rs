@@ -161,7 +161,7 @@ fn dispatch_mesh_control_frame(
             // straggler reconnect's replayed directive.
             let finalized_accepted = departed.reason == crate::consensus::LEAVE_REASON_DROPPED
                 && departed.finalized
-                && crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, &key);
+                && mesh.session.decision_makers.finalized_drops_enabled(&key);
             let stamps = crate::consensus::DepartureStamps {
                 last_frame: departed
                     .last_frame
@@ -245,7 +245,7 @@ fn dispatch_mesh_control_frame(
             // cache and the clients must never disagree about the count.
             let leave = crate::consensus::normalize_observed_leave(
                 &leave,
-                crate::consensus::finalized_drops_enabled(&mesh.session.decision_makers, &key),
+                mesh.session.decision_makers.finalized_drops_enabled(&key),
             );
             // A `false` here means this relay's own consensus state didn't
             // accept the directive as new: either an ordinary redundant copy
@@ -255,7 +255,7 @@ fn dispatch_mesh_control_frame(
             // local clients. Forwarding it anyway would hand them a decision
             // this relay's own cache just flagged as disagreeing with what it
             // already holds.
-            if !crate::consensus::observe_leave(&mesh.session.decision_makers, &key, &leave) {
+            if !mesh.session.decision_makers.observe_leave(&key, &leave) {
                 return;
             }
             mesh.session.decision_makers.flight_recorder().record(
