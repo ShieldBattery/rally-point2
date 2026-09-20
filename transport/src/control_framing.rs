@@ -8,7 +8,9 @@
 //! neither one has to depend on the other for it.
 
 use prost::Message;
-use rally_point_proto::control_stream::{CONTROL_LEN_PREFIX, decode_frame, frame_len};
+use rally_point_proto::control_stream::{
+    CONTROL_LEN_PREFIX, ControlStreamError, decode_frame, frame_len,
+};
 
 /// Reads one length-prefixed, decoded frame of type `M` off `recv`: the length
 /// prefix (validated against the frame cap *before* any allocation), then the
@@ -48,4 +50,24 @@ pub(crate) async fn read_one_frame<M: Message + Default>(
             None
         }
     }
+}
+
+/// Why a frame could not be written to a control stream — the same two
+/// failures on the client edge and on the mesh.
+///
+/// Every frame either of these streams carries is reliable and un-redundant
+/// (an oversize turn, a synced leave, a cursor snapshot), so a write error is
+/// never something the caller can silently drop; the message names the stream
+/// only generically because the caller's own log context already says which
+/// link it was writing.
+#[derive(Debug, thiserror::Error)]
+pub enum ControlSendError {
+    /// The frame exceeds the control stream's frame cap. It can then be
+    /// delivered by no channel at all, so the caller must fail fast rather
+    /// than stall lockstep on a frame that will never arrive.
+    #[error("control frame does not fit: {0}")]
+    Frame(#[from] ControlStreamError),
+    /// The stream is gone (the connection dropped or the peer stopped it).
+    #[error("control stream write failed: {0}")]
+    Write(#[from] noq::WriteError),
 }

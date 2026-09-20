@@ -28,6 +28,7 @@ use rally_point_proto::control_stream::{
 use rally_point_proto::messages::MeshControlFrame;
 use tokio::sync::mpsc;
 
+pub use crate::control_framing::ControlSendError;
 use crate::control_framing::read_one_frame;
 
 /// Depth of the reader-task → driver channel. Most mesh control frames are rare,
@@ -113,7 +114,7 @@ async fn read_mesh_control_frames(mut recv: noq::RecvStream, tx: mpsc::Sender<Me
 pub async fn send_mesh_control_frame(
     control_send: &mut noq::SendStream,
     frame: &MeshControlFrame,
-) -> Result<(), MeshControlSendError> {
+) -> Result<(), ControlSendError> {
     let encoded = encode_frame(frame)?;
     control_send.write_all(&encoded).await?;
     Ok(())
@@ -132,7 +133,7 @@ pub async fn send_mesh_control_frame(
 pub async fn send_mesh_control_frames(
     control_send: &mut noq::SendStream,
     frames: &[MeshControlFrame],
-) -> Result<(), MeshControlSendError> {
+) -> Result<(), ControlSendError> {
     let encoded = encode_mesh_control_frames(frames)?;
     if encoded.is_empty() {
         return Ok(());
@@ -170,21 +171,8 @@ fn encode_mesh_control_frames(frames: &[MeshControlFrame]) -> Result<Vec<u8>, Co
 /// on a link that carries no leaves. The reader drops it on receipt.
 pub async fn establish_mesh_control(
     control_send: &mut noq::SendStream,
-) -> Result<(), MeshControlSendError> {
+) -> Result<(), ControlSendError> {
     send_mesh_control_frame(control_send, &MeshControlFrame::default()).await
-}
-
-/// Why a mesh control frame could not be written to the control stream.
-#[derive(Debug, thiserror::Error)]
-pub enum MeshControlSendError {
-    /// The frame exceeds the control stream's frame cap. Not expected for a
-    /// mesh control frame (a `SlotDeparted`/`LeaveDirective` is a handful of
-    /// bytes), but surfaced rather than silently truncated.
-    #[error("mesh control frame does not fit: {0}")]
-    Frame(#[from] ControlStreamError),
-    /// The stream is gone (the connection dropped or the peer stopped it).
-    #[error("mesh control stream write failed: {0}")]
-    Write(#[from] noq::WriteError),
 }
 
 #[cfg(test)]
@@ -304,7 +292,7 @@ mod tests {
                 &[ack_cursors_frame(9, SlotId(3), 88)],
             )
             .await,
-            Err(MeshControlSendError::Write(noq::WriteError::Stopped(code)))
+            Err(ControlSendError::Write(noq::WriteError::Stopped(code)))
                 if code == stop_code,
         ));
     }

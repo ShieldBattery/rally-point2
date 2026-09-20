@@ -22,7 +22,7 @@
 //! without a wire break.
 
 use prost::bytes::Bytes;
-use rally_point_proto::control_stream::{ControlStreamError, encode_frame};
+use rally_point_proto::control_stream::encode_frame;
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, GameStarted, LeaveDirective, LeaveIntent, LoadStateProbe,
     LoadStateProbeAck, LobbyCommand, Payload, PhaseApplied, PhaseDirective, PlayerSkin,
@@ -30,6 +30,7 @@ use rally_point_proto::messages::{
 };
 use tokio::sync::mpsc;
 
+pub use crate::control_framing::ControlSendError;
 use crate::control_framing::read_one_frame;
 
 /// A frame surfaced from the reliable control stream to its consumer.
@@ -570,17 +571,4 @@ pub async fn send_control_load_state_probe_ack(
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;
     Ok(())
-}
-
-/// Why an oversize turn could not be written to the control stream.
-#[derive(Debug, thiserror::Error)]
-pub enum ControlSendError {
-    /// The turn exceeds even the control stream's frame cap — it can be
-    /// delivered by no channel at all, so the caller must fail fast rather
-    /// than stall lockstep on a turn that will never arrive.
-    #[error("turn does not fit a control frame: {0}")]
-    Frame(#[from] ControlStreamError),
-    /// The stream is gone (the connection dropped or the peer stopped it).
-    #[error("control stream write failed: {0}")]
-    Write(#[from] noq::WriteError),
 }
