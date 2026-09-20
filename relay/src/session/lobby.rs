@@ -49,7 +49,7 @@ use tokio::sync::mpsc;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::LobbyCommand;
 
-use crate::consensus::{RateLimitedCounter, TokenBucket};
+use crate::rate_limit::{RateLimitedCounter, TokenBucket};
 use crate::routing::SessionKey;
 
 /// Depth of one member's lobby-push channel. Sized above [`LOBBY_LOG_MAX_COMMANDS`]
@@ -435,8 +435,11 @@ mod tests {
         assert_eq!(drain(&mut after), vec![]);
     }
 
+    /// The burst-then-reject half of the cap. Recovery after a refill is the
+    /// token bucket's own test (`crate::rate_limit`), driven off synthetic
+    /// instants rather than a real wait on the production interval.
     #[test]
-    fn a_burst_past_the_rate_cap_is_rejected_then_recovers_after_refill() {
+    fn a_burst_past_the_rate_cap_is_rejected() {
         let registry = new_lobby_registry();
         let k = key();
         let slot = SlotId(0);
@@ -448,10 +451,6 @@ mod tests {
         }
         // The next one, still within the burst window, is rejected.
         assert!(!admit(&registry, &k, slot));
-
-        // After a refill interval passes, at least one more token is available.
-        std::thread::sleep(LOBBY_RATE_REFILL_INTERVAL + std::time::Duration::from_millis(50));
-        assert!(admit(&registry, &k, slot));
     }
 
     #[test]

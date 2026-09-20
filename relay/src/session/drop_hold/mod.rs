@@ -79,6 +79,7 @@ use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 use tokio::sync::oneshot;
 
+use crate::rate_limit::TokenBucket;
 use crate::routing::SessionKey;
 
 /// The map of live drop holds: each held `(session, slot)` mapped to the instant
@@ -89,7 +90,7 @@ type Holds = Arc<Mutex<HashMap<(SessionKey, SlotId), Instant>>>;
 /// The map of per-requester drop-request rate limiters, keyed by the session and
 /// the requesting slot. Kept separate from [`Holds`] because it is keyed by *who
 /// asked*, not *who dropped*.
-type RequestLimiters = Arc<Mutex<HashMap<(SessionKey, SlotId), RequestBucket>>>;
+type RequestLimiters = Arc<Mutex<HashMap<(SessionKey, SlotId), TokenBucket>>>;
 
 /// The map of live abandoned-session timers: one per session that has gone empty
 /// session-wide with an undecided departure. A present entry means a timer is
@@ -200,6 +201,13 @@ pub struct DropHolds {
     /// consume a *fresh* timer armed by a second abandonment after this one's
     /// cancellation, stealing that timer's full window.
     abandon_generation: Arc<AtomicU64>,
+    /// The burst size each requester's token bucket is built with. A field for
+    /// the same reason `unlock` is: a test drives the cap without waiting on
+    /// production numbers. Production builds it with [`DROP_REQUEST_BURST`].
+    request_burst: u32,
+    /// How often one drop-request token is refilled, up to `request_burst`.
+    /// Production builds it with [`DROP_REQUEST_REFILL_INTERVAL`].
+    request_refill_interval: Duration,
 }
 
 impl DropHolds {
@@ -213,6 +221,21 @@ impl DropHolds {
             unlock,
             abandon_timeout,
             abandon_generation: Arc::new(AtomicU64::new(0)),
+            request_burst: DROP_REQUEST_BURST,
+            request_refill_interval: DROP_REQUEST_REFILL_INTERVAL,
+        }
+    }
+
+    /// The same registry with a different drop-request rate cap. Only the
+    /// buckets built after this call see the new numbers, so it is meant to be
+    /// chained onto [`new`](Self::new) before any request is admitted — a test
+    /// naming a cap it can exercise in full rather than the production one.
+    #[must_use]
+    pub fn with_request_rate(self, burst: u32, refill_interval: Duration) -> Self {
+        Self {
+            request_burst: burst,
+            request_refill_interval: refill_interval,
+            ..self
         }
     }
 
@@ -387,7 +410,7 @@ impl DropHolds {
         self.limiters
             .lock()
             .entry((key.clone(), requester))
-            .or_insert_with(RequestBucket::new)
+            .or_insert_with(|| TokenBucket::new(self.request_burst, self.request_refill_interval))
             .try_take()
     }
 
@@ -568,51 +591,6 @@ impl DropHolds {
         self.limiters
             .lock()
             .retain(|(limiter_key, _), _| limiter_key != key);
-    }
-}
-
-/// A per-requester token bucket for the drop-request rate cap. A whole-token
-/// counter plus a last-refill instant, matching the game-chat limiter: drop
-/// requests are far rarer than chat, so whole-token granularity costs nothing and
-/// integer refill counts avoid floating-point drift over a long session.
-struct RequestBucket {
-    /// Tokens currently available, capped at [`DROP_REQUEST_BURST`].
-    tokens: u32,
-    /// The instant the tokens above were last refilled up to.
-    last_refill: Instant,
-}
-
-impl RequestBucket {
-    /// A fresh bucket starts with a full burst — a survivor's first drop requests
-    /// are not penalized.
-    fn new() -> Self {
-        Self {
-            tokens: DROP_REQUEST_BURST,
-            last_refill: Instant::now(),
-        }
-    }
-
-    /// Refills whole elapsed [`DROP_REQUEST_REFILL_INTERVAL`]s since the last
-    /// refill (capped at the burst), then attempts to take one token. Returns
-    /// `false` — taking nothing — when the bucket is still empty after refilling.
-    fn try_take(&mut self) -> bool {
-        let elapsed = self.last_refill.elapsed();
-        let interval_ms = DROP_REQUEST_REFILL_INTERVAL.as_millis().max(1);
-        let intervals = elapsed.as_millis() / interval_ms;
-        if intervals > 0 {
-            let intervals = u32::try_from(intervals).unwrap_or(DROP_REQUEST_BURST);
-            self.tokens = self
-                .tokens
-                .saturating_add(intervals)
-                .min(DROP_REQUEST_BURST);
-            self.last_refill += DROP_REQUEST_REFILL_INTERVAL * intervals;
-        }
-        if self.tokens == 0 {
-            false
-        } else {
-            self.tokens -= 1;
-            true
-        }
     }
 }
 

@@ -2,18 +2,17 @@
 //! views of the turn stream.
 //!
 //! This file holds the tuning constants, canonical-ordinal comparison state,
-//! and value types. `turns` establishes canonical ordinals, `tracker` folds
-//! reports, and `rate_limit` owns warning throttles.
+//! and value types. `turns` establishes canonical ordinals and `tracker`
+//! folds reports; the warning throttles they use are the relay-wide ones in
+//! [`crate::rate_limit`].
 
 use super::*;
+use crate::rate_limit::RateLimitedCounter;
 
-mod rate_limit;
 mod tracker;
 mod turns;
 
 pub(in crate::consensus) use turns::{SyncCommand, SyncGap, SyncTurn, SyncTurns};
-
-pub(crate) use rate_limit::{RateLimitedCounter, TokenBucket};
 
 // ---------------------------------------------------------------------------
 // Relay-side desync detection

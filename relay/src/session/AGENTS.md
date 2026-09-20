@@ -30,7 +30,7 @@ teardown).
   Resolved. Nothing is deleted while undrained; only descriptor retirement
   discards it. Fail-closed ceilings: per-session, aggregate byte, session count.
 - `drop_hold/` — indefinite holds on a *dropped* (not cleanly left) slot's
-  removal, the `RequestBucket` cap on manual `RequestDrop`s, and the
+  removal, the `TokenBucket` cap on manual `RequestDrop`s, and the
   abandoned-session force-decide timer. A hold is a marker, not a timer.
 - `turn_ring/` — bounded per-session record of forwarded turns for reconnect
   replay: count bound (sized to the drop-unlock window at live slot count)

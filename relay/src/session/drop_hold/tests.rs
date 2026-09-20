@@ -274,8 +274,11 @@ fn end_session_with_no_decided_slots_keeps_every_hold_for_the_session() {
     );
 }
 
+/// The production burst-then-reject half of the cap. Recovery after a refill
+/// is the token bucket's own test (`crate::rate_limit`), driven off synthetic
+/// instants rather than a real two-second wait.
 #[test]
-fn a_burst_past_the_request_cap_is_rejected_then_recovers_after_refill() {
+fn a_burst_past_the_request_cap_is_rejected() {
     let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT);
     let requester = SlotId(2);
     // The first DROP_REQUEST_BURST requests in a burst are all admitted.
@@ -285,10 +288,21 @@ fn a_burst_past_the_request_cap_is_rejected_then_recovers_after_refill() {
     // The next, still within the burst window, is rejected — a double-click
     // storm is throttled, not honored repeatedly.
     assert!(!holds.admit_request(&key(), requester));
+}
 
-    // After a refill interval passes, at least one more token is available.
-    std::thread::sleep(DROP_REQUEST_REFILL_INTERVAL + Duration::from_millis(50));
+/// An injected cap replaces the production numbers wholesale: a registry built
+/// with a burst of one rejects the second back-to-back request, where the
+/// production burst would have admitted it.
+#[test]
+fn an_injected_request_rate_replaces_the_production_cap() {
+    let holds = DropHolds::new(DROP_UNLOCK, ABANDONED_SESSION_TIMEOUT)
+        .with_request_rate(1, Duration::from_millis(1));
+    let requester = SlotId(2);
     assert!(holds.admit_request(&key(), requester));
+    assert!(
+        !holds.admit_request(&key(), requester),
+        "the injected burst of one is spent",
+    );
 }
 
 #[test]

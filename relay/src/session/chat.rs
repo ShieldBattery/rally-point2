@@ -48,7 +48,7 @@ use tokio::sync::mpsc;
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::GameChat;
 
-use crate::consensus::{RateLimitedCounter, TokenBucket};
+use crate::rate_limit::{RateLimitedCounter, TokenBucket};
 use crate::routing::SessionKey;
 
 /// Depth of one member's chat-push channel. Chat is bursty but small (a human
@@ -303,8 +303,11 @@ mod tests {
         assert!(!admit(&registry, &k, SlotId(0), CHAT_TEXT_MAX_BYTES + 1));
     }
 
+    /// The burst-then-reject half of the cap. Recovery after a refill is the
+    /// token bucket's own test (`crate::rate_limit`), driven off synthetic
+    /// instants rather than a real wait on the production interval.
     #[test]
-    fn a_burst_past_the_rate_cap_is_rejected_then_recovers_after_refill() {
+    fn a_burst_past_the_rate_cap_is_rejected() {
         let registry = new_chat_registry();
         let k = key();
         let slot = SlotId(0);
@@ -315,10 +318,6 @@ mod tests {
         }
         // The next one, still within the burst window, is rejected.
         assert!(!admit(&registry, &k, slot, 4));
-
-        // After a refill interval passes, at least one more token is available.
-        std::thread::sleep(CHAT_RATE_REFILL_INTERVAL + Duration::from_millis(50));
-        assert!(admit(&registry, &k, slot, 4));
     }
 
     #[test]
