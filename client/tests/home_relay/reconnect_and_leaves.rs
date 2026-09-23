@@ -46,6 +46,7 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
     let reconnect0 = Reconnect {
         endpoint: ClientEndpoint::from_endpoint(endpoint.endpoint().clone()),
         relay_addr: addr,
+        fallback_addrs: Vec::new(),
         server_name: "localhost".to_owned(),
         relay_id: 1,
         identity: id0,

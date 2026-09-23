@@ -46,7 +46,9 @@
   presence is what makes the relay seed the fresh window's acked holes. Same-relay and re-home
   anchors differ; read the comments before touching either.
 - Escalation timing is budgeted against BW's ~45s native stall-drop; widening `ESCALATE_AFTER`,
-  `REHOME_PROVIDER_DEADLINE` or `RECONNECT_DIAL_TIMEOUT` can push a re-home past it.
+  `REHOME_PROVIDER_DEADLINE` or `RECONNECT_DIAL_TIMEOUT` can push a re-home past it. A re-home
+  dial walks every address the replacement advertises, so its worst case is one
+  `RECONNECT_DIAL_TIMEOUT` per address.
 - Every driver → game push is non-blocking: awaiting one parks acks and outbound turns behind a
   stalled consumer.
 

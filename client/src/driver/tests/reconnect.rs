@@ -28,6 +28,7 @@ async fn a_classified_link_failure_closes_the_old_connection_before_the_re_dial(
     let reconnect = Reconnect {
         endpoint: crate::dial::ClientEndpoint::from_endpoint(ea.clone()),
         relay_addr: (Ipv4Addr::LOCALHOST, 1).into(),
+        fallback_addrs: Vec::new(),
         server_name: "localhost".to_owned(),
         relay_id: 7,
         identity: fake_identity(SlotId(0)),
@@ -130,6 +131,7 @@ async fn escalating_driver(
         // touches the network: the loop's cadence is its backoff alone, with no
         // connection attempt's own duration blurring it.
         relay_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+        fallback_addrs: Vec::new(),
         server_name: "localhost".to_owned(),
         relay_id: 7,
         identity: fake_identity(SlotId(0)),

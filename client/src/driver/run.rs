@@ -75,6 +75,7 @@ impl LinkDriver {
         let Reconnect {
             endpoint,
             relay_addr,
+            fallback_addrs,
             server_name,
             relay_id,
             identity,
@@ -88,12 +89,14 @@ impl LinkDriver {
         // The reconnect machinery, its target mutable so a successful re-home moves
         // where subsequent drops reconnect to.
         let mut rc = ReconnectDriver {
-            target: ReconnectTarget {
+            target: ReconnectTarget::new(
                 endpoint,
                 relay_addr,
+                fallback_addrs,
+                0,
                 server_name,
                 relay_id,
-            },
+            ),
             identity,
             rehome,
             escalate_after: escalate_after.unwrap_or(ESCALATE_AFTER),

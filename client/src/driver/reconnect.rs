@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rally_point_proto::ids::SlotId;
 use rally_point_transport::Link;
 use tokio::time::Instant;
 
@@ -35,9 +36,10 @@ use super::state::{
 /// [`ClientEndpoint`] whose trust roots pin the *new* relay's cert — the driver
 /// just dials it with the same identity and resume cursors.
 pub enum RehomeOutcome {
-    /// Move the session to a new relay: dial `endpoint` at `relay_addr` (TLS
-    /// `server_name`) with the same identity and resume cursors. The embedder built
-    /// `endpoint` with the replacement relay's pinned cert.
+    /// Move the session to a new relay: dial `endpoint` at `relay_addr`, then each of
+    /// `fallback_addrs` in order until one connects (TLS `server_name`), with the same
+    /// identity and resume cursors. The embedder built `endpoint` with the replacement
+    /// relay's pinned cert.
     NewTarget {
         /// The replacement relay's id. The driver adopts this as its current relay
         /// id only on a *successful* replacement dial, so the id it next passes to
@@ -47,8 +49,12 @@ pub enum RehomeOutcome {
         /// The endpoint to dial the replacement relay from — its trust roots pin the
         /// new relay's cert.
         endpoint: ClientEndpoint,
-        /// The replacement relay's address.
+        /// The replacement relay's most-preferred address.
         relay_addr: SocketAddr,
+        /// The replacement relay's other addresses (typically its other IP family),
+        /// dialed in order when `relay_addr` does not connect. Whichever address
+        /// connects becomes the one later same-relay re-dials start from.
+        fallback_addrs: Vec<SocketAddr>,
         /// The replacement relay's TLS server name.
         server_name: String,
     },
@@ -95,8 +101,16 @@ pub struct Reconnect {
     /// UDP socket held open for the session's life. If it is also dialing other
     /// slots, clone the caller's via [`ClientEndpoint::from_endpoint`].
     pub endpoint: ClientEndpoint,
-    /// The home relay's address.
+    /// The home relay's address to re-dial first — the one the initial connection
+    /// was made over.
     pub relay_addr: SocketAddr,
+    /// The home relay's other addresses (typically its other IP family). Each
+    /// failed re-dial moves on to the next address, wrapping back to `relay_addr`,
+    /// so a client whose path to one address dies mid-game — its IPv6 connectivity
+    /// dropping while IPv4 keeps working, say — resumes over another instead of
+    /// re-dialing the dead one until its drop is decided. Empty re-dials
+    /// `relay_addr` alone.
+    pub fallback_addrs: Vec<SocketAddr>,
     /// The relay's TLS server name, checked against its certificate.
     pub server_name: String,
     /// The home relay's id — seeds the reconnect target's current relay id. The
@@ -129,13 +143,51 @@ pub struct Reconnect {
 /// endpoint/address/name move.
 pub(super) struct ReconnectTarget {
     pub(super) endpoint: ClientEndpoint,
-    pub(super) relay_addr: SocketAddr,
+    /// Every address the relay is reachable at, never empty.
+    addrs: Vec<SocketAddr>,
+    /// The index into `addrs` the next same-relay re-dial dials. A failed dial
+    /// advances it (wrapping), a successful one leaves it, so the address that last
+    /// connected is the first one tried after a later drop.
+    next_addr: usize,
     pub(super) server_name: String,
     /// The id of the relay this target dials — the driver's current relay id, passed
     /// to [`RehomeProvider::rehome`] as the dead relay. Seeded from
     /// [`Reconnect::relay_id`] and updated only on a successful re-home dial (never a
     /// failed one), so it always names the relay the driver is actually homed on.
     pub(super) relay_id: u64,
+}
+
+impl ReconnectTarget {
+    /// A target over `primary` then `fallbacks`, the next re-dial starting at `addrs[first]`.
+    pub(super) fn new(
+        endpoint: ClientEndpoint,
+        primary: SocketAddr,
+        fallbacks: Vec<SocketAddr>,
+        first: usize,
+        server_name: String,
+        relay_id: u64,
+    ) -> Self {
+        let mut addrs = Vec::with_capacity(1 + fallbacks.len());
+        addrs.push(primary);
+        addrs.extend(fallbacks);
+        Self {
+            endpoint,
+            next_addr: first % addrs.len(),
+            addrs,
+            server_name,
+            relay_id,
+        }
+    }
+
+    /// The address the next same-relay re-dial dials.
+    pub(super) fn current_addr(&self) -> SocketAddr {
+        self.addrs[self.next_addr]
+    }
+
+    /// Moves the next re-dial on to the relay's next address, wrapping around.
+    fn advance_addr(&mut self) {
+        self.next_addr = (self.next_addr + 1) % self.addrs.len();
+    }
 }
 
 /// The reconnect machinery [`run_reconnecting`](super::LinkDriver::run_reconnecting) owns
@@ -263,11 +315,12 @@ pub(super) async fn reconnect_link(
             own_slot,
             state.next_outbound_seq,
         );
+        let addr = rc.target.current_addr();
         match rc
             .target
             .endpoint
             .reconnect_with_timeout(
-                rc.target.relay_addr,
+                addr,
                 &rc.target.server_name,
                 &rc.identity,
                 &same_relay_cursors,
@@ -297,16 +350,19 @@ pub(super) async fn reconnect_link(
                 link.rebind(fresh.connection().clone());
                 redivert_oversize_retention_on_same_relay_resume(link, state);
                 backoff.reset();
+                tracing::info!(relay = %addr, "re-dialed the home relay");
                 return Reconnected::Resumed;
             }
             // The game moved on without us: no dial can bring the slot back.
             Err(DialError::SlotDeparted) => {
                 return Reconnected::Terminal(DriverError::SlotDeparted);
             }
-            // A transient same-relay failure. Retry, and — for an in-game session
-            // with a provider — escalate to coordinator-mediated failover when the
-            // relay stays unreachable.
+            // A transient same-relay failure. Retry — over the relay's next address,
+            // in case it was this one's path that died rather than the relay — and,
+            // for an in-game session with a provider, escalate to
+            // coordinator-mediated failover when the relay stays unreachable.
             Err(error) => {
+                rc.target.advance_addr();
                 // Clone the provider handle out so the escalation block can mutate
                 // `rc.target` without holding a borrow of `rc.rehome` across it.
                 let provider = rc.rehome.clone();
@@ -364,6 +420,7 @@ pub(super) async fn reconnect_link(
                                     relay_id,
                                     endpoint,
                                     relay_addr,
+                                    fallback_addrs,
                                     server_name,
                                 } => {
                                     // The replacement relay has never seen this client, so
@@ -393,15 +450,20 @@ pub(super) async fn reconnect_link(
                                     ) {
                                         rehome_cursors.push((own_slot, anchor));
                                     }
-                                    match endpoint
-                                        .reconnect_with_timeout(
-                                            relay_addr,
-                                            &server_name,
-                                            &rc.identity,
-                                            &rehome_cursors,
-                                            RECONNECT_DIAL_TIMEOUT,
-                                        )
-                                        .await
+                                    let mut new_target = ReconnectTarget::new(
+                                        endpoint,
+                                        relay_addr,
+                                        fallback_addrs,
+                                        0,
+                                        server_name,
+                                        relay_id,
+                                    );
+                                    match dial_each_address(
+                                        &mut new_target,
+                                        &rc.identity,
+                                        &rehome_cursors,
+                                    )
+                                    .await
                                     {
                                         Ok(fresh) => {
                                             // A re-home resume onto a fresh relay: rebind, then
@@ -412,15 +474,11 @@ pub(super) async fn reconnect_link(
                                             // it naming a relay it isn't homed on.
                                             link.rebind(fresh.connection().clone());
                                             reinject_retention(link, state);
-                                            rc.target = ReconnectTarget {
-                                                endpoint,
-                                                relay_addr,
-                                                server_name,
-                                                relay_id,
-                                            };
+                                            let new_addr = new_target.current_addr();
+                                            rc.target = new_target;
                                             backoff.reset();
                                             tracing::info!(
-                                                relay = %relay_addr,
+                                                relay = %new_addr,
                                                 "re-homed onto a replacement relay",
                                             );
                                             return Reconnected::Resumed;
@@ -443,8 +501,44 @@ pub(super) async fn reconnect_link(
                         }
                     }
                 }
-                tracing::info!(%error, "re-dial attempt failed; backing off");
+                tracing::info!(%error, relay = %addr, "re-dial attempt failed; backing off");
             }
+        }
+    }
+}
+
+/// Dials `target`'s addresses in order from its first until one connects, leaving the
+/// target's next re-dial on the address that answered. A slot refusal ends the walk at
+/// once (no other address can reverse it); otherwise a total failure returns the last
+/// address's error.
+async fn dial_each_address(
+    target: &mut ReconnectTarget,
+    identity: &Identity,
+    cursors: &[(SlotId, u64)],
+) -> Result<Link, DialError> {
+    let mut index = 0;
+    loop {
+        target.next_addr = index;
+        let addr = target.addrs[index];
+        match target
+            .endpoint
+            .reconnect_with_timeout(
+                addr,
+                &target.server_name,
+                identity,
+                cursors,
+                RECONNECT_DIAL_TIMEOUT,
+            )
+            .await
+        {
+            Ok(link) => return Ok(link),
+            Err(error)
+                if index + 1 < target.addrs.len() && !matches!(error, DialError::SlotDeparted) =>
+            {
+                tracing::info!(%error, relay = %addr, "re-home dial failed; trying the relay's next address");
+                index += 1;
+            }
+            Err(error) => return Err(error),
         }
     }
 }

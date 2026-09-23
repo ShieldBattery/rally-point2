@@ -11,10 +11,12 @@
 //! turn/session-start path; `directives` covers the lobby/chat/skin
 //! control-stream broadcasts; `reconnect_and_leaves` covers a dropped link's
 //! reconnect-and-replay and a survivor's manual drop of a disconnected peer;
-//! `rehome` covers failover to a replacement relay.
+//! `rehome` covers failover to a replacement relay; `address_fallback` covers
+//! re-dialing past a relay address whose path died to its next one.
 
 mod helpers;
 
+mod address_fallback;
 mod connect_and_turns;
 mod directives;
 mod reconnect_and_leaves;

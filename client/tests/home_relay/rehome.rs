@@ -46,6 +46,7 @@ impl rally_point_client::RehomeProvider for FixedTarget {
                 relay_id,
                 endpoint: client_endpoint(&ca),
                 relay_addr: addr,
+                fallback_addrs: Vec::new(),
                 server_name: "localhost".to_owned(),
             }
         })
@@ -102,6 +103,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     let reconnect0 = Reconnect {
         endpoint: ep0,
         relay_addr: addr_a,
+        fallback_addrs: Vec::new(),
         server_name: "localhost".to_owned(),
         relay_id: 1,
         identity: id0,
@@ -117,6 +119,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
     let reconnect1 = Reconnect {
         endpoint: ep1,
         relay_addr: addr_a,
+        fallback_addrs: Vec::new(),
         server_name: "localhost".to_owned(),
         relay_id: 1,
         identity: id1,
