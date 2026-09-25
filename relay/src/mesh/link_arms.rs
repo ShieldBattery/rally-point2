@@ -23,8 +23,8 @@ use super::dispatch::dispatch_mesh_control;
 use super::fan_out::{apply_ack_cursors, fold_oversize_into_link, reconcile_ack_cursors};
 use super::forward::{resume_replay_for_frame, send_resume_replay};
 use super::join::{
-    local_live_players, push_presence_updates, reconcile_local_slots_on_join,
-    reconcile_started_slots_on_join,
+    SentPresence, local_presence, presence_catch_up, presence_statement, presence_updates,
+    push_presence_updates, reconcile_local_slots_on_join, reconcile_started_slots_on_join,
 };
 use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};
 use super::links::{
@@ -53,8 +53,8 @@ pub(super) struct LinkDriver {
     pub(super) forward_tx: MeshForwardTx,
     /// This link's reset signal, notified when its shared forward queue fills.
     pub(super) shutdown: Arc<Notify>,
-    /// The live-player count last pushed to the peer, per session.
-    pub(super) presence_sent: HashMap<SessionId, u32>,
+    /// The presence last pushed to the peer, per session.
+    pub(super) presence_sent: HashMap<SessionId, SentPresence>,
     /// Sessions whose peer has proved its own Join with a presence report.
     pub(super) peer_presence_seen: HashSet<SessionId>,
     /// The delivered-through cursor last pushed to the peer, per (session, slot).
@@ -109,6 +109,7 @@ impl LinkDriver {
             maintenance,
             lease,
             sessions,
+            presence,
             ..
         } = self;
         // Service due maintenance synchronously, before selecting on the data
@@ -130,7 +131,7 @@ impl LinkDriver {
             let now = tokio::time::Instant::now();
             let mut failed = None;
             let mut window_exhausted = false;
-            let mut presence_updates = Vec::new();
+            let mut pending_presence = Vec::new();
             let mut ack_cursor_frames = Vec::with_capacity(joined.len());
 
             // One link-wide pass handles every periodic responsibility.
@@ -157,10 +158,13 @@ impl LinkDriver {
                     state.flush_deadline = now + routing::FLUSH_INTERVAL;
                 }
 
-                let live = local_live_players(sessions, &state.key);
-                if presence_sent.get(&state.key.session) != Some(&live) {
-                    presence_updates.push((state.key.session, live));
-                }
+                let current = local_presence(sessions, presence, &state.key);
+                let sent = presence_sent.get(&state.key.session).copied();
+                pending_presence.extend(presence_updates(
+                    state.key.session,
+                    current,
+                    presence_catch_up(sent, current),
+                ));
 
                 if let Some(frame) = reconcile_ack_cursors(link, ack_cursors_sent, state) {
                     ack_cursor_frames.push(frame);
@@ -197,7 +201,7 @@ impl LinkDriver {
                 lease,
                 tokio::time::timeout(
                     MESH_STREAM_WRITE_TIMEOUT,
-                    push_presence_updates(presence_tx, presence_sent, &presence_updates),
+                    push_presence_updates(presence_tx, presence_sent, &pending_presence),
                 ),
             )
             .await
@@ -491,22 +495,23 @@ impl LinkDriver {
                         // cancelling it.
                         routing::reconcile_abandon(sessions, mesh_for_dispatch, &key);
                     }
-                    first_peer_presence
-                        .then(|| (report.session, local_live_players(sessions, &key)))
+                    first_peer_presence.then(|| {
+                        // The rendezvous restates presence in full: whatever this
+                        // link wrote before the peer joined was dropped unread.
+                        let current = local_presence(sessions, presence, &key);
+                        presence_updates(report.session, current, presence_statement(current))
+                            .collect::<Vec<_>>()
+                    })
                 });
                 let Some(handshake_presence) = handshake_presence else {
                     return ControlFlow::Break(MeshLinkExit::Superseded);
                 };
-                if let Some(update) = handshake_presence {
+                if let Some(updates) = handshake_presence {
                     match await_while_current(
                         lease,
                         tokio::time::timeout(
                             MESH_STREAM_WRITE_TIMEOUT,
-                            push_presence_updates(
-                                presence_tx,
-                                presence_sent,
-                                std::slice::from_ref(&update),
-                            ),
+                            push_presence_updates(presence_tx, presence_sent, &updates),
                         ),
                     )
                     .await

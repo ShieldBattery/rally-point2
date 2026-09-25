@@ -227,10 +227,11 @@ pub async fn run_mesh_link(
     let (control_forward_tx, mut control_forward_rx) =
         mpsc::unbounded_channel::<MeshControlFrame>();
 
-    // The live-player count last pushed to the peer, per session — presence is
-    // pushed on change (reconciled against the local slot roster on every
-    // flush tick and on each Join), so a stable roster sends nothing.
-    let presence_sent: HashMap<rally_point_proto::ids::SessionId, u32> = HashMap::new();
+    // The presence last pushed to the peer, per session — presence is pushed on
+    // change (reconciled against the local slot roster on every flush tick and
+    // on each Join), so a stable roster sends nothing.
+    let presence_sent: HashMap<rally_point_proto::ids::SessionId, super::join::SentPresence> =
+        HashMap::new();
 
     // Sessions for which this link has received at least one peer-presence
     // report since joining. The peer sends its first report only after its own

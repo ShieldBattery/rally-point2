@@ -143,6 +143,93 @@ pub(super) fn local_live_players(sessions: &routing::Sessions, key: &SessionKey)
     roster.get(key).map_or(0, |slots| slots.len() as u32)
 }
 
+/// This relay's presence for one session as a link pushes it: the live-player
+/// count and the own went-live count it is consistent with (see
+/// [`own_went_live`](crate::session::presence::own_went_live)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SentPresence {
+    /// The live-player count in the frame.
+    pub(super) live: u32,
+    /// This relay's own went-live count when the count was sampled.
+    pub(super) went_live: u64,
+}
+
+/// Samples this relay's presence for `key`. The went-live count is read
+/// **before** the roster: a fill is only counted once the roster holds a
+/// player, so a counted fill followed by an empty roster means those players
+/// really left. Read the other way round, a client connecting between the two
+/// reads would pair an empty roster with its fill and report players who never
+/// left as gone, handing a peer the authority while this relay still holds it.
+pub(super) fn local_presence(
+    sessions: &routing::Sessions,
+    presence: &crate::session::presence::PresenceRegistry,
+    key: &SessionKey,
+) -> SentPresence {
+    let went_live = crate::session::presence::own_went_live(presence, key);
+    SentPresence {
+        live: local_live_players(sessions, key),
+        went_live,
+    }
+}
+
+/// The live-player counts that state this relay's presence in full to a peer
+/// that may know nothing of it: the current count while players are live, a
+/// positive count ahead of the zero once players have come and gone, and a bare
+/// zero only while none ever have. A peer keeps a relay it has never seen serve
+/// players in contention for authority, while this relay demotes itself the
+/// moment its roster empties, so a bare zero after players would leave each
+/// deferring to the other.
+///
+/// Sent on a Join and on the Join rendezvous, where nothing this link wrote
+/// earlier is known to have landed: the peer drops reports for a session it
+/// has not joined yet, and a fresh link's peer may be a restarted process. A
+/// peer that already knew the players left sees them briefly return, which
+/// costs one handoff that ends where it started.
+pub(super) fn presence_statement(current: SentPresence) -> Vec<u32> {
+    if current.live == 0 && current.went_live > 0 {
+        vec![1, 0]
+    } else {
+        vec![current.live]
+    }
+}
+
+/// The live-player counts to push so a peer that has received everything this
+/// link sent since the rendezvous catches up on one session: nothing when
+/// neither the count nor its history moved, the current count when it changed,
+/// and a positive count ahead of the zero when players connected and left
+/// between two samples (see [`presence_statement`] for why the zero alone is
+/// not enough).
+pub(super) fn presence_catch_up(sent: Option<SentPresence>, current: SentPresence) -> Vec<u32> {
+    match sent {
+        Some(sent) if sent.live == current.live => {
+            if current.live == 0 && sent.went_live != current.went_live {
+                vec![1, 0]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => vec![current.live],
+    }
+}
+
+/// Pairs each count with the sample it came from, ready for
+/// [`push_presence_updates`].
+pub(super) fn presence_updates(
+    session: SessionId,
+    current: SentPresence,
+    counts: Vec<u32>,
+) -> impl Iterator<Item = (SessionId, SentPresence)> {
+    counts.into_iter().map(move |live| {
+        (
+            session,
+            SentPresence {
+                live,
+                went_live: current.went_live,
+            },
+        )
+    })
+}
+
 /// Pushes the presence changes a link-wide maintenance pass collected, the
 /// initial report a Join produced, or a one-shot Join-rendezvous reply. Regular
 /// maintenance is push-on-change over a reliable stream, so a stable roster
@@ -154,17 +241,17 @@ pub(super) fn local_live_players(sessions: &routing::Sessions, key: &SessionKey)
 /// with `ConnectionFailed` like any other send failure.
 pub(super) async fn push_presence_updates(
     presence_tx: &mut rally_point_transport::noq::SendStream,
-    presence_sent: &mut HashMap<SessionId, u32>,
-    updates: &[(SessionId, u32)],
+    presence_sent: &mut HashMap<SessionId, SentPresence>,
+    updates: &[(SessionId, SentPresence)],
 ) -> Result<(), rally_point_transport::noq::WriteError> {
-    for &(session_id, live) in updates {
+    for &(session_id, sent) in updates {
         let frame = rally_point_proto::mesh::MeshPresence {
             session: session_id,
-            live_players: live,
+            live_players: sent.live,
         }
         .encode();
         presence_tx.write_all(&frame).await?;
-        presence_sent.insert(session_id, live);
+        presence_sent.insert(session_id, sent);
     }
     Ok(())
 }

@@ -486,9 +486,19 @@ already opened; the acceptor opens one of its own). Presence rides a reliable st
 path, because the transition it reports is exactly when the sender's datagrams dry up: a relay whose
 players all left forwards nothing, so a datagram sidecar would stop flowing at the one moment it
 matters. Counts are pushed on change (reconciled against the roster on the mesh flush cadence), and a
-relay that has *never* reported is assumed live — descriptors usually land before any client has
+relay that has *never* reported players is assumed live — descriptors usually land before any client has
 connected, and assuming live makes every relay independently crown the same first-in-order relay
-instead of each skipping the silent others. The coordinator's only role here is to assign the **order**
+instead of each skipping the silent others. That includes the zero every relay sends when it joins a
+session's mesh before its own client has dialed: only a zero that follows a positive count is a departure,
+the same rule a relay applies to itself (it counts itself live until its own roster empties). Read as a
+departure, that initial zero would give the session two authorities while the first-in-order relay's
+client was still connecting, and both would fire session start with their own initial depths. The
+other half of the rule is that a peer must always be able to tell "left" from "not yet": a relay whose
+players have come and gone sends a positive count ahead of the zero whenever the peer may not have seen
+them. That covers players who connect and leave between two flush samples, and every Join and Join
+rendezvous, which restate presence in full because the peer drops reports for a session it has not joined
+yet. A peer that already knew sees one brief handoff that ends where it started. Without this, a relay
+that stepped down would stay in contention on its peers and the session would have no authority. The coordinator's only role here is to assign the **order**
 (home relay first) and set the **bounds** the decision-maker stays within; it makes no per-adjustment
 decision, so a running game is unaffected by a coordinator outage.
 

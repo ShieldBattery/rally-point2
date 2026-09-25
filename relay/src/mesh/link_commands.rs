@@ -14,8 +14,8 @@ use crate::routing;
 use super::conditions::snapshot_conditions;
 use super::forward::send_turn_over_link;
 use super::join::{
-    local_live_players, push_presence_updates, reconcile_leaves_on_join,
-    reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
+    local_presence, presence_statement, presence_updates, push_presence_updates,
+    reconcile_leaves_on_join, reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
     reconcile_started_slots_on_join,
 };
 use super::link_arms::LinkDriver;
@@ -144,6 +144,7 @@ impl LinkDriver {
             maintenance,
             idle_since,
             sessions,
+            presence,
             ..
         } = self;
         match command {
@@ -166,7 +167,10 @@ impl LinkDriver {
                         return None;
                     }
                     let first_session = joined.is_empty();
-                    let live_players = local_live_players(sessions, &key);
+                    let current = local_presence(sessions, presence, &key);
+                    let initial_presence: Vec<_> =
+                        presence_updates(session_id, current, presence_statement(current))
+                            .collect();
                     link.open_session(mesh_session_key(&key));
                     // Anchor each slot's receive window at the seq this
                     // session actually still needs — its forwarded-to-locals
@@ -224,29 +228,25 @@ impl LinkDriver {
                     }
                     *idle_since = None;
                     peer_presence_seen.remove(&session_id);
-                    Some((session_id, live_players))
+                    Some(initial_presence)
                 });
                 let Some(joined_presence) = joined_presence else {
                     return ControlFlow::Break(MeshLinkExit::Superseded);
                 };
-                let Some((session_id, live_players)) = joined_presence else {
+                let Some(initial_presence) = joined_presence else {
                     return ControlFlow::Continue(());
                 };
-                // Announce this session's presence right away rather
-                // than waiting a flush tick: a fresh join (or a
+                // Announce this session's presence in full right away
+                // rather than waiting a flush tick: a fresh join (or a
                 // rejoin on a redialed link, whose `presence_sent`
-                // starts empty) is exactly when the peer knows
+                // starts empty) is exactly when the peer may know
                 // nothing yet. Deadline-bounded like every inline
                 // stream write here — see `MESH_STREAM_WRITE_TIMEOUT`.
                 match await_while_current(
                     lease,
                     tokio::time::timeout(
                         MESH_STREAM_WRITE_TIMEOUT,
-                        push_presence_updates(
-                            presence_tx,
-                            presence_sent,
-                            &[(session_id, live_players)],
-                        ),
+                        push_presence_updates(presence_tx, presence_sent, &initial_presence),
                     ),
                 )
                 .await

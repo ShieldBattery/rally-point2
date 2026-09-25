@@ -39,8 +39,14 @@ fn presence_hands_authority_off_between_descriptor_pushes() {
     control.apply_descriptor(&descriptor_with_order(1, &[2], &[2, 1]));
     assert!(!makers.lock().get(&key(1)).unwrap().is_authority());
 
-    // What the mesh-link driver does when relay 2's presence frame says
-    // it no longer serves players.
+    // What the mesh-link driver does when relay 2's presence frames say
+    // it served players and then no longer does.
+    assert!(!presence::record_peer(
+        &presence_registry,
+        &key(1),
+        RelayId(2),
+        1
+    ));
     assert!(presence::record_peer(
         &presence_registry,
         &key(1),

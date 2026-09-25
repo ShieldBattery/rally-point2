@@ -1,6 +1,6 @@
 //! What a fresh link registration replays and asks for: leave state, local
-//! slots, started reports, and the resume-cursor exchange with the replay it
-//! answers.
+//! slots, started reports, the resume-cursor exchange with the replay it
+//! answers, and the presence counts that bring a peer up to date.
 
 use super::*;
 
@@ -455,4 +455,47 @@ fn resume_replay_is_none_for_an_unjoined_session_or_an_empty_result() {
         )),
     };
     assert!(resume_replay_for_frame(&other, &joined, &mesh).is_none());
+}
+
+/// A link pushes presence on change, and pushes a positive count ahead of the
+/// zero when players connected and left between two samples, so a peer that
+/// never saw them still learns this relay's players are gone.
+#[test]
+fn presence_catch_up_reports_players_that_came_and_went_between_samples() {
+    let at = |live, went_live| SentPresence { live, went_live };
+    let none = Vec::<u32>::new();
+
+    // Nothing pushed yet: the current count, whatever it is.
+    assert_eq!(presence_catch_up(None, at(0, 0)), vec![0]);
+    assert_eq!(presence_catch_up(None, at(2, 1)), vec![2]);
+
+    // Unchanged count and history: nothing to say.
+    assert_eq!(presence_catch_up(Some(at(0, 0)), at(0, 0)), none);
+    assert_eq!(presence_catch_up(Some(at(2, 1)), at(2, 1)), none);
+
+    // A changed count is pushed as is.
+    assert_eq!(presence_catch_up(Some(at(0, 0)), at(1, 1)), vec![1]);
+    assert_eq!(presence_catch_up(Some(at(1, 1)), at(0, 1)), vec![0]);
+
+    // Empty at both samples, but the roster filled in between.
+    assert_eq!(presence_catch_up(Some(at(0, 0)), at(0, 1)), vec![1, 0]);
+
+    // Live at both samples with a gap in between: still live, nothing to say.
+    assert_eq!(presence_catch_up(Some(at(1, 1)), at(1, 2)), none);
+}
+
+/// A Join or rendezvous cannot rely on anything the link wrote before, so it
+/// states the relay's whole presence history: a relay whose players have come
+/// and gone says so, rather than sending the bare zero a peer reads as "not
+/// yet joined".
+#[test]
+fn presence_statement_carries_the_history_a_bare_zero_would_hide() {
+    let at = |live, went_live| SentPresence { live, went_live };
+    assert_eq!(presence_statement(at(0, 0)), vec![0], "never had players");
+    assert_eq!(presence_statement(at(3, 1)), vec![3], "players live now");
+    assert_eq!(
+        presence_statement(at(0, 2)),
+        vec![1, 0],
+        "players came and went"
+    );
 }

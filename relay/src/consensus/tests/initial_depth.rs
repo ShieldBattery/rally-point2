@@ -191,6 +191,33 @@ fn a_peer_adopts_the_authoritys_stamped_depth() {
     );
 }
 
+#[test]
+fn a_relay_that_already_started_keeps_its_own_depth() {
+    // Two relays that both judged themselves the authority each fire a start
+    // with their own seed, and each receives the other's across the mesh. The
+    // relay's local clients already applied its own seed, and its first-frame
+    // re-affirm broadcasts its buffer to correct everyone else, so the peer's
+    // seed must not replace it.
+    let mut maker = initial_depth_maker(0, 20, &[0, 1], None, true);
+    let conds = multi_conditions(&[(0, 150_000, 0, 100), (1, 150_000, 0, 100)]);
+    maker.ingest_local(&conds);
+    assert!(drive_to_coverage(&mut maker, &[0, 1]));
+    assert_eq!(maker.initial_buffer_turns(), Some(4));
+
+    maker.adopt_session_start(Some(9));
+    assert_eq!(maker.initial_buffer_turns(), Some(4));
+    assert_eq!(maker.buffer(), BufferSize(4));
+    let decision = ingest_at(&mut maker, &conds, 10).expect("the re-affirm fires once");
+    assert_eq!(decision.buffer, BufferSize(4));
+
+    // A repeat delivery to a peer that already adopted is equally inert.
+    let mut peer = peer_maker_with(bounds(1, 20));
+    peer.adopt_session_start(Some(4));
+    peer.adopt_session_start(Some(9));
+    assert_eq!(peer.initial_buffer_turns(), Some(4));
+    assert_eq!(peer.buffer(), BufferSize(4));
+}
+
 /// Wire bounds deserialize with no validation, so a misconfigured or older
 /// coordinator can hand a maker a `max` past the game-sync-safe ceiling —
 /// but every depth the relay emits is capped at the ceiling regardless: a

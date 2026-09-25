@@ -226,6 +226,13 @@ impl DecisionMaker {
     /// defensively (bounds plus the game-sync-safe ceiling), though the
     /// authority already clamped it before stamping.
     ///
+    /// A relay that had already latched the session started keeps its own depth.
+    /// If it fired the directive itself (two relays briefly both judging
+    /// themselves the authority), its local clients have already applied its
+    /// seed, and the authority's first-frame re-affirm broadcasts its buffer to
+    /// correct everyone else, so a peer's seed arriving afterwards must not
+    /// replace the depth that re-affirm is about to carry.
+    ///
     /// Also stamps this relay's own wall clock as the session's start instant, so
     /// every relay that knows the session started can restate one on its
     /// heartbeat. The coordinator keeps the first instant it is told, so the
@@ -233,8 +240,12 @@ impl DecisionMaker {
     /// later stand-in is what a tenant gets when the authority's notice was lost
     /// and the authority died before a beat could restate it.
     pub fn adopt_session_start(&mut self, initial_buffer_turns: Option<u32>) {
+        let already_started = self.started;
         self.latch_started();
         self.note_started_at_ms(unix_millis());
+        if already_started {
+            return;
+        }
         if let Some(depth) = initial_buffer_turns {
             let clamped = self.game_safe_clamp(depth);
             self.buffer = BufferSize(clamped);
