@@ -285,7 +285,7 @@ pub enum DropRequestRefusalReason {
 ///
 /// Every turn-valued field is in game turns and every microsecond-valued one
 /// says `_us`. The terms compose as
-/// `law_target = ceil(path) + ceil(loss_risk) + burst_turns` and
+/// `law_target = ceil(path) + max(ceil(loss_risk), burst_turns)` and
 /// `target = law_target + cushion_turns + stretch_turns`; `target` above
 /// `buffer_turns` means the session bounds (or the sync-safe ceiling) trimmed
 /// what the law asked for.
