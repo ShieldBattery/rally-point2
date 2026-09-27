@@ -318,6 +318,7 @@ impl SyncTracker {
                     game_frame,
                     no_majority: false,
                     diverged,
+                    missing: Vec::new(),
                 })
             }
             None => {
@@ -329,6 +330,7 @@ impl SyncTracker {
                     game_frame,
                     no_majority: true,
                     diverged: Vec::new(),
+                    missing: Vec::new(),
                 })
             }
         }

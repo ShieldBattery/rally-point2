@@ -130,6 +130,7 @@ fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checks
     assert_eq!(
         divergence,
         Some(SyncDivergence {
+            missing: Vec::new(),
             sync_ordinal: 37,
             game_frame: Some(37),
             no_majority: false,

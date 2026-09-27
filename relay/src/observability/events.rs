@@ -159,11 +159,14 @@ pub enum FlightEvent {
         previous_ordinal: Option<u64>,
         ring: Option<u8>,
     },
-    /// The desync comparator confirmed a divergence.
+    /// The desync comparator confirmed a divergence, or in a rollback session, that a slot kept
+    /// playing without a state hash report it owed (`missing`).
     DesyncDetected {
         sync_ordinal: u64,
         diverged: Vec<u8>,
         no_majority: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        missing: Vec<u8>,
     },
     /// A dropped slot's leave decision was placed on hold (survivors stalled
     /// but the slot not yet removed). The later decision, if one comes, is the

@@ -40,6 +40,7 @@ mod seed_departed;
 mod session_start;
 mod shrink;
 mod silence;
+mod state_hash;
 mod target;
 
 /// The session shape almost every test here runs on: this relay decides,

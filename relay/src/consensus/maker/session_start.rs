@@ -11,6 +11,26 @@ impl DecisionMaker {
     /// Immutable for the session's lifetime, which is why this is only ever
     /// called at creation: every count-acceptance rule keys on the flag, so a
     /// session must never change its mind mid-game.
+    /// Latches whether this session rolls back. Called once, when the maker is created from a
+    /// descriptor.
+    pub fn latch_rollback(&mut self, enabled: bool) {
+        self.rollback_enabled = enabled;
+    }
+
+    /// Checks a later descriptor push's `rollback` against the latched value. A session never
+    /// changes mode mid-game: its clients were launched in one mode.
+    pub fn reconcile_rollback(&self, pushed: bool) {
+        if self.rollback_enabled != pushed {
+            tracing::warn!(
+                tenant = self.key.tenant.as_ref(),
+                session = self.key.session.0,
+                latched = self.rollback_enabled,
+                pushed,
+                "descriptor re-push disagrees on rollback; keeping the latched value",
+            );
+        }
+    }
+
     pub fn latch_finalized_drops(&mut self, enabled: bool) {
         self.finalized_drops_enabled = enabled;
     }

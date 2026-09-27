@@ -15,6 +15,7 @@ use super::*;
 /// a webhook delivers without depending on the coordinator's stored session.
 fn desync(session: SessionId, sync_ordinal: u64, no_majority: bool) -> DesyncNotice {
     DesyncNotice {
+        missing: Vec::new(),
         tenant: TenantId(TEST_TENANT.to_owned()),
         session,
         sync_ordinal,
@@ -57,6 +58,10 @@ async fn a_desync_webhook_carries_the_shape_the_tenant_parses() {
     assert_eq!(got.body["noMajority"], false);
     assert_eq!(got.body["diverged"][0]["slot"], 2);
     assert_eq!(got.body["diverged"][0]["externalRef"], "sb-user-diverged");
+    assert!(
+        got.body.get("missing").is_none(),
+        "an empty missing list is omitted"
+    );
 }
 
 #[tokio::test]
@@ -82,6 +87,28 @@ async fn a_no_majority_desync_omits_absent_optionals_and_carries_an_empty_diverg
         got.body.get("gameFrame").is_none(),
         "an absent game frame is omitted, not sent as null",
     );
+}
+
+#[tokio::test]
+async fn a_rollback_desync_names_the_slots_missing_their_reports() {
+    let (url, mut rx) = WebhookReceiver::default().spawn().await;
+    let setup = setup_without_session(url);
+    let lifecycle = Lifecycle::new(setup.clone());
+
+    let mut notice = desync(SessionId(9), 16, false);
+    notice.game_frame = None;
+    notice.diverged.clear();
+    notice.missing = vec![DivergedSlot {
+        slot: SlotId(1),
+        external_ref: Some("sb-user-missing".to_owned()),
+    }];
+    report(&lifecycle, SessionNotice::Desync(notice));
+
+    let got = signed_webhook(&setup, &mut rx).await;
+    assert_eq!(got.body["syncOrdinal"], 16);
+    assert_eq!(got.body["diverged"].as_array().unwrap().len(), 0);
+    assert_eq!(got.body["missing"][0]["slot"], 1);
+    assert_eq!(got.body["missing"][0]["externalRef"], "sb-user-missing");
 }
 
 #[tokio::test]

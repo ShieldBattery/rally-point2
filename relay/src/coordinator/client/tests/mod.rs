@@ -214,6 +214,7 @@ fn dropped_notice() -> DepartureNotice {
 
 fn desync_notice() -> DesyncNotice {
     DesyncNotice {
+        missing: Vec::new(),
         tenant: TenantId(TENANT.to_owned()),
         session: SessionId(42),
         sync_ordinal: 91,

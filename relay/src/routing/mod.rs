@@ -73,6 +73,7 @@ mod lifecycle;
 mod registry;
 mod silence;
 mod slot_link;
+mod state_hash;
 
 #[cfg(test)]
 mod tests;
@@ -86,6 +87,7 @@ pub use registry::{
 };
 pub use silence::{SILENCE_CHECK_INTERVAL, SilenceCloser, run_silence_watch};
 pub use slot_link::run_slot_link;
+pub use state_hash::{STATE_HASH_CHECK_INTERVAL, run_state_hash_watch};
 
 pub(crate) use close::maybe_close_emptied_session;
 pub(crate) use departure::{

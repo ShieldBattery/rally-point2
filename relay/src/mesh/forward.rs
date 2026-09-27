@@ -205,7 +205,7 @@ pub(super) fn deliver_turn_to_locals(
         // turn itself because a client picks what it sends and when, so any
         // count or stamp it supplies can be padded; only the turns it actually
         // produced move this prefix.
-        decision_makers.note_forward_advance(key, slot);
+        decision_makers.note_forward_advance(key, slot, forwarded.forwarded);
     }
     // The frame observation's one and only feed point, right after the
     // `mark_seen` dedup, for the same reason as the desync comparator just
@@ -253,6 +253,11 @@ pub(super) fn deliver_turn_to_locals(
         &payload.commands,
         payload.sync_generation,
     );
+    // A rollback session's clients report hashes of confirmed steps here instead of sending native
+    // sync commands. Fed at this same choke point, after the dedup, so each report counts once.
+    if let Some(report) = payload.state_hash {
+        decision_makers.observe_state_hash(key, slot, report.step, report.hash);
+    }
     match decision_makers.active_directive(key) {
         Some(directive) => payload.buffer_directive = Some(directive),
         // Preserving an upstream stamp also records its seq and buffer: an

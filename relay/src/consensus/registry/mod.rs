@@ -18,6 +18,7 @@ mod leave;
 mod phase;
 mod session_start;
 mod silence;
+mod state_hash;
 mod sync_coverage;
 
 pub use authority::{FrameRegression, MakerSync};
@@ -334,6 +335,17 @@ impl DecisionMakers {
                     }
                 })
                 .collect(),
+            missing: divergence
+                .missing
+                .iter()
+                .map(|slot| {
+                    let (_, external_ref) = refs.stamps(*slot);
+                    DivergedSlot {
+                        slot: *slot,
+                        external_ref,
+                    }
+                })
+                .collect(),
             external_id: refs.external_id.clone(),
         }
     }
@@ -539,6 +551,7 @@ pub(in crate::consensus) fn log_leave(key: &SessionKey, leave: &LeaveDirective) 
 /// because a desync is an abnormal, result-affecting event.
 pub(in crate::consensus) fn log_desync(key: &SessionKey, divergence: &SyncDivergence) {
     let diverged: Vec<u8> = divergence.diverged.iter().map(|slot| slot.0).collect();
+    let missing: Vec<u8> = divergence.missing.iter().map(|slot| slot.0).collect();
     tracing::warn!(
         tenant = key.tenant.as_ref(),
         session = key.session.0,
@@ -546,6 +559,7 @@ pub(in crate::consensus) fn log_desync(key: &SessionKey, divergence: &SyncDiverg
         game_frame = divergence.game_frame,
         no_majority = divergence.no_majority,
         ?diverged,
+        ?missing,
         "relay-side desync detected",
     );
 }

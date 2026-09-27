@@ -163,6 +163,7 @@ async fn the_coordinator_sink_compresses_a_shipment_that_reconstructs_the_blob()
             recorder.record(
                 &k,
                 FlightEvent::DesyncDetected {
+                    missing: Vec::new(),
                     sync_ordinal: 5,
                     diverged: vec![1],
                     no_majority: false,

@@ -17,6 +17,7 @@ mod leave;
 mod phase;
 mod session_start;
 mod silence;
+mod state_hash;
 mod sync;
 
 pub use departure::{DepartureStamps, FinalizeOutcome, RecordedDeparture};
@@ -323,6 +324,13 @@ pub struct DecisionMaker {
     /// field it mirrors: every count-acceptance rule keys on it, so a session
     /// must never change its mind mid-game.
     pub(in crate::consensus) finalized_drops_enabled: bool,
+    /// Whether this session rolls back (`SessionDescriptor::rollback`): its clients report state
+    /// hashes on their turns, which `hashes` compares, and send no native sync commands for
+    /// `sync` to. Latched at maker creation, like `finalized_drops_enabled`.
+    pub(in crate::consensus) rollback_enabled: bool,
+    /// The state hash comparator of a rollback session. Kept on every relay and across authority
+    /// changes, so a promoted authority carries on judging where the old one stopped.
+    pub(in crate::consensus) hashes: StateHashTracker,
     /// Slots whose drop is being (or has been) home-finalized here: admission
     /// is refused while a slot is in this set, which is what makes the
     /// finalization snapshot's ingress cut real. Populated only on the
@@ -471,6 +479,8 @@ impl DecisionMaker {
             started_at_ms: None,
             resumed: false,
             finalized_drops_enabled: false,
+            rollback_enabled: false,
+            hashes: StateHashTracker::default(),
             finalizing_drops: HashSet::new(),
             rehomed_homes: HashSet::new(),
             close_reported: false,

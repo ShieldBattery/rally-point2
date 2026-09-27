@@ -45,6 +45,9 @@ pub struct MakerSync<'a> {
     /// disagrees is ignored with a warning — every count-acceptance rule keys
     /// on the flag, so a session must never change its mind mid-game.
     pub finalized_drops: bool,
+    /// The descriptor's immutable per-session flag for rollback sessions, latched and reconciled
+    /// exactly like `finalized_drops`.
+    pub rollback: bool,
 }
 
 impl<'a> MakerSync<'a> {
@@ -60,6 +63,7 @@ impl<'a> MakerSync<'a> {
             held_slots: HashSet::new(),
             resumed_departed: None,
             finalized_drops: false,
+            rollback: false,
         }
     }
 
@@ -83,6 +87,7 @@ impl<'a> MakerSync<'a> {
                 .resumed
                 .then_some(descriptor.departed_slots.as_slice()),
             finalized_drops: descriptor.finalized_drops,
+            rollback: descriptor.rollback,
         }
     }
 }
@@ -136,6 +141,7 @@ impl DecisionMakers {
             held_slots,
             resumed_departed,
             finalized_drops,
+            rollback,
         } = sync;
         let (mut leaves, fresh, seeded) = {
             let mut makers = self.lock();
@@ -146,6 +152,7 @@ impl DecisionMakers {
                     maker.set_expected_slots(expected_slots);
                     maker.rehome_homed_slots(homed_slots);
                     maker.reconcile_finalized_drops(finalized_drops);
+                    maker.reconcile_rollback(rollback);
                     let seeded = resumed_departed
                         .map(|d| maker.seed_resumed(d))
                         .unwrap_or_default();
@@ -169,6 +176,7 @@ impl DecisionMakers {
                     maker.set_expected_slots(expected_slots);
                     maker.set_homed_slots(homed_slots);
                     maker.latch_finalized_drops(finalized_drops);
+                    maker.latch_rollback(rollback);
                     if resumed_departed.is_some() {
                         maker.mark_homes_rehomed();
                     }
@@ -436,16 +444,26 @@ impl DecisionMakers {
             );
         }
         if let Some(divergence) = divergence {
-            log_desync(key, &divergence);
-            self.record_event(
-                key,
-                FlightEvent::DesyncDetected {
-                    sync_ordinal: divergence.sync_ordinal,
-                    diverged: divergence.diverged.iter().map(|slot| slot.0).collect(),
-                    no_majority: divergence.no_majority,
-                },
-            );
-            self.emit_notice(RelayNotice::Desync(self.desync_notice(key, &divergence)));
+            self.publish_desync(key, &divergence);
         }
+    }
+
+    /// Logs, records and notifies the coordinator of a verdict. Called outside the registry lock.
+    pub(in crate::consensus) fn publish_desync(
+        &self,
+        key: &SessionKey,
+        divergence: &SyncDivergence,
+    ) {
+        log_desync(key, divergence);
+        self.record_event(
+            key,
+            FlightEvent::DesyncDetected {
+                sync_ordinal: divergence.sync_ordinal,
+                diverged: divergence.diverged.iter().map(|slot| slot.0).collect(),
+                no_majority: divergence.no_majority,
+                missing: divergence.missing.iter().map(|slot| slot.0).collect(),
+            },
+        );
+        self.emit_notice(RelayNotice::Desync(self.desync_notice(key, divergence)));
     }
 }

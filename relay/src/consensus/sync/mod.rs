@@ -9,9 +9,15 @@
 use super::*;
 use crate::rate_limit::RateLimitedCounter;
 
+mod hashes;
 mod tracker;
 mod turns;
 
+pub(in crate::consensus) use hashes::StateHashTracker;
+#[cfg(test)]
+pub(in crate::consensus) use hashes::{
+    STATE_HASH_DEADLINE, STATE_HASH_INTERVAL, STATE_HASH_LIVE_TURNS,
+};
 pub(in crate::consensus) use turns::{SyncCommand, SyncGap, SyncTurn, SyncTurns};
 
 // ---------------------------------------------------------------------------
@@ -162,6 +168,9 @@ pub struct SyncDivergence {
     /// The minority slots that diverged from the agreeing majority, ascending.
     /// Empty when `no_majority`.
     pub diverged: Vec<SlotId>,
+    /// The slots that kept sending turns without the state hash report a rollback session owed
+    /// for this step, ascending. Always empty for native sync checksums.
+    pub missing: Vec<SlotId>,
 }
 
 /// One slot's checksum report at an ordinal: its `hash16`, the hash kind

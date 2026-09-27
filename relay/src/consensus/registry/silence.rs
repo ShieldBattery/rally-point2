@@ -37,13 +37,16 @@ impl DecisionMakers {
     }
 
     /// Records that `slot`'s gap-free forwarded prefix advanced for `key`'s
-    /// session, stamping the slot's stop clock (see
-    /// [`DecisionMaker::note_forward_advance`]). Called from the forward gate's
+    /// session to `forwarded` turns, stamping the slot's stop clock (see
+    /// [`DecisionMaker::note_forward_advance`]) and, in a rollback session, starting the report
+    /// deadlines of the steps that became confirmable (see
+    /// [`DecisionMaker::note_forwarded_turns`]). Called from the forward gate's
     /// fan-out choke point, once per turn that genuinely extends the prefix.
-    pub fn note_forward_advance(&self, key: &SessionKey, slot: SlotId) {
+    pub fn note_forward_advance(&self, key: &SessionKey, slot: SlotId, forwarded: u64) {
         let now = Instant::now();
         if let Some(maker) = self.lock().get_mut(key) {
             maker.note_forward_advance(slot, now);
+            maker.note_forwarded_turns(slot, forwarded, now);
         }
     }
 

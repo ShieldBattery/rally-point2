@@ -40,6 +40,7 @@ fn every_kind(session: SessionId) -> Vec<(&'static str, SessionNotice)> {
         (
             "desync",
             SessionNotice::Desync(DesyncNotice {
+                missing: Vec::new(),
                 tenant: tenant.clone(),
                 session,
                 sync_ordinal: 91,

@@ -28,7 +28,9 @@ impl DecisionMaker {
         commands: &[u8],
         sync_generation: Option<u64>,
     ) -> Option<SyncDivergence> {
-        if self.observers.contains(&slot) {
+        // A rollback session's clients send no native sync commands; its state hash reports are
+        // compared instead.
+        if self.observers.contains(&slot) || self.rollback_enabled {
             return None;
         }
         if self.sync_turns.unavailable(slot) {
@@ -92,6 +94,15 @@ impl DecisionMaker {
             dormant: self.sync.dormant,
             ..Default::default()
         };
+        if self.rollback_enabled {
+            // Every expected player is compared through its state hash reports from the start.
+            coverage.dormant = self.hashes.dormant;
+            coverage.ordered_slots = coverage.expected_players;
+            if coverage.authority && !coverage.dormant {
+                coverage.comparable_slots = coverage.expected_players;
+            }
+            return coverage;
+        }
         for slot in players {
             if self.sync_turns.unavailable(slot) {
                 coverage.unavailable_slots += 1;

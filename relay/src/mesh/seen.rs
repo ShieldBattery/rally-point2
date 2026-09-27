@@ -94,6 +94,9 @@ pub struct Forwarded {
     /// cannot inflate: turns can be withheld, or sent far ahead of the prefix,
     /// but nothing advances this except the missing turns themselves.
     pub prefix_advanced: bool,
+    /// How many of the slot's turns the gap-free prefix covers, after this turn. Meaningful when
+    /// `prefix_advanced` is set.
+    pub forwarded: u64,
 }
 
 impl Forwarded {
@@ -103,6 +106,7 @@ impl Forwarded {
         Self {
             seen: Seen::Duplicate,
             prefix_advanced: false,
+            forwarded: 0,
         }
     }
 }
@@ -155,6 +159,7 @@ impl MeshSeen {
                 // relay never forwarded, so nothing stacked on top of it proves
                 // the slot's turns are still arriving in order.
                 prefix_advanced: !state.prefix_collapsed,
+                forwarded: state.forwarded_count(),
             };
         }
         if !state.ahead.insert(seq) {
@@ -174,11 +179,18 @@ impl MeshSeen {
             // pushes the sparse set over the cap reports no progress either: the
             // prefix it leaves behind has jumped a gap.
             prefix_advanced: closed_a_gap && !state.prefix_collapsed,
+            forwarded: state.forwarded_count(),
         }
     }
 }
 
 impl SlotSeen {
+    /// How many turns the gap-free prefix covers.
+    fn forwarded_count(&self) -> u64 {
+        self.forwarded_through
+            .map_or(0, |through| through.saturating_add(1))
+    }
+
     /// Folds the run of seqs sitting immediately above the contiguous prefix out
     /// of the sparse set and into the prefix. Called after a fresh seq lands: if
     /// it closed the gap the prefix was stalled behind, the whole run above it

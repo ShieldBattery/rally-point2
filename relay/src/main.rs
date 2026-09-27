@@ -226,6 +226,10 @@ async fn main() -> Result<()> {
             ));
         }
     }
+    tokio::spawn(rally_point_relay::routing::run_state_hash_watch(
+        Arc::clone(&mesh_state.session.decision_makers),
+        rally_point_relay::routing::STATE_HASH_CHECK_INTERVAL,
+    ));
 
     // A read handle onto the coordinator control-connection state, hoisted out of
     // the coordinator-config block so the idle self-exit can watch it. Populated
@@ -404,9 +408,12 @@ async fn main() -> Result<()> {
             // (and strips unproven dropped counts at every ingress); the
             // coordinator enables the feature per session only when every
             // assigned relay advertises it, and never mixes advertising and
-            // non-advertising relays in one session.
+            // non-advertising relays in one session. It also compares rollback
+            // sessions' state hash reports, which the coordinator likewise asks
+            // only of sessions every assigned relay supports.
             .with_capabilities(vec![
                 rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1.to_owned(),
+                rally_point_proto::control::CAPABILITY_ROLLBACK_V1.to_owned(),
             ]);
             if let Some(region) = &cli.region {
                 relay_hello = relay_hello.with_region(RegionId(region.clone()));

@@ -86,7 +86,8 @@ pub(super) struct DivergedSlotWebhook {
 /// The JSON body POSTed to the tenant for a desync. Same camelCase convention and
 /// same `event` discriminator as the departure body. Optional fields
 /// (`externalId`, `gameFrame`) are omitted when absent, never `null`. `diverged`
-/// is always present (possibly empty, when `noMajority`).
+/// is always present (possibly empty, when `noMajority`); `missing` is omitted when
+/// empty, which it always is outside rollback sessions.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DesyncWebhook {
@@ -101,6 +102,8 @@ pub(super) struct DesyncWebhook {
     pub(super) detected_at_ms: u64,
     pub(super) no_majority: bool,
     pub(super) diverged: Vec<DivergedSlotWebhook>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) missing: Vec<DivergedSlotWebhook>,
 }
 
 /// The JSON body POSTed to the tenant for a result report. Same camelCase

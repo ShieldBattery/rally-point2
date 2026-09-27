@@ -91,6 +91,7 @@ fn departure_omits_absent_correlation_ids_on_the_wire() {
 #[test]
 fn desync_roundtrips_json() {
     let notice = DesyncNotice {
+        missing: Vec::new(),
         tenant: TenantId("sb-staging".to_owned()),
         session: SessionId(42),
         sync_ordinal: 137,
@@ -119,6 +120,7 @@ fn desync_omits_absent_optionals_on_the_wire() {
     // always-present ones (detected_at_ms, no_majority, diverged) still
     // serialize.
     let notice = DesyncNotice {
+        missing: Vec::new(),
         tenant: TenantId("sb-staging".to_owned()),
         session: SessionId(1),
         sync_ordinal: 5,

@@ -52,6 +52,7 @@ fn a_late_older_report_is_dropped_without_corrupting_future_comparisons() {
     assert_eq!(
         divergence,
         Some(SyncDivergence {
+            missing: Vec::new(),
             sync_ordinal: base + 1,
             game_frame: u32::try_from(base + 1).ok(),
             no_majority: false,

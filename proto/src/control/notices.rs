@@ -179,6 +179,12 @@ pub struct DesyncNotice {
     /// The slots that diverged from the agreeing majority (the minority). Empty
     /// when `no_majority` is set.
     pub diverged: Vec<DivergedSlot>,
+    /// In a rollback session, the slots that kept sending turns without the state hash report
+    /// they owed for `sync_ordinal` (the step, in a rollback session). Like the `diverged`
+    /// minority, these are named at fault. May be non-empty even when `no_majority` is set.
+    /// Always empty outside rollback sessions, and absent from a relay that predates the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<DivergedSlot>,
     /// The tenant's own id for the session, stamped by the relay from its stored
     /// [`super::SessionDescriptor`]. Same source and fallback as
     /// [`DepartureNotice::external_id`].

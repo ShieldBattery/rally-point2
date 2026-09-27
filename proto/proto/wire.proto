@@ -244,10 +244,11 @@ message Payload {
   // are still flowing.
 }
 
-// A client's hash of its simulation state after a step, in a session that rolls back. Steps are
-// turn indices: the step that dispatches every slot's `seq`-th turn, pipe-seed turns included, so
-// a relay can tell when every slot's turn for the step has been forwarded without trusting a
-// client's frame stamp. Clients report every 8th step.
+// A client's hash of its simulation state once it has run every slot's first `step` turns
+// (pipe-seed turns included), in a session that rolls back. Counting turns rather than frames
+// lets a relay tell when every slot's turns for the step have been forwarded without trusting a
+// client's frame stamp, and a paused game takes turns without advancing frames. Clients report
+// every 8th step, from step 8.
 message StateHashReport {
   uint64 step = 1;
   fixed64 hash = 2;

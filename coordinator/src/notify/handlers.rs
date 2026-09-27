@@ -14,8 +14,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use rally_point_proto::control::{
-    DepartureNotice, DesyncNotice, ResultNotice, SessionStartedNotice, SlotConnectedNotice,
-    SlotStartedNotice, TenantId,
+    DepartureNotice, DesyncNotice, DivergedSlot, ResultNotice, SessionStartedNotice,
+    SlotConnectedNotice, SlotStartedNotice, TenantId,
 };
 use rally_point_proto::ids::SessionId;
 use serde::Serialize;
@@ -175,7 +175,7 @@ pub(crate) fn handle_departure(
 /// Correlation ids come notice-first, stored-session as fallback — the same rule
 /// as departures, so a coordinator restart that wiped the session store still
 /// delivers a correct webhook from the notice's self-stamped refs. Each diverged
-/// slot's `externalRef` resolves independently (notice ref, else the stored
+/// or missing slot's `externalRef` resolves independently (notice ref, else the stored
 /// per-slot ref), so a partially-ref'd notice still names whom it can.
 ///
 /// A desynced-session mark is recorded first of all, before the dedup and
@@ -220,17 +220,20 @@ pub(crate) fn handle_desync(
         return;
     };
 
-    let diverged = notice
-        .diverged
-        .iter()
-        .map(|d| DivergedSlotWebhook {
-            slot: d.slot.0,
-            external_ref: d
-                .external_ref
-                .clone()
-                .or_else(|| resolved.stored_slot_ref(d.slot)),
-        })
-        .collect();
+    let to_webhook = |slots: &[DivergedSlot]| -> Vec<DivergedSlotWebhook> {
+        slots
+            .iter()
+            .map(|d| DivergedSlotWebhook {
+                slot: d.slot.0,
+                external_ref: d
+                    .external_ref
+                    .clone()
+                    .or_else(|| resolved.stored_slot_ref(d.slot)),
+            })
+            .collect()
+    };
+    let diverged = to_webhook(&notice.diverged);
+    let missing = to_webhook(&notice.missing);
 
     let payload = DesyncWebhook {
         event: "desync",
@@ -242,6 +245,7 @@ pub(crate) fn handle_desync(
         detected_at_ms: notice.detected_at_ms,
         no_majority: notice.no_majority,
         diverged,
+        missing,
     };
 
     enqueue_dispatch(
