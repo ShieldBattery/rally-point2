@@ -349,6 +349,7 @@ fn enroll_second_relay(state: &CoordinatorState, region: Option<&'static str>) {
 /// existence and its `(tenant, session)` ownership matter.
 fn create_rehome_session(state: &CoordinatorState) -> SessionId {
     let req = SessionRequest {
+        rollback: false,
         tenant: tenant_id(),
         players: vec![PlayerHandoff {
             slot: SlotId(0),
@@ -399,6 +400,7 @@ fn create_session_with_user(state: &CoordinatorState, user: &str) -> SessionId {
     crate::session::create_session(
         &state.setup,
         SessionRequest {
+            rollback: false,
             tenant: tenant_id(),
             players: vec![PlayerHandoff {
                 slot: SlotId(0),

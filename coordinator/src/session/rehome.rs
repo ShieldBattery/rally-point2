@@ -4,14 +4,14 @@
 //! creation lives here, so the ordering rules that make the move safe against a
 //! concurrent close sit in one place.
 
-use rally_point_proto::control::{DepartedSlot, RegionId, RelayEndpoint, TenantId};
+use rally_point_proto::control::{DepartedSlot, RegionId, RelayEndpoint, RelayEntry, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId};
 
 use crate::registry::{self, cert_fingerprint};
 
 use super::RehomeOutcome;
 use super::descriptor::build_descriptor;
-use super::placement::relay_finalize_capable;
+use super::placement::{relay_finalize_capable, relay_rollback_capable};
 use super::setup::SessionSetup;
 
 /// The replacement relay a prior [`rehome`] already recorded for
@@ -294,27 +294,29 @@ pub(super) fn rehome_inner(
     // created without the feature picks only incapable ones — and if its
     // cohort has fully drained from the fleet, the rehome is Unavailable (the
     // session ends) rather than silently mixed.
-    let cohort_capable = setup
+    let (cohort_capable, rollback) = setup
         .session_refs
         .lock()
         .get(&key)
-        .is_some_and(|refs| refs.capable_cohort);
+        .map_or((false, false), |refs| (refs.capable_cohort, refs.rollback));
     // The cohort filter applies to BOTH branches: an already-serving member
     // can be capability-mismatched too — a serving relay that re-enrolled
     // across the finalized-drop boundary is being evicted concurrently, and
     // picking it here would land the whole homed group on the wrong side of
     // the boundary the placement kept apart.
-    let cohort_matches = |id: RelayId| {
-        registry::entry(&setup.registry, id)
-            .is_some_and(|e| relay_finalize_capable(&e) == cohort_capable)
+    // A rollback session also needs every relay it moves to to compare state hash reports.
+    let entry_matches = |e: &RelayEntry| {
+        relay_finalize_capable(e) == cohort_capable && (!rollback || relay_rollback_capable(e))
     };
+    let cohort_matches =
+        |id: RelayId| registry::entry(&setup.registry, id).is_some_and(|e| entry_matches(&e));
     let r_new = serving
         .iter()
         .copied()
         .find(|&id| registry::is_available(&setup.registry, id) && cohort_matches(id))
         .or_else(|| {
             let mut entries = registry::available_entries(&setup.registry);
-            entries.retain(|e| relay_finalize_capable(e) == cohort_capable);
+            entries.retain(entry_matches);
             entries.sort_by_key(|e| e.relay_id);
             dead_region
                 .as_ref()

@@ -84,6 +84,7 @@ fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
     // An absent estimate stays off the wire (byte-identical to the pre-field
     // form), while a present one round-trips.
     let request = SessionRequest {
+        rollback: false,
         tenant: TenantId("sb-staging".to_owned()),
         players: vec![],
         external_id: None,
@@ -111,6 +112,7 @@ fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
 #[test]
 fn session_descriptor_roundtrips_json() {
     let desc = SessionDescriptor {
+        rollback: false,
         finalized_drops: false,
         tenant: TenantId("sb-staging".to_owned()),
         session: SessionId(42),
@@ -236,6 +238,7 @@ fn session_descriptor_omits_absent_correlation_ids_on_the_wire() {
     // `authority_order`'s plain `#[serde(default)]`), so an empty Vec still
     // serializes as `[]`, not omitted.
     let desc = SessionDescriptor {
+        rollback: false,
         finalized_drops: false,
         tenant: TenantId("sb-staging".to_owned()),
         session: SessionId(1),
@@ -316,6 +319,7 @@ fn a_pre_additive_descriptor_decodes_with_every_added_field_at_its_default() {
 #[test]
 fn session_response_roundtrips_json() {
     let resp = SessionResponse {
+        rollback: false,
         session: SessionId(1),
         home_relay: RelayEndpoint {
             relay_id: RelayId(1),
@@ -356,6 +360,7 @@ fn session_response_with_no_tagged_relays_omits_relay_regions() {
     // an empty array — this is what an app-server client built against an
     // older coordinator with no `relay_regions` field at all still parses.
     let resp = SessionResponse {
+        rollback: false,
         session: SessionId(1),
         home_relay: RelayEndpoint {
             relay_id: RelayId(1),
@@ -419,6 +424,7 @@ fn session_request_omits_absent_correlation_ids_on_the_wire() {
     // `skip_serializing_if` keeps an unset id off the wire, so a new
     // encoder talking to an old decoder emits exactly the old shape.
     let req = SessionRequest {
+        rollback: false,
         tenant: TenantId("sb-staging".to_owned()),
         players: vec![PlayerHandoff {
             slot: SlotId(0),

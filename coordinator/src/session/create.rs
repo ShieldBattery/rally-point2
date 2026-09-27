@@ -302,6 +302,7 @@ fn create_body(
         relay_regions,
         finalized_drops,
         capable_cohort,
+        rollback,
     } = placement;
 
     // Test seam: a drain mark racing this create lands wholly before or after,
@@ -345,6 +346,7 @@ fn create_body(
         relay_regions,
         finalized_drops,
         capable_cohort,
+        rollback,
         latency_estimate_ms: request.latency_estimate_ms,
     };
     setup
@@ -384,6 +386,7 @@ fn create_body(
     }
 
     let response = SessionResponse {
+        rollback,
         session,
         home_relay: home,
         slot_homes,

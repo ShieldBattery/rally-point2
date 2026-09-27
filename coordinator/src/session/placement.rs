@@ -38,6 +38,9 @@ pub(super) struct Placement {
     /// build class, kept even when the feature switch is off so rehome and
     /// eviction never mix build classes.
     pub(super) capable_cohort: bool,
+    /// Whether the session rolls back: the request asked for it and every placed relay supports
+    /// it (see `place_by_region`).
+    pub(super) rollback: bool,
     /// Each serving relay's client-cert fingerprint, for a later re-home's
     /// restart-in-place detection.
     pub(super) relay_certs: std::collections::BTreeMap<RelayId, [u8; 32]>,
@@ -150,11 +153,21 @@ pub(super) fn place_by_region(
     // enabled — build classes must never mix in one session regardless — but
     // the handshake itself only turns on for a capable cohort when the
     // coordinator's feature switch says so.
+    // A rollback session is granted only when every relay serving it compares state hash reports,
+    // so the placement keeps to relays that do when any is available and otherwise creates a
+    // lockstep session, which the response reports so the tenant launches its clients to match.
+    // Those relays are all finalized-drop capable too, and a rollback session always runs the
+    // handshake, whatever the feature switch says: its clients apply a leave at exactly the step
+    // a finalized count names, and a drop without a count gives them no step they would agree on.
+    let rollback = request.rollback && entries.iter().any(relay_rollback_capable);
+    if rollback {
+        entries.retain(relay_rollback_capable);
+    }
     let capable_cohort = entries.iter().any(relay_finalize_capable);
     if capable_cohort {
         entries.retain(relay_finalize_capable);
     }
-    let finalized_drops = capable_cohort && finalize_feature;
+    let finalized_drops = capable_cohort && (finalize_feature || rollback);
 
     // NOTE(version-aware placement): each entry carries the relay's advertised
     // `protocol` (negotiated against at enroll — an incompatible relay never gets
@@ -246,7 +259,18 @@ pub(super) fn place_by_region(
         relay_regions,
         finalized_drops,
         capable_cohort,
+        rollback,
     })
+}
+
+/// Whether `entry` enrolled advertising what a rollback session needs from every relay serving
+/// it: comparing state hash reports, and the finalized-drop handshake.
+pub(super) fn relay_rollback_capable(entry: &RelayEntry) -> bool {
+    relay_finalize_capable(entry)
+        && entry
+            .capabilities
+            .iter()
+            .any(|c| c == rally_point_proto::control::CAPABILITY_ROLLBACK_V1)
 }
 
 /// Whether `entry` enrolled advertising the finalized-drop capability — the

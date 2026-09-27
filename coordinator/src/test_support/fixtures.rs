@@ -151,6 +151,7 @@ pub(crate) fn two_players() -> Vec<PlayerHandoff> {
 /// latency estimate. Override either with struct-update syntax.
 pub(crate) fn request(players: Vec<PlayerHandoff>) -> SessionRequest {
     SessionRequest {
+        rollback: false,
         tenant: tid(),
         players,
         external_id: None,
@@ -163,6 +164,7 @@ pub(crate) fn request(players: Vec<PlayerHandoff>) -> SessionRequest {
 /// struct-update syntax, so its body shows only what it is about.
 pub(crate) fn descriptor(tenant: TenantId, session: u64) -> SessionDescriptor {
     SessionDescriptor {
+        rollback: false,
         tenant,
         session: SessionId(session),
         peers: Vec::new(),

@@ -438,6 +438,10 @@ impl<'a> EnrollHandshake<'a> {
             .capabilities
             .iter()
             .any(|c| c == rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1);
+        let rollback_capable = hello
+            .capabilities
+            .iter()
+            .any(|c| c == rally_point_proto::control::CAPABILITY_ROLLBACK_V1);
         // Read out before the hello is consumed by the enroll below.
         let boot_id = hello.boot_id;
         // The enrollment's registry mutation and the capability-transition
@@ -489,6 +493,9 @@ impl<'a> EnrollHandshake<'a> {
                         .filter(|d| {
                             session::session_capable_cohort(setup, &d.tenant, d.session)
                                 .is_some_and(|cohort| cohort != finalize_capable)
+                                // A rollback session needs every relay serving it to compare state
+                                // hash reports; one that no longer does has to be evicted too.
+                                || (d.rollback && !rollback_capable)
                         })
                         .map(|d| (d.tenant.clone(), d.session))
                         .collect();

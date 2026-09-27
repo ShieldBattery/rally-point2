@@ -211,6 +211,15 @@ pub struct SessionRequest {
     /// interops (the control protos don't `deny_unknown_fields`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_estimate_ms: Option<u32>,
+    /// Whether the tenant wants this session to roll back instead of running lockstep: its clients
+    /// simulate ahead of turns they haven't received, strip native sync commands and report hashes
+    /// of confirmed steps instead. The tenant decides this for every player in the session, never
+    /// the players themselves. The coordinator grants it only when it can place the session on
+    /// relays that all support it, and says whether it did on
+    /// [`SessionResponse::rollback`]. Additive, so a request that predates the field still
+    /// interops.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rollback: bool,
 }
 
 /// One player's completed handoff: the token the coordinator minted and the
@@ -287,6 +296,13 @@ pub struct SessionResponse {
     /// client before that release would have disclosed the same information.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_regions: Vec<RelayRegionLabel>,
+    /// Whether the session was created to roll back ([`SessionRequest::rollback`] asked for it and
+    /// every relay it was placed on supports it). The tenant must launch every client in the
+    /// matching mode: a client that rolls back strips its native sync commands, which a lockstep
+    /// session's relays and peers would treat as a desync. Absent (false) from a coordinator that
+    /// predates the field, which never creates rollback sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rollback: bool,
 }
 
 /// One slot's tenant-assigned correlation id, as carried in a
@@ -417,6 +433,15 @@ pub struct SessionDescriptor {
     /// field.
     #[serde(default)]
     pub finalized_drops: bool,
+    /// Whether this session rolls back instead of running lockstep: its clients strip native sync
+    /// commands and put state hash reports on their turns, which this relay compares in place of
+    /// the native checksums (see [`super::CAPABILITY_ROLLBACK_V1`]). A rollback session always has
+    /// [`finalized_drops`](Self::finalized_drops) on, since clients apply a leave at the exact step
+    /// a finalized count names. **Immutable for the session's lifetime**, like
+    /// `finalized_drops`. Defaults `false` for a descriptor from a coordinator that predates the
+    /// field.
+    #[serde(default)]
+    pub rollback: bool,
     /// The slots the coordinator already knows have departed this session, each
     /// with the relay's left-vs-dropped classification. Carried only on a
     /// rehome-rebuilt descriptor (see [`resumed`](Self::resumed)): a fresh relay

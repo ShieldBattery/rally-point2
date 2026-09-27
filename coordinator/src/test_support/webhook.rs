@@ -274,6 +274,7 @@ fn create_fixture_session(
     session::create_session(
         setup,
         SessionRequest {
+            rollback: false,
             tenant: TenantId(TEST_TENANT.to_owned()),
             players,
             external_id: external_id.map(str::to_owned),

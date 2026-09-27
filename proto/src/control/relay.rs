@@ -29,6 +29,13 @@ use super::RegionId;
 /// counted-drop behavior.
 pub const CAPABILITY_FINALIZED_DROP_V1: &str = "finalized_drop_v1";
 
+/// The [`RelayHello::capabilities`] tag for rollback sessions: the relay honors a descriptor's
+/// `rollback` flag by comparing the state hash reports clients put on their turns instead of the
+/// native sync commands in them. The coordinator creates a rollback session only on relays that
+/// all advertise this (and [`CAPABILITY_FINALIZED_DROP_V1`], which rollback sessions require), and
+/// re-homes one only onto such relays.
+pub const CAPABILITY_ROLLBACK_V1: &str = "rollback_v1";
+
 /// The fleet-wide ceiling on a player token's lifetime, in seconds (24 hours).
 ///
 /// A shared contract, not a tuning knob: the coordinator clamps its configured

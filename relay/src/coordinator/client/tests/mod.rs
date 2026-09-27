@@ -169,6 +169,7 @@ fn key(session: u64) -> SessionKey {
 
 fn descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        rollback: false,
         finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
         session: SessionId(session),

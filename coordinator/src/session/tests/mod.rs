@@ -35,6 +35,7 @@ mod placement;
 mod provisioning;
 mod rehome;
 mod rehome_close;
+mod rollback;
 
 /// A fleet of two untagged, incapable relays (ids 1 and 2) and the tenant --
 /// the shape most tests that don't care about regions or capabilities want.

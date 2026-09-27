@@ -96,6 +96,7 @@ fn stage_assignments(setup: &SessionSetup, session: SessionId, relays: &[RelayId
         setup.descriptors().record(
             relay,
             SessionDescriptor {
+                rollback: false,
                 finalized_drops: false,
                 tenant: tid(),
                 session,

@@ -260,6 +260,7 @@ pub fn build_turn(slot: u8, seq: u64, frame: Option<u32>) -> Payload {
 /// field costs one line here instead of one per test.
 pub fn descriptor(tenant: &str, session: SessionId) -> SessionDescriptor {
     SessionDescriptor {
+        rollback: false,
         finalized_drops: false,
         tenant: TenantId(tenant.to_owned()),
         session,

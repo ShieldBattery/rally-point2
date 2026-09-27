@@ -90,6 +90,11 @@ pub struct SessionRefs {
     /// classes deliver dropped-leave counts differently and mixing them
     /// hands different clients different leave schedules.
     pub capable_cohort: bool,
+    /// Whether this session rolls back
+    /// ([`SessionDescriptor::rollback`](rally_point_proto::control::SessionDescriptor::rollback)).
+    /// Decided once at create and immutable, like `finalized_drops`; a rehome only picks relays
+    /// that support it.
+    pub rollback: bool,
     /// The tenant's own id for the player in each slot (a stringified
     /// `SbUserId`). Only slots whose handoff carried an `external_ref` appear.
     pub slots: HashMap<SlotId, String>,
