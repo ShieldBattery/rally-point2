@@ -271,7 +271,7 @@ pub(super) fn deliver_turn_to_locals(
     // reliable control stream (the relay pushes it to each surviving client), not
     // the turn envelope — a drop stops the turn stream, so an envelope stamp would
     // never reach the survivors it must unstall. See `routing`'s leave trigger.
-    routing::fan_out(sessions, key, slot, payload.clone());
+    routing::fan_out(sessions, key, slot, for_clients(&payload));
     // Record the fanned turn into the session's replay ring so a client that drops
     // and re-dials while its drop is undecided can be replayed what it missed. This is the one
     // choke point every turn-delivery path funnels through, placed right after the
@@ -293,6 +293,15 @@ pub(super) fn deliver_turn_to_locals(
         turn_ring.record(key, &payload, origin, slots);
     }
     Some(payload)
+}
+
+/// The copy of `payload` this relay forwards to its clients: without the sender's state hash
+/// report. Reports stay on the mesh, where the authority relay compares them, but a client that saw
+/// another's hash before its own was due could copy it instead of computing its own.
+fn for_clients(payload: &Payload) -> Payload {
+    let mut payload = payload.clone();
+    payload.state_hash = None;
+    payload
 }
 
 /// Whether `frame` is a resume-cursor ask, and if so, the local-origin turns

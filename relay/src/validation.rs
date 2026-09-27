@@ -223,6 +223,7 @@ pub fn assert_validate_turn_invariants(
     commands: &[u8],
 ) {
     let submitted = Payload {
+        state_hash: None,
         seq,
         // Deliberately untrusted: a successful validation must replace it
         // with the authorized slot.
@@ -271,6 +272,7 @@ mod tests {
 
     fn payload(seq: u64, game_frame_count: Option<u32>, commands: &[u8]) -> Payload {
         Payload {
+            state_hash: None,
             seq,
             // Deliberately untrusted: successful validation must replace it
             // with the authorized slot.
@@ -342,6 +344,25 @@ mod tests {
             assert_eq!(turn.payload.sync_generation, generation);
             assert_eq!(&turn.payload.commands[..], &[0x37, 4, 1, 2, 3, 4, 5]);
             assert_eq!(turn.stripped_control, 1);
+        }
+    }
+
+    #[test]
+    fn preserves_the_state_hash_report() {
+        use rally_point_proto::messages::StateHashReport;
+        for report in [
+            None,
+            Some(StateHashReport { step: 0, hash: 0 }),
+            Some(StateHashReport {
+                step: 2040,
+                hash: u64::MAX,
+            }),
+        ] {
+            let mut input = payload(2041, None, &[0x55, 0, 0x05]);
+            input.state_hash = report;
+            let turn = validate_turn(SLOT, input).unwrap();
+            assert_eq!(turn.payload.state_hash, report);
+            assert_eq!(&turn.payload.commands[..], &[0x05]);
         }
     }
 

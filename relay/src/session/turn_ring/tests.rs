@@ -303,6 +303,35 @@ fn replay_local_excludes_mesh_delivered_entries() {
 }
 
 #[test]
+fn only_the_mesh_resume_reply_carries_state_hash_reports() {
+    let ring = TurnRing::new();
+    let k = key();
+    let report = rally_point_proto::messages::StateHashReport { step: 8, hash: 42 };
+    ring.record(
+        &k,
+        &Payload {
+            state_hash: Some(report),
+            ..turn(0, 8, 8)
+        },
+        TurnOrigin::Local,
+        MAX_GAME_SLOTS,
+    );
+    let cursors: HashMap<SlotId, u64> = [(SlotId(0), 0)].into();
+    let to_client = ring.replay(&k, &cursors, RECONNECTING);
+    assert_eq!(to_client.len(), 1);
+    assert_eq!(
+        to_client[0].state_hash, None,
+        "a client never gets a report"
+    );
+    let to_mesh = ring.replay_local(&k, &cursors, true);
+    assert_eq!(
+        to_mesh[0].state_hash,
+        Some(report),
+        "the mesh keeps the report"
+    );
+}
+
+#[test]
 fn replay_local_answers_an_unlisted_slot_from_zero_only_when_resuming() {
     // The gap a mesh-side death leaves behind with no other re-carrier:
     // this relay's Local turns for slot 0 were never listed in the

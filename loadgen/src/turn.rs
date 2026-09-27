@@ -242,6 +242,7 @@ mod tests {
             for builder in [&honest, &diverging] {
                 let commands = builder.turn(ordinal);
                 let payload = Payload {
+                    state_hash: None,
                     seq: 0,
                     slot: u32::MAX,
                     commands: commands.clone().into(),

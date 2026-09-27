@@ -240,6 +240,48 @@ fn client_turn_enters_each_mesh_link_once() {
 }
 
 #[test]
+fn a_state_hash_report_reaches_mesh_peers_but_never_a_client() {
+    use rally_point_proto::messages::StateHashReport;
+
+    let sessions = routing::Sessions::default();
+    let links = new_mesh_links();
+    let key = control_key();
+    let (_registration, mut local) =
+        routing::register(&sessions, &key, SlotId(1), 1).expect("local slot registers");
+    let (mut peer_rx, _peer_control_rx) = register_link_channels(&links, &key);
+    let mesh_state = MeshState {
+        links: links.clone(),
+        ..MeshState::default()
+    };
+    let report = StateHashReport {
+        step: 16,
+        hash: 0xfeed,
+    };
+
+    forward_client_turn(
+        &sessions,
+        &mesh_state,
+        &key,
+        SlotId(0),
+        Payload {
+            seq: 16,
+            slot: 0,
+            commands: vec![0x05].into(),
+            state_hash: Some(report),
+            ..Default::default()
+        },
+    );
+
+    let forwarded = local
+        .try_recv_forward()
+        .expect("the local peer receives the turn");
+    assert_eq!(forwarded.seq, 16);
+    assert_eq!(forwarded.state_hash, None, "clients never see a report");
+    let (_, meshed) = peer_rx.try_recv().expect("the mesh peer receives the turn");
+    assert_eq!(meshed.state_hash, Some(report), "the mesh keeps the report");
+}
+
+#[test]
 fn mesh_turn_delivers_locally_and_never_reenters_the_mesh() {
     use crate::consensus::{self, Authority};
     use rally_point_proto::ids::GameFrameCount;

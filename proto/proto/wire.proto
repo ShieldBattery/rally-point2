@@ -227,12 +227,30 @@ message Payload {
   // majority of turns.
   optional BufferDirective buffer_directive = 5;
 
+  // A hash of the sending client's simulation state after one of its steps whose inputs it has
+  // all received, in a session that rolls back instead of running lockstep. Such a client
+  // simulates ahead on predicted inputs, so native 0x37 checksums would hash predictions; it
+  // strips them and reports hashes of confirmed steps here instead, for the authority relay to
+  // compare across slots. Origin-claimed, like `sync_generation`. Relays preserve it on the mesh
+  // but never forward it to clients, so no client can copy another's hash before its own is due.
+  // Absent on most turns.
+  optional StateHashReport state_hash = 7;
+
   // NOTE: player-leaves are deliberately NOT on the turn envelope. A drop stalls
   // every remaining player (lockstep), which stops the turn stream — so an
   // envelope stamp could never be delivered when it is needed. Leaves ride the
   // reliable control stream instead (see `ControlFrame.leave_directive`). The
   // buffer directive keeps the envelope because buffer changes happen while turns
   // are still flowing.
+}
+
+// A client's hash of its simulation state after a step, in a session that rolls back. Steps are
+// turn indices: the step that dispatches every slot's `seq`-th turn, pipe-seed turns included, so
+// a relay can tell when every slot's turn for the step has been forwarded without trusting a
+// client's frame stamp. Clients report every 8th step.
+message StateHashReport {
+  uint64 step = 1;
+  fixed64 hash = 2;
 }
 
 // One message on the client ↔ relay reliable control stream — the channel for

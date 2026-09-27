@@ -49,6 +49,7 @@ async fn preserves_payload_annotations_across_send_and_recv() {
     };
     client
         .send(Some(Payload {
+            state_hash: None,
             seq: 0,
             slot: 0,
             game_frame_count: Some(1337),

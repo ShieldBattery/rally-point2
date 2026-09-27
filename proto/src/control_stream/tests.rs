@@ -8,6 +8,7 @@ use super::*;
 fn oversize_turn(bytes: usize) -> ControlFrame {
     ControlFrame {
         kind: Some(control_frame::Kind::OversizeTurn(Payload {
+            state_hash: None,
             seq: 9,
             slot: 2,
             commands: vec![0x0C; bytes].into(),
@@ -21,6 +22,7 @@ fn oversize_turn(bytes: usize) -> ControlFrame {
 #[test]
 fn payload_sync_generation_presence_and_round_trip_are_backward_compatible() {
     let legacy = Payload {
+        state_hash: None,
         seq: 9,
         slot: 2,
         commands: vec![0x0C].into(),
@@ -429,6 +431,7 @@ fn every_mesh_control_frame_kind_round_trips_through_the_shared_framing() {
         (
             "oversize_turn",
             mesh_control_frame::Kind::OversizeTurn(Payload {
+                state_hash: None,
                 seq: 9,
                 slot: 2,
                 commands: vec![0x0C; 2000].into(),

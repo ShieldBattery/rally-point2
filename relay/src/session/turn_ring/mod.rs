@@ -307,13 +307,18 @@ impl TurnRing {
     /// Oldest-first preserves each slot's seq order for the client's per-slot reorder
     /// buffer. Every origin qualifies: a client wants everything it missed regardless
     /// of whether its home client edge or a direct peer link first delivered it here.
+    /// Replayed turns carry no state hash report, like every turn a client is forwarded.
     pub fn replay(
         &self,
         key: &SessionKey,
         cursors: &HashMap<SlotId, u64>,
         own: SlotId,
     ) -> Vec<Payload> {
-        self.matching(key, cursors, None, true, Some(own))
+        let mut turns = self.matching(key, cursors, None, true, Some(own));
+        for turn in &mut turns {
+            turn.state_hash = None;
+        }
+        turns
     }
 
     /// Like [`replay`](Self::replay), but additionally restricted to turns this

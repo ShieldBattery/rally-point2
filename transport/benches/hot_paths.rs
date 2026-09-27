@@ -7,6 +7,7 @@ use rally_point_transport::AckManager;
 
 fn payload(slot: u8, seq: u64, command_bytes: usize) -> Payload {
     Payload {
+        state_hash: None,
         seq,
         slot: u32::from(slot),
         commands: vec![0x05; command_bytes].into(),

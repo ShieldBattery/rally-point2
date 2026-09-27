@@ -14,6 +14,7 @@ use super::measure::{DeliveryTracker, Measurement};
 
 fn payload(origin: u32, frame: u32) -> Payload {
     Payload {
+        state_hash: None,
         seq: u64::from(frame),
         slot: origin,
         commands: Default::default(),

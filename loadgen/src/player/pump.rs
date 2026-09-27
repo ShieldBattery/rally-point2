@@ -55,6 +55,7 @@ pub(super) async fn pump_turns(
                 }
                 // seq/slot are left zero: the driver stamps seq, the relay rebinds slot.
                 let payload = Payload {
+                    state_hash: None,
                     seq: 0,
                     slot: 0,
                     commands: commands.into(),

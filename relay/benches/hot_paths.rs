@@ -14,6 +14,7 @@ use rally_point_relay::validation::validate_turn;
 
 fn payload(seq: u64, commands: Vec<u8>) -> Payload {
     Payload {
+        state_hash: None,
         seq,
         // Deliberately wrong: validation must bind the authorized slot while
         // retaining the command allocation on the clean fast path.

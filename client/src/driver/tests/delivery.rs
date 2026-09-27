@@ -243,6 +243,7 @@ async fn envelope_metadata_survives_delivery_to_the_game() {
     // changes for this client. (Leaves ride the control stream, not the
     // envelope — see the control-stream leave test.)
     let stamped = Payload {
+        state_hash: None,
         seq: 0,
         slot: 0,
         commands: vec![0x0C].into(),
