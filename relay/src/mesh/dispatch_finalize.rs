@@ -1,14 +1,14 @@
-//! The drop-finalization handshake's two mesh control-frame arms, split out of
-//! the main dispatch: the home relay sealing a dropped slot's exact turn count,
-//! and the authority acting on the answer.
+//! The drop-finalization handshake's mesh control-frame arms, split out of the
+//! main dispatch: the home relay sealing a dropped slot's exact turn count, the
+//! authority acting on the answer, and the home evicting a slot a rollback
+//! verdict named, which ends in that same handshake.
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{FinalizeDrop, FinalizeDropResult};
+use rally_point_proto::messages::{EvictSlot, FinalizeDrop, FinalizeDropResult};
 
 use crate::key::SessionKey;
 use crate::routing;
 
-use super::seen::forwarded_count;
 use super::{
     FINALIZE_OUTCOME_FINALIZED, FINALIZE_OUTCOME_REJECTED_LIVE,
     FINALIZE_OUTCOME_REJECTED_NO_CURSOR, MeshState, fan_out_finalize_drop_result,
@@ -38,12 +38,10 @@ pub(super) fn dispatch_finalize_drop(request: FinalizeDrop, key: &SessionKey, me
     {
         return;
     }
-    let outcome =
-        mesh.session
-            .decision_makers
-            .finalize_drop(key, slot, request.connection_epoch, || {
-                forwarded_count(&mesh.seen, key, slot)
-            });
+    // A refusal for want of a cursor is the fail-closed branch: the drop
+    // stays undecided (survivors remain stalled and may retry), never a
+    // frame fallback.
+    let outcome = routing::finalize_home_drop(mesh, key, slot, request.connection_epoch);
     tracing::info!(
         tenant = key.tenant.as_ref(),
         session = session_id.0,
@@ -51,19 +49,6 @@ pub(super) fn dispatch_finalize_drop(request: FinalizeDrop, key: &SessionKey, me
         ?outcome,
         "home-side drop finalization evaluated",
     );
-    if outcome == crate::consensus::FinalizeOutcome::RejectedNoCursor {
-        // The fail-closed branch: the drop stays undecided (survivors
-        // remain stalled and may retry), never a frame fallback. Make
-        // it observable — a session stuck here is the signal for the
-        // coordinated-abort follow-up.
-        mesh.session.decision_makers.flight_recorder().record(
-            key,
-            crate::observability::flight_recorder::FlightEvent::DropFinalizeRejected {
-                slot: slot.0,
-                no_cursor: true,
-            },
-        );
-    }
     fan_out_finalize_drop_result(&mesh.links, key, slot, request.connection_epoch, outcome);
 }
 
@@ -153,4 +138,36 @@ pub(super) fn dispatch_finalize_drop_result(
             );
         }
     }
+}
+
+/// The authority's order to evict a slot its rollback verdict named. Only the
+/// relay whose descriptor strictly homes the slot acts: it marks the slot
+/// evicted, which refuses every later dial for it, and only then closes its
+/// link, so a dial racing the close cannot reinstate it. The drop is finalized
+/// once the link is down (see `routing::end_desynced_slot_link`). Every other
+/// relay ignores the frame.
+pub(super) fn dispatch_evict_slot(
+    evict: EvictSlot,
+    sessions: &routing::Sessions,
+    key: &SessionKey,
+    mesh: &MeshState,
+) {
+    let Ok(slot) = u8::try_from(evict.slot).map(SlotId) else {
+        tracing::warn!(
+            session = key.session.0,
+            slot = evict.slot,
+            "mesh EvictSlot names a slot id out of range; dropping",
+        );
+        return;
+    };
+    if !mesh.session.decision_makers.mark_desync_evicted(key, slot) {
+        return;
+    }
+    routing::record_desync_eviction(
+        mesh.session.decision_makers.flight_recorder(),
+        key,
+        slot,
+        evict.sync_ordinal,
+    );
+    routing::end_desynced_slot_link(sessions, mesh, key, slot);
 }

@@ -79,7 +79,8 @@ mod state_hash;
 mod tests;
 
 pub use lifecycle::{
-    announce_slot_present, close_slots, close_slots_for_silence, maybe_start_session,
+    announce_slot_present, close_slots, close_slots_for_desync, close_slots_for_silence,
+    maybe_start_session,
 };
 pub use registry::{
     SlotRegistration, holds_any_slots, live_session_slot_epochs, live_slots, register,
@@ -87,19 +88,22 @@ pub use registry::{
 };
 pub use silence::{SILENCE_CHECK_INTERVAL, SilenceCloser, run_silence_watch};
 pub use slot_link::run_slot_link;
-pub use state_hash::{STATE_HASH_CHECK_INTERVAL, run_state_hash_watch};
+pub use state_hash::{DesyncEvictor, MeshEvictor, STATE_HASH_CHECK_INTERVAL, run_state_hash_watch};
 
 pub(crate) use close::maybe_close_emptied_session;
 pub(crate) use departure::{
     announce_departure, announce_departure_recorded, hold_or_decide_leave, reconcile_abandon,
 };
-pub(crate) use drops::{complete_finalized_drop, honor_drop_request};
+pub(crate) use drops::{
+    complete_finalized_drop, finalize_evicted_drop, finalize_home_drop, honor_drop_request,
+};
 pub(crate) use fan_out::{
     broadcast_connectivity, deliver_load_state_probe_to_slot, deliver_phase_directive_to_slot,
     deliver_region_labels_to_slot, deliver_session_start_to_slot, fan_out, fan_out_connectivity,
     fan_out_leave, fan_out_phase_directives, fan_out_region_labels, fan_out_session_start,
 };
 pub(crate) use lifecycle::{abandon_refused_admission, deliver_session_start, reap_provisional};
+pub(crate) use state_hash::{end_desynced_slot_link, record_desync_eviction};
 
 /// How many outbound payloads may queue for one slot before fan-out to it applies
 /// backpressure. Turns are small and drained promptly; a slot this far behind is
@@ -227,12 +231,16 @@ enum SlotCloseReason {
     /// The slot's client stopped producing turns while its session advanced past
     /// it, stalling every other player behind it.
     SilentSlot = 1,
+    /// A rollback session's state hash verdict named the slot: its game state
+    /// diverged from the majority's, or it withheld its report.
+    DesyncEvicted = 2,
 }
 
 impl SlotCloseReason {
     fn from_raw(raw: u8) -> Self {
         match raw {
             raw if raw == Self::SilentSlot as u8 => Self::SilentSlot,
+            raw if raw == Self::DesyncEvicted as u8 => Self::DesyncEvicted,
             _ => Self::Unspecified,
         }
     }

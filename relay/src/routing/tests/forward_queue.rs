@@ -38,6 +38,10 @@ fn every_relay_close_code_names_its_own_cause() {
             close_codes::PROVISIONAL_CAPACITY,
         ),
         ("a slot that went silent", close_codes::SILENT_SLOT),
+        (
+            "a slot whose game state diverged",
+            close_codes::DESYNC_EVICTED,
+        ),
     ];
     let mut by_code = std::collections::HashMap::new();
     for (cause, code) in causes {
@@ -54,7 +58,11 @@ fn every_relay_close_code_names_its_own_cause() {
 /// degrades to the generic close rather than to some other specific cause.
 #[test]
 fn a_stamped_close_reason_round_trips_and_an_unknown_byte_degrades() {
-    for reason in [SlotCloseReason::Unspecified, SlotCloseReason::SilentSlot] {
+    for reason in [
+        SlotCloseReason::Unspecified,
+        SlotCloseReason::SilentSlot,
+        SlotCloseReason::DesyncEvicted,
+    ] {
         assert_eq!(SlotCloseReason::from_raw(reason as u8), reason);
     }
     assert_eq!(
@@ -100,6 +108,11 @@ async fn close_slots_signals_a_held_slot_with_a_reason_and_skips_an_absent_one()
     close_slots_for_silence(&sessions, &k, &[SlotId(0)]);
     shutdown.notified().await;
     assert_eq!(inbox0.close_reason(), SlotCloseReason::SilentSlot);
+
+    // So does a desync eviction.
+    close_slots_for_desync(&sessions, &k, &[SlotId(0)]);
+    shutdown.notified().await;
+    assert_eq!(inbox0.close_reason(), SlotCloseReason::DesyncEvicted);
 }
 
 #[tokio::test(start_paused = true)]

@@ -35,4 +35,41 @@ impl DecisionMakers {
             self.publish_desync(key, verdict);
         }
     }
+
+    /// Every slot a rollback verdict named since the last claim, across every session, each one
+    /// this relay strictly homes already marked evicted (see
+    /// [`DecisionMaker::claim_desync_evictions`]). What a caller does with them — closing the
+    /// link of a slot this relay homes and telling every other relay serving the session —
+    /// belongs to the layer that owns links and the mesh, which is why this hands the slots back
+    /// rather than acting on them.
+    ///
+    /// The whole sweep runs under one acquisition of the registry lock, and the mark is taken
+    /// inside it, so a dial arriving while the caller acts is already refused.
+    pub fn claim_desync_evictions(&self) -> Vec<(SessionKey, DesyncEviction)> {
+        let mut claimed = Vec::new();
+        for (key, maker) in self.lock().iter_mut() {
+            claimed.extend(
+                maker
+                    .claim_desync_evictions()
+                    .into_iter()
+                    .map(|eviction| (key.clone(), eviction)),
+            );
+        }
+        claimed
+    }
+
+    /// Marks `slot` evicted for desync in `key`'s session if this relay strictly homes it, and
+    /// returns whether it does (see [`DecisionMaker::mark_desync_evicted`]). For a verdict another
+    /// relay produced; `false` when no maker exists.
+    pub fn mark_desync_evicted(&self, key: &SessionKey, slot: SlotId) -> bool {
+        self.lock()
+            .get_mut(key)
+            .is_some_and(|maker| maker.mark_desync_evicted(slot))
+    }
+
+    /// Why this relay evicted `slot` from `key`'s session, if it did (see
+    /// [`DecisionMaker::eviction`]).
+    pub fn eviction(&self, key: &SessionKey, slot: SlotId) -> Option<EvictionCause> {
+        self.lock().get(key).and_then(|maker| maker.eviction(slot))
+    }
 }

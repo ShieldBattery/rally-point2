@@ -56,8 +56,9 @@ pub(super) fn handle_shutdown(link: &mut Link, ctx: &SlotLinkCtx, close_reason: 
     // Something asked for this slot's link to end. Close it and leave;
     // deregistration below then frees the slot, only now that this task is
     // actually gone. The reason the signaler stamped picks the close code:
-    // a silenced slot's link was healthy, so saying "isolated" for it would
-    // send whoever reads the client's log after the wrong problem.
+    // a silenced or desync-evicted slot's link was healthy, so saying
+    // "isolated" for it would send whoever reads the client's log after the
+    // wrong problem.
     match SlotCloseReason::from_raw(close_reason.load(Ordering::Acquire)) {
         SlotCloseReason::SilentSlot => {
             tracing::info!(
@@ -69,6 +70,18 @@ pub(super) fn handle_shutdown(link: &mut Link, ctx: &SlotLinkCtx, close_reason: 
             link.connection().close(
                 VarInt::from_u32(close_codes::SILENT_SLOT),
                 b"slot stopped producing turns",
+            );
+        }
+        SlotCloseReason::DesyncEvicted => {
+            tracing::info!(
+                tenant = ctx.key.tenant.as_ref(),
+                session = ctx.key.session.0,
+                slot = ctx.slot.0,
+                "slot's game state diverged from the session's; closing connection",
+            );
+            link.connection().close(
+                VarInt::from_u32(close_codes::DESYNC_EVICTED),
+                b"game state diverged",
             );
         }
         SlotCloseReason::Unspecified => {

@@ -432,7 +432,7 @@ fn a_slot_not_ours_or_already_on_its_way_out_is_never_named() {
     );
 
     let (mut evicted, start) = stalled_session(&[0, 1], &[0, 1]);
-    evicted.mark_silence_evicted(SlotId(1));
+    evicted.mark_evicted(SlotId(1), EvictionCause::Silent);
     assert!(
         evicted
             .silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW)
@@ -513,7 +513,7 @@ fn a_healthy_replacement_link_refreshes_its_clock_by_forwarding() {
 #[test]
 fn a_silence_evicted_slot_is_refused_readmission_without_taking_the_hold() {
     let (mut maker, _start) = stalled_session(&[0, 1], &[0, 1]);
-    maker.mark_silence_evicted(SlotId(1));
+    maker.mark_evicted(SlotId(1), EvictionCause::Silent);
     drop_slot(&mut maker, 1);
 
     let transition = maker.resolve_reconnect_with(SlotId(1), Some(2), true, || {});

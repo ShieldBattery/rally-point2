@@ -3,8 +3,9 @@
 //!
 //! The behavior is split across sibling files by concern -- frame observation
 //! and authority handoff, connection epochs, the buffer control law, synced
-//! leaves and departures, session start and shape, the silence watch, and the
-//! desync hook -- each contributing its own `impl DecisionMaker` block.
+//! leaves and departures, session start and shape, the silence watch, the
+//! eviction record both it and the rollback verdicts feed, and the desync hook
+//! -- each contributing its own `impl DecisionMaker` block.
 
 use super::*;
 
@@ -12,6 +13,7 @@ mod authority;
 mod buffer;
 mod connection;
 mod departure;
+mod eviction;
 mod homing;
 mod leave;
 mod phase;
@@ -21,6 +23,7 @@ mod state_hash;
 mod sync;
 
 pub use departure::{DepartureStamps, FinalizeOutcome, RecordedDeparture};
+pub use eviction::{DesyncEviction, EvictionCause};
 pub use silence::SilentSlot;
 
 pub(in crate::consensus) use departure::Departure;
@@ -274,14 +277,22 @@ pub struct DecisionMaker {
     /// union wherever the question is simply whether a slot has left loading
     /// behind (see [`has_started`](Self::has_started)).
     pub(in crate::consensus) peer_started_slots: HashSet<SlotId>,
-    /// Slots this relay closed for producing no turns while the session advanced
-    /// past them (see [`silent_slot`](Self::silent_slot)). Kept so a
-    /// re-dialing client whose simulation is dead is refused rather than
-    /// readmitted: readmission would clear the survivors' drop hold and restart
-    /// their countdown on every redial, which is the stall this eviction exists
-    /// to end. Only the slot's home ever marks one, since only the home closed
-    /// the link.
-    pub(in crate::consensus) silence_evicted: HashSet<SlotId>,
+    /// Slots this relay closed for good, and why: for producing no turns while
+    /// the session advanced past them (see [`silent_slot`](Self::silent_slot)),
+    /// or because a rollback verdict named them (see
+    /// [`claim_desync_evictions`](Self::claim_desync_evictions)). Kept so a
+    /// re-dialing client is refused rather than readmitted — a dead simulation
+    /// cannot restart and a diverged one cannot repair itself, and readmission
+    /// would clear the survivors' drop hold and restart their countdown on
+    /// every redial. Only the slot's home ever marks one, since only the home
+    /// closes the link. The first cause recorded for a slot stands.
+    pub(in crate::consensus) evictions: HashMap<SlotId, EvictionCause>,
+    /// Slots a rollback verdict named, waiting for
+    /// [`claim_desync_evictions`](Self::claim_desync_evictions) to hand them to
+    /// the layer that closes links and tells the other relays. Filled only on
+    /// the authority, where verdicts are produced, and each slot at most once:
+    /// the comparator takes no further reports from a slot it named.
+    pub(in crate::consensus) pending_desync_evictions: Vec<(SlotId, u64)>,
     /// When each decided leave was decided here, on this relay's monotonic
     /// clock: the instant this relay authored the decision, or the instant a
     /// peer authority's directive for the slot arrived. The silence watch keeps
@@ -472,7 +483,8 @@ impl DecisionMaker {
             connected_slots: HashSet::new(),
             started_slots: HashSet::new(),
             peer_started_slots: HashSet::new(),
-            silence_evicted: HashSet::new(),
+            evictions: HashMap::new(),
+            pending_desync_evictions: Vec::new(),
             decided_leave_at: HashMap::new(),
             recovered_leaves: HashSet::new(),
             resume_stand_down_logged: false,

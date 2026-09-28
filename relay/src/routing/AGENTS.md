@@ -21,6 +21,12 @@
   the named slot's link. The verdict is consensus's and stays there; the
   actuation is here, behind a `SilenceCloser` the roster implements, so the
   loop is testable with a fake closer.
+- `state_hash.rs` — the rollback comparator's sweep, and the same split for its
+  evictions: `claim_desync_evictions` hands over the named slots, and a
+  `DesyncEvictor` (`MeshEvictor` in production) closes the ones this relay homes
+  and broadcasts `EvictSlot` for every one. The home finalizes the drop itself
+  once the link is down (`finalize_evicted_drop`, from `end_slot_link` or at
+  once for a slot already gone).
 
 ## Easy to break
 
@@ -44,7 +50,12 @@
   count. A *clean leave* decides immediately, at the home.
 - A slot the silence watch named is already marked evicted by the claim that
   named it, so the close is owed exactly once — don't re-derive the verdict
-  here, and don't let a failed close silently un-name it.
+  here, and don't let a failed close silently un-name it. A desync-evicted slot
+  is marked the same way before its close, for the same reason: the mark is
+  what refuses the re-dial that would otherwise reinstate it.
+- A desync-evicted slot's finalization runs after `announce_departure` returns,
+  never inside it: that call holds the roster lock, and the decide's fan-out
+  takes it again.
 
 ## Slot-link context
 

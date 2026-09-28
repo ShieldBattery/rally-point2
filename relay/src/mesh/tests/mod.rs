@@ -40,6 +40,7 @@ mod delivery;
 mod dispatch_frames;
 mod dispatch_local;
 mod drop_request;
+mod evict_slot;
 mod fan_out_links;
 mod finalize_drop;
 mod gating;

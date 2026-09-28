@@ -13,6 +13,7 @@ mod helpers;
 
 mod auth;
 mod connectivity;
+mod desync_eviction;
 mod drop_holds;
 mod leaves;
 mod provisional;

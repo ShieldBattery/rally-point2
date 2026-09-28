@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
-    FinalizeDrop, FinalizeDropResult, GameChat, LeaveDirective, LobbyCommand, MeshControlFrame,
-    Payload, PlayerSkin, mesh_control_frame,
+    EvictSlot, FinalizeDrop, FinalizeDropResult, GameChat, LeaveDirective, LobbyCommand,
+    MeshControlFrame, Payload, PlayerSkin, mesh_control_frame,
 };
 use tokio::sync::{Notify, mpsc};
 
@@ -457,6 +457,31 @@ pub(crate) fn fan_out_finalize_drop_result(
                     final_turn_count,
                 },
             )),
+        },
+    );
+}
+
+/// Broadcasts the authority's order that `slot` leave the game because the
+/// verdict on state hash step `sync_ordinal` named it. Sent to every peer
+/// serving `key`; the one relay whose descriptor strictly homes the slot
+/// self-selects, marks it evicted, closes its link and finalizes its drop, and
+/// the rest ignore it (as does a peer that predates the frame kind, which then
+/// leaves the slot playing and its drop to the survivors).
+pub(crate) fn fan_out_evict_slot(
+    links: &MeshLinks,
+    key: &SessionKey,
+    slot: SlotId,
+    sync_ordinal: u64,
+) {
+    fan_out_control(
+        links,
+        key,
+        MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::EvictSlot(EvictSlot {
+                slot: u32::from(slot.0),
+                sync_ordinal,
+            })),
         },
     );
 }

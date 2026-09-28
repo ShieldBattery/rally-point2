@@ -294,13 +294,14 @@ impl DecisionMaker {
                 consume_hold: hold_pending,
             };
         }
-        // This slot's link was closed because its simulation stopped stepping
-        // while the session ran on past it, and reconnecting cannot restart a
-        // dead simulation. Admitting it would clear the survivors' drop hold and
-        // restart their countdown on every redial, leaving them stalled forever
-        // — so refuse, and deliberately do NOT consume the hold, which is what
-        // lets them decide the drop.
-        if self.silence_evicted.contains(&slot) {
+        // This slot's link was closed for good: its simulation stopped stepping
+        // while the session ran on past it, or its state diverged from the
+        // majority's, and reconnecting can neither restart a dead simulation
+        // nor repair a diverged one. Admitting it would clear the survivors'
+        // drop hold and restart their countdown on every redial, leaving them
+        // stalled forever — so refuse, and deliberately do NOT consume the
+        // hold, which is what the drop is decided against.
+        if self.evictions.contains_key(&slot) {
             return ReconnectTransition {
                 admission: ReconnectAdmission::Rejected,
                 consume_hold: false,

@@ -112,6 +112,21 @@ pub fn close_slots_for_silence(sessions: &Sessions, key: &SessionKey, slots: &[S
     );
 }
 
+/// Closes the links of `slots` in the `key` routing group because a rollback
+/// verdict named them (see [`crate::routing::run_state_hash_watch`]). Identical
+/// to [`close_slots`] but for the reason it stamps, which makes the closed
+/// connection carry [`close_codes::DESYNC_EVICTED`]: the client's link was
+/// healthy, and its log should say its game state was the problem.
+pub fn close_slots_for_desync(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
+    signal_close(
+        sessions,
+        key,
+        slots,
+        SlotCloseReason::DesyncEvicted,
+        "closing slot link after desync eviction",
+    );
+}
+
 /// Stamps `reason` on each named slot's roster entry and fires its shutdown
 /// signal, logging `message`. The stamp lands before the signal, so the woken
 /// link task always reads the reason for the wake it is answering.

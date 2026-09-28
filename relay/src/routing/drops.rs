@@ -188,7 +188,6 @@ pub(crate) fn honor_drop_request(
     let drop_holds = &mesh.session.drop_holds;
     let decision_makers = &mesh.session.decision_makers;
     let mesh_links = &mesh.links;
-    let seen = &mesh.seen;
     if !decision_makers.is_authority(key) {
         // Not the authority — the authority is among the broadcast's receivers and
         // will act. Nothing to do, and the hold stays for a possible promotion.
@@ -206,11 +205,11 @@ pub(crate) fn honor_drop_request(
             // and undecided, never frame-scheduled.
             if decision_makers.finalized_drops_enabled(key) {
                 if decision_makers.strictly_homes(key, target) {
-                    let outcome = decision_makers.finalize_drop(
+                    let outcome = finalize_home_drop(
+                        mesh,
                         key,
                         target,
                         decision_makers.departure_epoch(key, target),
-                        || crate::mesh::forwarded_count(seen, key, target),
                     );
                     tracing::info!(
                         tenant = key.tenant.as_ref(),
@@ -222,14 +221,6 @@ pub(crate) fn honor_drop_request(
                     );
                     if let consensus::FinalizeOutcome::Finalized { final_turn_count } = outcome {
                         complete_finalized_drop(sessions, mesh, key, target, final_turn_count);
-                    } else if outcome == consensus::FinalizeOutcome::RejectedNoCursor {
-                        decision_makers.flight_recorder().record(
-                            key,
-                            FlightEvent::DropFinalizeRejected {
-                                slot: target.0,
-                                no_cursor: true,
-                            },
-                        );
                     }
                 } else {
                     // A peer homes the target: ask it to finalize. The decide
@@ -333,6 +324,100 @@ pub(crate) fn honor_drop_request(
             );
         }
     }
+}
+
+/// Seals the drop of `slot`, a slot this relay strictly homes, and snapshots
+/// its count: [`crate::consensus::DecisionMakers::finalize_drop`] against this
+/// relay's own gap-free forwarded prefix for the slot, the only cursor a home's
+/// finalization may seal. `connection_epoch` is the departed generation being
+/// finalized. A refusal for want of a sealable cursor is recorded: the drop
+/// stays undecided and its survivors stalled, which is the signal worth
+/// keeping. Every home-side finalization goes through here, whatever asked for
+/// it.
+pub(crate) fn finalize_home_drop(
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+    slot: SlotId,
+    connection_epoch: Option<u64>,
+) -> consensus::FinalizeOutcome {
+    let decision_makers = &mesh.session.decision_makers;
+    let outcome = decision_makers.finalize_drop(key, slot, connection_epoch, || {
+        crate::mesh::forwarded_count(&mesh.seen, key, slot)
+    });
+    if outcome == consensus::FinalizeOutcome::RejectedNoCursor {
+        decision_makers.flight_recorder().record(
+            key,
+            FlightEvent::DropFinalizeRejected {
+                slot: slot.0,
+                no_cursor: true,
+            },
+        );
+    }
+    outcome
+}
+
+/// Finalizes the drop of a slot this relay evicted for desync, unprompted,
+/// once the slot's link is down and its departure recorded here: seals the
+/// count (see [`finalize_home_drop`]) and, as the session authority, decides
+/// the leave at once, or otherwise sends the result to the authority exactly as
+/// an answer to its own `FinalizeDrop` would go. The authority's handling of a
+/// result already checks that it is the authority and that the result names
+/// the generation its departure record holds; the `SlotDeparted` this relay
+/// sent when the link ended precedes the result on the same ordered control
+/// stream, so that record exists by the time the result is read.
+///
+/// Nothing happens unless the session finalizes drops, this relay strictly
+/// homes the slot, the slot was evicted for desync here, and a departure is
+/// recorded for it: the link must be down, or there is no departed generation
+/// to seal. A refused finalization leaves the drop held like any other. A home
+/// gained by a mid-session rehome has no cursor continuity and is always
+/// refused, and the survivors' own drop request is then what decides it.
+/// Idempotent: a repeat answers from the sealed record or the decided leave.
+///
+/// Runs under the session's ingress gate, so a retirement racing it cannot
+/// have it recreate swept state; the gate re-enters, so a caller already inside
+/// it is fine.
+pub(crate) fn finalize_evicted_drop(
+    sessions: &Sessions,
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+    slot: SlotId,
+) {
+    let _ = mesh.session.gates.with_ingress(key, || {
+        let decision_makers = &mesh.session.decision_makers;
+        if decision_makers.eviction(key, slot) != Some(consensus::EvictionCause::Desync)
+            || !decision_makers.finalized_drops_enabled(key)
+            || !decision_makers.strictly_homes(key, slot)
+            || !decision_makers.has_departure(key, slot)
+        {
+            return;
+        }
+        let connection_epoch = decision_makers.departure_epoch(key, slot);
+        let outcome = finalize_home_drop(mesh, key, slot, connection_epoch);
+        tracing::info!(
+            tenant = key.tenant.as_ref(),
+            session = key.session.0,
+            slot = slot.0,
+            ?outcome,
+            "finalizing a desync-evicted slot's drop",
+        );
+        if decision_makers.is_authority(key) {
+            if let consensus::FinalizeOutcome::Finalized { final_turn_count } = outcome {
+                complete_finalized_drop(sessions, mesh, key, slot, final_turn_count);
+                // The decide may have been the last undecided departure
+                // deferring this relay's session-emptied close.
+                maybe_close_emptied_session(sessions, mesh, key);
+            }
+        } else {
+            crate::mesh::fan_out_finalize_drop_result(
+                &mesh.links,
+                key,
+                slot,
+                connection_epoch,
+                outcome,
+            );
+        }
+    });
 }
 
 /// Completes a home-finalized drop on the authority: stamps the sealed count

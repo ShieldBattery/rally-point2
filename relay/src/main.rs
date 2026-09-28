@@ -228,6 +228,10 @@ async fn main() -> Result<()> {
     }
     tokio::spawn(rally_point_relay::routing::run_state_hash_watch(
         Arc::clone(&mesh_state.session.decision_makers),
+        rally_point_relay::routing::MeshEvictor {
+            sessions: Arc::clone(&sessions),
+            mesh: mesh_state.clone(),
+        },
         rally_point_relay::routing::STATE_HASH_CHECK_INTERVAL,
     ));
 

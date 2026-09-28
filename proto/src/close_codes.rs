@@ -91,6 +91,12 @@ pub const PROVISIONAL_CAPACITY: u32 = 0x0C;
 /// until the slot is out. Nothing was wrong with the link.
 pub const SILENT_SLOT: u32 = 0x0D;
 
+/// The session's rollback-state comparison named this client as the one at fault
+/// — its state hash disagreed with the majority's, or it kept sending turns
+/// without reporting one — so the game goes on without it. Every later dial for
+/// the slot is refused with [`SLOT_DEPARTED`].
+pub const DESYNC_EVICTED: u32 = 0x0E;
+
 /// Sent **by a client** abandoning a dial because the authorization exchange
 /// did not finish within its deadline. Client-space, so it shares a number with
 /// the relay's [`INVALID_TURN`] and means nothing like it.

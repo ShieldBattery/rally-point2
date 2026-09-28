@@ -17,8 +17,8 @@
   `slot_departed`/`has_departure`, `session_started`/`is_started`, `record_*`/`note_*`)
   the maker's spelling won, so one grep finds a concept everywhere.
   Files by concern: `authority` (descriptor sync + frames + the desync hook),
-  `buffer`, `departure`, `homing`, `leave`, `phase`, `session_start`, `silence`,
-  `sync_coverage`; `registry/mod.rs` holds the type itself, the notice builders and
+  `buffer`, `departure`, `eviction` (maker only), `homing`, `leave`, `phase`,
+  `session_start`, `silence`, `state_hash`, `sync_coverage`; `registry/mod.rs` holds the type itself, the notice builders and
   the `log_*` helpers.
 - Policy lives on the maker, not the registry: the registry sequences lock, record
   and notify, and every decision it sequences is a `DecisionMaker` method
@@ -51,6 +51,12 @@
   entirely while any required slot is unaccounted for. Only the *verdict* is here
   (`claim_silent_slots`, which also marks what it names); the watch that closes the
   named link is `routing::run_silence_watch`.
+- **Desync eviction** is the rollback comparator's verdict turned into a queue:
+  `judge_state_hashes` queues every slot a majority verdict names (a no-majority
+  verdict evicts nobody), and `claim_desync_evictions` drains it, marking the slots
+  this relay strictly homes. Both evictions share one record (`evictions`, with a
+  cause) that refuses a re-dial without consuming the drop hold; the actuation is
+  `routing::run_state_hash_watch` and the mesh `EvictSlot` arm.
 
 ## Easy to break
 

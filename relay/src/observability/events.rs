@@ -62,6 +62,16 @@ pub enum FlightEvent {
         silent_ms: u64,
         lead_ms: u64,
     },
+    /// The relay closed a slot's link, as its home, because the rollback
+    /// session's state hash comparison named it: its hash disagreed with the
+    /// majority's, or it kept sending turns without reporting one. Rollback
+    /// clients run no native sync, so nothing else takes a diverged player out
+    /// of the game. The slot is refused every later dial, and once its link is
+    /// down the home finalizes its drop unprompted; the
+    /// [`SlotDisconnected`](Self::SlotDisconnected) that follows, and the
+    /// finalized leave the session authority then decides, are that path.
+    /// `sync_ordinal` is the state hash step whose verdict named the slot.
+    SlotEvictedDesync { slot: u8, sync_ordinal: u64 },
     /// This relay (as session authority) decided the synced leave for a slot.
     LeaveDecided {
         slot: u8,

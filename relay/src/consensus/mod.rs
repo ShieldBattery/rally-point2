@@ -273,7 +273,10 @@ use slot::*;
 use sync::*;
 
 pub use law::ControlLaw;
-pub use maker::{DecisionMaker, DepartureStamps, FinalizeOutcome, RecordedDeparture, SilentSlot};
+pub use maker::{
+    DecisionMaker, DepartureStamps, DesyncEviction, EvictionCause, FinalizeOutcome,
+    RecordedDeparture, SilentSlot,
+};
 
 pub use registry::{
     DecisionMakers, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,

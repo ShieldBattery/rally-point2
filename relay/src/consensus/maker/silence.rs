@@ -163,9 +163,9 @@ impl DecisionMaker {
     ///   verdict exists to name it in — and stating it here as well is what makes
     ///   "a loader is not a culprit" true of the candidate rule on its own terms,
     ///   rather than a coincidence of the order the checks run in;
-    /// — it has not already been evicted for silence
-    ///   ([`mark_silence_evicted`](Self::mark_silence_evicted)), so a slot whose
-    ///   link is already closing is not re-reported every tick;
+    /// — it has not already been evicted, for silence or for desync
+    ///   ([`mark_evicted`](Self::mark_evicted)), so a slot whose link is
+    ///   already closing is not re-reported every tick;
     /// — the whole session has been quiet for at least `window`: no participant's
     ///   prefix has advanced within it. Any advance is an unblocking event the
     ///   survivors may still be answering — a late turn from the slot everyone
@@ -277,7 +277,7 @@ impl DecisionMaker {
                 || !self.has_started(slot)
                 || self.departures.contains_key(&slot)
                 || self.decided_leaves.contains_key(&slot)
-                || self.silence_evicted.contains(&slot)
+                || self.evictions.contains_key(&slot)
             {
                 continue;
             }
@@ -327,13 +327,6 @@ impl DecisionMaker {
             }
         }
         None
-    }
-
-    /// Marks `slot` as evicted for silence, so it is neither re-reported by
-    /// [`silent_slot`](Self::silent_slot) nor readmitted if it re-dials (see
-    /// the `silence_evicted` field). Idempotent.
-    pub fn mark_silence_evicted(&mut self, slot: SlotId) {
-        self.silence_evicted.insert(slot);
     }
 
     /// Records the wall-clock instant this relay learned the session started, for

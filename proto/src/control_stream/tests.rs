@@ -339,8 +339,8 @@ fn an_empty_region_label_map_is_a_set_oneof_not_an_unset_one() {
 #[test]
 fn every_mesh_control_frame_kind_round_trips_through_the_shared_framing() {
     use crate::messages::{
-        DeliveryCursor, DeliveryCursors, GameChat, LobbyCommand, PlayerSkin, SessionStart,
-        SlotPresent, SlotStarted,
+        DeliveryCursor, DeliveryCursors, EvictSlot, GameChat, LobbyCommand, PlayerSkin,
+        SessionStart, SlotPresent, SlotStarted,
     };
 
     // The relay ↔ relay half of the same kind-agnostic framing. Several kinds
@@ -389,6 +389,13 @@ fn every_mesh_control_frame_kind_round_trips_through_the_shared_framing() {
         (
             "slot_started",
             mesh_control_frame::Kind::SlotStarted(SlotStarted { slot: 4 }),
+        ),
+        (
+            "evict_slot",
+            mesh_control_frame::Kind::EvictSlot(EvictSlot {
+                slot: 2,
+                sync_ordinal: 64,
+            }),
         ),
         (
             "slot_connectivity",

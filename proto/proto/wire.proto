@@ -1221,6 +1221,16 @@ message MeshControlFrame {
     // idempotent: the accumulated set is a set, so the join reconcile and a
     // re-announce on a redialed link cost nothing. See `SlotStarted`.
     SlotStarted slot_started = 17;
+
+    // The session authority's rollback-state comparison named a slot as the one at fault: its
+    // state hash disagreed with the majority's, or it went on sending turns without reporting
+    // one. The game goes on without it. Broadcast to every session peer; the relay whose
+    // descriptor strictly homes the slot marks it evicted (refusing every later dial for it) and
+    // only then closes its link, and once that link is down finalizes the drop and answers with
+    // an unprompted `FinalizeDropResult`, so the authority decides a leave carrying the exact
+    // count. Every other relay ignores it, as does a relay that predates this kind. Not
+    // re-broadcast. See `EvictSlot`.
+    EvictSlot evict_slot = 18;
   }
 }
 
@@ -1523,6 +1533,17 @@ message FinalizeDrop {
   // The departed connection generation the authority is finalizing, from its
   // departure record. Absent in legacy mode (no generation observed).
   optional fixed64 connection_epoch = 2;
+}
+
+// The authority's order that a slot leave the game because its rollback state diverged — see the
+// `evict_slot` oneof arm.
+message EvictSlot {
+  // The slot to evict.
+  uint32 slot = 1;
+
+  // The state hash step whose verdict named the slot, carried so the home's own record of the
+  // eviction says which comparison it rested on.
+  uint64 sync_ordinal = 2;
 }
 
 // The home's answer to `FinalizeDrop` — see the `finalize_drop_result` oneof

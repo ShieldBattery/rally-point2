@@ -113,6 +113,16 @@ pub(in crate::routing) fn end_slot_link(
             );
         }
     }
+    // A slot evicted for desync is finalized here, by its home, the moment its
+    // departure is recorded: its survivors should not have to ask for a drop
+    // that nothing can undo. Outside the roster lock, which the decide's
+    // fan-out takes itself, and before the presence report below can hand
+    // authority away, so a home that is the authority decides the leave
+    // directly. A mark landing after this read is finalized by the eviction
+    // path itself, which finds the link already gone.
+    if retired_connection {
+        crate::routing::finalize_evicted_drop(sessions, mesh, key, slot);
+    }
     // This client leaving may hand the session's buffer authority to the next
     // relay in the order — the presence-driven half of the handoff. The local
     // verdict moves here; the peers hear the emptied roster from the mesh

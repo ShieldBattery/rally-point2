@@ -11,7 +11,9 @@ use rally_point_proto::messages::{MeshControlFrame, mesh_control_frame};
 use crate::key::SessionKey;
 use crate::routing;
 
-use super::dispatch_finalize::{dispatch_finalize_drop, dispatch_finalize_drop_result};
+use super::dispatch_finalize::{
+    dispatch_evict_slot, dispatch_finalize_drop, dispatch_finalize_drop_result,
+};
 use super::links::JoinedSession;
 use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 
@@ -57,6 +59,10 @@ use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 ///   session authority and the target slot's drop has stood past the unlock floor;
 ///   a non-authority ignores it (the authority is among the broadcast's
 ///   receivers). Not re-broadcast across the mesh — no echo, like the arms above.
+/// - **`EvictSlot`**: the authority's order that a slot its rollback verdict
+///   named leave the game. Acted on only by the relay that strictly homes the
+///   slot, which marks it evicted, closes its link and finalizes its drop; not
+///   re-broadcast.
 /// - **`MeshResumeCursors`**: the peer's per-origin-slot resume cursors.
 ///   Answered before this function ever runs — the reply is a replay of this
 ///   relay's own turns, sent directly over the link that received the ask, not
@@ -486,6 +492,9 @@ fn dispatch_mesh_control_frame(
         }
         Some(mesh_control_frame::Kind::FinalizeDropResult(result)) => {
             dispatch_finalize_drop_result(result, sessions, &key, mesh);
+        }
+        Some(mesh_control_frame::Kind::EvictSlot(evict)) => {
+            dispatch_evict_slot(evict, sessions, &key, mesh);
         }
         Some(mesh_control_frame::Kind::DeliveryCursors(delivery)) => {
             // A peer-homed destination's delivered-through cursors: fold each

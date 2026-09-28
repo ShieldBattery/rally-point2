@@ -72,7 +72,7 @@ impl DecisionMakers {
         let mut claimed = Vec::new();
         for (key, maker) in self.lock().iter_mut() {
             if let Some(found) = maker.silent_slot(now, window) {
-                maker.mark_silence_evicted(found.slot);
+                maker.mark_evicted(found.slot, EvictionCause::Silent);
                 claimed.push((key.clone(), found));
             }
         }
