@@ -126,6 +126,76 @@ fn a_peer_relays_local_fan_out_frames_deliver_locally_and_never_echo() {
 }
 
 #[test]
+fn peer_lobby_mismatch_is_dropped_without_eviction_or_replay() {
+    use rally_point_proto::control::{AllowedLobbyCommand, BufferBounds, LobbyPolicy};
+
+    let sessions: routing::Sessions = Arc::default();
+    let mesh_state = test_mesh_state();
+    let key = control_key();
+    let makers = &mesh_state.session.decision_makers;
+    let _ = makers.sync_maker(
+        &key,
+        crate::consensus::MakerSync {
+            lobby_policy: Some(LobbyPolicy {
+                allowed: vec![AllowedLobbyCommand {
+                    slot: SlotId(0),
+                    payload: vec![0xAB],
+                }],
+            }),
+            ..crate::consensus::MakerSync::new(
+                BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::Peer,
+            )
+        },
+    );
+    let (notice_tx, mut notices) = mpsc::unbounded_channel();
+    makers.set_notice_notifier(notice_tx);
+    let mut member = mesh_state
+        .session
+        .side_channels
+        .lobby
+        .register_member(&key, SlotId(5));
+    let joined = joined_state(&mesh_state.links, &key);
+    let dispatch = |payload: Vec<u8>| {
+        dispatch_mesh_control(
+            MeshControlFrame {
+                session: key.session.0,
+                kind: Some(mesh_control_frame::Kind::LobbyCommand(LobbyCommand {
+                    slot: 0,
+                    payload: payload.into(),
+                })),
+            },
+            RelayId(9),
+            &joined,
+            &sessions,
+            &mesh_state,
+        );
+    };
+    dispatch(vec![0xCD]);
+    assert!(
+        member.try_recv().is_err(),
+        "mismatch must not reach local members"
+    );
+    let mut late = mesh_state
+        .session
+        .side_channels
+        .lobby
+        .register_member(&key, SlotId(6));
+    assert!(
+        late.try_recv().is_err(),
+        "mismatch must not enter replay log"
+    );
+    assert_eq!(makers.lock().get(&key).unwrap().eviction(SlotId(0)), None);
+    assert!(
+        notices.try_recv().is_err(),
+        "peer relay cannot report home violation"
+    );
+    dispatch(vec![0xAB]);
+    assert_eq!(member.try_recv().unwrap().payload.as_ref(), &[0xAB]);
+    assert_eq!(late.try_recv().unwrap().payload.as_ref(), &[0xAB]);
+}
+
+#[test]
 fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
     let sessions: routing::Sessions = Arc::default();
     let mesh_state = test_mesh_state();

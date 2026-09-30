@@ -370,3 +370,64 @@ async fn chat_and_skin_reach_a_cross_relay_peer_and_the_skin_replays_to_a_late_j
 
     Ok(())
 }
+
+/// A policy check belongs before the local side-channel append and mesh fan-out:
+/// if the home relay rejects opaque bytes, a peer relay must neither receive the
+/// live command nor retain it for a later local replay.
+#[tokio::test]
+async fn rejected_home_lobby_command_never_crosses_the_mesh() -> Result<(), AnyError> {
+    use rally_point_proto::close_codes;
+    use rally_point_proto::control::{AllowedLobbyCommand, BufferBounds, LobbyPolicy};
+    use rally_point_relay::consensus::{Authority, MakerSync};
+    use rally_point_transport::noq::ConnectionError;
+
+    let tenant = make_default_tenant();
+    let session = SessionId(51);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
+    let _ = relay_a.mesh.session.decision_makers.sync_maker(
+        &key,
+        MakerSync {
+            lobby_policy: Some(LobbyPolicy {
+                allowed: vec![AllowedLobbyCommand {
+                    slot: SlotId(0),
+                    payload: b"allowed".to_vec(),
+                }],
+            }),
+            ..MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
+        },
+    );
+    let (_cmds_a, _cmds_b, _mesh_ep) = mesh_two_relays(&relay_a, &mut relay_b, &key).await;
+    let host = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let peer = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    let (mut host_send, _) = open_lobby_streams(host.connection()).await;
+    let (_peer_send, mut peer_rx) = open_lobby_streams(peer.connection()).await;
+    wait_for_slots(&relay_a.sessions, &key, 1).await;
+    wait_for_slots(&relay_b.sessions, &key, 1).await;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    wait_for_mesh_link(&relay_b.mesh, &key).await;
+
+    rally_point_transport::control::send_control_lobby(
+        &mut host_send,
+        LobbyCommand {
+            slot: 0,
+            payload: b"wrong".to_vec().into(),
+        },
+    )
+    .await?;
+    assert!(matches!(
+        host.connection().closed().await,
+        ConnectionError::ApplicationClosed(ref close) if close.error_code == close_codes::LOBBY_VIOLATION.into()
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), next_lobby(&mut peer_rx))
+            .await
+            .is_err(),
+        "a rejected home command must never leave its relay",
+    );
+    Ok(())
+}

@@ -181,6 +181,7 @@ pub(crate) async fn coordinator_with_session(
     let resp = session::create_session(
         &served.setup,
         SessionRequest {
+            lobby_policy: None,
             rollback: false,
             tenant: TenantId(TENANT.to_owned()),
             players: vec![
@@ -244,6 +245,7 @@ pub(crate) async fn serve_coordinator_returning_setup(
 /// the descriptor outbox directly.
 pub(crate) fn a_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        lobby_policy: None,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
@@ -385,6 +387,7 @@ pub(crate) fn try_create_one_slot_session(
     session::create_session(
         setup,
         SessionRequest {
+            lobby_policy: None,
             rollback: false,
             tenant: TenantId(TENANT.to_owned()),
             players: vec![PlayerHandoff {

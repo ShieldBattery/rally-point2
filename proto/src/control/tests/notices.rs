@@ -350,3 +350,19 @@ fn a_down_frame_decodes_to_unknown_on_a_decoder_that_predates_it() {
         assert_eq!(decoded, RelayToCoordinator::Unknown, "{json}");
     }
 }
+
+#[test]
+fn lobby_violation_roundtrips_json() {
+    let message = RelayToCoordinator::LobbyViolation(LobbyViolationNotice {
+        tenant: TenantId("sb-staging".to_owned()),
+        session: SessionId(42),
+        slot: SlotId(3),
+        arrival_ms: 1_700_000_000_000,
+    });
+    let json = serde_json::to_string(&message).unwrap();
+    assert!(json.contains("\"type\":\"lobby_violation\""));
+    assert_eq!(
+        serde_json::from_str::<RelayToCoordinator>(&json).unwrap(),
+        message
+    );
+}

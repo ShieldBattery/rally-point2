@@ -149,6 +149,12 @@ pub struct SessionRefs {
     /// too (harmless there: a resumed relay never re-stamps a depth). `None` when
     /// the request carried no estimate.
     pub latency_estimate_ms: Option<u32>,
+    /// The session's lobby command allow-list, from the
+    /// [`SessionRequest`](rally_point_proto::control::SessionRequest). Carried into every serving
+    /// relay's `SessionDescriptor::lobby_policy`, a rehome-rebuilt one included, so a replacement
+    /// home keeps enforcing it. Decided once at create and immutable. `None` when the request
+    /// carried none.
+    pub lobby_policy: Option<rally_point_proto::control::LobbyPolicy>,
 }
 
 /// The outcome of [`create_session`]: the response to hand the app server, and

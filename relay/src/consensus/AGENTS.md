@@ -56,7 +56,9 @@
   verdict evicts nobody), and `claim_desync_evictions` drains it, marking the slots
   this relay strictly homes. Both evictions share one record (`evictions`, with a
   cause) that refuses a re-dial without consuming the drop hold; the actuation is
-  `routing::run_state_hash_watch` and the mesh `EvictSlot` arm.
+  `routing::run_state_hash_watch` and the mesh `EvictSlot` arm. A pre-game lobby-policy
+  violation uses that same home-side atomic mark, reports once, and never decides or
+  finalizes the held drop.
 
 ## Easy to break
 

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use rally_point_proto::control::{RegionId, SessionRequest, SessionResponse};
+use rally_point_proto::control::{LobbyPolicy, RegionId, SessionRequest, SessionResponse};
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::token::ClientPublicKey;
 
@@ -46,6 +46,10 @@ use super::DEFAULT_WARM_TTL;
 ///   where the authority relay sizes the initial buffer from it, so replaying
 ///   a cached response for a request naming a different estimate would bind
 ///   the wrong depth input to the session.
+/// - the request's `lobby_policy` — carried into every serving relay's
+///   descriptor, where it decides which lobby commands are admitted and which
+///   evict their sender, so replaying a cached response for a request naming a
+///   different policy would enforce the wrong allow-list.
 ///
 /// Equality is plain struct equality ([`PartialEq`]), never a hash: a hash
 /// collision must not be able to bind two genuinely different rosters to one
@@ -58,6 +62,8 @@ pub(super) struct CreateFingerprint {
     players: Vec<FingerprintPlayer>,
     /// The request's worst-pairwise one-way path-latency estimate.
     latency_estimate_ms: Option<u32>,
+    /// The request's lobby command allow-list.
+    lobby_policy: Option<LobbyPolicy>,
 }
 
 /// One player's contribution to a [`CreateFingerprint`]: the fields of a
@@ -93,6 +99,7 @@ impl CreateFingerprint {
         Self {
             players,
             latency_estimate_ms: request.latency_estimate_ms,
+            lobby_policy: request.lobby_policy.clone(),
         }
     }
 }

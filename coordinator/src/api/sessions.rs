@@ -129,7 +129,12 @@ pub(super) async fn create_session(
                 | registry::SessionSetupError::NoPlayers
                 | registry::SessionSetupError::DuplicateSlot(_)
                 | registry::SessionSetupError::ExternalIdTooLong
-                | registry::SessionSetupError::ExternalRefTooLong(_) => StatusCode::BAD_REQUEST,
+                | registry::SessionSetupError::ExternalRefTooLong(_)
+                | registry::SessionSetupError::LobbyPolicyTooManyEntries
+                | registry::SessionSetupError::LobbyPolicyPayloadsTooLarge
+                | registry::SessionSetupError::LobbyPolicySlotNotInRoster(_) => {
+                    StatusCode::BAD_REQUEST
+                }
             });
         }
     };

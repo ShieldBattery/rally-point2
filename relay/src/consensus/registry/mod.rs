@@ -15,6 +15,7 @@ mod buffer;
 mod departure;
 mod homing;
 mod leave;
+mod lobby_policy;
 mod phase;
 mod session_start;
 mod silence;
@@ -23,6 +24,7 @@ mod sync_coverage;
 
 pub use authority::{FrameRegression, MakerSync};
 pub use leave::normalize_observed_leave;
+pub use lobby_policy::LobbyCommandVerdict;
 
 /// The per-session decision-maker map behind [`DecisionMakers`]. A plain
 /// (non-async) mutex mirrors `MeshLinks` and `routing::Sessions`: every critical
@@ -77,6 +79,8 @@ pub enum RelayNotice {
     SessionStarted(SessionStartedNotice),
     /// A client reported that its game loop began running.
     SlotStarted(SlotStartedNotice),
+    /// A client sent a lobby command the descriptor policy rejects before it started.
+    LobbyViolation(LobbyViolationNotice),
     /// This relay tore down its last local state for a session. Fired after the
     /// session's departures have already gone up this same ordered channel, so
     /// the coordinator — which waits for every serving relay to report it — can
@@ -450,6 +454,19 @@ impl DecisionMakers {
             arrival_ms: unix_millis(),
             session_frame,
             slot_frame,
+        }
+    }
+
+    pub(in crate::consensus) fn lobby_violation_notice(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+    ) -> LobbyViolationNotice {
+        LobbyViolationNotice {
+            tenant: key.tenant.clone(),
+            session: key.session,
+            slot,
+            arrival_ms: unix_millis(),
         }
     }
 

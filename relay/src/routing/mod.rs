@@ -70,6 +70,7 @@ mod drops;
 mod fan_out;
 mod forward;
 mod lifecycle;
+mod lobby;
 mod registry;
 mod silence;
 mod slot_link;
@@ -79,9 +80,10 @@ mod state_hash;
 mod tests;
 
 pub use lifecycle::{
-    announce_slot_present, close_slots, close_slots_for_desync, close_slots_for_silence,
-    maybe_start_session,
+    announce_slot_present, close_slots, close_slots_for_desync, close_slots_for_lobby_violation,
+    close_slots_for_silence, maybe_start_session,
 };
+pub(crate) use lobby::{deliver_lobby_command, report_game_started};
 pub use registry::{
     SlotRegistration, holds_any_slots, live_session_slot_epochs, live_slots, register,
     session_count,
@@ -234,6 +236,8 @@ enum SlotCloseReason {
     /// A rollback session's state hash verdict named the slot: its game state
     /// diverged from the majority's, or it withheld its report.
     DesyncEvicted = 2,
+    /// A pre-start lobby command violated the descriptor policy.
+    LobbyViolation = 3,
 }
 
 impl SlotCloseReason {
@@ -241,6 +245,7 @@ impl SlotCloseReason {
         match raw {
             raw if raw == Self::SilentSlot as u8 => Self::SilentSlot,
             raw if raw == Self::DesyncEvicted as u8 => Self::DesyncEvicted,
+            raw if raw == Self::LobbyViolation as u8 => Self::LobbyViolation,
             _ => Self::Unspecified,
         }
     }

@@ -28,6 +28,7 @@ mod leave_clamp;
 mod leave_promotion;
 mod leave_schedule;
 mod load_state;
+mod lobby_policy;
 mod loss;
 mod loss_memory;
 mod notices_departure;
@@ -400,6 +401,9 @@ fn recv_departure(rx: &mut tokio::sync::mpsc::UnboundedReceiver<RelayNotice>) ->
         }
         RelayNotice::SlotStarted(_) => {
             panic!("expected a departure notice, got a slot-started")
+        }
+        RelayNotice::LobbyViolation(_) => {
+            panic!("expected a departure notice, got a lobby violation")
         }
         RelayNotice::SessionClosed { .. } => {
             panic!("expected a departure notice, got a session-closed")

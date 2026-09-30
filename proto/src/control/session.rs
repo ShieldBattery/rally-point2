@@ -220,6 +220,44 @@ pub struct SessionRequest {
     /// interops.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub rollback: bool,
+    /// The only lobby commands this session carries before a slot's game starts. Absent, the relay
+    /// forwards lobby commands without looking at them. Present, a slot that sends anything else
+    /// before reporting its game started is evicted and reported to the tenant as a
+    /// [`super::LobbyViolationNotice`]; after that report, a command that doesn't match is only
+    /// dropped. The tenant builds each game's setup itself, so it can name every lobby command an
+    /// honest client sends, and anything outside that list could only be one client editing the
+    /// others' setup behind the tenant's back. Additive, so a request that predates the field
+    /// still interops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lobby_policy: Option<LobbyPolicy>,
+}
+
+/// A session's allow-list of lobby commands (see [`SessionRequest::lobby_policy`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyPolicy {
+    /// Every lobby command the session admits. A command is admitted only when its sending slot
+    /// and bytes both match one entry exactly; sending the same entry again is admitted too. An
+    /// empty list admits nothing.
+    pub allowed: Vec<AllowedLobbyCommand>,
+}
+
+impl LobbyPolicy {
+    /// Whether `slot` may send `payload`.
+    pub fn admits(&self, slot: SlotId, payload: &[u8]) -> bool {
+        self.allowed
+            .iter()
+            .any(|entry| entry.slot == slot && entry.payload == payload)
+    }
+}
+
+/// One lobby command a [`LobbyPolicy`] admits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllowedLobbyCommand {
+    /// The slot allowed to send it.
+    pub slot: SlotId,
+    /// The command's exact bytes.
+    #[serde(with = "super::serde_bytes")]
+    pub payload: Vec<u8>,
 }
 
 /// One player's completed handoff: the token the coordinator minted and the
@@ -442,6 +480,12 @@ pub struct SessionDescriptor {
     /// field.
     #[serde(default)]
     pub rollback: bool,
+    /// The session's lobby command allow-list, forwarded verbatim from
+    /// [`SessionRequest::lobby_policy`]. The relay checks every lobby command a slot it homes
+    /// sends against it. **Immutable for the session's lifetime**, like `rollback`. Absent for a
+    /// session created without one, or from a coordinator that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lobby_policy: Option<LobbyPolicy>,
     /// The slots the coordinator already knows have departed this session, each
     /// with the relay's left-vs-dropped classification. Carried only on a
     /// rehome-rebuilt descriptor (see [`resumed`](Self::resumed)): a fresh relay

@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{SessionId, SlotId};
 
 use super::{
-    DepartureNotice, DescriptorKey, DesyncNotice, MeshPeerIdentity, RegionBeaconTarget,
-    RegionRttReport, RelayHello, ResultNotice, SessionDescriptor, SessionStartedNotice,
-    SlotConnectedNotice, SlotStartedNotice, TenantId, TenantVerifyingKey,
+    DepartureNotice, DescriptorKey, DesyncNotice, LobbyViolationNotice, MeshPeerIdentity,
+    RegionBeaconTarget, RegionRttReport, RelayHello, ResultNotice, SessionDescriptor,
+    SessionStartedNotice, SlotConnectedNotice, SlotStartedNotice, TenantId, TenantVerifyingKey,
 };
 
 /// `serde(skip_serializing_if)` helper: keep a field off the wire when it is
@@ -430,6 +430,12 @@ pub enum RelayToCoordinator {
     /// `(tenant, session, slot)`. Together with `SlotConnected` this is what lets
     /// a tenant attribute a stalled load to the slots that never got there.
     SlotStarted(SlotStartedNotice),
+    /// A slot sent a lobby command its session's lobby policy doesn't admit before
+    /// its game started, and the relay evicted it. Only the violating slot's home
+    /// relay sends it, once per eviction; the coordinator dedups again by
+    /// `(tenant, session, slot)`. Only a session created with a lobby policy can
+    /// produce one, so a relay never sends it to a coordinator that predates it.
+    LobbyViolation(LobbyViolationNotice),
     /// The relay tore down its last local state for a session — every slot it
     /// homed or held is gone. The coordinator, which assigned the session's
     /// serving relay set, waits for every serving relay to report this and then

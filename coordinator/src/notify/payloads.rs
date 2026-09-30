@@ -191,6 +191,23 @@ pub(super) struct SlotStartedWebhook {
     pub(super) slot_frame: Option<u32>,
 }
 
+/// The JSON body POSTed to the tenant when a relay evicts a slot for sending a
+/// lobby command its session's lobby policy doesn't admit. Same camelCase
+/// convention and `event` discriminator as the other bodies.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct LobbyViolationWebhook {
+    pub(super) event: &'static str,
+    pub(super) tenant: String,
+    pub(super) session: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) external_id: Option<String>,
+    pub(super) slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) external_ref: Option<String>,
+    pub(super) arrival_ms: u64,
+}
+
 /// The JSON body POSTed to the tenant when a session fully closes — every serving
 /// relay tore down its state for it. Same camelCase convention and `event`
 /// discriminator as the other bodies. `externalId` (the tenant's gameId) is

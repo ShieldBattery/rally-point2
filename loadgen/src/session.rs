@@ -87,6 +87,7 @@ pub async fn run_session(config: SessionConfig) -> SessionReport {
     }
 
     let request = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: rally_point_proto::control::TenantId(config.tenant.clone()),
         players: handoffs,

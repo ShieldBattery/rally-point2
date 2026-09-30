@@ -9,7 +9,8 @@
 use std::net::SocketAddr;
 
 use super::create::{
-    MAX_EXTERNAL_STRING_LEN, candidate_session_id, create_session_inner, first_session_id,
+    MAX_EXTERNAL_STRING_LEN, MAX_LOBBY_POLICY_ENTRIES, MAX_LOBBY_POLICY_PAYLOAD_BYTES,
+    candidate_session_id, create_session_inner, first_session_id,
 };
 use super::rehome::rehome_inner;
 use super::*;
@@ -18,8 +19,8 @@ use crate::registry::{self, SessionSetupError, cert_fingerprint};
 use crate::tenant;
 use crate::test_support::*;
 use rally_point_proto::control::{
-    BufferBounds, DepartedSlot, DepartureKind, PlayerHandoff, RelayHello, RelayRegionLabel,
-    SessionRequest, TenantId,
+    AllowedLobbyCommand, BufferBounds, DepartedSlot, DepartureKind, LobbyPolicy, PlayerHandoff,
+    RelayHello, RelayRegionLabel, SessionRequest, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::token::{ClientPublicKey, ExpiresAt, KeyId, SignedToken};

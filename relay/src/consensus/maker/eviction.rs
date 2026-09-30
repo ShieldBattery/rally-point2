@@ -19,6 +19,9 @@ pub enum EvictionCause {
     /// disagreed with the majority's, or it kept sending turns without
     /// reporting one.
     Desync,
+    /// A pre-game lobby command did not match the descriptor allow-list. This
+    /// refuses redials but deliberately leaves the drop held and undecided.
+    LobbyViolation,
 }
 
 /// One slot a rollback verdict named, as

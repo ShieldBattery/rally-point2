@@ -80,6 +80,7 @@ const UNLISTED_SEED: [u8; 32] = [0x77; 32];
 /// replay.
 fn create_body(external_id: &str) -> Vec<u8> {
     serde_json::to_vec(&SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: two_players(),

@@ -16,6 +16,7 @@ mod departure;
 mod eviction;
 mod homing;
 mod leave;
+mod lobby_policy;
 mod phase;
 mod session_start;
 mod silence;
@@ -220,6 +221,8 @@ pub struct DecisionMaker {
     /// authority change (a result is a per-slot one-shot the relay reports
     /// regardless of authority).
     pub(in crate::consensus) results: HashMap<SlotId, ResultEcho>,
+    /// Immutable descriptor allow-list for client lobby commands before a slot starts.
+    pub(in crate::consensus) lobby_policy: Option<LobbyPolicy>,
     /// The per-session desync comparator. Only meaningful while this relay is the
     /// authority; reset wholesale on promotion (a real desync re-diverges every
     /// interval). Per-origin ordering and epochs live separately in `sync_turns`.
@@ -474,6 +477,7 @@ impl DecisionMaker {
             next_leave_seq: 0,
             observers,
             results: HashMap::new(),
+            lobby_policy: None,
             sync: SyncTracker::default(),
             sync_turns: SyncTurns::default(),
             expected_slots: HashSet::new(),

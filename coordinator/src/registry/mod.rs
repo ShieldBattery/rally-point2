@@ -571,6 +571,17 @@ pub enum SessionSetupError {
     /// A player's `external_ref` exceeds the coordinator's length cap.
     #[error("external_ref for slot {0} exceeds the maximum length")]
     ExternalRefTooLong(u16),
+    /// The lobby-command allow-list names more entries than a relay's replay
+    /// log can retain for one session.
+    #[error("lobby policy exceeds the maximum command count")]
+    LobbyPolicyTooManyEntries,
+    /// The lobby-command allow-list's payloads exceed a relay's replay-byte
+    /// budget for one session.
+    #[error("lobby policy payloads exceed the maximum total size")]
+    LobbyPolicyPayloadsTooLarge,
+    /// A lobby-policy entry names a slot absent from the session roster.
+    #[error("lobby policy names slot {0}, which is not in the player list")]
+    LobbyPolicySlotNotInRoster(u16),
     /// The request's `external_id` is already bound to a still-live session, but
     /// the roster it names (slots, pubkeys, observer flags, or correlation refs)
     /// differs from the one that created that session. The coordinator neither

@@ -48,6 +48,8 @@ pub struct MakerSync<'a> {
     /// The descriptor's immutable per-session flag for rollback sessions, latched and reconciled
     /// exactly like `finalized_drops`.
     pub rollback: bool,
+    /// Immutable descriptor allow-list reconciled into the per-session decision maker.
+    pub lobby_policy: Option<LobbyPolicy>,
 }
 
 impl<'a> MakerSync<'a> {
@@ -64,6 +66,7 @@ impl<'a> MakerSync<'a> {
             resumed_departed: None,
             finalized_drops: false,
             rollback: false,
+            lobby_policy: None,
         }
     }
 
@@ -88,6 +91,7 @@ impl<'a> MakerSync<'a> {
                 .then_some(descriptor.departed_slots.as_slice()),
             finalized_drops: descriptor.finalized_drops,
             rollback: descriptor.rollback,
+            lobby_policy: descriptor.lobby_policy.clone(),
         }
     }
 }
@@ -142,6 +146,7 @@ impl DecisionMakers {
             resumed_departed,
             finalized_drops,
             rollback,
+            lobby_policy,
         } = sync;
         let (mut leaves, fresh, seeded) = {
             let mut makers = self.lock();
@@ -153,6 +158,7 @@ impl DecisionMakers {
                     maker.rehome_homed_slots(homed_slots);
                     maker.reconcile_finalized_drops(finalized_drops);
                     maker.reconcile_rollback(rollback);
+                    maker.reconcile_lobby_policy(&lobby_policy);
                     let seeded = resumed_departed
                         .map(|d| maker.seed_resumed(d))
                         .unwrap_or_default();
@@ -177,6 +183,7 @@ impl DecisionMakers {
                     maker.set_homed_slots(homed_slots);
                     maker.latch_finalized_drops(finalized_drops);
                     maker.latch_rollback(rollback);
+                    maker.latch_lobby_policy(lobby_policy);
                     if resumed_departed.is_some() {
                         maker.mark_homes_rehomed();
                     }

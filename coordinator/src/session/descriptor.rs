@@ -80,6 +80,7 @@ pub fn build_descriptor(
     let refs = session_refs(setup, tenant, session).unwrap_or_default();
 
     Some(SessionDescriptor {
+        lobby_policy: refs.lobby_policy.clone(),
         rollback: refs.rollback,
         finalized_drops: refs.finalized_drops,
         tenant: tenant.clone(),

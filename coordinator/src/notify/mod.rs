@@ -75,8 +75,8 @@ mod payloads;
 
 pub(crate) use dispatch::dispatch;
 pub(crate) use handlers::{
-    handle_departure, handle_desync, handle_result, handle_session_started, handle_slot_connected,
-    handle_slot_started,
+    handle_departure, handle_desync, handle_lobby_violation, handle_result, handle_session_started,
+    handle_slot_connected, handle_slot_started,
 };
 pub(crate) use payloads::session_closed_dispatch;
 
@@ -85,8 +85,8 @@ pub(crate) use payloads::session_closed_dispatch;
 // the `payloads` submodule (see `payloads` for why they're `pub(super)`
 // rather than private there).
 use payloads::{
-    DepartureWebhook, DesyncWebhook, DivergedSlotWebhook, ResultEchoWebhook, ResultWebhook,
-    SessionStartedWebhook, SlotConnectedWebhook, SlotStartedWebhook,
+    DepartureWebhook, DesyncWebhook, DivergedSlotWebhook, LobbyViolationWebhook, ResultEchoWebhook,
+    ResultWebhook, SessionStartedWebhook, SlotConnectedWebhook, SlotStartedWebhook,
 };
 // Test-only: not needed by `handlers`/`dispatch` themselves (each already has
 // direct access to its own module's items), only by `notify::tests`' `use
@@ -132,6 +132,10 @@ pub type SessionStartedDedup = Arc<Mutex<HashSet<(TenantId, SessionId)>>>;
 /// report per slot, the same key shape as [`ResultDedup`].
 pub type SlotStartedDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
 
+/// Lobby violations already notified, keyed by `(tenant, session, slot)` — a slot
+/// is evicted at most once, the same key shape as [`ResultDedup`].
+pub type LobbyViolationDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
+
 /// Sessions the coordinator has seen a desync for, keyed by `(tenant, session)` and
 /// stamped with when the mark was made. The flight-recorder sink reads this to pin a
 /// recording's retention class even when the desync webhook was ultimately dropped
@@ -165,6 +169,8 @@ pub struct NoticeDedup {
     pub session_starts: SessionStartedDedup,
     /// Game-loop-start dedup by `(tenant, session, slot)`.
     pub slot_starts: SlotStartedDedup,
+    /// Lobby-violation dedup by `(tenant, session, slot)`.
+    pub lobby_violations: LobbyViolationDedup,
     /// Desynced-session marks the flight-recorder sink reads to pin a recording's
     /// retention class. Not a dedup set — one mark per `(tenant, session)`, refreshed
     /// on every desync and pruned by [`DESYNC_MARK_TTL`], never by session retirement.
@@ -179,7 +185,7 @@ impl Default for NoticeDedup {
 
 impl NoticeDedup {
     /// Creates an empty notice dedup set (departures + desyncs + results + slot
-    /// arrivals + session starts + game-loop starts + desync marks).
+    /// arrivals + session starts + game-loop starts + lobby violations + desync marks).
     pub fn new() -> Self {
         Self {
             departures: Arc::new(Mutex::new(HashSet::new())),
@@ -188,6 +194,7 @@ impl NoticeDedup {
             slot_connects: Arc::new(Mutex::new(HashSet::new())),
             session_starts: Arc::new(Mutex::new(HashSet::new())),
             slot_starts: Arc::new(Mutex::new(HashSet::new())),
+            lobby_violations: Arc::new(Mutex::new(HashSet::new())),
             desync_marks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -242,6 +249,9 @@ impl NoticeDedup {
             .retain(|(t, s, _)| !matches(t, *s));
         self.session_starts.lock().retain(|(t, s)| !matches(t, *s));
         self.slot_starts.lock().retain(|(t, s, _)| !matches(t, *s));
+        self.lobby_violations
+            .lock()
+            .retain(|(t, s, _)| !matches(t, *s));
     }
 }
 

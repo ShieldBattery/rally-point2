@@ -20,8 +20,8 @@
 //! the ordering, or the authorization rule itself.
 
 use rally_point_proto::control::{
-    DepartureNotice, DesyncNotice, ResultNotice, SessionStartedNotice, SlotConnectedNotice,
-    SlotStartedNotice, TenantId,
+    DepartureNotice, DesyncNotice, LobbyViolationNotice, ResultNotice, SessionStartedNotice,
+    SlotConnectedNotice, SlotStartedNotice, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 
@@ -29,7 +29,7 @@ use super::Lifecycle;
 use crate::notify;
 
 /// One per-session fact a relay reports up its control connection, as the union
-/// of the six kinds that share the ingest path above. The relay's terminal
+/// of the seven kinds that share the ingest path above. The relay's terminal
 /// `SessionClosed` is deliberately not a member: it is fenced on the control
 /// connection's generation rather than on session membership, and it drives no
 /// webhook of its own.
@@ -47,6 +47,9 @@ pub enum SessionNotice {
     SessionStarted(SessionStartedNotice),
     /// A client reported that its game loop began running.
     SlotStarted(SlotStartedNotice),
+    /// A slot sent a lobby command its session's lobby policy doesn't admit, and
+    /// its home relay evicted it.
+    LobbyViolation(LobbyViolationNotice),
 }
 
 /// What identifies one notice *within* its session, for the logs a refused or
@@ -74,6 +77,7 @@ impl SessionNotice {
             Self::SlotConnected(n) => &n.tenant,
             Self::SessionStarted(n) => &n.tenant,
             Self::SlotStarted(n) => &n.tenant,
+            Self::LobbyViolation(n) => &n.tenant,
         }
     }
 
@@ -86,6 +90,7 @@ impl SessionNotice {
             Self::SlotConnected(n) => n.session,
             Self::SessionStarted(n) => n.session,
             Self::SlotStarted(n) => n.session,
+            Self::LobbyViolation(n) => n.session,
         }
     }
 
@@ -98,6 +103,7 @@ impl SessionNotice {
             Self::SlotConnected(n) => NoticeKey::Slot(n.slot),
             Self::SessionStarted(_) => NoticeKey::Session,
             Self::SlotStarted(n) => NoticeKey::Slot(n.slot),
+            Self::LobbyViolation(n) => NoticeKey::Slot(n.slot),
         }
     }
 
@@ -110,6 +116,7 @@ impl SessionNotice {
             Self::SlotConnected(_) => "slot-connected",
             Self::SessionStarted(_) => "session-started",
             Self::SlotStarted(_) => "slot-started",
+            Self::LobbyViolation(_) => "lobby-violation",
         }
     }
 }
@@ -171,9 +178,10 @@ impl Lifecycle {
     ///
     /// A notice from a relay outside the session's serving set is refused here
     /// and has no effect at all — it claims no dedup entry, lands no fact, and
-    /// signs nothing with the tenant's key. Adding a notice kind means adding a
-    /// [`SessionNotice`] variant and an arm below; there is no second path that
-    /// could quietly bypass the check.
+    /// signs nothing with the tenant's key. A lobby-violation notice is stricter:
+    /// only the current home relay for its authenticated slot may report it.
+    /// Adding a notice kind means adding a [`SessionNotice`] variant and an arm
+    /// below; there is no second path that could quietly bypass the check.
     pub fn ingest_notice(&self, relay: RelayId, notice: SessionNotice) {
         let (tenant, session) = (notice.tenant(), notice.session());
         if !self
@@ -189,6 +197,20 @@ impl Lifecycle {
                     "{} notice from a relay not serving the session; rejecting",
                     notice.log_kind()
                 ),
+            );
+            return;
+        }
+        if let SessionNotice::LobbyViolation(lobby) = &notice
+            && !self
+                .inner
+                .setup
+                .relay_homes_slot(relay, &lobby.tenant, lobby.session, lobby.slot)
+        {
+            NoticeKey::Slot(lobby.slot).warn_refused(
+                relay,
+                &lobby.tenant,
+                lobby.session,
+                "lobby-violation notice from a relay not homing the slot; rejecting",
             );
             return;
         }
@@ -233,6 +255,9 @@ impl Lifecycle {
             SessionNotice::SlotStarted(notice) => {
                 self.on_slot_started(notice.tenant.clone(), notice.session, notice.slot);
                 notify::handle_slot_started(setup, &dedup.slot_starts, self, notice);
+            }
+            SessionNotice::LobbyViolation(notice) => {
+                notify::handle_lobby_violation(setup, &dedup.lobby_violations, self, notice);
             }
         }
     }

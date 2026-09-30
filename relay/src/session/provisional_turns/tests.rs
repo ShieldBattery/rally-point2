@@ -508,3 +508,130 @@ fn arming_is_relay_wide_across_clones() {
     pen.arm();
     assert!(clone.armed(), "the armed flag is shared, not per-clone");
 }
+
+fn lobby(slot: u8, payload: &[u8]) -> PennedIngress {
+    PennedIngress::Lobby(
+        SlotId(slot),
+        LobbyCommand {
+            slot: u32::from(slot),
+            payload: payload.to_vec().into(),
+        },
+    )
+}
+
+#[test]
+fn lobby_and_start_remain_ordered_and_starts_deduplicate_per_slot() {
+    let pen = ProvisionalTurnPen::default();
+    assert_eq!(pen.hold(&key(), lobby(1, b"init")), HoldOutcome::Held);
+    assert_eq!(
+        pen.hold(&key(), PennedIngress::GameStarted(SlotId(1))),
+        HoldOutcome::Held
+    );
+    assert_eq!(
+        pen.hold(&key(), PennedIngress::GameStarted(SlotId(1))),
+        HoldOutcome::Held
+    );
+    assert_eq!(pen.hold(&key(), lobby(1, b"later")), HoldOutcome::Held);
+    let batch = pen.begin_drain(&key()).unwrap();
+    assert_eq!(batch.len(), 3);
+    assert!(matches!(batch[0], PennedIngress::Lobby(SlotId(1), _)));
+    assert!(matches!(batch[1], PennedIngress::GameStarted(SlotId(1))));
+    assert!(matches!(batch[2], PennedIngress::Lobby(SlotId(1), _)));
+    assert!(matches!(pen.continue_drain(&key()), DrainStep::Done));
+}
+
+#[test]
+fn unresolved_includes_a_drainer_with_an_empty_private_queue() {
+    let pen = ProvisionalTurnPen::default();
+    assert!(!pen.is_unresolved(&key()));
+    assert!(pen.reserve(&key()));
+    assert!(pen.is_unresolved(&key()));
+    let batch = pen.begin_drain(&key()).unwrap();
+    assert!(batch.is_empty());
+    assert!(pen.is_unresolved(&key()));
+    assert!(!pen.has_undrained(&key()));
+    assert!(matches!(pen.continue_drain(&key()), DrainStep::Done));
+    assert!(!pen.is_unresolved(&key()));
+}
+
+#[test]
+fn lobby_overflow_seals_slot_and_retains_earlier_command() {
+    let pen = ProvisionalTurnPen::with_turn_byte_budget(128);
+    assert_eq!(pen.hold(&key(), lobby(1, b"first")), HoldOutcome::Held);
+    assert!(matches!(
+        pen.hold(&key(), lobby(1, &[7; 128])),
+        HoldOutcome::Overflow(_)
+    ));
+    assert!(pen.slot_sealed(&key(), SlotId(1)));
+    let batch = pen.begin_drain(&key()).unwrap();
+    assert_eq!(batch.len(), 1);
+    assert!(matches!(batch[0], PennedIngress::Lobby(SlotId(1), _)));
+}
+
+#[test]
+fn lobby_count_limit_includes_the_drainers_private_batch() {
+    let pen = ProvisionalTurnPen::default();
+    let limit = super::super::side_channel::LOBBY.replay.max_messages;
+    for _ in 0..limit {
+        assert_eq!(pen.hold(&key(), lobby(1, b"x")), HoldOutcome::Held);
+    }
+    let batch = pen.begin_drain(&key()).unwrap();
+    assert_eq!(batch.len(), limit);
+    assert_eq!(pen.hold(&key(), lobby(0, b"init")), HoldOutcome::Held);
+    assert!(!pen.slot_sealed(&key(), SlotId(0)));
+    assert!(matches!(
+        pen.hold(&key(), lobby(1, b"x")),
+        HoldOutcome::Overflow(_)
+    ));
+    assert!(pen.slot_sealed(&key(), SlotId(1)));
+}
+
+#[test]
+fn lobby_byte_limit_includes_the_drainers_private_batch() {
+    let pen = ProvisionalTurnPen::default();
+    let limit = super::super::side_channel::LOBBY.replay.max_bytes;
+    let chunk = vec![1; limit / 4];
+    for _ in 0..4 {
+        assert_eq!(pen.hold(&key(), lobby(1, &chunk)), HoldOutcome::Held);
+    }
+    let batch = pen.begin_drain(&key()).unwrap();
+    assert_eq!(batch.len(), 4);
+    assert_eq!(pen.hold(&key(), lobby(0, b"init")), HoldOutcome::Held);
+    assert!(!pen.slot_sealed(&key(), SlotId(0)));
+    assert!(matches!(
+        pen.hold(&key(), lobby(1, b"x")),
+        HoldOutcome::Overflow(_)
+    ));
+    assert!(pen.slot_sealed(&key(), SlotId(1)));
+}
+
+#[test]
+fn lobby_quota_survives_disconnect_and_uses_authenticated_slot() {
+    let pen = ProvisionalTurnPen::default();
+    let limit = super::super::side_channel::LOBBY.replay.max_bytes;
+    let forged = PennedIngress::Lobby(
+        SlotId(1),
+        LobbyCommand {
+            slot: 0,
+            payload: vec![0; limit].into(),
+        },
+    );
+    assert_eq!(pen.hold(&key(), forged), HoldOutcome::Held);
+    assert!(
+        !pen.discard_if_empty(&key()),
+        "last disconnect retains usage and evidence"
+    );
+    assert!(
+        pen.reserve(&key()),
+        "a reconnect shares the existing journal"
+    );
+    assert!(matches!(
+        pen.hold(&key(), lobby(1, b"x")),
+        HoldOutcome::Overflow(_)
+    ));
+    assert_eq!(
+        pen.hold(&key(), lobby(0, b"honest-init")),
+        HoldOutcome::Held
+    );
+    assert!(!pen.slot_sealed(&key(), SlotId(0)));
+}

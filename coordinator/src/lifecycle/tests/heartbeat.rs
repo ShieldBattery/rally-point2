@@ -301,6 +301,7 @@ async fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
         session::create_session(
             &setup,
             SessionRequest {
+                lobby_policy: None,
                 rollback: false,
                 tenant: tid(),
                 players: vec![PlayerHandoff {

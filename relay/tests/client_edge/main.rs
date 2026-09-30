@@ -16,6 +16,8 @@ mod connectivity;
 mod desync_eviction;
 mod drop_holds;
 mod leaves;
+mod lobby_policy;
+mod lobby_policy_descriptor;
 mod provisional;
 mod reconnect;
 mod region_labels;

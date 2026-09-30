@@ -314,19 +314,41 @@ fn dispatch_mesh_control_frame(
             deliver_mesh_turn(sessions, mesh, &key, slot, payload, peer_id);
         }
         Some(mesh_control_frame::Kind::LobbyCommand(command)) => {
-            // A lobby command a peer relay's member authored, already slot-stamped
-            // by the origin. Fold it into this relay's local delivery (append to
-            // the replay log, fan out to local members — the remote author is not
-            // one of them, so every local member receives it). Deliberately NOT
-            // re-broadcast across the mesh: the origin already sent a copy to every
-            // link serving the session, exactly as with the oversize turn above.
+            // A peer command is validated for delivery but cannot evict or
+            // report its author here: only the slot's home can do that. The
+            // peer's descriptor may arrive before this relay's, so a missing
+            // local maker trusts the authenticated origin's ingress check.
+            let Ok(slot) = u8::try_from(command.slot).map(SlotId) else {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = command.slot,
+                    "mesh lobby command names a slot id out of range; dropping",
+                );
+                return;
+            };
+            if !mesh
+                .session
+                .decision_makers
+                .allows_mesh_lobby_command(&key, slot, &command.payload)
+            {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    "mesh lobby command disagrees with local policy; dropping",
+                );
+                return;
+            }
+            // Store and fan out locally, without a mesh echo: the origin
+            // already sent a copy to every serving relay.
             mesh.session.side_channels.lobby.deliver(&key, command);
         }
         Some(mesh_control_frame::Kind::GameChat(chat_msg)) => {
             // A chat message a peer relay's member authored, already
             // slot-stamped by the origin — its size and rate caps already
-            // applied there, so a mesh copy is trusted, not re-checked (mirrors
-            // how a mesh-received lobby command's bytes are not re-validated).
+            // applied there, so a mesh copy is trusted without repeating
+            // the origin's size and rate checks.
             // No log to append to; deliberately NOT re-broadcast across the
             // mesh, exactly as the lobby command and oversize turn above.
             mesh.session.side_channels.chat.deliver(&key, chat_msg);

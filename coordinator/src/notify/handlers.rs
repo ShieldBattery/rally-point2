@@ -14,8 +14,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
 use rally_point_proto::control::{
-    DepartureNotice, DesyncNotice, DivergedSlot, ResultNotice, SessionStartedNotice,
-    SlotConnectedNotice, SlotStartedNotice, TenantId,
+    DepartureNotice, DesyncNotice, DivergedSlot, LobbyViolationNotice, ResultNotice,
+    SessionStartedNotice, SlotConnectedNotice, SlotStartedNotice, TenantId,
 };
 use rally_point_proto::ids::SessionId;
 use serde::Serialize;
@@ -480,6 +480,59 @@ pub(crate) fn handle_slot_started(
         resolved.config,
         &payload,
         "slotStarted",
+    );
+}
+
+/// Handles one relay's lobby-violation notice — a slot evicted for sending a lobby
+/// command its session's lobby policy doesn't admit.
+///
+/// A sibling of [`handle_slot_started`] with the same `(tenant, session, slot)`
+/// dedup key (a slot is evicted once). Its correlation ids are deliberately
+/// coordinator-recorded only: unlike ordinary restart-tail notices, this
+/// security event is accepted only while the coordinator can prove the
+/// reporter homes its slot, so relay-carried ids must not choose whom the
+/// tenant sees as violating.
+pub(crate) fn handle_lobby_violation(
+    setup: &SessionSetup,
+    dedup: &LobbyViolationDedup,
+    lifecycle: &Lifecycle,
+    notice: LobbyViolationNotice,
+) {
+    let is_new = dedup
+        .lock()
+        .insert((notice.tenant.clone(), notice.session, notice.slot));
+
+    let Some(resolved) = resolve_or_drop(
+        setup,
+        &notice.tenant,
+        notice.session,
+        NoticeKey::Slot(notice.slot),
+        "lobby-violation",
+        None,
+        is_new,
+    ) else {
+        return;
+    };
+
+    let external_ref = resolved.stored_slot_ref(notice.slot);
+
+    let payload = LobbyViolationWebhook {
+        event: "lobbyViolation",
+        tenant: notice.tenant.as_ref().to_owned(),
+        session: notice.session.0,
+        external_id: Some(resolved.external_id),
+        slot: notice.slot.0,
+        external_ref,
+        arrival_ms: notice.arrival_ms,
+    };
+
+    enqueue_dispatch(
+        lifecycle,
+        notice.tenant,
+        notice.session,
+        resolved.config,
+        &payload,
+        "lobbyViolation",
     );
 }
 

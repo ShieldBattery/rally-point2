@@ -69,8 +69,12 @@ pub fn forward_client_turn(
             {
                 HoldOutcome::Held => Funnel::Held,
                 HoldOutcome::Resolved(PennedIngress::Turn(_, payload)) => Funnel::Proceed(payload),
-                HoldOutcome::Resolved(PennedIngress::Departure { .. }) => {
-                    unreachable!("a turn deposit is echoed back as a turn")
+                HoldOutcome::Resolved(
+                    PennedIngress::Lobby(..)
+                    | PennedIngress::GameStarted(..)
+                    | PennedIngress::Departure { .. },
+                ) => {
+                    unreachable!("a turn deposit is echoed back as another ingress kind")
                 }
                 HoldOutcome::Overflow(_) => Funnel::Overflow,
             }

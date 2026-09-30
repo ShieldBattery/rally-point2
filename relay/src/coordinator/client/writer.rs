@@ -513,6 +513,7 @@ pub(super) async fn send_notice(
         RelayNotice::SlotConnected(notice) => RelayToCoordinator::SlotConnected(notice.clone()),
         RelayNotice::SessionStarted(notice) => RelayToCoordinator::SessionStarted(notice.clone()),
         RelayNotice::SlotStarted(notice) => RelayToCoordinator::SlotStarted(notice.clone()),
+        RelayNotice::LobbyViolation(notice) => RelayToCoordinator::LobbyViolation(notice.clone()),
         RelayNotice::SessionClosed { tenant, session } => RelayToCoordinator::SessionClosed {
             tenant: tenant.clone(),
             session: *session,

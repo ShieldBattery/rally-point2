@@ -446,3 +446,61 @@ fn rehome_stays_when_a_relay_reconnects_under_an_unchanged_cert() {
     );
     assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(1)]);
 }
+
+#[test]
+fn rehome_preserves_the_lobby_policy_on_the_replacement_descriptor() {
+    let setup = two_relay_fleet();
+    let response = create_session(
+        &setup,
+        SessionRequest {
+            lobby_policy: Some(rally_point_proto::control::LobbyPolicy {
+                allowed: vec![rally_point_proto::control::AllowedLobbyCommand {
+                    slot: SlotId(1),
+                    payload: vec![0xB0],
+                }],
+            }),
+            ..request(two_players())
+        },
+        ExpiresAt(u64::MAX),
+    )
+    .unwrap()
+    .response;
+    registry::remove(setup.registry(), RelayId(1));
+
+    assert!(matches!(
+        rehome(&setup, &tid(), response.session, RelayId(1), vec![]),
+        RehomeOutcome::NewTarget(ref endpoint) if endpoint.relay_id == RelayId(2)
+    ));
+    assert_eq!(
+        setup.descriptors().current_for(RelayId(2))[0].lobby_policy,
+        Some(rally_point_proto::control::LobbyPolicy {
+            allowed: vec![rally_point_proto::control::AllowedLobbyCommand {
+                slot: SlotId(1),
+                payload: vec![0xB0],
+            }],
+        }),
+        "the resumed descriptor retains the immutable policy",
+    );
+}
+
+#[test]
+fn lobby_violation_home_authorization_tracks_a_rehome() {
+    let setup = two_relay_fleet();
+    let response = create_default_session(&setup);
+    assert!(setup.relay_homes_slot(RelayId(1), &tid(), response.session, SlotId(0)));
+    assert!(
+        !setup.relay_homes_slot(RelayId(2), &tid(), response.session, SlotId(0)),
+        "a serving relay cannot attribute another relay's slot",
+    );
+
+    registry::remove(setup.registry(), RelayId(1));
+    assert!(matches!(
+        rehome(&setup, &tid(), response.session, RelayId(1), vec![]),
+        RehomeOutcome::NewTarget(ref endpoint) if endpoint.relay_id == RelayId(2)
+    ));
+    assert!(
+        !setup.relay_homes_slot(RelayId(1), &tid(), response.session, SlotId(0)),
+        "the former home loses authority when the rehome commits",
+    );
+    assert!(setup.relay_homes_slot(RelayId(2), &tid(), response.session, SlotId(0)));
+}

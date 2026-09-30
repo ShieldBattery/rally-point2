@@ -5,6 +5,25 @@
 use super::*;
 
 impl DecisionMaker {
+    /// Latches the descriptor policy at maker creation. A lobby's allowed byte
+    /// sequence is session setup state and must not change during a re-push.
+    pub fn latch_lobby_policy(&mut self, policy: Option<LobbyPolicy>) {
+        self.lobby_policy = policy;
+    }
+
+    /// A later descriptor may refresh topology, but cannot change this policy.
+    pub fn reconcile_lobby_policy(&self, pushed: &Option<LobbyPolicy>) {
+        if &self.lobby_policy != pushed {
+            tracing::warn!(
+                tenant = self.key.tenant.as_ref(),
+                session = self.key.session.0,
+                latched = ?self.lobby_policy,
+                pushed = ?pushed,
+                "descriptor re-push disagrees on lobby policy; keeping the latched value",
+            );
+        }
+    }
+
     /// Latches whether this session runs the home-side drop-finalization
     /// handshake, from the descriptor that created the maker.
     ///

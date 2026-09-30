@@ -9,6 +9,7 @@ async fn create_session_endpoint_returns_tokens() {
     let app = router(state);
 
     let req = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: two_players(),
@@ -33,6 +34,7 @@ async fn create_session_endpoint_replays_a_duplicate_and_keeps_one_live_session(
     let app = router(state.clone());
 
     let req = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: two_players(),
@@ -75,6 +77,7 @@ async fn create_session_endpoint_conflicts_on_a_reused_live_id_with_a_different_
     let app = router(state.clone());
 
     let original = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: two_players(),
@@ -96,6 +99,7 @@ async fn create_session_endpoint_conflicts_on_a_reused_live_id_with_a_different_
     // The coordinator maps this to 409 rather than minting a duplicate or
     // handing back the first game's tokens.
     let conflicting = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: vec![
@@ -140,6 +144,7 @@ async fn create_session_refuses_every_bad_signature_shape_with_the_same_401() {
 
     let create_body = |tenant: &str| {
         serde_json::to_vec(&SessionRequest {
+            lobby_policy: None,
             rollback: false,
             tenant: TenantId(tenant.to_owned()),
             players: two_players(),
@@ -243,6 +248,7 @@ async fn create_session_no_relays_returns_503() {
     let app = router(state_over(setup));
 
     let req = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: two_players(),
@@ -265,6 +271,7 @@ async fn create_session_stamps_expiry_at_now_plus_configured_lifetime() {
     let app = router(state);
 
     let req = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: two_players(),

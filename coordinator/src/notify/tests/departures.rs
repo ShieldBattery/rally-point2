@@ -36,6 +36,35 @@ fn notify_at(setup: &SessionSetup, url: String) {
     );
 }
 
+#[test]
+fn prune_session_removes_only_the_matching_lobby_violation_dedup_entries() {
+    let dedup = NoticeDedup::new();
+    let tenant = TenantId(TEST_TENANT.to_owned());
+    let other_tenant = TenantId("other-tenant".to_owned());
+    let retired = SessionId(71);
+
+    dedup.lobby_violations.lock().extend([
+        (tenant.clone(), retired, SlotId(0)),
+        (tenant.clone(), SessionId(72), SlotId(0)),
+        (other_tenant, retired, SlotId(0)),
+    ]);
+    dedup.prune_session(&tenant, retired);
+
+    let entries = dedup.lobby_violations.lock();
+    assert!(
+        !entries.contains(&(tenant.clone(), retired, SlotId(0))),
+        "the reaped session's violation key is removed",
+    );
+    assert!(
+        entries.contains(&(tenant.clone(), SessionId(72), SlotId(0))),
+        "a different session for the same tenant remains deduplicated",
+    );
+    assert!(
+        entries.contains(&(TenantId("other-tenant".to_owned()), retired, SlotId(0))),
+        "the same numeric session for another tenant remains deduplicated",
+    );
+}
+
 #[tokio::test]
 async fn a_departure_webhook_carries_the_shape_the_tenant_parses() {
     let (url, mut rx) = WebhookReceiver::default().spawn().await;

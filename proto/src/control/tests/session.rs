@@ -84,6 +84,7 @@ fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
     // An absent estimate stays off the wire (byte-identical to the pre-field
     // form), while a present one round-trips.
     let request = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: TenantId("sb-staging".to_owned()),
         players: vec![],
@@ -112,6 +113,7 @@ fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
 #[test]
 fn session_descriptor_roundtrips_json() {
     let desc = SessionDescriptor {
+        lobby_policy: None,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId("sb-staging".to_owned()),
@@ -238,6 +240,7 @@ fn session_descriptor_omits_absent_correlation_ids_on_the_wire() {
     // `authority_order`'s plain `#[serde(default)]`), so an empty Vec still
     // serializes as `[]`, not omitted.
     let desc = SessionDescriptor {
+        lobby_policy: None,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId("sb-staging".to_owned()),
@@ -424,6 +427,7 @@ fn session_request_omits_absent_correlation_ids_on_the_wire() {
     // `skip_serializing_if` keeps an unset id off the wire, so a new
     // encoder talking to an old decoder emits exactly the old shape.
     let req = SessionRequest {
+        lobby_policy: None,
         rollback: false,
         tenant: TenantId("sb-staging".to_owned()),
         players: vec![PlayerHandoff {
@@ -444,4 +448,51 @@ fn session_request_omits_absent_correlation_ids_on_the_wire() {
     // `skip_serializing_if`, so a competitor still serializes as
     // `"observer":false` — an old decoder just ignores it.
     assert!(json.contains("\"observer\":false"));
+}
+
+#[test]
+fn lobby_policy_defaults_absent_and_admits_only_exact_slot_payload_records() {
+    let old = r#"{"tenant":"sb-staging","players":[]}"#;
+    assert!(
+        serde_json::from_str::<SessionRequest>(old)
+            .unwrap()
+            .lobby_policy
+            .is_none(),
+        "a request that predates the optional policy remains permissive",
+    );
+
+    let policy = LobbyPolicy {
+        allowed: vec![AllowedLobbyCommand {
+            slot: SlotId(2),
+            payload: vec![0x09, 0x10],
+        }],
+    };
+    assert!(policy.admits(SlotId(2), &[0x09, 0x10]));
+    assert!(!policy.admits(SlotId(1), &[0x09, 0x10]));
+    assert!(!policy.admits(SlotId(2), &[0x09]));
+
+    let request = SessionRequest {
+        lobby_policy: Some(policy.clone()),
+        rollback: false,
+        tenant: TenantId("sb-staging".to_owned()),
+        players: vec![],
+        external_id: None,
+        latency_estimate_ms: None,
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("\"lobby_policy\""));
+    assert_eq!(
+        serde_json::from_str::<SessionRequest>(&json).unwrap(),
+        request
+    );
+
+    let descriptor = SessionDescriptor {
+        lobby_policy: Some(policy),
+        ..a_descriptor()
+    };
+    assert_eq!(
+        serde_json::from_str::<SessionDescriptor>(&serde_json::to_string(&descriptor).unwrap())
+            .unwrap(),
+        descriptor,
+    );
 }

@@ -53,6 +53,10 @@
   here, and don't let a failed close silently un-name it. A desync-evicted slot
   is marked the same way before its close, for the same reason: the mark is
   what refuses the re-dial that would otherwise reinstate it.
+- A descriptor lobby-policy check runs at authenticated ingress before lobby
+  delivery, replay, or mesh fan-out. A pre-start mismatch marks and closes only
+  that home slot; a mismatch after that slot reported started is discarded.
+  Neither path is a desync or changes the finalized-drop gate.
 - A desync-evicted slot's finalization runs after `announce_departure` returns,
   never inside it: that call holds the roster lock, and the decide's fan-out
   takes it again.

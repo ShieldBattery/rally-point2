@@ -38,6 +38,7 @@ pub(super) async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                         | RelayToCoordinator::SlotConnected(_)
                         | RelayToCoordinator::SessionStarted(_)
                         | RelayToCoordinator::SlotStarted(_)
+                        | RelayToCoordinator::LobbyViolation(_)
                         | RelayToCoordinator::SessionClosed { .. }
                         | RelayToCoordinator::FlightUploadRequest { .. }
                         | RelayToCoordinator::FlightUploadDone { .. }

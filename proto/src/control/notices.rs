@@ -360,3 +360,24 @@ pub struct SlotStartedNotice {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub slot_frame: Option<u32>,
 }
+
+/// A relay's report that a slot sent a lobby command its session's
+/// [`super::LobbyPolicy`] doesn't admit before reporting its game started, sent up
+/// the relay control connection ([`super::RelayToCoordinator::LobbyViolation`]).
+///
+/// The relay dropped the command before any other member saw it, evicted the
+/// slot and closed its link, so the tenant can hold that player responsible for
+/// the game that followed. `slot` is the authenticated connection's slot, never a
+/// client-asserted value. Only the violating slot's home relay sends it, once per
+/// eviction; the coordinator dedups again by `(tenant, session, slot)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LobbyViolationNotice {
+    /// The tenant the session belongs to.
+    pub tenant: TenantId,
+    /// The session the violation happened in.
+    pub session: SessionId,
+    /// The slot that sent the command — the authenticated connection's slot.
+    pub slot: SlotId,
+    /// Relay wall-clock when the violation was detected, unix epoch milliseconds.
+    pub arrival_ms: u64,
+}

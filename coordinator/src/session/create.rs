@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use rally_point_proto::control::{PlayerToken, SessionRequest, SessionResponse};
+use rally_point_proto::control::{LobbyPolicy, PlayerToken, SessionRequest, SessionResponse};
 use rally_point_proto::ids::SessionId;
 use rally_point_proto::time::unix_secs_fail_closed;
 use rally_point_proto::token::ExpiresAt;
@@ -348,6 +348,7 @@ fn create_body(
         capable_cohort,
         rollback,
         latency_estimate_ms: request.latency_estimate_ms,
+        lobby_policy: request.lobby_policy.clone(),
     };
     setup
         .session_refs
@@ -427,6 +428,15 @@ fn create_body(
 /// legitimate use.
 pub(super) const MAX_EXTERNAL_STRING_LEN: usize = 256;
 
+/// The lobby replay log retains at most this many commands. The policy cannot
+/// name more commands than a serving relay could retain for a late joiner.
+pub(super) const MAX_LOBBY_POLICY_ENTRIES: usize = 1024;
+
+/// The lobby replay log retains at most this many command bytes. Keeping the
+/// policy within the same bound prevents a create request from placing a larger
+/// persistent allocation in every serving relay than the lobby itself allows.
+pub(super) const MAX_LOBBY_POLICY_PAYLOAD_BYTES: usize = 256 * 1024;
+
 /// Validates a session request before any work is done.
 fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
     if request.players.is_empty() {
@@ -451,5 +461,36 @@ fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
     {
         return Err(SessionSetupError::ExternalIdTooLong);
     }
+    if let Some(policy) = &request.lobby_policy {
+        validate_lobby_policy(policy, &seen_slots)?;
+    }
+    Ok(())
+}
+
+/// Validates the lobby-command allow-list against the roster and the relay's
+/// bounded lobby replay capacity.
+fn validate_lobby_policy(
+    policy: &LobbyPolicy,
+    roster_slots: &std::collections::HashSet<u8>,
+) -> Result<(), SessionSetupError> {
+    if policy.allowed.len() > MAX_LOBBY_POLICY_ENTRIES {
+        return Err(SessionSetupError::LobbyPolicyTooManyEntries);
+    }
+
+    let mut payload_bytes = 0_usize;
+    for entry in &policy.allowed {
+        if !roster_slots.contains(&entry.slot.0) {
+            return Err(SessionSetupError::LobbyPolicySlotNotInRoster(
+                entry.slot.0 as u16,
+            ));
+        }
+        payload_bytes = payload_bytes
+            .checked_add(entry.payload.len())
+            .ok_or(SessionSetupError::LobbyPolicyPayloadsTooLarge)?;
+        if payload_bytes > MAX_LOBBY_POLICY_PAYLOAD_BYTES {
+            return Err(SessionSetupError::LobbyPolicyPayloadsTooLarge);
+        }
+    }
+
     Ok(())
 }

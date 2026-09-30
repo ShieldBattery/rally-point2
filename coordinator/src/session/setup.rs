@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicU64;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::TenantId;
-use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 
 use crate::attest::LoadStateAttest;
 use crate::descriptors::{RelayDescriptors, RelayReaps};
@@ -303,6 +303,24 @@ impl SessionSetup {
     ) -> bool {
         let serving = self.serving_relays(tenant, session);
         serving.is_empty() || serving.contains(&relay)
+    }
+
+    /// Whether `relay` is the current authoritative home for `slot`. Unlike a
+    /// serving-set check, this requires a live session record: a slot-specific
+    /// security notice cannot be attributed safely after coordinator restart
+    /// amnesia, when both its home and its tenant correlation ids are unknown.
+    pub fn relay_homes_slot(
+        &self,
+        relay: RelayId,
+        tenant: &TenantId,
+        session: SessionId,
+        slot: SlotId,
+    ) -> bool {
+        self.session_refs
+            .lock()
+            .get(&(tenant.clone(), session))
+            .and_then(|refs| refs.homes.get(&slot))
+            .is_some_and(|&home| home == relay)
     }
 
     /// The number of live sessions `relay` currently serves — how many recorded

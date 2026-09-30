@@ -97,6 +97,12 @@ pub const SILENT_SLOT: u32 = 0x0D;
 /// the slot is refused with [`SLOT_DEPARTED`].
 pub const DESYNC_EVICTED: u32 = 0x0E;
 
+/// The client sent a lobby command its session's lobby policy doesn't admit
+/// before its game started — something no honest client sends — so the relay
+/// dropped the command before any other player saw it and evicted the slot.
+/// Every later dial for the slot is refused with [`SLOT_DEPARTED`].
+pub const LOBBY_VIOLATION: u32 = 0x0F;
+
 /// Sent **by a client** abandoning a dial because the authorization exchange
 /// did not finish within its deadline. Client-space, so it shares a number with
 /// the relay's [`INVALID_TURN`] and means nothing like it.

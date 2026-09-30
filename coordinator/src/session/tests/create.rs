@@ -283,6 +283,82 @@ fn slot_11_is_accepted_and_slot_12_is_rejected() {
 }
 
 #[test]
+fn lobby_policy_must_fit_the_replay_capacity_and_name_roster_slots() {
+    let setup = two_relay_fleet();
+    let request_with_policy = |allowed| SessionRequest {
+        lobby_policy: Some(LobbyPolicy { allowed }),
+        ..request(two_players())
+    };
+    let command = |slot, payload| AllowedLobbyCommand {
+        slot: SlotId(slot),
+        payload,
+    };
+
+    assert_eq!(
+        create_session(
+            &setup,
+            request_with_policy(
+                (0..=MAX_LOBBY_POLICY_ENTRIES)
+                    .map(|_| command(0, Vec::new()))
+                    .collect(),
+            ),
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap_err(),
+        SessionSetupError::LobbyPolicyTooManyEntries,
+    );
+    assert_eq!(
+        create_session(
+            &setup,
+            request_with_policy(vec![command(2, Vec::new())]),
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap_err(),
+        SessionSetupError::LobbyPolicySlotNotInRoster(2),
+    );
+    let half_payload = MAX_LOBBY_POLICY_PAYLOAD_BYTES / 2;
+    assert_eq!(
+        create_session(
+            &setup,
+            request_with_policy(vec![
+                command(0, vec![0; half_payload + 1]),
+                command(1, vec![0; half_payload]),
+            ]),
+            ExpiresAt(u64::MAX),
+        )
+        .unwrap_err(),
+        SessionSetupError::LobbyPolicyPayloadsTooLarge,
+        "individually valid payloads whose aggregate exceeds the replay budget are rejected",
+    );
+
+    assert!(
+        create_session(
+            &setup,
+            request_with_policy(
+                (0..MAX_LOBBY_POLICY_ENTRIES)
+                    .map(|_| command(0, Vec::new()))
+                    .collect(),
+            ),
+            ExpiresAt(u64::MAX),
+        )
+        .is_ok(),
+        "exactly the command-count bound is accepted",
+    );
+    assert!(
+        create_session(
+            &setup,
+            request_with_policy(vec![
+                command(0, vec![0; half_payload]),
+                command(1, vec![0; MAX_LOBBY_POLICY_PAYLOAD_BYTES - half_payload]),
+            ]),
+            ExpiresAt(u64::MAX),
+        )
+        .is_ok(),
+        "an aggregate exactly at the payload-byte bound is accepted",
+    );
+}
+
+#[test]
 fn a_restarted_coordinator_does_not_reuse_session_ids() {
     // Relays keep per-session state through a coordinator outage, so ids
     // from different coordinator lifetimes must be disjoint. The counter

@@ -127,6 +127,19 @@ pub fn close_slots_for_desync(sessions: &Sessions, key: &SessionKey, slots: &[Sl
     );
 }
 
+/// Closes a home slot whose pre-start lobby command violated the descriptor
+/// policy, preserving the specific 0x0F close reason even when the violation
+/// is found while a provisional journal drains after the client has dialed.
+pub fn close_slots_for_lobby_violation(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
+    signal_close(
+        sessions,
+        key,
+        slots,
+        SlotCloseReason::LobbyViolation,
+        "closing slot link after lobby-policy violation",
+    );
+}
+
 /// Stamps `reason` on each named slot's roster entry and fires its shutdown
 /// signal, logging `message`. The stamp lands before the signal, so the woken
 /// link task always reads the reason for the wake it is answering.

@@ -230,6 +230,10 @@ pub(super) fn note_inbound(
             lifecycle.ingest_notice(relay_id, SessionNotice::SlotStarted(notice));
             InboundAction::None
         }
+        Ok(RelayToCoordinator::LobbyViolation(notice)) => {
+            lifecycle.ingest_notice(relay_id, SessionNotice::LobbyViolation(notice));
+            InboundAction::None
+        }
         Ok(RelayToCoordinator::SessionClosed { tenant, session }) => {
             if !registry::generation_is_current(setup.registry(), relay_id, generation) {
                 tracing::debug!(

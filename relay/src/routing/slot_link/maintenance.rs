@@ -84,6 +84,18 @@ pub(super) fn handle_shutdown(link: &mut Link, ctx: &SlotLinkCtx, close_reason: 
                 b"game state diverged",
             );
         }
+        SlotCloseReason::LobbyViolation => {
+            tracing::warn!(
+                tenant = ctx.key.tenant.as_ref(),
+                session = ctx.key.session.0,
+                slot = ctx.slot.0,
+                "slot violated the lobby policy; closing connection",
+            );
+            link.connection().close(
+                VarInt::from_u32(close_codes::LOBBY_VIOLATION),
+                b"lobby policy violation",
+            );
+        }
         SlotCloseReason::Unspecified => {
             tracing::info!(
                 tenant = ctx.key.tenant.as_ref(),

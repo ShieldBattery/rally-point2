@@ -240,6 +240,22 @@ impl MeshControl {
                                 payload,
                             );
                         }
+                        crate::session::provisional_turns::PennedIngress::Lobby(slot, command) => {
+                            let _ = self.mesh.session.gates.with_ingress(&key, || {
+                                routing::deliver_lobby_command(
+                                    &self.sessions,
+                                    &self.mesh,
+                                    &key,
+                                    slot,
+                                    command,
+                                );
+                            });
+                        }
+                        crate::session::provisional_turns::PennedIngress::GameStarted(slot) => {
+                            let _ = self.mesh.session.gates.with_ingress(&key, || {
+                                routing::report_game_started(&self.mesh, &key, slot);
+                            });
+                        }
                         crate::session::provisional_turns::PennedIngress::Departure {
                             slot,
                             reason,

@@ -274,6 +274,7 @@ fn create_fixture_session(
     session::create_session(
         setup,
         SessionRequest {
+            lobby_policy: None,
             rollback: false,
             tenant: TenantId(TEST_TENANT.to_owned()),
             players,

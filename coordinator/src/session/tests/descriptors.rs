@@ -70,6 +70,12 @@ fn descriptor_for_includes_the_stored_session_refs() {
         SessionRequest {
             external_id: Some("game-99".to_owned()),
             latency_estimate_ms: Some(72),
+            lobby_policy: Some(rally_point_proto::control::LobbyPolicy {
+                allowed: vec![rally_point_proto::control::AllowedLobbyCommand {
+                    slot: SlotId(0),
+                    payload: vec![0x01, 0x02],
+                }],
+            }),
             ..request(vec![
                 PlayerHandoff {
                     external_ref: Some("sb-user-7".to_owned()),
@@ -102,6 +108,16 @@ fn descriptor_for_includes_the_stored_session_refs() {
         desc.latency_estimate_ms,
         Some(72),
         "the tenant's latency hint is carried into the descriptor",
+    );
+    assert_eq!(
+        desc.lobby_policy,
+        Some(rally_point_proto::control::LobbyPolicy {
+            allowed: vec![rally_point_proto::control::AllowedLobbyCommand {
+                slot: SlotId(0),
+                payload: vec![0x01, 0x02],
+            }],
+        }),
+        "the relay receives the tenant's exact lobby-command allow-list",
     );
     // Every slot the request listed — the competitor and the observer alike —
     // is carried as an expected slot so the authority relay knows the full set

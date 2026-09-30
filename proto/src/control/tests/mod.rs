@@ -23,6 +23,7 @@ mod session;
 /// different shape build on it with struct-update syntax.
 fn a_descriptor() -> SessionDescriptor {
     SessionDescriptor {
+        lobby_policy: None,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId("sb-staging".to_owned()),

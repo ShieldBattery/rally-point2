@@ -280,6 +280,16 @@ fn each_fingerprint_field_change_alone_is_refused_as_a_create_mismatch() {
         ("latency_estimate_ms", |r| {
             r.latency_estimate_ms = Some(90);
         }),
+        // The policy decides which pre-start commands evict their sender, so
+        // reusing a game's id with a different allow-list cannot replay it.
+        ("lobby_policy", |r| {
+            r.lobby_policy = Some(rally_point_proto::control::LobbyPolicy {
+                allowed: vec![rally_point_proto::control::AllowedLobbyCommand {
+                    slot: SlotId(0),
+                    payload: vec![0x2A],
+                }],
+            });
+        }),
     ];
 
     for (label, mutate) in cases {

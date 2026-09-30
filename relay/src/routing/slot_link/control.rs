@@ -158,20 +158,48 @@ pub(super) fn handle_control_frame(
                     "dropping repeat game-started report on this link",
                 );
             } else {
+                use crate::session::provisional_turns::{HoldOutcome, PennedIngress};
+
                 ctx.game_started_reported = true;
-                ctx.decision_makers.flight_recorder().record(
-                    &ctx.key,
-                    crate::observability::flight_recorder::FlightEvent::SlotGameStarted {
-                        slot: ctx.slot.0,
-                    },
-                );
-                ctx.decision_makers.note_slot_started(&ctx.key, ctx.slot);
-                // Only this relay hears the report, and every relay
-                // serving the session needs it: its silent-slot
-                // watch cannot weigh a slot it does not know has
-                // left loading behind. Peers record it and stop
-                // there -- reporting the load stays this home's job.
-                crate::mesh::fan_out_slot_started(&ctx.mesh_links, &ctx.key, ctx.slot);
+                let result = ctx
+                    .mesh_for_teardown
+                    .session
+                    .gates
+                    .with_ingress(&ctx.key, || {
+                        ctx.decision_makers.flight_recorder().record(
+                            &ctx.key,
+                            crate::observability::flight_recorder::FlightEvent::SlotGameStarted {
+                                slot: ctx.slot.0,
+                            },
+                        );
+                        let pen = &ctx.mesh_for_teardown.session.provisional_turns;
+                        if pen.armed() {
+                            match pen.hold(&ctx.key, PennedIngress::GameStarted(ctx.slot)) {
+                                HoldOutcome::Held => return true,
+                                HoldOutcome::Resolved(PennedIngress::GameStarted(_)) => {}
+                                HoldOutcome::Resolved(_) => {
+                                    unreachable!("a game-start deposit remains a game start")
+                                }
+                                HoldOutcome::Overflow(_) => return false,
+                            }
+                        }
+                        crate::routing::report_game_started(
+                            &ctx.mesh_for_teardown,
+                            &ctx.key,
+                            ctx.slot,
+                        );
+                        true
+                    });
+                if result != Some(true) {
+                    let code = if result.is_none() {
+                        close_codes::SESSION_RETIRED
+                    } else {
+                        close_codes::PROVISIONAL_CAPACITY
+                    };
+                    link.connection()
+                        .close(VarInt::from_u32(code), b"game-start journal unavailable");
+                    return ControlFlow::Break(());
+                }
             }
         }
         // The client's lobby command. Admit it against the relay's
@@ -189,12 +217,90 @@ pub(super) fn handle_control_frame(
         // locals. The bytes are opaque; the relay frames nothing of
         // its own around them.
         Some(ControlInbound::Lobby(mut command)) => {
-            let lobby = &ctx.side_channels.lobby;
-            if lobby.admit(&ctx.key, ctx.slot, command.payload.len()) {
-                command.slot = u32::from(ctx.slot.0);
-                if lobby.deliver(&ctx.key, command.clone()) {
-                    crate::mesh::fan_out_lobby_command(&ctx.mesh_links, &ctx.key, command);
+            use crate::session::provisional_turns::{HoldOutcome, PennedIngress};
+
+            enum LobbyIngress {
+                Held,
+                RateLimited,
+                Overflow,
+                Verdict(crate::consensus::LobbyCommandVerdict),
+            }
+
+            // Admission, the provisional deposit, and live delivery are one
+            // ingress section. A descriptor drain takes queued commands in
+            // arrival order, including commands from clients that disconnected
+            // before it arrived; new deposits during that drain stay behind
+            // the earlier batch until the journal resolves.
+            let ingress = ctx
+                .mesh_for_teardown
+                .session
+                .gates
+                .with_ingress(&ctx.key, || {
+                    let lobby = &ctx.side_channels.lobby;
+                    if !lobby.admit(&ctx.key, ctx.slot, command.payload.len()) {
+                        return LobbyIngress::RateLimited;
+                    }
+                    command.slot = u32::from(ctx.slot.0);
+                    let pen = &ctx.mesh_for_teardown.session.provisional_turns;
+                    if pen.armed() {
+                        match pen.hold(&ctx.key, PennedIngress::Lobby(ctx.slot, command.clone())) {
+                            HoldOutcome::Held => return LobbyIngress::Held,
+                            HoldOutcome::Resolved(PennedIngress::Lobby(_, ready)) => {
+                                command = ready;
+                            }
+                            HoldOutcome::Resolved(_) => {
+                                unreachable!("a lobby deposit remains a lobby command")
+                            }
+                            HoldOutcome::Overflow(_) => return LobbyIngress::Overflow,
+                        }
+                    }
+                    LobbyIngress::Verdict(crate::routing::deliver_lobby_command(
+                        &ctx.sessions,
+                        &ctx.mesh_for_teardown,
+                        &ctx.key,
+                        ctx.slot,
+                        command.clone(),
+                    ))
+                });
+            match ingress {
+                None => {
+                    link.connection().close(
+                        VarInt::from_u32(close_codes::SESSION_RETIRED),
+                        b"session retired",
+                    );
+                    return ControlFlow::Break(());
                 }
+                Some(LobbyIngress::Held | LobbyIngress::RateLimited) => {}
+                Some(LobbyIngress::Overflow) => {
+                    link.connection().close(
+                        VarInt::from_u32(close_codes::PROVISIONAL_CAPACITY),
+                        b"lobby journal full",
+                    );
+                    return ControlFlow::Break(());
+                }
+                Some(LobbyIngress::Verdict(crate::consensus::LobbyCommandVerdict::Violation)) => {
+                    link.connection().close(
+                        VarInt::from_u32(close_codes::LOBBY_VIOLATION),
+                        b"lobby policy violation",
+                    );
+                    return ControlFlow::Break(());
+                }
+                Some(LobbyIngress::Verdict(
+                    crate::consensus::LobbyCommandVerdict::AwaitingDescriptor,
+                )) => {
+                    tracing::error!(
+                        tenant = ctx.key.tenant.as_ref(),
+                        session = ctx.key.session.0,
+                        slot = ctx.slot.0,
+                        "resolved lobby journal has no descriptor policy",
+                    );
+                    link.connection().close(
+                        VarInt::from_u32(close_codes::SESSION_RETIRED),
+                        b"lobby descriptor unavailable",
+                    );
+                    return ControlFlow::Break(());
+                }
+                Some(LobbyIngress::Verdict(_)) => {}
             }
         }
         // The client's in-game chat message. Admit it against the
@@ -251,6 +357,18 @@ pub(super) fn handle_control_frame(
         // fences the connection the probe was actually written to and
         // never a later one that took the same seat.
         Some(ControlInbound::LoadStateProbeAck(probe_id)) => {
+            // A control-stream ACK may follow a GameStarted already accepted
+            // into the provisional journal but not yet applied to the maker.
+            // Until the drain completes, it cannot attest the maker's state.
+            if ctx.mesh_for_teardown.session.provisional_turns.armed()
+                && ctx
+                    .mesh_for_teardown
+                    .session
+                    .provisional_turns
+                    .is_unresolved(&ctx.key)
+            {
+                return ControlFlow::Continue(());
+            }
             if !ctx
                 .load_fence
                 .resolve(probe_id, &ctx.key, ctx.slot, ctx.connection_epoch)

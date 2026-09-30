@@ -15,10 +15,13 @@
 //!   records it, yet the announce path marks it announced, so when the
 //!   descriptor arrives the slot is expected-but-absent and the session
 //!   stalls on it until the coordinator's holdout reap.
+//! - A lobby command forwarded before its policy arrives can reach peers and
+//!   the replay log without validation. A later GameStarted must not overtake
+//!   an earlier lobby command when the policy is installed.
 //!
 //! The journal closes both without refusing anything: while a session has no
-//! decision-maker, the turn funnel and the departure announce deposit their
-//! ingress here, in arrival order. Descriptor application then drains the
+//! decision-maker, the turn funnel, control stream, and departure announce
+//! deposit their ingress here in arrival order. Descriptor application then drains the
 //! journal through the ordinary paths — the freshly seeded decided leaves
 //! fence a departed slot's turns, a current slot's turns flow as if they had
 //! arrived a moment later, and a journaled departure announces into a maker
@@ -86,13 +89,13 @@
 //! standalone dev/loopback relay has no descriptor source, so journaling
 //! there would starve sessions that legitimately never see one.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::Payload;
+use rally_point_proto::messages::{LobbyCommand, Payload};
 
 use crate::key::SessionKey;
 
@@ -108,6 +111,12 @@ pub(crate) const PER_SESSION_CAP: usize = 4096;
 pub enum PennedIngress {
     /// A client turn the funnel would have fanned out.
     Turn(SlotId, Payload),
+    /// A home client's rate-admitted lobby command, stamped to its
+    /// authenticated slot but not delivered until the descriptor is applied.
+    Lobby(SlotId, LobbyCommand),
+    /// A home client's first game-loop start report, ordered after all earlier
+    /// lobby commands on that connection's reliable control stream.
+    GameStarted(SlotId),
     /// A departure the announce path would have recorded and broadcast. The
     /// exact final turn count is deliberately NOT captured here: a clean
     /// leave's count is derived at the drain, after the slot's own journaled
@@ -169,6 +178,12 @@ enum Phase {
     Resolved,
 }
 
+#[derive(Default)]
+struct LobbyUsage {
+    count: usize,
+    bytes: usize,
+}
+
 struct SessionPen {
     phase: Phase,
     /// Slots terminal to admission: a journaled CLEAN leave (the intent is
@@ -195,6 +210,14 @@ struct SessionPen {
     /// transport-acknowledged at deposit, and a resume-seeding read that
     /// missed one would leave a permanent hole in the resumed receive window.
     in_flight_turns: Vec<(SlotId, u64)>,
+    /// Queued turns only; reset when a drain takes a batch.
+    turn_count: usize,
+    /// Cumulative usage per authenticated slot, including private drain batches.
+    /// One sender cannot spend another slot's setup allowance. Kept across
+    /// reconnects so redialing does not reset a sender's quota.
+    lobby_usage: HashMap<SlotId, LobbyUsage>,
+    /// A start report is retained once per slot while the journal is unresolved.
+    started_slots: HashSet<SlotId>,
 }
 
 impl SessionPen {
@@ -204,6 +227,9 @@ impl SessionPen {
             sealed: std::collections::HashSet::new(),
             departure_revisions: HashMap::new(),
             in_flight_turns: Vec::new(),
+            turn_count: 0,
+            lobby_usage: HashMap::new(),
+            started_slots: HashSet::new(),
         }
     }
 }
@@ -215,7 +241,9 @@ fn turn_identities(batch: &VecDeque<PennedIngress>) -> Vec<(SlotId, u64)> {
         .iter()
         .filter_map(|entry| match entry {
             PennedIngress::Turn(slot, payload) => Some((*slot, payload.seq)),
-            PennedIngress::Departure { .. } => None,
+            PennedIngress::Lobby(..)
+            | PennedIngress::GameStarted(..)
+            | PennedIngress::Departure { .. } => None,
         })
         .collect()
 }
@@ -229,7 +257,7 @@ pub enum DrainStep {
     Done,
 }
 
-/// The relay-wide aggregate budget for journaled TURN bytes, across every
+/// The relay-wide aggregate budget for journaled ingress bytes, across every
 /// session. Sessions are unbounded over a relay's lifetime and tokens are
 /// not relay-bound, so per-session caps alone let repeated valid tokens grow
 /// one chosen relay without limit; this is the hard relay-wide ceiling. At
@@ -264,12 +292,13 @@ const JOURNAL_ENVELOPE_BYTES: usize = 64;
 /// The accounting size of one journaled entry: the shared command-byte measure
 /// plus [`JOURNAL_ENVELOPE_BYTES`]; departures (tiny, per-slot-deduped) count
 /// nothing — see [`ProvisionalTurnPen::hold`] for why they are exempt.
-fn entry_turn_bytes(entry: &PennedIngress) -> usize {
+fn entry_resident_bytes(entry: &PennedIngress) -> usize {
     match entry {
         PennedIngress::Turn(_, payload) => {
             super::payload_command_bytes(payload) + JOURNAL_ENVELOPE_BYTES
         }
-        PennedIngress::Departure { .. } => 0,
+        PennedIngress::Lobby(_, command) => command.payload.len() + JOURNAL_ENVELOPE_BYTES,
+        PennedIngress::GameStarted(_) | PennedIngress::Departure { .. } => 0,
     }
 }
 
@@ -286,10 +315,10 @@ struct PenInner {
     /// Disarmed (the default, and every test constructor's state), nothing
     /// is ever journaled and every ingress path behaves exactly as before.
     armed: AtomicBool,
-    /// The aggregate turn-byte ceiling — [`AGGREGATE_TURN_BYTE_BUDGET`] in
+    /// The aggregate journal-byte ceiling — [`AGGREGATE_TURN_BYTE_BUDGET`] in
     /// production; injectable so a test can drive the budget path without
     /// megabytes of fixture.
-    turn_byte_budget: usize,
+    resident_byte_budget: usize,
     /// The tracked-session ceiling — [`MAX_JOURNALED_SESSIONS`] in
     /// production; injectable for the same reason.
     max_sessions: usize,
@@ -300,7 +329,7 @@ impl Default for PenInner {
     fn default() -> Self {
         PenInner {
             armed: AtomicBool::new(false),
-            turn_byte_budget: AGGREGATE_TURN_BYTE_BUDGET,
+            resident_byte_budget: AGGREGATE_TURN_BYTE_BUDGET,
             max_sessions: MAX_JOURNALED_SESSIONS,
             state: Mutex::new(PenState::default()),
         }
@@ -308,17 +337,17 @@ impl Default for PenInner {
 }
 
 /// Everything the journal mutex guards: the per-session states and the
-/// relay-wide turn-byte total they sum to. One mutex, so the budget check,
+/// relay-wide resident-byte total they sum to. One mutex, so the budget check,
 /// the deposit, and every removal's release are each one atomic step.
 #[derive(Default)]
 struct PenState {
     sessions: HashMap<SessionKey, SessionPen>,
-    /// Total [`entry_turn_bytes`] charged against the budget: every
+    /// Total [`entry_resident_bytes`] charged against the budget: every
     /// session's in-pen queue PLUS batches a drain has taken but not yet
     /// finished replaying — the budget tracks resident memory, and a taken
     /// batch's allocations live until the drainer replays, drops, and
     /// releases them ([`ProvisionalTurnPen::release_drained`]).
-    turn_bytes: usize,
+    resident_bytes: usize,
 }
 
 impl ProvisionalTurnPen {
@@ -367,8 +396,9 @@ impl ProvisionalTurnPen {
     /// journaled and replayed by the drain loop's next pass, so it stays
     /// ordered behind everything already in flight.
     ///
-    /// A [`Departure`](PennedIngress::Departure) is exempt from the
-    /// per-session cap and the aggregate byte budget — there is at most one
+    /// A [`Departure`](PennedIngress::Departure) and per-slot-deduplicated
+    /// [`GameStarted`](PennedIngress::GameStarted) are exempt from the
+    /// per-session count cap and aggregate byte budget — there is at most one
     /// per slot (enforced by compaction), each is a few dozen bytes, and
     /// losing one strands the session on an expected-but-absent slot. Only
     /// the relay-wide session ceiling refuses one, and only when it would
@@ -384,10 +414,16 @@ impl ProvisionalTurnPen {
         // the journal's life while the accounting charged only the slice.
         // This is an exceptional, pre-descriptor path — the copy is cheap
         // and makes the charge below describe the actual owned allocation.
-        if let PennedIngress::Turn(_, payload) = &mut entry {
-            payload.commands = payload.commands.to_vec().into();
+        match &mut entry {
+            PennedIngress::Turn(_, payload) => {
+                payload.commands = payload.commands.to_vec().into();
+            }
+            PennedIngress::Lobby(_, command) => {
+                command.payload = command.payload.to_vec().into();
+            }
+            PennedIngress::GameStarted(_) | PennedIngress::Departure { .. } => {}
         }
-        let entry_bytes = entry_turn_bytes(&entry);
+        let entry_bytes = entry_resident_bytes(&entry);
         let mut guard = self.inner.state.lock();
         let state = &mut *guard;
         // The session ceiling: a deposit may not CREATE a tracking entry
@@ -400,27 +436,26 @@ impl ProvisionalTurnPen {
         // without inserting anything — including the seal, which would
         // itself be the map growth the ceiling exists to stop.
         if !state.sessions.contains_key(key) && state.sessions.len() >= self.inner.max_sessions {
-            if matches!(entry, PennedIngress::Turn(..)) {
+            if matches!(entry, PennedIngress::Turn(..) | PennedIngress::Lobby(..)) {
                 tracing::error!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
-                    "a turn reached the journal session ceiling; admission should have reserved                      this session's entry",
+                    "ingress reached the journal session ceiling; admission should have reserved this session's entry",
                 );
             }
             return HoldOutcome::Overflow(entry);
         }
         let over_budget =
-            state.turn_bytes.saturating_add(entry_bytes) > self.inner.turn_byte_budget;
+            state.resident_bytes.saturating_add(entry_bytes) > self.inner.resident_byte_budget;
         let pen = state
             .sessions
             .entry(key.clone())
             .or_insert_with(SessionPen::gathering);
-        let queue = match &mut pen.phase {
-            Phase::Resolved => return HoldOutcome::Resolved(entry),
-            Phase::Gathering(queue) | Phase::Draining(queue) => queue,
-        };
+        if matches!(pen.phase, Phase::Resolved) {
+            return HoldOutcome::Resolved(entry);
+        }
         if let PennedIngress::Turn(slot, _) = &entry
-            && (queue.len() >= PER_SESSION_CAP || over_budget)
+            && (pen.turn_count >= PER_SESSION_CAP || over_budget)
         {
             // Per-session cap or relay-wide budget: either way the turn
             // cannot be journaled, and dropping it silently would hole an
@@ -434,6 +469,31 @@ impl ProvisionalTurnPen {
             pen.sealed.insert(*slot);
             return HoldOutcome::Overflow(entry);
         }
+        if let PennedIngress::Lobby(slot, command) = &entry {
+            let limits = super::side_channel::LOBBY.replay;
+            let usage = pen.lobby_usage.entry(*slot).or_default();
+            if usage.count >= limits.max_messages
+                || usage.bytes.saturating_add(command.payload.len()) > limits.max_bytes
+                || over_budget
+            {
+                pen.sealed.insert(*slot);
+                return HoldOutcome::Overflow(entry);
+            }
+            usage.count += 1;
+            usage.bytes += command.payload.len();
+        }
+        if matches!(entry, PennedIngress::Turn(..)) {
+            pen.turn_count += 1;
+        }
+        if let PennedIngress::GameStarted(slot) = &entry
+            && !pen.started_slots.insert(*slot)
+        {
+            return HoldOutcome::Held;
+        }
+        let queue = match &mut pen.phase {
+            Phase::Gathering(queue) | Phase::Draining(queue) => queue,
+            Phase::Resolved => unreachable!("resolved phase returned before admission"),
+        };
         if let PennedIngress::Departure {
             slot,
             reason,
@@ -462,7 +522,7 @@ impl ProvisionalTurnPen {
             );
         }
         queue.push_back(entry);
-        state.turn_bytes += entry_bytes;
+        state.resident_bytes += entry_bytes;
         HoldOutcome::Held
     }
 
@@ -517,6 +577,7 @@ impl ProvisionalTurnPen {
         match &mut pen.phase {
             Phase::Gathering(queue) => {
                 let batch = std::mem::take(queue);
+                pen.turn_count = 0;
                 pen.in_flight_turns = turn_identities(&batch);
                 pen.phase = Phase::Draining(VecDeque::new());
                 Some(batch.into())
@@ -535,13 +596,13 @@ impl ProvisionalTurnPen {
     /// queue is eventually released here.
     pub fn release_drained(&self, bytes: usize) {
         let mut guard = self.inner.state.lock();
-        guard.turn_bytes = guard.turn_bytes.saturating_sub(bytes);
+        guard.resident_bytes = guard.resident_bytes.saturating_sub(bytes);
     }
 
     /// The budget charge of one journaled entry, for the drainer's
     /// [`release_drained`](Self::release_drained) accounting.
     pub fn entry_bytes(entry: &PennedIngress) -> usize {
-        entry_turn_bytes(entry)
+        entry_resident_bytes(entry)
     }
 
     /// One step of the drain loop: under the journal lock, either hands back
@@ -574,6 +635,7 @@ impl ProvisionalTurnPen {
             // queue membership.
             Phase::Draining(queue) => {
                 let batch = std::mem::take(queue);
+                pen.turn_count = 0;
                 pen.in_flight_turns = turn_identities(&batch);
                 DrainStep::More(batch.into())
             }
@@ -594,12 +656,24 @@ impl ProvisionalTurnPen {
         if let Some(pen) = state.sessions.remove(key) {
             let released: usize = match &pen.phase {
                 Phase::Gathering(queue) | Phase::Draining(queue) => {
-                    queue.iter().map(entry_turn_bytes).sum()
+                    queue.iter().map(entry_resident_bytes).sum()
                 }
                 Phase::Resolved => 0,
             };
-            state.turn_bytes = state.turn_bytes.saturating_sub(released);
+            state.resident_bytes = state.resident_bytes.saturating_sub(released);
         }
+    }
+
+    /// Whether a coordinator descriptor has yet to finish draining this
+    /// session's ingress. A Draining pen stays unresolved even with an empty
+    /// queue because its private batch may still contain an earlier start.
+    pub fn is_unresolved(&self, key: &SessionKey) -> bool {
+        self.inner
+            .state
+            .lock()
+            .sessions
+            .get(key)
+            .is_some_and(|pen| !matches!(pen.phase, Phase::Resolved))
     }
 
     /// Whether `key` has journaled entries still awaiting a drain.
@@ -686,7 +760,7 @@ impl ProvisionalTurnPen {
     pub(crate) fn with_turn_byte_budget(budget: usize) -> Self {
         ProvisionalTurnPen {
             inner: Arc::new(PenInner {
-                turn_byte_budget: budget,
+                resident_byte_budget: budget,
                 ..PenInner::default()
             }),
         }

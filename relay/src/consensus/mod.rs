@@ -246,8 +246,8 @@ use std::time::{Duration, Instant};
 use rally_point_proto::commands::command_length;
 use rally_point_proto::control::{
     BufferBounds, DepartedSlot, DepartureKind, DepartureNotice, DesyncNotice, DivergedSlot,
-    GAME_SYNC_SAFE_BUFFER_MAX, ResultEcho, ResultNotice, SessionDescriptor, SessionStartedNotice,
-    SlotConnectedNotice, SlotStartedNotice, TenantId,
+    GAME_SYNC_SAFE_BUFFER_MAX, LobbyPolicy, LobbyViolationNotice, ResultEcho, ResultNotice,
+    SessionDescriptor, SessionStartedNotice, SlotConnectedNotice, SlotStartedNotice, TenantId,
 };
 use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
@@ -277,6 +277,7 @@ pub use maker::{
     DecisionMaker, DepartureStamps, DesyncEviction, EvictionCause, FinalizeOutcome,
     RecordedDeparture, SilentSlot,
 };
+pub use registry::LobbyCommandVerdict;
 
 pub use registry::{
     DecisionMakers, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,
