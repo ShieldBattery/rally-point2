@@ -326,6 +326,7 @@ pub(super) async fn run_writer(
                     tenant: ask.tenant,
                     session: ask.session,
                     request_id: ask.request_id,
+                    settle_lobby: ask.settle_lobby,
                 });
                 if !writer_send(write_half, frame, relay_id, liveness_timeout, "load-state-request")
                     .await

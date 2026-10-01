@@ -166,6 +166,7 @@ pub(crate) fn request(players: Vec<PlayerHandoff>) -> SessionRequest {
 pub(crate) fn descriptor(tenant: TenantId, session: u64) -> SessionDescriptor {
     SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         tenant,
         session: SessionId(session),

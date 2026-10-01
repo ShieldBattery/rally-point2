@@ -260,6 +260,40 @@ impl SessionSetup {
             .unwrap_or_default()
     }
 
+    /// Marks the session's lobby epoch settled only while its serving set still
+    /// matches `expected` and `still_current` confirms the caller's other
+    /// lifecycle evidence, then republishes every current descriptor with the
+    /// monotonic latch. The assignment lock linearizes both checks and this cut
+    /// against rehomes.
+    pub fn settle_lobby(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+        expected: &[RelayId],
+        still_current: impl FnOnce() -> bool,
+    ) -> bool {
+        let _assignment = self.lock_assignment();
+        let mut serving = self.serving_relays(tenant, session);
+        serving.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        if serving != expected || serving.is_empty() || !still_current() {
+            return false;
+        }
+        {
+            let mut refs = self.session_refs.lock();
+            let Some(refs) = refs.get_mut(&(tenant.clone(), session)) else {
+                return false;
+            };
+            refs.lobby_settled = true;
+        }
+        for relay in serving {
+            if let Some(descriptor) = super::descriptor_for(self, tenant, session, relay) {
+                self.descriptors.record(relay, descriptor);
+            }
+        }
+        true
+    }
     /// Installs authoritative membership for lifecycle tests that intentionally
     /// bypass [`create_session`]. Keeping this seam test-only ensures production
     /// close handling never fabricates membership from its cached lifecycle view.

@@ -81,6 +81,7 @@ pub fn build_descriptor(
 
     Some(SessionDescriptor {
         lobby_policy: refs.lobby_policy.clone(),
+        lobby_settled: refs.lobby_settled,
         rollback: refs.rollback,
         finalized_drops: refs.finalized_drops,
         tenant: tenant.clone(),

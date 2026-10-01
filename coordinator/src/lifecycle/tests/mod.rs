@@ -97,6 +97,7 @@ fn stage_assignments(setup: &SessionSetup, session: SessionId, relays: &[RelayId
             relay,
             SessionDescriptor {
                 lobby_policy: None,
+                lobby_settled: false,
                 rollback: false,
                 finalized_drops: false,
                 tenant: tid(),

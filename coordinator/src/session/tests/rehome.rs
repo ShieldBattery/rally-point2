@@ -2,6 +2,8 @@
 //! its idempotency, the cert-pin check that catches a restart in place, and the
 //! resumed descriptors a move (or a late departure) stages.
 
+use std::collections::HashSet;
+
 use super::*;
 
 #[test]
@@ -503,4 +505,55 @@ fn lobby_violation_home_authorization_tracks_a_rehome() {
         "the former home loses authority when the rehome commits",
     );
     assert!(setup.relay_homes_slot(RelayId(2), &tid(), response.session, SlotId(0)));
+}
+
+#[test]
+fn settlement_latch_survives_a_rehome_descriptor_rebuild() {
+    let setup = two_relay_fleet();
+    let response = create_default_session(&setup);
+    assert!(setup.settle_lobby(&tid(), response.session, &[RelayId(1)], || true));
+    assert!(
+        setup.descriptors().current_for(RelayId(1))[0].lobby_settled,
+        "the current home receives the latch before finality is reported",
+    );
+
+    registry::remove(setup.registry(), RelayId(1));
+    assert!(matches!(
+        rehome(&setup, &tid(), response.session, RelayId(1), vec![]),
+        RehomeOutcome::NewTarget(ref endpoint) if endpoint.relay_id == RelayId(2)
+    ));
+    assert!(
+        setup.descriptors().current_for(RelayId(2))[0].lobby_settled,
+        "a replacement home cannot reopen the settled lobby epoch",
+    );
+}
+
+#[tokio::test]
+async fn settlement_refuses_a_same_set_lifecycle_break_inside_the_assignment_cut() {
+    let setup = two_relay_fleet();
+    let response = create_default_session(&setup);
+    let lifecycle = crate::lifecycle::Lifecycle::new(setup.clone());
+    lifecycle.register_session(
+        tid(),
+        response.session,
+        vec![RelayId(1)],
+        HashSet::from([SlotId(0), SlotId(1)]),
+        HashSet::new(),
+    );
+
+    // A same-id rehome replaces the relay's process while preserving the visible
+    // serving vector. It still destroys the old maker's memory.
+    lifecycle.on_rehome(&tid(), response.session, RelayId(1), RelayId(1));
+    assert!(
+        !setup.settle_lobby(&tid(), response.session, &[RelayId(1)], || {
+            lifecycle
+                .load_state(&tid(), response.session)
+                .is_some_and(|state| state.created_here && state.attestable)
+        }),
+        "the locked cut rereads lineage rather than trusting a stale attestation",
+    );
+    assert!(
+        !setup.descriptors().current_for(RelayId(1))[0].lobby_settled,
+        "a stale load-state read cannot publish finality to the replacement",
+    );
 }

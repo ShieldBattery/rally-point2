@@ -52,6 +52,7 @@ pub(crate) fn deliver_lobby_command(
         }
         LobbyCommandVerdict::AwaitingDescriptor
         | LobbyCommandVerdict::DroppedAfterStart
+        | LobbyCommandVerdict::DroppedAfterSettlement
         | LobbyCommandVerdict::AlreadyEvicted => {}
     }
     verdict

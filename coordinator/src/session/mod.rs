@@ -155,6 +155,8 @@ pub struct SessionRefs {
     /// home keeps enforcing it. Decided once at create and immutable. `None` when the request
     /// carried none.
     pub lobby_policy: Option<rally_point_proto::control::LobbyPolicy>,
+    /// Whether an authoritative failed-setup read has closed lobby ingress.
+    pub lobby_settled: bool,
 }
 
 /// The outcome of [`create_session`]: the response to hand the app server, and

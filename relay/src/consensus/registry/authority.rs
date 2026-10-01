@@ -50,6 +50,8 @@ pub struct MakerSync<'a> {
     pub rollback: bool,
     /// Immutable descriptor allow-list reconciled into the per-session decision maker.
     pub lobby_policy: Option<LobbyPolicy>,
+    /// Monotonic descriptor latch closing future home-authored lobby ingress.
+    pub lobby_settled: bool,
 }
 
 impl<'a> MakerSync<'a> {
@@ -67,6 +69,7 @@ impl<'a> MakerSync<'a> {
             finalized_drops: false,
             rollback: false,
             lobby_policy: None,
+            lobby_settled: false,
         }
     }
 
@@ -92,6 +95,7 @@ impl<'a> MakerSync<'a> {
             finalized_drops: descriptor.finalized_drops,
             rollback: descriptor.rollback,
             lobby_policy: descriptor.lobby_policy.clone(),
+            lobby_settled: descriptor.lobby_settled,
         }
     }
 }
@@ -147,6 +151,7 @@ impl DecisionMakers {
             finalized_drops,
             rollback,
             lobby_policy,
+            lobby_settled,
         } = sync;
         let (mut leaves, fresh, seeded) = {
             let mut makers = self.lock();
@@ -159,6 +164,9 @@ impl DecisionMakers {
                     maker.reconcile_finalized_drops(finalized_drops);
                     maker.reconcile_rollback(rollback);
                     maker.reconcile_lobby_policy(&lobby_policy);
+                    if lobby_settled {
+                        maker.settle_lobby();
+                    }
                     let seeded = resumed_departed
                         .map(|d| maker.seed_resumed(d))
                         .unwrap_or_default();
@@ -184,6 +192,9 @@ impl DecisionMakers {
                     maker.latch_finalized_drops(finalized_drops);
                     maker.latch_rollback(rollback);
                     maker.latch_lobby_policy(lobby_policy);
+                    if lobby_settled {
+                        maker.settle_lobby();
+                    }
                     if resumed_departed.is_some() {
                         maker.mark_homes_rehomed();
                     }

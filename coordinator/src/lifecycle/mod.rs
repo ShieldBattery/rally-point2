@@ -174,6 +174,8 @@ pub struct SessionLoadState {
     pub connected_slots: Vec<SlotId>,
     /// Slots that ever reported their game loop running, ascending.
     pub started_slots: Vec<SlotId>,
+    /// Slots whose home relay observed a pre-game lobby policy violation, ascending.
+    pub lobby_violation_slots: Vec<SlotId>,
 }
 
 /// A slot set as an ascending vector, so a load-state answer is deterministic
@@ -266,6 +268,9 @@ struct SessionState {
     /// Slots that have ever reported their game loop running. Grows
     /// monotonically for the same reason as `connected_slots`.
     started_slots: HashSet<SlotId>,
+    /// Slots whose home relay observed a pre-game lobby policy violation.
+    /// Positive evidence only; retained heartbeats repair a lost notice.
+    lobby_violation_slots: HashSet<SlotId>,
     /// Whether an unbroken chain of relay memory still covers this session's whole
     /// life, so a snapshot the serving relays produce today can still speak for
     /// what happened at its beginning.

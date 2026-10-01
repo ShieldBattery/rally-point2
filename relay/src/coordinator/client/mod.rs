@@ -518,6 +518,10 @@ pub struct HeartbeatSources {
     /// exactly the same handles, and against exactly the same session state, the
     /// snapshot beside it is built from.
     pub load_fence: crate::coordinator::load_fence::LoadStateFence,
+    /// The session gate that makes setup settlement an ingress cut.
+    pub session_gates: crate::session::gate::SessionGates,
+    /// The pre-descriptor journal whose resolved state is required before setup settles.
+    pub provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen,
 }
 
 /// What each heartbeat carries and how often it goes up.

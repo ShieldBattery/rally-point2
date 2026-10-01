@@ -223,6 +223,8 @@ pub struct DecisionMaker {
     pub(in crate::consensus) results: HashMap<SlotId, ResultEcho>,
     /// Immutable descriptor allow-list for client lobby commands before a slot starts.
     pub(in crate::consensus) lobby_policy: Option<LobbyPolicy>,
+    /// Whether an attested failed-setup read closed future home-authored lobby ingress.
+    pub(in crate::consensus) lobby_closed: bool,
     /// The per-session desync comparator. Only meaningful while this relay is the
     /// authority; reset wholesale on promotion (a real desync re-diverges every
     /// interval). Per-origin ordering and epochs live separately in `sync_turns`.
@@ -478,6 +480,7 @@ impl DecisionMaker {
             observers,
             results: HashMap::new(),
             lobby_policy: None,
+            lobby_closed: false,
             sync: SyncTracker::default(),
             sync_turns: SyncTurns::default(),
             expected_slots: HashSet::new(),

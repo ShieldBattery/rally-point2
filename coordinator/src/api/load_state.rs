@@ -26,11 +26,14 @@ struct SessionLoadStateRequest {
     tenant: TenantId,
     /// The session, in the coordinator's `(tenant, session)` id space.
     session: u64,
+    /// Whether this failed-setup read must make a final setup-lobby ingress cut.
+    #[serde(default, rename = "settleLobby")]
+    settle_lobby: bool,
 }
 
 /// Response body for `POST /session/load-state`: what the coordinator knows about
 /// the session's load progress. camelCase, the tenant's own convention (like the
-/// webhook bodies), unlike the snake_case control-plane request above.
+/// webhook bodies).
 ///
 /// `connectedSlots` / `startedSlots` / `startedAtMs` are always whatever the
 /// coordinator has accumulated, `known` or not: they are positive evidence, and the
@@ -59,10 +62,12 @@ struct SessionLoadStateRequest {
 #[serde(rename_all = "camelCase")]
 struct SessionLoadStateResponse {
     known: bool,
+    setup_final: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at_ms: Option<u64>,
     connected_slots: Vec<u8>,
     started_slots: Vec<u8>,
+    lobby_violation_slots: Vec<u8>,
 }
 
 /// Session load-progress read: which slots ever connected, which ever reported
@@ -137,14 +142,23 @@ pub(super) async fn session_load_state(
     let Some(before) = state.lifecycle.load_state(&request.tenant, session) else {
         return Ok(Json(SessionLoadStateResponse {
             known: false,
+            setup_final: false,
             started_at_ms: None,
             connected_slots: Vec::new(),
             started_slots: Vec::new(),
+            lobby_violation_slots: Vec::new(),
         })
         .into_response());
     };
 
-    let round = attest_round(&state, &request.tenant, session, &before.serving_relays).await;
+    let round = attest_round(
+        &state,
+        &request.tenant,
+        session,
+        &before.serving_relays,
+        request.settle_lobby,
+    )
+    .await;
     // Re-read after the exchange so the answer carries whatever the snapshots added.
     // A session retired while the relays were answering leaves nothing to re-read,
     // and the snapshots that landed went into a record that no longer exists — so
@@ -152,9 +166,11 @@ pub(super) async fn session_load_state(
     let Some(after) = state.lifecycle.load_state(&request.tenant, session) else {
         return Ok(Json(SessionLoadStateResponse {
             known: false,
+            setup_final: false,
             started_at_ms: before.started_at_ms,
             connected_slots: before.connected_slots.iter().map(|s| s.0).collect(),
             started_slots: before.started_slots.iter().map(|s| s.0).collect(),
+            lobby_violation_slots: before.lobby_violation_slots.iter().map(|s| s.0).collect(),
         })
         .into_response());
     };
@@ -168,11 +184,33 @@ pub(super) async fn session_load_state(
             .serving_relays
             .iter()
             .all(|relay| round.fenced.contains(relay));
+    let setup_final = request.settle_lobby
+        && after.created_here
+        && after.attestable
+        && every_relay_fenced
+        && before
+            .serving_relays
+            .iter()
+            .all(|relay| round.setup_settled.contains(relay))
+        && state
+            .setup
+            .settle_lobby(&request.tenant, session, &before.serving_relays, || {
+                state
+                    .lifecycle
+                    .load_state(&request.tenant, session)
+                    .is_some_and(|current| {
+                        current.created_here
+                            && current.attestable
+                            && current.serving_relays == before.serving_relays
+                    })
+            });
     Ok(Json(SessionLoadStateResponse {
         known: after.created_here && after.attestable && every_relay_fenced,
+        setup_final,
         started_at_ms: after.started_at_ms,
         connected_slots: after.connected_slots.iter().map(|s| s.0).collect(),
         started_slots: after.started_slots.iter().map(|s| s.0).collect(),
+        lobby_violation_slots: after.lobby_violation_slots.iter().map(|s| s.0).collect(),
     })
     .into_response())
 }
@@ -185,9 +223,10 @@ async fn attest_round(
     tenant: &TenantId,
     session: SessionId,
     serving: &[RelayId],
+    settle_lobby: bool,
 ) -> crate::attest::AttestRound {
-    crate::attest::shared_round(state.setup.attest(), tenant, session, || {
-        attest_serving_relays(state, tenant, session, serving)
+    crate::attest::shared_round(state.setup.attest(), tenant, session, settle_lobby, || {
+        attest_serving_relays(state, tenant, session, serving, settle_lobby)
     })
     .await
 }
@@ -207,6 +246,7 @@ async fn attest_serving_relays(
     tenant: &TenantId,
     session: SessionId,
     serving: &[RelayId],
+    settle_lobby: bool,
 ) -> crate::attest::AttestRound {
     // Taken BEFORE the first question is queued, so it is a lower bound on every
     // snapshot this round collects. Stamping it after the fan-out instead would let
@@ -220,18 +260,22 @@ async fn attest_serving_relays(
             state
                 .setup
                 .attest()
-                .request(relay, tenant, session)
+                .request(relay, tenant, session, settle_lobby)
                 .map(|waiter| (relay, waiter))
         })
         .collect();
     let deadline = tokio::time::Instant::now() + state.attest_timeout;
     let mut attested = std::collections::HashSet::new();
     let mut fenced = std::collections::HashSet::new();
+    let mut setup_settled = std::collections::HashSet::new();
     for (relay, waiter) in &mut pending {
         if let Ok(Some(snapshot)) = tokio::time::timeout_at(deadline, waiter.recv()).await {
             attested.insert(*relay);
             if snapshot.fenced {
                 fenced.insert(*relay);
+            }
+            if snapshot.setup_settled {
+                setup_settled.insert(*relay);
             }
         }
     }
@@ -239,5 +283,6 @@ async fn attest_serving_relays(
         started_before_any_request,
         attested: std::sync::Arc::new(attested),
         fenced: std::sync::Arc::new(fenced),
+        setup_settled: std::sync::Arc::new(setup_settled),
     }
 }

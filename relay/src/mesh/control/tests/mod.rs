@@ -36,6 +36,7 @@ fn relay_peer(id: u64) -> RelayPeer {
 fn descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),

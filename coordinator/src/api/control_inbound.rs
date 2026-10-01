@@ -267,8 +267,9 @@ pub(super) fn note_inbound(
             request_id,
             state,
             fenced,
+            setup_settled,
         }) => {
-            handle_load_state_snapshot(inbound, request_id, state, fenced);
+            handle_load_state_snapshot(inbound, request_id, state, fenced, setup_settled);
             InboundAction::None
         }
         // A second Hello or a future up-frame: presence is enough, content unused.

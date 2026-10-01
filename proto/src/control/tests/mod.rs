@@ -24,6 +24,7 @@ mod session;
 fn a_descriptor() -> SessionDescriptor {
     SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId("sb-staging".to_owned()),

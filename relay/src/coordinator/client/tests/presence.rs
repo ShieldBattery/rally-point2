@@ -45,6 +45,8 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
     SubscriberFixture {
         heartbeat: HeartbeatConfig {
             sources: HeartbeatSources {
+                session_gates: crate::session::gate::SessionGates::default(),
+                provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
                 sessions: Arc::clone(&sessions),
                 decision_makers,
                 region_rtt_cache: RegionRttCache::default(),
@@ -81,6 +83,7 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
                 // coverage latch nor an adopted directive — so it has no
                 // instant to restate.
                 started_at_ms: None,
+                lobby_violations: vec![],
             }],
             region_rtts: vec![],
         },
@@ -109,6 +112,9 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
     assert!(crate::routing::live_slots(&sessions).is_empty());
 
     let sources = HeartbeatSources {
+        session_gates: crate::session::gate::SessionGates::default(),
+
+        provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
         sessions: Arc::clone(&sessions),
         decision_makers: Arc::clone(&decision_makers),
         region_rtt_cache: RegionRttCache::default(),
@@ -123,6 +129,7 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
             ever_connected: vec![SlotId(0)],
             started: vec![SlotId(0)],
             started_at_ms: None,
+            lobby_violations: vec![],
         }],
         "the session is still named, with no connected slot and its retained sets",
     );
@@ -163,6 +170,7 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
             tenant: TenantId(TENANT.to_owned()),
             session: SessionId(7),
             request_id: 99,
+            settle_lobby: false,
         })
         .unwrap();
         ws.send(Message::Text(request.into())).await.unwrap();
@@ -189,6 +197,8 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
     SubscriberFixture {
         heartbeat: HeartbeatConfig {
             sources: HeartbeatSources {
+                session_gates: crate::session::gate::SessionGates::default(),
+                provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
                 sessions: Arc::clone(&sessions),
                 decision_makers,
                 region_rtt_cache: RegionRttCache::default(),
@@ -219,11 +229,13 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
                 ],
                 started: vec![rally_point_proto::ids::SlotId(3)],
                 started_at_ms: None,
+                lobby_violations: vec![],
             },
             // Slot 2 arrived here and is gone: no stream to probe, and its
             // client may be holding a report for the stream it opens next, so
             // this answer's absences carry no proof.
             fenced: false,
+            setup_settled: false,
         },
     );
 }
@@ -242,6 +254,9 @@ fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
     decision_makers.note_slot_started(&key(7), SlotId(0));
 
     let sources = HeartbeatSources {
+        session_gates: crate::session::gate::SessionGates::default(),
+
+        provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
         sessions: Arc::clone(&sessions),
         decision_makers: Arc::clone(&decision_makers),
         region_rtt_cache: RegionRttCache::default(),
@@ -263,6 +278,8 @@ fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
     // completeness claim rests on the difference between this and silence, and
     // silence is never produced here: every question gets an answer.
     let sources = HeartbeatSources {
+        session_gates: crate::session::gate::SessionGates::default(),
+        provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
         sessions: Arc::default(),
         decision_makers: Arc::new(crate::consensus::new_decision_makers()),
         region_rtt_cache: RegionRttCache::default(),
@@ -277,6 +294,7 @@ fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
             ever_connected: vec![],
             started: vec![],
             started_at_ms: None,
+            lobby_violations: vec![],
         },
     );
 }

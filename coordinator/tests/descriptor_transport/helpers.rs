@@ -98,6 +98,9 @@ pub(crate) fn no_outbound() -> coordinator::client::OutboundQueues {
 pub(crate) fn heartbeat(interval: Duration) -> coordinator::client::HeartbeatConfig {
     coordinator::client::HeartbeatConfig {
         sources: coordinator::client::HeartbeatSources {
+            session_gates: rally_point_relay::session::gate::SessionGates::default(),
+            provisional_turns:
+                rally_point_relay::session::provisional_turns::ProvisionalTurnPen::default(),
             sessions: std::sync::Arc::default(),
             decision_makers: std::sync::Arc::new(consensus::new_decision_makers()),
             region_rtt_cache: region_ping::RegionRttCache::default(),
@@ -246,6 +249,7 @@ pub(crate) async fn serve_coordinator_returning_setup(
 pub(crate) fn a_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),

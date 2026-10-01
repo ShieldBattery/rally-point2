@@ -491,6 +491,8 @@ async fn main() -> Result<()> {
                     decision_makers: Arc::clone(&mesh_state.session.decision_makers),
                     region_rtt_cache: region_rtt_cache.clone(),
                     load_fence: mesh_state.session.load_fence.clone(),
+                    session_gates: mesh_state.session.gates.clone(),
+                    provisional_turns: mesh_state.session.provisional_turns.clone(),
                 },
                 drain_rx.clone(),
                 control_connected_tx,

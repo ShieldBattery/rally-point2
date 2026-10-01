@@ -310,6 +310,7 @@ impl Lifecycle {
             accounted: HashSet::new(),
             connected_slots: HashSet::new(),
             started_slots: HashSet::new(),
+            lobby_violation_slots: HashSet::new(),
             // A state built anywhere but `register_session` covers only what
             // arrived after it appeared, so it can vouch for nothing about the
             // session's beginning until a registration says otherwise.

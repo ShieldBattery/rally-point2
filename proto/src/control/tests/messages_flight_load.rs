@@ -59,6 +59,7 @@ fn load_state_request_roundtrips_json() {
         tenant: TenantId("sb-staging".to_owned()),
         session: SessionId(42),
         request_id: 9,
+        settle_lobby: false,
     };
     let json = serde_json::to_string(&message).unwrap();
     assert!(json.contains("\"type\":\"load_state_request\""));
@@ -80,13 +81,17 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
             ever_connected: vec![],
             started: vec![],
             started_at_ms: None,
+            lobby_violations: vec![],
         },
         fenced: false,
+        setup_settled: false,
     };
     let json = serde_json::to_string(&message).unwrap();
     assert!(!json.contains("ever_connected"));
     assert!(!json.contains("started_at_ms"));
     assert!(!json.contains("fenced"));
+    assert!(!json.contains("setup_settled"));
+    assert!(!json.contains("lobby_violations"));
     let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
     assert_eq!(back, message);
 
@@ -101,13 +106,17 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
             ever_connected: vec![SlotId(0), SlotId(1)],
             started: vec![SlotId(1)],
             started_at_ms: Some(1_700_000_000_000),
+            lobby_violations: vec![SlotId(1)],
         },
         fenced: true,
+        setup_settled: true,
     };
     let json = serde_json::to_string(&populated).unwrap();
     assert!(json.contains("\"type\":\"load_state_snapshot\""));
     assert!(json.contains("\"ever_connected\":[0,1]"));
     assert!(json.contains("\"fenced\":true"));
+    assert!(json.contains("\"setup_settled\":true"));
+    assert!(json.contains("\"lobby_violations\":[1]"));
     assert_eq!(
         serde_json::from_str::<RelayToCoordinator>(&json).unwrap(),
         populated
@@ -124,4 +133,28 @@ fn a_snapshot_from_a_relay_predating_the_fence_decodes_unfenced() {
         panic!("decodes as a snapshot");
     };
     assert!(!fenced);
+}
+
+#[test]
+fn settlement_fields_default_false_for_pre_settlement_peers() {
+    let request =
+        r#"{"type":"load_state_request","tenant":"sb-staging","session":7,"request_id":3}"#;
+    let CoordinatorToRelay::LoadStateRequest { settle_lobby, .. } =
+        serde_json::from_str::<CoordinatorToRelay>(request).unwrap()
+    else {
+        panic!("decodes as a load-state request");
+    };
+    assert!(!settle_lobby);
+
+    let snapshot = r#"{"type":"load_state_snapshot","request_id":3,"state":{"tenant":"sb-staging","session":7,"slots":[]}}"#;
+    let RelayToCoordinator::LoadStateSnapshot {
+        state,
+        setup_settled,
+        ..
+    } = serde_json::from_str::<RelayToCoordinator>(snapshot).unwrap()
+    else {
+        panic!("decodes as a load-state snapshot");
+    };
+    assert!(!setup_settled);
+    assert!(state.lobby_violations.is_empty());
 }

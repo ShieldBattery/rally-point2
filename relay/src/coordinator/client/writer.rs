@@ -409,6 +409,7 @@ pub(super) async fn write_control_frames(
                     request_id: answer.request_id,
                     state: answer.state,
                     fenced: answer.fenced,
+                    setup_settled: answer.setup_settled,
                 })
                 .expect("a load-state snapshot always serializes");
                 sink.send(Message::Text(frame.into())).await?;

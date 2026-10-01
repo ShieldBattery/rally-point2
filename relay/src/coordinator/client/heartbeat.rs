@@ -34,6 +34,8 @@ pub(super) struct LoadStateAsk {
     pub(super) request_id: u64,
     /// The session to snapshot.
     pub(super) key: SessionKey,
+    /// Whether this request asks the relay to close its setup lobby epoch.
+    pub(super) settle_lobby: bool,
 }
 
 /// Snapshots what this relay holds for each session into the [`SessionPresence`]
@@ -120,6 +122,8 @@ pub(super) struct LoadStateAnswer {
     /// Whether every slot that could be holding something back was proven not to
     /// be (see [`fenced_load_state_snapshot`]).
     pub(super) fenced: bool,
+    /// Whether this request made a final home-lobby ingress cut.
+    pub(super) setup_settled: bool,
 }
 
 /// Starts one routed load-state ask's fence, or sheds it when this relay is already
@@ -171,9 +175,18 @@ fn spawn_load_state_answer(
 ) {
     let sessions = Arc::clone(&sources.sessions);
     let decision_makers = Arc::clone(&sources.decision_makers);
+    let gates = sources.session_gates.clone();
+    let provisional_turns = sources.provisional_turns.clone();
     let fence = sources.load_fence.clone();
     tokio::spawn(async move {
         let _permit = permit;
+        let setup_settled = ask.settle_lobby
+            && gates
+                .with_exclusive(&ask.key, || {
+                    !provisional_turns.is_unresolved(&ask.key)
+                        && decision_makers.settle_lobby(&ask.key)
+                })
+                .unwrap_or(false);
         let (state, fenced) =
             fenced_load_state_snapshot(&sessions, &decision_makers, &fence, ask.key).await;
         if answers
@@ -181,6 +194,7 @@ fn spawn_load_state_answer(
                 request_id: ask.request_id,
                 state,
                 fenced,
+                setup_settled,
             })
             .is_err()
         {
@@ -309,6 +323,7 @@ fn presence_entry(key: SessionKey, slots: Vec<SlotId>, load: RetainedLoadState) 
         slots,
         ever_connected: load.ever_connected,
         started: load.started,
+        lobby_violations: load.lobby_violations,
         started_at_ms: load.started_at_ms,
     }
 }

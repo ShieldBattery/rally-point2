@@ -486,6 +486,10 @@ pub struct SessionDescriptor {
     /// session created without one, or from a coordinator that predates the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lobby_policy: Option<LobbyPolicy>,
+    /// Whether a failed-setup attestation closed future home-authored lobby commands.
+    /// This monotonic latch survives descriptor rebuilds and rehomes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lobby_settled: bool,
     /// The slots the coordinator already knows have departed this session, each
     /// with the relay's left-vs-dropped classification. Carried only on a
     /// rehome-rebuilt descriptor (see [`resumed`](Self::resumed)): a fresh relay

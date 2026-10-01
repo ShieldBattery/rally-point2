@@ -523,6 +523,8 @@ pub struct RetainedLoadState {
     pub ever_connected: Vec<SlotId>,
     /// Slots that ever reported their game loop running here, ascending.
     pub started: Vec<SlotId>,
+    /// Home slots this relay evicted for a pre-game lobby policy violation.
+    pub lobby_violations: Vec<SlotId>,
     /// Relay wall-clock (unix epoch milliseconds) for the session's start, as
     /// this relay knows it. `None` on a relay that has not seen the session
     /// start at all.

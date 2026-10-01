@@ -170,6 +170,7 @@ fn key(session: u64) -> SessionKey {
 fn descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId(TENANT.to_owned()),
@@ -258,6 +259,8 @@ fn enroll(addr: std::net::SocketAddr, relay_hello: RelayHello) -> EnrollConfig {
 fn heartbeat(interval: Duration) -> HeartbeatConfig {
     HeartbeatConfig {
         sources: HeartbeatSources {
+            session_gates: crate::session::gate::SessionGates::default(),
+            provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
             sessions: Arc::default(),
             decision_makers: Arc::new(crate::consensus::new_decision_makers()),
             region_rtt_cache: RegionRttCache::default(),

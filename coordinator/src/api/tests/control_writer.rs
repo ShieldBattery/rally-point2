@@ -11,6 +11,7 @@ use super::*;
 fn diff_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         finalized_drops: false,
         tenant: tenant_id(),

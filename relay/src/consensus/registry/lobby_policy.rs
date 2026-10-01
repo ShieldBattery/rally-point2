@@ -12,6 +12,8 @@ pub enum LobbyCommandVerdict {
     DroppedAfterStart,
     /// A pre-start command violated the policy and atomically marked its slot evicted.
     Violation,
+    /// Setup finality closed new home-authored lobby commands without a penalty.
+    DroppedAfterSettlement,
     /// The slot has already been marked evicted for a policy violation.
     AlreadyEvicted,
 }
@@ -30,6 +32,17 @@ impl DecisionMakers {
             .get_mut(key)
             .map(|maker| maker.admit_lobby_command(slot, payload))
             .unwrap_or(LobbyCommandVerdict::AwaitingDescriptor)
+    }
+
+    /// Closes future home-authored lobby ingress if a maker exists, returning whether the
+    /// descriptor had established one.
+    pub fn settle_lobby(&self, key: &SessionKey) -> bool {
+        self.lock()
+            .get_mut(key)
+            .map(|maker| {
+                maker.settle_lobby();
+            })
+            .is_some()
     }
 
     /// Checks a peer relay's lobby command without modifying eviction state.

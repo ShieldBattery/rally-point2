@@ -11,6 +11,8 @@ struct AttestOptions {
     /// clients — the difference between a relay that merely answered and one
     /// whose answer rules out a report still queued in a client.
     fenced: bool,
+    /// Whether its snapshot confirms that the relay closed lobby ingress.
+    setup_settled: bool,
     /// When set, each answer is held until the test sends a release, so a test
     /// can keep a round open while other reads arrive.
     release: Option<tokio::sync::mpsc::Receiver<()>>,
@@ -23,6 +25,7 @@ impl Default for AttestOptions {
     fn default() -> Self {
         Self {
             fenced: true,
+            setup_settled: false,
             release: None,
             seen: None,
         }
@@ -44,6 +47,7 @@ fn spawn_attesting_relay(
     let mut asks = setup.attest().subscribe(relay);
     let AttestOptions {
         fenced,
+        setup_settled,
         mut release,
         seen,
     } = opts;
@@ -63,6 +67,7 @@ fn spawn_attesting_relay(
                     request_id: ask.request_id,
                     state: snapshot.clone(),
                     fenced,
+                    setup_settled,
                 })
                 .expect("a snapshot serializes")
                 .into(),
@@ -84,6 +89,22 @@ async fn read_load_state(app: axum::Router, session: u64) -> axum::body::Bytes {
         .unwrap()
 }
 
+/// Posts a signed load-state read that asks the coordinator to make the setup
+/// lobby cut, returning the raw response body.
+async fn settle_lobby_load_state(app: axum::Router, session: u64) -> axum::body::Bytes {
+    let body = serde_json::to_vec(&serde_json::json!({
+        "tenant": TEST_TENANT,
+        "session": session,
+        "settleLobby": true,
+    }))
+    .unwrap();
+    let resp = signed_post(app, "/session/load-state", &body, &TEST_CLIENT_SEED).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap()
+}
+
 /// Registers session 5 as served by `serving`, with slots 0 and 1 expected.
 fn register_session_five(state: &CoordinatorState, serving: Vec<RelayId>) {
     state.lifecycle.register_session(
@@ -92,6 +113,150 @@ fn register_session_five(state: &CoordinatorState, serving: Vec<RelayId>) {
         serving,
         std::collections::HashSet::from([SlotId(0), SlotId(1)]),
         std::collections::HashSet::new(),
+    );
+}
+
+#[tokio::test]
+async fn settling_read_returns_finality_and_retained_lobby_violation() {
+    let (setup, session) = SessionFixture::default().build();
+    let state = state_over(setup);
+    let tenant = tenant_id();
+    let serving = state.setup.serving_relays(&tenant, session);
+    state.lifecycle.register_session(
+        tenant.clone(),
+        session,
+        serving.clone(),
+        std::collections::HashSet::from([SlotId(0)]),
+        std::collections::HashSet::new(),
+    );
+    let _relay = spawn_attesting_relay(
+        &state,
+        RelayId(1),
+        SessionPresence {
+            lobby_violations: slots(&[0]),
+            ..presence_entry(&tenant, session, &[])
+        },
+        AttestOptions {
+            setup_settled: true,
+            ..Default::default()
+        },
+    );
+
+    let body = settle_lobby_load_state(router(state.clone()), session.0).await;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "known": true,
+            "setupFinal": true,
+            "connectedSlots": [],
+            "startedSlots": [],
+            "lobbyViolationSlots": [0],
+        }),
+    );
+    assert!(
+        state
+            .setup
+            .descriptors()
+            .current_for(RelayId(1))
+            .iter()
+            .any(|descriptor| descriptor.session == session && descriptor.lobby_settled),
+        "the coordinator publishes the final cut for a reconnecting relay",
+    );
+}
+
+#[tokio::test]
+async fn settling_read_stays_nonfinal_when_one_home_is_not_settled() {
+    let (setup, session) = SessionFixture {
+        relays: vec![
+            RelaySpec {
+                id: 1,
+                region: Some("region-a"),
+            },
+            RelaySpec {
+                id: 2,
+                region: Some("region-b"),
+            },
+        ],
+        players: vec![
+            PlayerSpec {
+                slot: 0,
+                external_ref: None,
+                region: Some("region-a"),
+            },
+            PlayerSpec {
+                slot: 1,
+                external_ref: None,
+                region: Some("region-b"),
+            },
+        ],
+        ..Default::default()
+    }
+    .build();
+    let state = state_over(setup);
+    let tenant = tenant_id();
+    let serving = state.setup.serving_relays(&tenant, session);
+    assert_eq!(serving.len(), 2);
+    assert!(serving.contains(&RelayId(1)));
+    assert!(serving.contains(&RelayId(2)));
+    state.lifecycle.register_session(
+        tenant.clone(),
+        session,
+        serving,
+        std::collections::HashSet::from([SlotId(0), SlotId(1)]),
+        std::collections::HashSet::new(),
+    );
+    let _one = spawn_attesting_relay(
+        &state,
+        RelayId(1),
+        presence_entry(&tenant, session, &[]),
+        AttestOptions {
+            setup_settled: true,
+            ..Default::default()
+        },
+    );
+    let _two = spawn_attesting_relay(
+        &state,
+        RelayId(2),
+        presence_entry(&tenant, session, &[]),
+        AttestOptions::default(),
+    );
+
+    let body = settle_lobby_load_state(router(state.clone()), session.0).await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["known"], true);
+    assert_eq!(response["setupFinal"], false);
+    for relay in [RelayId(1), RelayId(2)] {
+        assert!(
+            state
+                .setup
+                .descriptors()
+                .current_for(relay)
+                .iter()
+                .all(|descriptor| descriptor.session != session || !descriptor.lobby_settled),
+            "no home may receive the latch until every home settled",
+        );
+    }
+
+    _two.abort();
+    let _settled_two = spawn_attesting_relay(
+        &state,
+        RelayId(2),
+        presence_entry(&tenant, session, &[]),
+        AttestOptions {
+            setup_settled: true,
+            ..Default::default()
+        },
+    );
+    let body = settle_lobby_load_state(router(state.clone()), session.0).await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["setupFinal"], true);
+    let mut reversed = state.setup.serving_relays(&tenant, session);
+    reversed.reverse();
+    assert!(
+        state
+            .setup
+            .settle_lobby(&tenant, session, &reversed, || true),
+        "settlement compares serving membership independently of vector order",
     );
 }
 
@@ -134,7 +299,7 @@ async fn every_serving_relay_attesting_makes_the_answer_complete() {
     // completeness is the exchange, not a clock.
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":true,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1]}"#,
+        r#"{"known":true,"setupFinal":false,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1],"lobbyViolationSlots":[]}"#,
     );
 }
 
@@ -165,6 +330,7 @@ async fn one_unfenced_relay_costs_the_claim_but_not_the_others_facts() {
         },
         AttestOptions {
             fenced: false,
+            setup_settled: false,
             ..Default::default()
         },
     );
@@ -173,7 +339,7 @@ async fn one_unfenced_relay_costs_the_claim_but_not_the_others_facts() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"connectedSlots":[0,1],"startedSlots":[1]}"#,
+        r#"{"known":false,"setupFinal":false,"connectedSlots":[0,1],"startedSlots":[1],"lobbyViolationSlots":[]}"#,
         "both relays' positives stand; only the negative inference is withheld",
     );
 }
@@ -238,7 +404,7 @@ async fn concurrent_reads_of_one_session_cost_fewer_rounds_than_reads() {
         let body = read.await.expect("the read completes");
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            r#"{"known":true,"connectedSlots":[0],"startedSlots":[0]}"#,
+            r#"{"known":true,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"lobbyViolationSlots":[]}"#,
         );
     }
     assert!(
@@ -314,7 +480,7 @@ async fn one_silent_relay_costs_the_claim_but_not_the_others_facts() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"connectedSlots":[1],"startedSlots":[1]}"#,
+        r#"{"known":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[1],"lobbyViolationSlots":[]}"#,
     );
 }
 
@@ -340,7 +506,7 @@ async fn a_relay_with_no_control_connection_never_attests() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"connectedSlots":[0],"startedSlots":[]}"#,
+        r#"{"known":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[],"lobbyViolationSlots":[]}"#,
     );
 }
 
@@ -367,7 +533,7 @@ async fn a_broken_lineage_withholds_the_claim_even_when_every_relay_attests() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"connectedSlots":[1],"startedSlots":[]}"#,
+        r#"{"known":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[],"lobbyViolationSlots":[]}"#,
         "the facts the snapshot carried still stand",
     );
 }
@@ -381,7 +547,7 @@ async fn a_session_the_coordinator_holds_nothing_for_answers_no_information() {
     let body = read_load_state(app, 6).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"connectedSlots":[],"startedSlots":[]}"#,
+        r#"{"known":false,"setupFinal":false,"connectedSlots":[],"startedSlots":[],"lobbyViolationSlots":[]}"#,
     );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("startedAtMs").is_none(), "absent, never null");
@@ -405,7 +571,7 @@ async fn a_session_this_coordinator_never_created_answers_its_facts_only() {
     let body = read_load_state(app, 7).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"connectedSlots":[0],"startedSlots":[0]}"#,
+        r#"{"known":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"lobbyViolationSlots":[]}"#,
         "the facts stand; only the read-absence-as-proof claim is withheld",
     );
 }
@@ -422,7 +588,7 @@ async fn a_snapshot_correlated_to_another_relays_request_is_discarded() {
     let mut asks_one = attest.subscribe(RelayId(1));
     let _asks_two = attest.subscribe(RelayId(2));
     let one = attest
-        .request(RelayId(1), &tenant, SessionId(5))
+        .request(RelayId(1), &tenant, SessionId(5), false)
         .expect("relay 1 is connected");
     let ask = asks_one.recv().await.expect("the question was queued");
 
@@ -437,6 +603,7 @@ async fn a_snapshot_correlated_to_another_relays_request_is_discarded() {
                 ..presence_entry(&tenant, SessionId(5), &[])
             },
             fenced: true,
+            setup_settled: false,
         })
         .unwrap()
         .into(),

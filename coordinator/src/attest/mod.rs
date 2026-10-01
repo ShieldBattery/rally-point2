@@ -103,6 +103,8 @@ pub const LOAD_STATE_ASK_CAPACITY: usize = 64;
 /// sending a [`CoordinatorToRelay::LoadStateRequest`](rally_point_proto::control::CoordinatorToRelay::LoadStateRequest).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadStateAsk {
+    /// Whether this request must make a final setup-lobby ingress cut before answering.
+    pub settle_lobby: bool,
     /// The tenant the session belongs to.
     pub tenant: TenantId,
     /// The session to ask about.
@@ -144,7 +146,7 @@ struct AttestState {
 }
 
 /// The key of one in-flight attestation round: which session, for which tenant.
-type RoundKey = (TenantId, SessionId);
+type RoundKey = (TenantId, SessionId, bool);
 
 /// One outstanding request: who was asked, about what, and where the answer goes.
 struct PendingRequest {
@@ -172,6 +174,8 @@ pub struct AttestedSnapshot {
     /// back. False is not a refusal — it only means this answer's absences may
     /// not be read as proof.
     pub fenced: bool,
+    /// Whether this request made a final setup-lobby ingress cut on the relay.
+    pub setup_settled: bool,
 }
 
 /// One attestation round's outcome, shared by every read that joined it.
@@ -190,6 +194,8 @@ pub struct AttestRound {
     pub attested: Arc<HashSet<RelayId>>,
     /// The relays whose answer was fenced — a subset of `attested`.
     pub fenced: Arc<HashSet<RelayId>>,
+    /// The relays that made a final setup-lobby ingress cut — a subset of `attested`.
+    pub setup_settled: Arc<HashSet<RelayId>>,
 }
 
 /// A request in flight, held by the caller waiting on its answer.
@@ -248,6 +254,7 @@ impl LoadStateAttest {
         relay: RelayId,
         tenant: &TenantId,
         session: SessionId,
+        settle_lobby: bool,
     ) -> Option<PendingSnapshot> {
         let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
         let (answer_tx, answer_rx) = oneshot::channel();
@@ -257,6 +264,7 @@ impl LoadStateAttest {
             tenant: tenant.clone(),
             session,
             request_id,
+            settle_lobby,
         }) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
@@ -358,8 +366,13 @@ impl LoadStateAttest {
     /// own arrival (see the module docs): a round that had begun asking before it
     /// joined answers a question older than the one it asked. [`shared_round`] is
     /// that whole protocol; prefer it to driving this by hand.
-    pub fn begin_round(&self, tenant: &TenantId, session: SessionId) -> RoundEntry {
-        let key = (tenant.clone(), session);
+    pub fn begin_round(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+        settle_lobby: bool,
+    ) -> RoundEntry {
+        let key = (tenant.clone(), session, settle_lobby);
         let mut state = self.inner.state.lock();
         if let Some(rx) = state.rounds.get(&key) {
             return RoundEntry::Joined(rx.clone());
@@ -452,6 +465,7 @@ pub async fn shared_round<F, Fut>(
     attest: &LoadStateAttest,
     tenant: &TenantId,
     session: SessionId,
+    settle_lobby: bool,
     run_round: F,
 ) -> AttestRound
 where
@@ -460,7 +474,7 @@ where
 {
     let asked_at = Instant::now();
     loop {
-        match attest.begin_round(tenant, session) {
+        match attest.begin_round(tenant, session, settle_lobby) {
             RoundEntry::Leader(leader) => {
                 let round = run_round().await;
                 leader.publish(round.clone());

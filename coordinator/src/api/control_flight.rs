@@ -309,6 +309,7 @@ pub(super) fn handle_load_state_snapshot(
     request_id: u64,
     mut snapshot: rally_point_proto::control::SessionPresence,
     fenced: bool,
+    setup_settled: bool,
 ) {
     let relay_id = inbound.relay_id;
     bound_session_slot_lists(relay_id, &mut snapshot);
@@ -324,6 +325,22 @@ pub(super) fn handle_load_state_snapshot(
         );
         return;
     }
+    snapshot.lobby_violations.retain(|&slot| {
+        let allowed =
+            inbound
+                .setup
+                .relay_homes_slot(relay_id, &snapshot.tenant, snapshot.session, slot);
+        if !allowed {
+            tracing::warn!(
+                relay_id = relay_id.0,
+                tenant = snapshot.tenant.as_ref(),
+                session = snapshot.session.0,
+                slot = slot.0,
+                "load-state lobby violation from a relay not homing the slot; rejecting",
+            );
+        }
+        allowed
+    });
     inbound
         .lifecycle
         .merge_load_state(std::slice::from_ref(&snapshot));
@@ -336,6 +353,7 @@ pub(super) fn handle_load_state_snapshot(
             crate::attest::AttestedSnapshot {
                 state: snapshot,
                 fenced,
+                setup_settled,
             },
         )
         .is_err()

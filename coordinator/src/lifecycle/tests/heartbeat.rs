@@ -244,6 +244,7 @@ async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_ten
             attestable: true,
             serving_relays: vec![RelayId(1)],
             started_at_ms: None,
+            lobby_violation_slots: vec![],
             connected_slots: vec![],
             started_slots: vec![],
         }),
@@ -355,6 +356,72 @@ async fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
     );
 }
 
+#[tokio::test]
+async fn heartbeat_keeps_lobby_violations_only_from_the_reporting_slots_home() {
+    let (setup, response) = SessionFixture {
+        relays: vec![
+            RelaySpec {
+                id: 1,
+                region: Some("region-a"),
+            },
+            RelaySpec {
+                id: 2,
+                region: Some("region-b"),
+            },
+        ],
+        players: vec![
+            PlayerSpec {
+                slot: 0,
+                external_ref: None,
+                region: Some("region-a"),
+            },
+            PlayerSpec {
+                slot: 1,
+                external_ref: None,
+                region: Some("region-b"),
+            },
+        ],
+        ..Default::default()
+    }
+    .build_response();
+    let session = response.session;
+    let relay_2_generation = registry::enrolled_relays(setup.registry())
+        .into_iter()
+        .find(|relay| relay.relay_id == RelayId(2))
+        .expect("relay 2 is enrolled")
+        .generation;
+    assert!(setup.relay_homes_slot(RelayId(2), &tid(), session, SlotId(1)));
+    assert!(!setup.relay_homes_slot(RelayId(2), &tid(), session, SlotId(0)));
+
+    let lifecycle = Lifecycle::new(setup.clone());
+    lifecycle.register_session(
+        tid(),
+        session,
+        setup.serving_relays(&tid(), session),
+        HashSet::from([SlotId(0), SlotId(1)]),
+        HashSet::new(),
+    );
+    let regions = RegionsConfig::default();
+    let store = PairRttStore::new();
+    lifecycle.ingest_heartbeat(
+        RelayId(2),
+        relay_2_generation,
+        beat_with_sessions(vec![SessionPresence {
+            lobby_violations: slots(&[0, 1]),
+            ..presence_entry(&tid(), session, &[1])
+        }]),
+        &idle_rtt_ingest(&regions, &store),
+    );
+
+    assert_eq!(
+        lifecycle
+            .load_state(&tid(), session)
+            .expect("the session was registered")
+            .lobby_violation_slots,
+        vec![SlotId(1)],
+        "a serving relay cannot retain a punitive violation for another relay's slot",
+    );
+}
 #[tokio::test]
 async fn heartbeat_session_roster_beyond_the_cap_is_truncated_and_stops_being_authoritative() {
     // Truncation drops a suffix the relay actually reported, so the beat stops

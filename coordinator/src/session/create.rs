@@ -349,6 +349,7 @@ fn create_body(
         rollback,
         latency_estimate_ms: request.latency_estimate_ms,
         lobby_policy: request.lobby_policy.clone(),
+        lobby_settled: false,
     };
     setup
         .session_refs

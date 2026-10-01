@@ -28,6 +28,7 @@ fn a_presence_bearing_heartbeat_roundtrips_json() {
             ever_connected: vec![],
             started: vec![],
             started_at_ms: None,
+            lobby_violations: vec![],
         }],
         region_rtts: vec![],
     };
@@ -54,6 +55,7 @@ fn a_load_state_bearing_heartbeat_roundtrips_json() {
             ever_connected: vec![SlotId(0), SlotId(3)],
             started: vec![SlotId(3)],
             started_at_ms: Some(1_700_000_000_000),
+            lobby_violations: vec![],
         }],
         region_rtts: vec![],
     };
@@ -80,6 +82,7 @@ fn a_heartbeat_without_load_state_omits_the_fields_and_decodes() {
             ever_connected: vec![],
             started: vec![],
             started_at_ms: None,
+            lobby_violations: vec![],
         }],
         region_rtts: vec![],
     };
@@ -183,6 +186,7 @@ fn a_presence_bearing_heartbeat_decodes_on_a_pre_presence_decoder() {
             ever_connected: vec![],
             started: vec![],
             started_at_ms: None,
+            lobby_violations: vec![],
         }],
         region_rtts: vec![],
     })

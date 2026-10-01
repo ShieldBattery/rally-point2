@@ -13,6 +13,7 @@ fn roster_for(tenant: TenantId, session: u64, slots: &[u8]) -> Vec<SessionPresen
         ever_connected: vec![],
         started: vec![],
         started_at_ms: None,
+        lobby_violations: vec![],
     }]
 }
 

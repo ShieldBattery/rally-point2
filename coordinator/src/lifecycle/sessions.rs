@@ -291,6 +291,17 @@ impl Lifecycle {
         self.arm_webhook_reap_if_orphan(&tenant, session, state);
     }
 
+    /// Records that a home relay observed a pre-game lobby policy violation. This
+    /// positive evidence is restated on heartbeats and never causes a second webhook.
+    pub fn on_lobby_violation(&self, tenant: TenantId, session: SessionId, slot: SlotId) {
+        let mut sessions = self.inner.sessions.lock();
+        let state = sessions
+            .entry((tenant.clone(), session))
+            .or_insert_with(|| self.new_state(Vec::new()));
+        state.lobby_violation_slots.insert(slot);
+        self.arm_webhook_reap_if_orphan(&tenant, session, state);
+    }
+
     /// The session's load progress as the coordinator currently knows it: when it
     /// started, which slots ever connected, which ever reported their game loop
     /// running, plus the two facts a completeness claim rests on — whether this
@@ -319,6 +330,7 @@ impl Lifecycle {
                 started_at_ms: state.started_at_ms,
                 connected_slots: sorted_slots(&state.connected_slots),
                 started_slots: sorted_slots(&state.started_slots),
+                lobby_violation_slots: sorted_slots(&state.lobby_violation_slots),
             })
     }
 
@@ -353,6 +365,9 @@ impl Lifecycle {
             }
             for &slot in &session.started {
                 self.on_slot_started(session.tenant.clone(), session.session, slot);
+            }
+            for &slot in &session.lobby_violations {
+                self.on_lobby_violation(session.tenant.clone(), session.session, slot);
             }
             if let Some(started_at_ms) = session.started_at_ms {
                 self.on_session_started(session.tenant.clone(), session.session, started_at_ms);

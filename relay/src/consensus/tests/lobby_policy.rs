@@ -88,3 +88,36 @@ fn re_push_cannot_replace_the_latched_lobby_policy() {
         LobbyCommandVerdict::Allowed
     );
 }
+
+#[test]
+fn settlement_closes_lobby_ingress_without_evicting_or_reopening_on_a_repush() {
+    let registry = new_decision_makers();
+    let k = key();
+    let _ = registry.sync_maker(
+        &k,
+        MakerSync {
+            lobby_policy: Some(policy(0, b"allowed")),
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
+    );
+    assert!(registry.settle_lobby(&k));
+    assert_eq!(
+        registry.admit_lobby_command(&k, SlotId(0), b"wrong"),
+        LobbyCommandVerdict::DroppedAfterSettlement,
+    );
+    assert_eq!(registry.lock().get(&k).unwrap().eviction(SlotId(0)), None);
+
+    let _ = registry.sync_maker(
+        &k,
+        MakerSync {
+            lobby_policy: Some(policy(0, b"allowed")),
+            lobby_settled: false,
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
+    );
+    assert_eq!(
+        registry.admit_lobby_command(&k, SlotId(0), b"allowed"),
+        LobbyCommandVerdict::DroppedAfterSettlement,
+        "a later descriptor cannot reopen the settled epoch",
+    );
+}

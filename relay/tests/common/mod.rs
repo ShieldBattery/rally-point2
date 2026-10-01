@@ -261,6 +261,7 @@ pub fn build_turn(slot: u8, seq: u64, frame: Option<u32>) -> Payload {
 pub fn descriptor(tenant: &str, session: SessionId) -> SessionDescriptor {
     SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId(tenant.to_owned()),

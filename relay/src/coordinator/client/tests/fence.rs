@@ -245,6 +245,8 @@ async fn an_ask_beyond_the_fence_cap_is_shed_without_probing() {
     registration.disarm();
     decision_makers.note_slot_connected(&key(7), SlotId(0), false);
     let sources = HeartbeatSources {
+        session_gates: crate::session::gate::SessionGates::default(),
+        provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
         sessions: Arc::clone(&sessions),
         decision_makers: Arc::clone(&decision_makers),
         region_rtt_cache: RegionRttCache::default(),
@@ -260,6 +262,7 @@ async fn an_ask_beyond_the_fence_cap_is_shed_without_probing() {
         &sources,
         LoadStateAsk {
             request_id: 1,
+            settle_lobby: false,
             key: key(7),
         },
         &answers_tx,
@@ -282,6 +285,7 @@ async fn an_ask_beyond_the_fence_cap_is_shed_without_probing() {
         &sources,
         LoadStateAsk {
             request_id: 2,
+            settle_lobby: false,
             key: key(7),
         },
         &answers_tx,

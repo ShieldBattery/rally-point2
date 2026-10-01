@@ -114,6 +114,7 @@ fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
 fn session_descriptor_roundtrips_json() {
     let desc = SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId("sb-staging".to_owned()),
@@ -241,6 +242,7 @@ fn session_descriptor_omits_absent_correlation_ids_on_the_wire() {
     // serializes as `[]`, not omitted.
     let desc = SessionDescriptor {
         lobby_policy: None,
+        lobby_settled: false,
         rollback: false,
         finalized_drops: false,
         tenant: TenantId("sb-staging".to_owned()),

@@ -12,8 +12,10 @@ fn snapshot(session: SessionId, ever_connected: &[u8]) -> AttestedSnapshot {
             ever_connected: ever_connected.iter().map(|&s| SlotId(s)).collect(),
             started: vec![],
             started_at_ms: None,
+            lobby_violations: vec![],
         },
         fenced: true,
+        setup_settled: false,
     }
 }
 
@@ -22,7 +24,7 @@ async fn a_request_reaches_the_relay_and_its_answer_reaches_the_waiter() {
     let attest = LoadStateAttest::new();
     let mut asks = attest.subscribe(RelayId(1));
     let mut pending = attest
-        .request(RelayId(1), &tid(), SessionId(5))
+        .request(RelayId(1), &tid(), SessionId(5), false)
         .expect("the relay is connected");
     let ask = asks.recv().await.expect("the question was queued");
     assert_eq!(ask.tenant, tid());
@@ -40,7 +42,11 @@ async fn a_request_reaches_the_relay_and_its_answer_reaches_the_waiter() {
 #[tokio::test]
 async fn a_relay_with_no_connection_cannot_be_asked() {
     let attest = LoadStateAttest::new();
-    assert!(attest.request(RelayId(9), &tid(), SessionId(5)).is_none());
+    assert!(
+        attest
+            .request(RelayId(9), &tid(), SessionId(5), false)
+            .is_none()
+    );
     assert_eq!(attest.pending_count(), 0);
 }
 
@@ -51,8 +57,16 @@ async fn a_dead_connection_is_dropped_rather_than_asked_again() {
     let attest = LoadStateAttest::new();
     let asks = attest.subscribe(RelayId(1));
     drop(asks);
-    assert!(attest.request(RelayId(1), &tid(), SessionId(5)).is_none());
-    assert!(attest.request(RelayId(1), &tid(), SessionId(5)).is_none());
+    assert!(
+        attest
+            .request(RelayId(1), &tid(), SessionId(5), false)
+            .is_none()
+    );
+    assert!(
+        attest
+            .request(RelayId(1), &tid(), SessionId(5), false)
+            .is_none()
+    );
     assert_eq!(attest.pending_count(), 0);
 }
 
@@ -62,7 +76,7 @@ async fn ids_do_not_cross_match_between_relays_sessions_or_reads() {
     let mut asks_one = attest.subscribe(RelayId(1));
     let _asks_two = attest.subscribe(RelayId(2));
     let mut pending = attest
-        .request(RelayId(1), &tid(), SessionId(5))
+        .request(RelayId(1), &tid(), SessionId(5), false)
         .expect("connected");
     let ask = asks_one.recv().await.expect("queued");
 
@@ -112,12 +126,14 @@ async fn a_full_question_channel_is_a_non_answer_rather_than_a_block() {
     for _ in 0..LOAD_STATE_ASK_CAPACITY {
         filled.push(
             attest
-                .request(RelayId(1), &tid(), SessionId(5))
+                .request(RelayId(1), &tid(), SessionId(5), false)
                 .expect("the channel has room"),
         );
     }
     assert!(
-        attest.request(RelayId(1), &tid(), SessionId(5)).is_none(),
+        attest
+            .request(RelayId(1), &tid(), SessionId(5), false)
+            .is_none(),
         "a full channel answers nothing rather than queueing behind the backlog",
     );
     assert_eq!(
@@ -128,7 +144,9 @@ async fn a_full_question_channel_is_a_non_answer_rather_than_a_block() {
 
     asks.recv().await.expect("the backlog drains");
     assert!(
-        attest.request(RelayId(1), &tid(), SessionId(5)).is_some(),
+        attest
+            .request(RelayId(1), &tid(), SessionId(5), false)
+            .is_some(),
         "the sender survives a full channel, so a caught-up relay is asked again",
     );
 }
@@ -139,15 +157,15 @@ async fn concurrent_reads_of_one_session_share_a_single_round() {
     // so a tenant polling a session hard cannot multiply fleet-wide traffic by
     // the number of requests it has in flight.
     let attest = LoadStateAttest::new();
-    let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5)) else {
+    let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5), false) else {
         panic!("the first caller leads");
     };
-    let RoundEntry::Joined(watch) = attest.begin_round(&tid(), SessionId(5)) else {
+    let RoundEntry::Joined(watch) = attest.begin_round(&tid(), SessionId(5), false) else {
         panic!("a second caller joins rather than leading");
     };
     // A different session is a different round: sharing is per-session. Bound
     // rather than matched in place — the handle retires its round when dropped.
-    let other = attest.begin_round(&tid(), SessionId(6));
+    let other = attest.begin_round(&tid(), SessionId(6), false);
     assert!(matches!(other, RoundEntry::Leader(_)));
     assert_eq!(attest.round_count(), 2);
 
@@ -156,6 +174,7 @@ async fn concurrent_reads_of_one_session_share_a_single_round() {
         started_before_any_request,
         attested: Arc::new(HashSet::from([RelayId(1)])),
         fenced: Arc::new(HashSet::from([RelayId(1)])),
+        setup_settled: Arc::new(HashSet::new()),
     });
     let joined = joined_round(watch).await.expect("the round published");
     assert_eq!(
@@ -165,6 +184,18 @@ async fn concurrent_reads_of_one_session_share_a_single_round() {
     assert_eq!(*joined.attested, HashSet::from([RelayId(1)]));
 }
 
+#[test]
+fn a_settling_read_never_joins_an_ordinary_round() {
+    let attest = LoadStateAttest::new();
+    let RoundEntry::Leader(ordinary) = attest.begin_round(&tid(), SessionId(5), false) else {
+        panic!("the ordinary read leads");
+    };
+    let RoundEntry::Leader(settling) = attest.begin_round(&tid(), SessionId(5), true) else {
+        panic!("a settling read has its own cut");
+    };
+    assert_eq!(attest.round_count(), 2);
+    drop((ordinary, settling));
+}
 #[test]
 fn a_round_stamped_at_the_very_instant_a_read_arrived_does_not_answer_it() {
     // Equal samples of a monotonic clock cannot order the two events, so the
@@ -188,6 +219,7 @@ fn round_started_at(started: Instant, relay: RelayId) -> AttestRound {
         started_before_any_request: started,
         attested: Arc::new(HashSet::from([relay])),
         fenced: Arc::new(HashSet::from([relay])),
+        setup_settled: Arc::new(HashSet::new()),
     }
 }
 
@@ -211,7 +243,7 @@ async fn a_read_that_arrived_mid_round_leads_its_own() {
         async move {
             // Arrives while the leader's round is mid-fan-out.
             tokio::time::sleep(Duration::from_millis(10)).await;
-            shared_round(&attest, &tid(), SessionId(5), || {
+            shared_round(&attest, &tid(), SessionId(5), false, || {
                 rounds_run.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 std::future::ready(round_started_at(Instant::now(), RelayId(2)))
             })
@@ -219,7 +251,7 @@ async fn a_read_that_arrived_mid_round_leads_its_own() {
         }
     });
 
-    let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5)) else {
+    let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5), false) else {
         panic!("the first caller leads");
     };
     // The boundary, taken before the first relay is asked.
@@ -253,14 +285,14 @@ async fn a_read_that_arrived_before_the_boundary_shares_the_round() {
     let attest = LoadStateAttest::new();
     let rounds_run = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5)) else {
+    let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5), false) else {
         panic!("the first caller leads");
     };
     let joiner = tokio::spawn({
         let attest = attest.clone();
         let rounds_run = Arc::clone(&rounds_run);
         async move {
-            shared_round(&attest, &tid(), SessionId(5), || {
+            shared_round(&attest, &tid(), SessionId(5), false, || {
                 rounds_run.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 std::future::ready(round_started_at(Instant::now(), RelayId(2)))
             })
@@ -292,17 +324,17 @@ async fn a_round_whose_leader_leaves_without_publishing_frees_the_next_caller() 
     // joiner learns there is no outcome and the entry is gone, so the next
     // caller leads.
     let attest = LoadStateAttest::new();
-    let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5)) else {
+    let RoundEntry::Leader(leader) = attest.begin_round(&tid(), SessionId(5), false) else {
         panic!("the first caller leads");
     };
-    let RoundEntry::Joined(watch) = attest.begin_round(&tid(), SessionId(5)) else {
+    let RoundEntry::Joined(watch) = attest.begin_round(&tid(), SessionId(5), false) else {
         panic!("a second caller joins");
     };
 
     drop(leader);
     assert!(joined_round(watch).await.is_none(), "there is no outcome");
     assert_eq!(attest.round_count(), 0, "the map tracks live rounds only");
-    let next = attest.begin_round(&tid(), SessionId(5));
+    let next = attest.begin_round(&tid(), SessionId(5), false);
     assert!(matches!(next, RoundEntry::Leader(_)));
 }
 
@@ -314,7 +346,7 @@ async fn a_request_nobody_waits_on_is_no_longer_pending() {
     let attest = LoadStateAttest::new();
     let mut asks = attest.subscribe(RelayId(1));
     let pending = attest
-        .request(RelayId(1), &tid(), SessionId(5))
+        .request(RelayId(1), &tid(), SessionId(5), false)
         .expect("connected");
     let ask = asks.recv().await.expect("queued");
     assert!(attest.is_pending(ask.request_id));
@@ -338,7 +370,7 @@ async fn a_reconnect_replaces_the_question_channel() {
     let mut old = attest.subscribe(RelayId(1));
     let mut new = attest.subscribe(RelayId(1));
     let _pending = attest
-        .request(RelayId(1), &tid(), SessionId(5))
+        .request(RelayId(1), &tid(), SessionId(5), false)
         .expect("connected");
     assert!(new.recv().await.is_some());
     assert!(old.recv().await.is_none(), "the old channel is closed");

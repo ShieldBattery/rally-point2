@@ -170,6 +170,7 @@ pub(crate) fn bound_session_slot_lists(relay_id: RelayId, session: &mut SessionP
         ("connected", &mut session.slots),
         ("ever-connected", &mut session.ever_connected),
         ("started", &mut session.started),
+        ("lobby-violations", &mut session.lobby_violations),
     ] {
         if slots.len() > MAX_HEARTBEAT_SESSION_SLOTS {
             tracing::warn!(
@@ -285,6 +286,24 @@ impl Lifecycle {
             }
             allowed
         });
+        // A retained lobby violation can lead to a game cancellation. Keep the
+        // same slot-home attribution as its one-shot notice: another serving
+        // relay can repeat ordinary load facts, but cannot blame this slot.
+        for session in &mut sessions {
+            session.lobby_violations.retain(|&slot| {
+                let allowed = setup.relay_homes_slot(relay, &session.tenant, session.session, slot);
+                if !allowed {
+                    tracing::warn!(
+                        relay_id = relay.0,
+                        tenant = session.tenant.as_ref(),
+                        session = session.session.0,
+                        slot = slot.0,
+                        "heartbeat lobby violation from a relay not homing the slot; rejecting",
+                    );
+                }
+                allowed
+            });
+        }
         presence::apply_heartbeat(
             setup.presence(),
             relay,

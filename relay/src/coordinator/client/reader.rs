@@ -141,6 +141,7 @@ pub(super) async fn read_control_frames(
                         tenant,
                         session,
                         request_id,
+                        settle_lobby,
                     } => {
                         // Answering is a send, so route the question to the write
                         // half, which snapshots the session's state at send time. The
@@ -156,6 +157,7 @@ pub(super) async fn read_control_frames(
                             .try_send(LoadStateAsk {
                                 request_id,
                                 key: SessionKey { tenant, session },
+                                settle_lobby,
                             })
                             .is_err()
                         {

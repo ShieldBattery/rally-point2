@@ -284,6 +284,11 @@ pub enum CoordinatorToRelay {
         /// snapshot so the coordinator matches an answer to the request it made and
         /// discards one for a request it no longer holds.
         request_id: u64,
+        /// Whether the relay must close the pre-game lobby policy epoch before
+        /// answering. Absent decodes as false so ordinary reads retain their
+        /// historical behavior.
+        #[serde(default, skip_serializing_if = "is_false")]
+        settle_lobby: bool,
     },
     /// A message kind this build does not recognize — a newer coordinator sent
     /// one this relay's protocol version predates. An unknown `type` decodes here
@@ -545,6 +550,11 @@ pub enum RelayToCoordinator {
         /// `false`, so it can never claim a fence it did not run.
         #[serde(default, skip_serializing_if = "is_false")]
         fenced: bool,
+        /// Whether this relay closed future home-authored lobby commands before
+        /// taking this snapshot. Absent decodes as false so an older relay can
+        /// never attest final setup state.
+        #[serde(default, skip_serializing_if = "is_false")]
+        setup_settled: bool,
     },
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
@@ -601,6 +611,11 @@ pub struct SessionPresence {
     /// relay, ascending. Monotonic for the same reason as `ever_connected`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub started: Vec<SlotId>,
+    /// Every home slot this relay evicted for a pre-game lobby policy violation,
+    /// ascending. A relay restates this positive evidence on every heartbeat so
+    /// the coordinator can recover it after losing a notice or restarting.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lobby_violations: Vec<SlotId>,
     /// Relay wall-clock (unix epoch milliseconds) for the session's start, as the
     /// reporting relay knows it: its own coverage latch where that fired,
     /// otherwise the moment it adopted the authority's start directive off the
