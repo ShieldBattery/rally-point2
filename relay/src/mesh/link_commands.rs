@@ -16,7 +16,7 @@ use super::forward::send_turn_over_link;
 use super::join::{
     local_presence, presence_statement, presence_updates, push_presence_updates,
     reconcile_leaves_on_join, reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
-    reconcile_started_slots_on_join,
+    reconcile_session_clock_on_join, reconcile_started_slots_on_join,
 };
 use super::link_arms::LinkDriver;
 use super::link_run::{MeshCommand, defer_flush_after_send};
@@ -201,6 +201,10 @@ impl LinkDriver {
                     // And the game-started reports its own home clients made,
                     // which reach no other relay on their own.
                     reconcile_started_slots_on_join(decision_makers, control_forward_tx, &key);
+                    // And the authority's session clock, for a peer that
+                    // joined after the anchor (re-sent on its first presence
+                    // too, in case it hasn't joined the session yet).
+                    reconcile_session_clock_on_join(decision_makers, control_forward_tx, &key);
                     // Re-send this relay's known leave state for the session
                     // down the fresh registration, so a link that died and
                     // redialed (its `joined` empty again) reconverges. All of

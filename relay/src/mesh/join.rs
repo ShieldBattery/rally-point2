@@ -53,12 +53,6 @@ pub(super) fn reconcile_leaves_on_join(
         let initial_buffer_turns = decision_makers.initial_buffer_turns(key);
         let _ = control_tx.send(session_start_frame(key.session, initial_buffer_turns));
     }
-    // The authority's session clock, for a relay that joins (or redials) after
-    // the anchor: without it that relay would have no deadlines to measure its
-    // own players against. Only the authority has one to send.
-    if let Some(clock) = decision_makers.session_clock_frame(key) {
-        let _ = control_tx.send(session_clock_frame(key.session, clock));
-    }
 }
 
 /// Replays every active home-client slot and connection generation to a mesh
@@ -111,6 +105,23 @@ pub(super) fn reconcile_started_slots_on_join(
 ) {
     for slot in decision_makers.started_home_slots(key) {
         let _ = control_tx.send(slot_started_frame(key.session, slot));
+    }
+}
+
+/// Sends the authority's session clock for `key` down a freshly registered
+/// link's control channel, so a relay that joins (or redials) after the anchor
+/// has deadlines to measure its own players against. Called both at this relay's
+/// own Join and when the peer proves its Join with its first presence report:
+/// a frame sent before the peer joined the session is dropped there, and the
+/// clock only goes out again when it stops. Only the authority has one to send;
+/// adopting it twice changes nothing.
+pub(super) fn reconcile_session_clock_on_join(
+    decision_makers: &crate::consensus::DecisionMakers,
+    control_tx: &MeshControlTx,
+    key: &SessionKey,
+) {
+    if let Some(clock) = decision_makers.session_clock_frame(key) {
+        let _ = control_tx.send(session_clock_frame(key.session, clock));
     }
 }
 

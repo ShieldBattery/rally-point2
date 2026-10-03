@@ -27,7 +27,7 @@ use super::frames::*;
 use super::join::{
     SentPresence, presence_catch_up, presence_statement, reconcile_leaves_on_join,
     reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
-    reconcile_started_slots_on_join,
+    reconcile_session_clock_on_join, reconcile_started_slots_on_join,
 };
 use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};
 use super::links::{

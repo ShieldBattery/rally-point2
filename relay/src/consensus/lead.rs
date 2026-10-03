@@ -21,12 +21,20 @@ pub(in crate::consensus) const LEAD_WINDOW_TURNS: usize = 24;
 /// How many turns go between a slot's reports: half a second.
 pub(in crate::consensus) const LEAD_REPORT_EVERY: u64 = 12;
 
+/// How far below a slot's newest seq a turn can still be told apart from a repeat: about five
+/// seconds of turns. Turns arrive out of order, so a turn first arriving after a newer one is a
+/// late arrival like any other and is measured; one this far behind can't be told from a copy of
+/// a turn already measured (a resume replay on a new link), and is skipped.
+const LEAD_SEEN_SEQS: u64 = u128::BITS as u64;
+
 /// One home slot's measurements.
 #[derive(Debug)]
 struct SlotLead {
-    /// The newest seq measured. A seq at or below it is a copy of a turn already measured (a
-    /// resume replay arriving on a new link) and is skipped.
+    /// The newest seq measured.
     newest: u64,
+    /// Which of the [`LEAD_SEEN_SEQS`] seqs up to `newest` were measured: bit `i` is seq
+    /// `newest - i`. A seq whose bit is set is a copy of a turn already measured.
+    seen: u128,
     /// The lateness of the newest turns, in microseconds, as a ring.
     window: [i32; LEAD_WINDOW_TURNS],
     len: usize,
@@ -39,11 +47,34 @@ impl SlotLead {
     fn new(seq: u64) -> Self {
         Self {
             newest: seq,
+            seen: 1,
             window: [0; LEAD_WINDOW_TURNS],
             len: 0,
             next: 0,
             report_at: seq,
         }
+    }
+
+    /// Marks `seq` measured, returning `false` when it already was or is too far behind the newest
+    /// seq to tell.
+    fn mark(&mut self, seq: u64) -> bool {
+        if seq > self.newest {
+            let ahead = seq - self.newest;
+            self.seen = if ahead >= LEAD_SEEN_SEQS {
+                0
+            } else {
+                self.seen << ahead
+            };
+            self.seen |= 1;
+            self.newest = seq;
+            return true;
+        }
+        let behind = self.newest - seq;
+        if behind >= LEAD_SEEN_SEQS || self.seen & (1 << behind) != 0 {
+            return false;
+        }
+        self.seen |= 1 << behind;
+        true
     }
 
     fn push(&mut self, lateness_us: i32) {
@@ -96,19 +127,20 @@ impl LeadTracker {
         let lead = match self.slots.entry(slot) {
             std::collections::hash_map::Entry::Occupied(entry) => {
                 let lead = entry.into_mut();
-                if seq <= lead.newest {
+                if !lead.mark(seq) {
                     return None;
                 }
                 lead
             }
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(SlotLead::new(seq)),
         };
-        lead.newest = seq;
         lead.push(lateness_us.clamp(i32::MIN.into(), i32::MAX.into()) as i32);
-        if seq < lead.report_at {
+        // Due by the newest seq, so a late turn filling a gap below it is measured without
+        // bringing a report forward.
+        if lead.newest < lead.report_at {
             return None;
         }
-        lead.report_at = seq + LEAD_REPORT_EVERY;
+        lead.report_at = lead.newest + LEAD_REPORT_EVERY;
         Some(lead.report(pause))
     }
 

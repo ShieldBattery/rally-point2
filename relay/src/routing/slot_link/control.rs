@@ -7,7 +7,7 @@ use super::*;
 use crate::consensus::MAX_GAME_RESULT_PAYLOAD_LEN;
 use crate::validation::validate_turn;
 
-use super::inbound::log_link_closed;
+use super::inbound::{log_link_closed, measure_lead};
 
 /// Handles one frame off this client's control stream. `None` means the reader
 /// task ended, which costs the relay the only channel a leave-intent or a drop
@@ -524,6 +524,10 @@ fn handle_oversize_turn(
     ctx: &mut SlotLinkCtx,
     payload: Payload,
 ) -> ControlFlow<()> {
+    // The turn's arrival, for the lead measurement below. The control stream's
+    // reader task decoded it a moment ago, which is as close to the wire as this
+    // path gets.
+    let received_at = std::time::Instant::now();
     // A turn larger than any legitimate one can ever be is
     // rejected before it can occupy the count-bounded forward
     // queues (see `MAX_OVERSIZE_TURN_COMMANDS_LEN`). Closing
@@ -563,6 +567,7 @@ fn handle_oversize_turn(
         Ok(turn) => {
             let payload = turn.payload;
             ctx.flight_counters.note_validated(payload.seq);
+            let seq = payload.seq;
             // NOTE: no frame-observation or
             // desync-comparator call here either —
             // `forward_client_turn` funnels into the one
@@ -576,6 +581,9 @@ fn handle_oversize_turn(
                 ctx.slot,
                 payload,
             );
+            // Measured like a datagram turn: an oversize turn is still one of
+            // this player's turns, and a stream of them still needs reports.
+            measure_lead(ctx, seq, received_at);
         }
         Err(error) => {
             tracing::warn!(

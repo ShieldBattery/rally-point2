@@ -8,6 +8,22 @@ use rally_point_proto::messages::SlotConditions;
 
 use crate::validation::validate_turn;
 
+/// Measures this slot's turn with seq `seq`, which first arrived at `received_at`,
+/// against a rollback session's clock, and pushes the slot's lead report down its
+/// own control stream when one is due. Called for every validated turn this
+/// client sends, on either ingress (a datagram, or an oversize turn on the
+/// reliable stream), after the turn is forwarded: a turn that moved the
+/// authority's clock (resuming it after a stop) is then measured against the
+/// clock it moved. Nothing outside a rollback session.
+pub(super) fn measure_lead(ctx: &SlotLinkCtx, seq: u64, received_at: std::time::Instant) {
+    if let Some(report) =
+        ctx.decision_makers
+            .note_lead_arrival(&ctx.key, ctx.slot, seq, received_at)
+    {
+        deliver_lead_report_to_slot(&ctx.sessions, &ctx.key, ctx.slot, report);
+    }
+}
+
 /// Handles one datagram received from this client: sample the path, validate and
 /// fan out every fresh turn, feed the send-phase controller, and push the
 /// advanced delivered-through cursor back over the beacon stream.
@@ -95,19 +111,9 @@ pub(super) async fn handle_received(
                     ctx.slot,
                     payload,
                 );
-                // In a rollback session, measure this turn against the
-                // session clock: every first arrival counts, a catch-up
-                // burst included, because a turn that arrived in a burst
-                // arrived late. Measured after forwarding, so a turn that
-                // moved the authority's clock (resuming it after a stop) is
-                // measured against the clock it moved. Its report, when one
-                // is due, goes back down this slot's own control stream.
-                if let Some(report) =
-                    ctx.decision_makers
-                        .note_lead_arrival(&ctx.key, ctx.slot, seq, received_at)
-                {
-                    deliver_lead_report_to_slot(&ctx.sessions, &ctx.key, ctx.slot, report);
-                }
+                // A catch-up burst counts too: a turn that arrived in a
+                // burst arrived late.
+                measure_lead(ctx, seq, received_at);
             }
             Err(error) => {
                 tracing::warn!(

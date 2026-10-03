@@ -24,7 +24,8 @@ use super::fan_out::{apply_ack_cursors, fold_oversize_into_link, reconcile_ack_c
 use super::forward::{resume_replay_for_frame, send_resume_replay};
 use super::join::{
     SentPresence, local_presence, presence_catch_up, presence_statement, presence_updates,
-    push_presence_updates, reconcile_local_slots_on_join, reconcile_started_slots_on_join,
+    push_presence_updates, reconcile_local_slots_on_join, reconcile_session_clock_on_join,
+    reconcile_started_slots_on_join,
 };
 use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};
 use super::links::{
@@ -473,6 +474,7 @@ impl LinkDriver {
                     if first_peer_presence {
                         reconcile_local_slots_on_join(conditions, control_forward_tx, &key);
                         reconcile_started_slots_on_join(decision_makers, control_forward_tx, &key);
+                        reconcile_session_clock_on_join(decision_makers, control_forward_tx, &key);
                     }
                     if crate::session::presence::record_peer(
                         presence,

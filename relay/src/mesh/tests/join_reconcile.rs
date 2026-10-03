@@ -87,6 +87,54 @@ fn join_reconcile_re_shares_this_relay_s_own_started_slots() {
     );
 }
 
+/// The authority re-sends its rollback session clock on every reconcile (a peer
+/// that hadn't joined the session yet dropped the first one); a relay that
+/// isn't the authority, or a clock not yet anchored, sends nothing.
+#[test]
+fn join_reconcile_re_sends_the_authoritys_session_clock() {
+    let makers = Arc::new(crate::consensus::new_decision_makers());
+    let key = control_key();
+    let _ = makers.sync_maker(
+        &key,
+        crate::consensus::MakerSync {
+            expected_slots: [SlotId(0)].into(),
+            homed_slots: [SlotId(0)].into(),
+            finalized_drops: true,
+            rollback: true,
+            ..crate::consensus::MakerSync::new(
+                rally_point_proto::control::BufferBounds::new(0, 20).unwrap(),
+                crate::consensus::Authority::SelfRelay,
+            )
+        },
+    );
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    reconcile_session_clock_on_join(&makers, &control_tx, &key);
+    assert!(control_rx.try_recv().is_err(), "no clock before the anchor");
+
+    let start = rally_point_proto::rollback::LOCKSTEP_START_STEPS;
+    let _ = makers.note_forward_advance(&key, SlotId(0), start);
+    reconcile_session_clock_on_join(&makers, &control_tx, &key);
+    reconcile_session_clock_on_join(&makers, &control_tx, &key);
+    let clocks: Vec<_> = std::iter::from_fn(|| control_rx.try_recv().ok())
+        .map(|frame| match frame.kind {
+            Some(mesh_control_frame::Kind::SessionClock(clock)) => clock.anchor_step,
+            other => panic!("unexpected clock reconcile frame {other:?}"),
+        })
+        .collect();
+    assert_eq!(clocks, vec![start - 1, start - 1], "on every reconcile");
+
+    let peer_key = SessionKey {
+        session: SessionId(2),
+        ..control_key()
+    };
+    test_maker(&makers, &peer_key, crate::consensus::Authority::Peer);
+    reconcile_session_clock_on_join(&makers, &control_tx, &peer_key);
+    assert!(
+        control_rx.try_recv().is_err(),
+        "only the authority sends one"
+    );
+}
+
 #[test]
 fn join_reconcile_replays_each_active_slot_and_generation_every_time() {
     let conditions = new_conditions_registry();

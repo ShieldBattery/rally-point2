@@ -203,6 +203,51 @@ fn a_home_slots_turns_are_measured_against_the_clock() {
 }
 
 #[test]
+fn a_turn_first_arriving_after_a_newer_one_is_measured_but_a_repeat_is_not() {
+    let start = Instant::now();
+    let mut m = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut m, &[0, 1], LOCKSTEP_START_STEPS, start);
+    let anchored_at = m.clock.due_at(ANCHOR).unwrap();
+    let due = |seq: u64| anchored_at + steps(seq - ANCHOR);
+
+    let _ = m.note_lead_arrival(SlotId(0), ANCHOR + 2, due(ANCHOR + 2));
+    // Turns arrive out of order: the turn before it shows up 30 ms late, after it. It is a first
+    // arrival like any other, and its lateness counts.
+    let _ = m.note_lead_arrival(SlotId(0), ANCHOR + 1, due(ANCHOR + 1) + 30 * MS);
+    let report = m.lead_report(SlotId(0)).unwrap();
+    assert_eq!(report.samples, 2);
+    assert_eq!(report.p90_us, 30_000, "the late turn is in the window");
+    assert_eq!(
+        report.through_step,
+        ANCHOR + 2,
+        "the newest seq stays the newest"
+    );
+
+    // A copy of either (a resume replay on a new link) doesn't count again, and neither does a
+    // turn too far behind the newest to tell from one.
+    let _ = m.note_lead_arrival(
+        SlotId(0),
+        ANCHOR + 1,
+        due(ANCHOR + 1) + Duration::from_secs(9),
+    );
+    let _ = m.note_lead_arrival(
+        SlotId(0),
+        ANCHOR + 2,
+        due(ANCHOR + 2) + Duration::from_secs(9),
+    );
+    let far = ANCHOR + 2 + 200;
+    let _ = m.note_lead_arrival(SlotId(0), far, due(far));
+    let _ = m.note_lead_arrival(
+        SlotId(0),
+        ANCHOR + 3,
+        due(ANCHOR + 3) + Duration::from_secs(9),
+    );
+    let report = m.lead_report(SlotId(0)).unwrap();
+    assert_eq!(report.samples, 3, "only the far turn was added");
+    assert_eq!(report.p90_us, 30_000);
+}
+
+#[test]
 fn nothing_is_measured_outside_a_rollback_session() {
     let start = Instant::now();
     let mut m = maker();
