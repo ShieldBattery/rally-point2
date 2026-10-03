@@ -1,7 +1,7 @@
 //! Rollback sessions' state hash reports: judged once every report is in or the deadline passes,
 //! naming the minority and any slot that kept playing without its report, and nobody when there
-//! is nobody to trust. Every slot a verdict names is queued for eviction, claimed once, and
-//! refused readmission on its home.
+//! is nobody to trust. Every slot a verdict names (every player, when it names nobody) is queued
+//! for eviction, claimed once, and refused readmission on its home.
 
 use super::*;
 
@@ -301,20 +301,34 @@ fn a_majority_verdict_queues_exactly_the_slots_it_names_for_eviction() {
 }
 
 #[test]
-fn a_verdict_with_no_majority_queues_nobody() {
+fn a_verdict_with_no_majority_queues_every_player() {
     let start = Instant::now();
-    let mut m = rollback_maker(&[0, 1]);
-    m.set_homed_slots([SlotId(0), SlotId(1)].into());
-    forward(&mut m, &[0, 1], STATE_HASH_INTERVAL, start);
-    m.observe_state_hash(SlotId(0), 8, A, start);
-    let verdicts = m.observe_state_hash(SlotId(1), 8, B, start);
+    // Slots 0 and 1 split 2-2 against 2 and 3; slot 4 is an observer, which reports nothing.
+    let mut m = rollback_maker(&[0, 1, 2, 3, 4]);
+    m.set_observers([SlotId(4)].into());
+    m.set_homed_slots([SlotId(0), SlotId(1), SlotId(2), SlotId(3), SlotId(4)].into());
+    forward(&mut m, &[0, 1, 2, 3, 4], STATE_HASH_INTERVAL, start);
+    for (slot, hash) in [(0, A), (1, A), (2, B)] {
+        m.observe_state_hash(SlotId(slot), 8, hash, start);
+    }
+    let verdicts = m.observe_state_hash(SlotId(3), 8, B, start);
     assert!(verdicts[0].no_majority);
     assert!(
-        m.claim_desync_evictions().is_empty(),
-        "with nobody to trust, the relay picks no side",
+        verdicts[0].diverged.is_empty() && verdicts[0].missing.is_empty(),
+        "the verdict still names nobody at fault",
     );
-    assert_eq!(m.eviction(SlotId(0)), None);
-    assert_eq!(m.eviction(SlotId(1)), None);
+    assert_eq!(
+        m.claim_desync_evictions()
+            .iter()
+            .map(|x| x.slot)
+            .collect::<Vec<_>>(),
+        vec![SlotId(0), SlotId(1), SlotId(2), SlotId(3)],
+        "every player's game ends, without the relay picking a side",
+    );
+    for slot in [0, 1, 2, 3] {
+        assert_eq!(m.eviction(SlotId(slot)), Some(EvictionCause::Desync));
+    }
+    assert_eq!(m.eviction(SlotId(4)), None, "the observer watches on");
 }
 
 #[test]

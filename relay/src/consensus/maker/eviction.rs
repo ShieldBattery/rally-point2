@@ -65,11 +65,22 @@ impl DecisionMaker {
     }
 
     /// Queues every slot `verdicts` name for eviction. A verdict that found no
-    /// majority names nobody and queues nothing: with nobody to trust, the
-    /// tenant voids the game rather than having the relay pick a side.
-    pub(in crate::consensus) fn queue_desync_evictions(&mut self, verdicts: &[SyncDivergence]) {
-        for verdict in verdicts.iter().filter(|verdict| !verdict.no_majority) {
-            for &slot in verdict.diverged.iter().chain(&verdict.missing) {
+    /// majority names nobody at fault, but the players' simulations no longer
+    /// agree and nothing can reconcile them, so it queues every slot in
+    /// `required` (the players it compared): the game ends for all of them, and
+    /// the tenant voids it rather than having the relay pick a side.
+    pub(in crate::consensus) fn queue_desync_evictions(
+        &mut self,
+        verdicts: &[SyncDivergence],
+        required: &[SlotId],
+    ) {
+        for verdict in verdicts {
+            let everyone = if verdict.no_majority { required } else { &[] };
+            for &slot in everyone
+                .iter()
+                .chain(&verdict.diverged)
+                .chain(&verdict.missing)
+            {
                 if !self
                     .pending_desync_evictions
                     .iter()
