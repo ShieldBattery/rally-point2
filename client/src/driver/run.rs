@@ -7,7 +7,7 @@ use rally_point_transport::Link;
 
 use super::backoff::{Backoff, push_to_game};
 use super::reconnect::{
-    ReconnectDriver, ReconnectTarget, Reconnected, is_link_failure, reconnect_link,
+    ReconnectDriver, ReconnectTarget, Reconnected, eviction_code, is_link_failure, reconnect_link,
 };
 use super::state::{ESCALATE_AFTER, ESCALATE_RETRY, GameSeam, LoopState};
 use super::{DriverError, LinkDriver, Reconnect};
@@ -68,8 +68,8 @@ impl LinkDriver {
     ///
     /// The loop ends — dropping the channels, which the game reads as end-of-session
     /// — on a clean game shutdown (→ `Ok`), a terminal relay refusal
-    /// ([`DriverError::SlotDeparted`]), an expired token
-    /// ([`DriverError::TokenExpired`]), or a non-link failure the loop can't fix (a
+    /// ([`DriverError::SlotDeparted`]), an eviction ([`DriverError::Evicted`]), an
+    /// expired token ([`DriverError::TokenExpired`]), or a non-link failure the loop can't fix (a
     /// stalled game, an exhausted unacked window).
     pub async fn run_reconnecting(self, reconnect: Reconnect) -> Result<(), DriverError> {
         let Reconnect {
@@ -112,6 +112,11 @@ impl LinkDriver {
                 Ok(()) => return Ok(()),
                 // A link/stream failure: keep the channels alive and re-dial.
                 Err(error) if is_link_failure(&error) => {
+                    // An eviction closes the link like any lost connection, but
+                    // no re-dial can bring the slot back.
+                    if let Some(code) = eviction_code(link.connection()) {
+                        return Err(DriverError::Evicted { code });
+                    }
                     // With the game seam already closed, re-dialing is
                     // pointless — the reconnect machinery would only bounce
                     // off the dead seam as GameGone, laundering the session's

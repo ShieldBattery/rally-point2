@@ -12,10 +12,11 @@
 //! are sent the other way, by a client abandoning its own dial. A number may
 //! therefore appear in both groups and mean two unrelated things.
 //!
-//! Only one of these gets special client-side handling: [`SLOT_DEPARTED`] is
-//! terminal for a reconnecting client (no later dial can bring the slot back),
-//! so it must stop retrying. Every other relay close is treated as an ordinary
-//! transport failure and retried.
+//! Three of these are terminal for a reconnecting client, which must stop
+//! retrying since no later dial can bring the slot back: [`SLOT_DEPARTED`] on a
+//! re-dial, and the evictions [`DESYNC_EVICTED`] and [`LOBBY_VIOLATION`] on a
+//! live link. Every other relay close is treated as an ordinary transport
+//! failure and retried.
 
 /// The client sent a turn that failed validation. Closing the link routes the
 /// offender through the ordinary departure machinery, so survivors get a synced

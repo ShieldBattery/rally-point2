@@ -59,6 +59,45 @@ async fn a_classified_link_failure_closes_the_old_connection_before_the_re_dial(
 }
 
 #[tokio::test]
+async fn an_eviction_ends_the_driver_without_a_re_dial() {
+    for code in [
+        rally_point_proto::close_codes::DESYNC_EVICTED,
+        rally_point_proto::close_codes::LOBBY_VIOLATION,
+    ] {
+        let (link_a, link_b, ea, _eb) = connected_links().await;
+        let (driver_a, chan_a) = test_driver(link_a);
+        // Unreachable, so a driver that re-dialed would park here instead of
+        // ending.
+        let reconnect = Reconnect {
+            endpoint: crate::dial::ClientEndpoint::from_endpoint(ea.clone()),
+            relay_addr: (Ipv4Addr::LOCALHOST, 1).into(),
+            fallback_addrs: Vec::new(),
+            server_name: "localhost".to_owned(),
+            relay_id: 7,
+            identity: fake_identity(SlotId(0)),
+            rehome: None,
+            escalate_after: None,
+            escalate_retry: None,
+        };
+        let task = tokio::spawn(driver_a.run_reconnecting(reconnect));
+
+        link_b
+            .connection()
+            .close(noq::VarInt::from_u32(code), b"evicted");
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("an evicted driver ends instead of re-dialing")
+            .unwrap();
+        assert!(
+            matches!(ended, Err(DriverError::Evicted { code: c }) if c == code),
+            "close code {code:#04x} ends the driver as an eviction: {ended:?}",
+        );
+        drop(chan_a);
+    }
+}
+
+#[tokio::test]
 async fn a_hung_provider_ask_times_out_and_is_treated_as_unavailable() {
     let (mut seam, chan_a, mut state) = seam_only();
     let (provider, _asked) = HangingProvider::new();

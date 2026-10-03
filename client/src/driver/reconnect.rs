@@ -9,8 +9,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use rally_point_proto::close_codes;
 use rally_point_proto::ids::SlotId;
-use rally_point_transport::Link;
+use rally_point_transport::{Link, noq};
 use tokio::time::Instant;
 
 use crate::dial::{ClientEndpoint, DialError};
@@ -210,6 +211,19 @@ pub(super) fn is_link_failure(error: &DriverError) -> bool {
         error,
         DriverError::Link(_) | DriverError::ControlStream(_) | DriverError::ControlStreamLost
     )
+}
+
+/// The relay's close code when it closed `connection` to evict the slot
+/// ([`close_codes::DESYNC_EVICTED`], [`close_codes::LOBBY_VIOLATION`]). The relay
+/// refuses every later dial for an evicted slot as slot-departed, so the link
+/// failure this close surfaces as is terminal, not something to re-dial through.
+pub(super) fn eviction_code(connection: &noq::Connection) -> Option<u32> {
+    let Some(noq::ConnectionError::ApplicationClosed(close)) = connection.close_reason() else {
+        return None;
+    };
+    [close_codes::DESYNC_EVICTED, close_codes::LOBBY_VIOLATION]
+        .into_iter()
+        .find(|&code| close.error_code == noq::VarInt::from_u32(code))
 }
 
 /// Whether the identity's authorization token has expired against the wall clock —

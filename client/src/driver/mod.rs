@@ -323,6 +323,15 @@ pub enum DriverError {
     /// as end-of-session.
     #[error("relay refused the re-dial: slot already departed")]
     SlotDeparted,
+    /// The relay closed the live link to evict this slot from the session, with
+    /// the close `code` saying why: its rollback state was named at fault
+    /// ([`DESYNC_EVICTED`](rally_point_proto::close_codes::DESYNC_EVICTED)), or it
+    /// sent a lobby command its session's policy doesn't admit
+    /// ([`LOBBY_VIOLATION`](rally_point_proto::close_codes::LOBBY_VIOLATION)). The
+    /// relay refuses every later dial for the slot as
+    /// [`SlotDeparted`](Self::SlotDeparted), so the driver ends without re-dialing.
+    #[error("relay evicted this slot (close code {code:#04x})")]
+    Evicted { code: u32 },
     /// The authorization token expired while reconnecting, so no re-dial could ever
     /// be authorized. Terminal for the reconnect loop, like [`SlotDeparted`](Self::SlotDeparted).
     #[error("authorization token expired; cannot reconnect")]
