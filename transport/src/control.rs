@@ -24,9 +24,10 @@
 use prost::bytes::Bytes;
 use rally_point_proto::control_stream::encode_frame;
 use rally_point_proto::messages::{
-    ControlFrame, GameChat, GameResult, GameStarted, LeaveDirective, LeaveIntent, LoadStateProbe,
-    LoadStateProbeAck, LobbyCommand, Payload, PhaseApplied, PhaseDirective, PlayerSkin,
-    RegionLabel, RegionLabels, RequestDrop, SessionStart, SlotConnectivity, control_frame,
+    ControlFrame, GameChat, GameResult, GameStarted, LeadReport, LeaveDirective, LeaveIntent,
+    LoadStateProbe, LoadStateProbeAck, LobbyCommand, Payload, PhaseApplied, PhaseDirective,
+    PlayerSkin, RegionLabel, RegionLabels, RequestDrop, SessionStart, SlotConnectivity,
+    control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -147,6 +148,12 @@ pub enum ControlInbound {
     /// authenticated connection's slot; a client never receives one back, so the
     /// client edge ignores a stray one just as it does a `LeaveIntent`.
     LoadStateProbeAck(u64),
+    /// How early or late this client's turns have been reaching its home relay
+    /// against a rollback session's clock (relay → client only). Absolute — each
+    /// report restates the whole window, newest wins — so the consumer keeps
+    /// only the latest. A relay never receives one from a client, so the relay
+    /// edge ignores a stray one just as it does a `Leave`.
+    LeadReport(LeadReport),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -243,6 +250,9 @@ pub fn spawn_control_reader(connection: noq::Connection) -> mpsc::Receiver<Contr
                     kind:
                         Some(control_frame::Kind::LoadStateProbeAck(LoadStateProbeAck { probe_id })),
                 } => ControlInbound::LoadStateProbeAck(probe_id),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::LeadReport(report)),
+                } => ControlInbound::LeadReport(report),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -511,6 +521,23 @@ pub async fn send_control_phase_directive(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::PhaseDirective(directive)),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Writes a lead report down a client's control stream (relay → client).
+/// Absolute — the report restates the whole window — so a repeat (a report
+/// racing the connect-time re-send) costs a frame and nothing else. An error
+/// means the stream is gone, which the caller treats as that client having
+/// left, exactly like a send-phase directive.
+pub async fn send_control_lead_report(
+    control_send: &mut noq::SendStream,
+    report: LeadReport,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::LeadReport(report)),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

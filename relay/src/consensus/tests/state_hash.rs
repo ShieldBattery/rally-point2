@@ -228,8 +228,8 @@ fn a_missing_report_reaches_the_coordinator_as_a_desync_notice() {
             ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
         },
     );
-    registry.note_forward_advance(&k, SlotId(0), STATE_HASH_INTERVAL);
-    registry.note_forward_advance(&k, SlotId(1), 8 + STATE_HASH_LIVE_TURNS);
+    let _ = registry.note_forward_advance(&k, SlotId(0), STATE_HASH_INTERVAL);
+    let _ = registry.note_forward_advance(&k, SlotId(1), 8 + STATE_HASH_LIVE_TURNS);
     registry.observe_state_hash(&k, SlotId(0), 8, A);
     registry.judge_overdue_state_hashes(Instant::now() + STATE_HASH_DEADLINE);
     let notice = std::iter::from_fn(|| rx.try_recv().ok())
@@ -418,7 +418,7 @@ fn a_verdict_on_the_turn_path_is_claimed_through_the_registry() {
         },
     );
     for slot in [0, 1, 2] {
-        registry.note_forward_advance(&k, SlotId(slot), STATE_HASH_INTERVAL);
+        let _ = registry.note_forward_advance(&k, SlotId(slot), STATE_HASH_INTERVAL);
     }
     registry.observe_state_hash(&k, SlotId(0), 8, A);
     registry.observe_state_hash(&k, SlotId(1), 8, B);

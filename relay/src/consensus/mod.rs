@@ -230,7 +230,9 @@ pub mod phase;
 #[cfg(test)]
 mod buffer_law_sim;
 
+mod clock;
 mod law;
+mod lead;
 mod maker;
 mod registry;
 mod slot;
@@ -251,7 +253,8 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::{GameFrameCount, RelayId, SessionId, SlotId};
 use rally_point_proto::messages::{
-    BufferDirective, LeaveDirective, LinkConditions, RegionLabel, SlotConditions,
+    BufferDirective, LeadReport, LeaveDirective, LinkConditions, RegionLabel,
+    SessionClock as SessionClockFrame, SlotConditions,
 };
 use rally_point_proto::time::unix_millis;
 use tokio::sync::mpsc::UnboundedSender;
@@ -267,14 +270,16 @@ use crate::observability::events::{
 // Every submodule of this one reaches the rest of the module's internals
 // through these globs: each file's own `use super::*` picks them up, so an item
 // keeps resolving by its bare name wherever it was written.
+use clock::*;
 use law::*;
+use lead::*;
 use registry::*;
 use slot::*;
 use sync::*;
 
 pub use law::ControlLaw;
 pub use maker::{
-    DecisionMaker, DepartureStamps, DesyncEviction, EvictionCause, FinalizeOutcome,
+    ClockUpdate, DecisionMaker, DepartureStamps, DesyncEviction, EvictionCause, FinalizeOutcome,
     RecordedDeparture, SilentSlot,
 };
 pub use registry::LobbyCommandVerdict;

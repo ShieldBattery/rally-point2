@@ -54,6 +54,7 @@ fn a_peer_relays_local_fan_out_frames_deliver_locally_and_never_echo() {
                 kind: Some(kind),
             },
             RelayId(9),
+            0,
             &joined,
             &sessions,
             &mesh_state,
@@ -166,6 +167,7 @@ fn peer_lobby_mismatch_is_dropped_without_eviction_or_replay() {
                 })),
             },
             RelayId(9),
+            0,
             &joined,
             &sessions,
             &mesh_state,
@@ -219,7 +221,7 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
             },
         )),
     };
-    dispatch_mesh_control(stale_down, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(stale_down, RelayId(9), 0, &joined, &sessions, &mesh_state);
     assert_eq!(inbox.try_recv_connectivity(), None);
     assert!(makers.flight_recorder().events(&key).iter().any(|record| {
         record.event
@@ -247,7 +249,14 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
             final_turn_count: None,
         })),
     };
-    dispatch_mesh_control(stale_departure, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(
+        stale_departure,
+        RelayId(9),
+        0,
+        &joined,
+        &sessions,
+        &mesh_state,
+    );
     assert!(!makers.has_departure(&key, SlotId(0)));
     assert!(!mesh_state.session.drop_holds.is_pending(&key, SlotId(0)));
 
@@ -261,7 +270,7 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
             },
         )),
     };
-    dispatch_mesh_control(current_down, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(current_down, RelayId(9), 0, &joined, &sessions, &mesh_state);
     assert_eq!(inbox.try_recv_connectivity(), Some((SlotId(0), false)));
 }
 
@@ -287,6 +296,7 @@ fn departure_then_same_epoch_connectivity_reaches_the_survivor() {
                 kind: Some(kind),
             },
             RelayId(9),
+            0,
             &joined,
             &sessions,
             &mesh,
@@ -358,6 +368,7 @@ fn a_stale_mesh_reconnect_records_rejection_without_releasing_the_hold() {
             )),
         },
         RelayId(9),
+        0,
         &joined,
         &sessions,
         &mesh,

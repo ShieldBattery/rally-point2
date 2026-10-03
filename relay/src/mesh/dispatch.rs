@@ -82,6 +82,7 @@ use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 pub(super) fn dispatch_mesh_control(
     frame: MeshControlFrame,
     peer_id: RelayId,
+    mesh_rtt_us: u32,
     joined: &HashMap<SessionId, JoinedSession>,
     sessions: &routing::Sessions,
     mesh: &MeshState,
@@ -110,7 +111,7 @@ pub(super) fn dispatch_mesh_control(
     // which case the frame is dropped here — a frame can no longer check one
     // piece of state and then mutate another across the sweep.
     let dispatched = mesh.session.gates.with_ingress(&key, || {
-        dispatch_mesh_control_frame(frame, peer_id, &key, sessions, mesh)
+        dispatch_mesh_control_frame(frame, peer_id, mesh_rtt_us, &key, sessions, mesh)
     });
     if dispatched.is_none() {
         tracing::debug!(
@@ -126,6 +127,7 @@ pub(super) fn dispatch_mesh_control(
 fn dispatch_mesh_control_frame(
     frame: MeshControlFrame,
     peer_id: RelayId,
+    mesh_rtt_us: u32,
     key: &SessionKey,
     sessions: &routing::Sessions,
     mesh: &MeshState,
@@ -427,6 +429,21 @@ fn dispatch_mesh_control_frame(
                 .adopt_session_start(&key, start.initial_buffer_turns);
             let initial_buffer_turns = mesh.session.decision_makers.initial_buffer_turns(&key);
             routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
+        }
+        Some(mesh_control_frame::Kind::SessionClock(clock)) => {
+            // The authority's session clock. Adopt it — the anchor once, placed
+            // by the frame's age and half this link's round trip, and any growth
+            // in its stopped time — and when the stopped time grew, give this
+            // relay's own players reports carrying it at once, so none of them
+            // races to make up time the session never ran. Not re-broadcast: the
+            // authority sent a copy to every relay.
+            let reports = mesh.session.decision_makers.adopt_session_clock(
+                &key,
+                &clock,
+                std::time::Instant::now(),
+                mesh_rtt_us,
+            );
+            routing::fan_out_lead_reports(sessions, &key, &reports);
         }
         Some(mesh_control_frame::Kind::SlotConnectivity(change)) => {
             let Ok(slot) = u8::try_from(change.slot).map(SlotId) else {

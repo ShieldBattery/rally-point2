@@ -51,7 +51,7 @@ async fn a_mesh_request_drop_decides_the_leave_at_the_authority_only_and_never_e
                 requester: 3,
             })),
         };
-        dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(frame, RelayId(9), 0, &joined, &sessions, &mesh_state);
 
         assert_eq!(
             mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),

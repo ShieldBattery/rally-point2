@@ -39,15 +39,27 @@ impl DecisionMakers {
     /// Records that `slot`'s gap-free forwarded prefix advanced for `key`'s
     /// session to `forwarded` turns, stamping the slot's stop clock (see
     /// [`DecisionMaker::note_forward_advance`]) and, in a rollback session, starting the report
-    /// deadlines of the steps that became confirmable (see
-    /// [`DecisionMaker::note_forwarded_turns`]). Called from the forward gate's
-    /// fan-out choke point, once per turn that genuinely extends the prefix.
-    pub fn note_forward_advance(&self, key: &SessionKey, slot: SlotId, forwarded: u64) {
+    /// deadlines of the steps that became confirmable and moving the authority's session clock
+    /// on (see [`DecisionMaker::note_forwarded_turns`]). Returns a change the authority made to
+    /// the clock, for the caller to send to the other relays and push the carried reports down
+    /// this relay's home slots. Called from the forward gate's fan-out choke point, once per turn
+    /// that genuinely extends the prefix.
+    #[must_use]
+    pub fn note_forward_advance(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        forwarded: u64,
+    ) -> Option<ClockUpdate> {
         let now = Instant::now();
-        if let Some(maker) = self.lock().get_mut(key) {
+        let update = {
+            let mut makers = self.lock();
+            let maker = makers.get_mut(key)?;
             maker.note_forward_advance(slot, now);
-            maker.note_forwarded_turns(slot, forwarded, now);
-        }
+            maker.note_forwarded_turns(slot, forwarded, now)
+        }?;
+        Self::log_clock_update(key, &update);
+        Some(update)
     }
 
     /// Every session whose decision-maker names a slot that has gone silent, with

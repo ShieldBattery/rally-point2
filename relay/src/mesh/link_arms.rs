@@ -353,6 +353,7 @@ impl LinkDriver {
             conditions,
             sessions,
             mesh_for_dispatch,
+            mesh_rtt,
             ..
         } = self;
         match received {
@@ -399,9 +400,20 @@ impl LinkDriver {
                 // An oversize turn's transport-dedup fold also needs
                 // direct link access, so it too runs here. A copy the
                 // link has already delivered stops before dispatch.
+                // The link's round trip, for a session clock frame to place its
+                // anchor by. Cached, so the common frame pays nothing for it.
+                let mesh_rtt_us =
+                    mesh_rtt.get_or_refresh(link.connection(), tokio::time::Instant::now());
                 let _ = lease.with_current(|| {
                     if fold_oversize_into_link(link, &frame, joined) {
-                        dispatch_mesh_control(frame, peer_id, joined, sessions, mesh_for_dispatch);
+                        dispatch_mesh_control(
+                            frame,
+                            peer_id,
+                            mesh_rtt_us,
+                            joined,
+                            sessions,
+                            mesh_for_dispatch,
+                        );
                     }
                 });
             }

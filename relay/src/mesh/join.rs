@@ -53,6 +53,12 @@ pub(super) fn reconcile_leaves_on_join(
         let initial_buffer_turns = decision_makers.initial_buffer_turns(key);
         let _ = control_tx.send(session_start_frame(key.session, initial_buffer_turns));
     }
+    // The authority's session clock, for a relay that joins (or redials) after
+    // the anchor: without it that relay would have no deadlines to measure its
+    // own players against. Only the authority has one to send.
+    if let Some(clock) = decision_makers.session_clock_frame(key) {
+        let _ = control_tx.send(session_clock_frame(key.session, clock));
+    }
 }
 
 /// Replays every active home-client slot and connection generation to a mesh

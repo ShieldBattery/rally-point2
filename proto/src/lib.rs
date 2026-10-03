@@ -33,6 +33,7 @@ pub mod handshake;
 pub mod ids;
 pub mod mesh;
 pub mod request_auth;
+pub mod rollback;
 pub mod time;
 pub mod token;
 pub mod version;

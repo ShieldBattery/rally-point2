@@ -5,7 +5,8 @@
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
     GameChat, LeaveDirective, LobbyCommand, MeshControlFrame, PlayerSkin, RequestDrop,
-    SessionStart, SlotConnectivity, SlotDeparted, SlotPresent, SlotStarted, mesh_control_frame,
+    SessionClock, SessionStart, SlotConnectivity, SlotDeparted, SlotPresent, SlotStarted,
+    mesh_control_frame,
 };
 
 /// Builds a `MeshResumeCursors` mesh control frame for `session`, from
@@ -118,6 +119,15 @@ pub(super) fn session_start_frame(
         kind: Some(mesh_control_frame::Kind::SessionStart(SessionStart {
             initial_buffer_turns,
         })),
+    }
+}
+
+/// Builds a `SessionClock` mesh control frame for `session`, carrying the
+/// authority's session clock as `clock` describes it.
+pub(super) fn session_clock_frame(session: SessionId, clock: SessionClock) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::SessionClock(clock)),
     }
 }
 

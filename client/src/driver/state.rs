@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeaveDirective, Payload};
+use rally_point_proto::messages::{LeadReport, LeaveDirective, Payload};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -129,6 +129,9 @@ pub(super) struct GameSeam {
     /// The send-phase state to publish to the game thread as directives arrive
     /// and the applied delay slews (see [`TurnChannels::phase_status`]).
     pub(super) phase_status: watch::Sender<PhaseStatus>,
+    /// The newest lead report, to hand to the game thread (see
+    /// [`TurnChannels::lead_report`]).
+    pub(super) lead_report: watch::Sender<Option<LeadReport>>,
 }
 
 impl GameSeam {
@@ -176,6 +179,9 @@ impl GameSeam {
         // Send-phase state is latest-wins display information; a watch cell
         // holds exactly the newest value with nothing to drain.
         let (phase_status_tx, phase_status_rx) = watch::channel(PhaseStatus::default());
+        // Lead reports each restate the whole window, so the newest is the only
+        // one the game needs.
+        let (lead_report_tx, lead_report_rx) = watch::channel(None);
         let seam = Self {
             outbound: outbound_rx,
             inbound: inbound_tx,
@@ -194,6 +200,7 @@ impl GameSeam {
             connectivity: connectivity_tx,
             region_labels: region_labels_tx,
             phase_status: phase_status_tx,
+            lead_report: lead_report_tx,
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
@@ -214,6 +221,7 @@ impl GameSeam {
             connectivity: connectivity_rx,
             region_labels: region_labels_rx,
             phase_status: phase_status_rx,
+            lead_report: lead_report_rx,
         };
         (seam, channels, result_expected)
     }

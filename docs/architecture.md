@@ -705,6 +705,41 @@ disjoint sensors (no distributed chasing), and cross-relay pairs stay unaligned 
 shared clock across relays, and mesh sessions carry a hop cushion that keeps them off depth one
 anyway.
 
+### Rollback session clock
+
+A rollback session's clients don't wait for each other's turns: each predicts the turns it lacks
+and rolls back when they arrive, so the question the latency buffer answers for lockstep (how far
+ahead must everyone send) becomes a per-player one. The relays answer it with a **session clock**:
+the turn with seq `n` is due at the relay `STEP_DURATION_US` (42 ms, one game step at Fastest) after
+turn `n - 1`. Each player's home relay measures every turn's first client-edge arrival against it and
+sends that player a `LeadReport` twice a second (the median and 90th percentile of the last second's
+lateness), and the client sets its own pacing and input delay from the reports. A player's link then
+costs only that player: their turns are measured against a clock nobody else moves, and the time
+their turns take to reach everyone else is everyone else's to roll back over within their own
+targets.
+
+- **Anchor.** The authority anchors the clock when the session's lockstep start (the first
+  `LOCKSTEP_START_STEPS`, which every client steps only once every turn is known) becomes
+  confirmable: the turn that completed it is due when it arrived. That is when the slowest player's
+  start reached the authority, so no player is asked to be earlier than the session has shown it can
+  be.
+- **Stopping.** The clock may not run more than `STALL_SLACK_STEPS` (12, the client's prediction
+  limit plus a margin) past the newest turn the authority can confirm for every player; time beyond
+  that accumulates as `pause` and pushes every later deadline back. Past the prediction limit every
+  player is stalled anyway, so that time is the whole session waiting (a drop wait, an outage), and
+  no client should race to make it up afterwards. A player whose own turns run later than the slack
+  still measures that late, since only the time past the slack is taken up.
+- **Copies.** Relays share no timebase. The authority sends its clock over the mesh
+  (`SessionClock`: the anchor seq, the anchor's age, the pause); a peer places the anchor at the
+  frame's receipt less its age and half the link's RTT, once, and afterwards only adopts a grown
+  pause. A pause change goes out at once, and the relays push every measured player a report
+  carrying it, so clients move their pacing by exactly the stop instead of sprinting. Each player's
+  window starts over with it: a turn measured around the stop may have been read against the clock
+  from before it, and would count as late by the whole stop.
+- **What it replaces.** In a rollback session the buffer law re-affirms the start's buffer once and
+  then decides nothing (the buffer only seeds the lockstep start), and send-phase alignment never
+  runs: the report sets each client's send timing outright, and a phase delay would only fight it.
+
 ### Relay-side desync detection
 
 SC:R's lockstep sim guards against divergence by exchanging a per-turn **checksum** through the

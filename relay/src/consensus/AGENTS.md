@@ -7,8 +7,9 @@
   path at `consensus::X`. Submodules are private; the `use law::*` / `use registry::*`
   … glob block is what lets each child's `use super::*` keep resolving bare names.
 - `law.rs` tuning + `ControlLaw` + RTT/loss/outage windows; `slot.rs` per-slot state
-  and connection-epoch types; `sync/` the desync comparator. `phase/`, `delivery.rs`,
-  and `buffer_law_sim/` also live here.
+  and connection-epoch types; `sync/` the desync comparator; `clock.rs` a rollback
+  session's clock and `lead.rs` the per-slot lateness measured against it. `phase/`,
+  `delivery.rs`, and `buffer_law_sim/` also live here.
 - **Two layers, one vocabulary.** `maker/` is one `impl DecisionMaker` block per
   concern — the pure core. `registry/` is one `impl DecisionMakers` block per the
   *same* concerns — the locked map every caller holds, adding the lock, the log, the
@@ -53,7 +54,8 @@
   named link is `routing::run_silence_watch`.
 - **Desync eviction** is the rollback comparator's verdict turned into a queue:
   `judge_state_hashes` queues every slot a majority verdict names (a no-majority
-  verdict evicts nobody), and `claim_desync_evictions` drains it, marking the slots
+  verdict names nobody at fault but queues every player, since nothing can reconcile
+  their games), and `claim_desync_evictions` drains it, marking the slots
   this relay strictly homes. Both evictions share one record (`evictions`, with a
   cause) that refuses a re-dial without consuming the drop hold; the actuation is
   `routing::run_state_hash_watch` and the mesh `EvictSlot` arm. A pre-game lobby-policy

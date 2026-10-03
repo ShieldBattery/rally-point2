@@ -82,6 +82,7 @@ pub fn register(
     // seconds between corrections, plus a connect-time re-push); the same small
     // channel suits them.
     let (phase_tx, phase_rx) = mpsc::channel(LEAVE_PUSH_CAPACITY);
+    let (lead_tx, lead_rx) = mpsc::channel(LEAD_PUSH_CAPACITY);
     // Fence probes are rarer than any of the above (one per load-state read the
     // tenant makes, and only while this slot has connected without starting);
     // the same small channel suits them, and a full one simply leaves the slot
@@ -108,6 +109,7 @@ pub fn register(
                 conn_push: conn_tx,
                 region_push: region_tx,
                 phase_push: phase_tx,
+                lead_push: lead_tx,
                 probe_push: probe_tx,
                 connection_epoch,
                 shutdown: Arc::clone(&shutdown),
@@ -132,6 +134,7 @@ pub fn register(
         conn_push_rx: conn_rx,
         region_push_rx: region_rx,
         phase_push_rx: phase_rx,
+        lead_push_rx: lead_rx,
         probe_push_rx: probe_rx,
         shutdown,
         close_reason,

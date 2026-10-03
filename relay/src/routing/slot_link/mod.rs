@@ -112,6 +112,7 @@ pub async fn run_slot_link(
         mut conn_push_rx,
         mut region_push_rx,
         mut phase_push_rx,
+        mut lead_push_rx,
         mut probe_push_rx,
         shutdown,
         close_reason,
@@ -255,6 +256,9 @@ pub async fn run_slot_link(
     // Mirrors `leave_push_alive` for the send-phase push channel, disarmed
     // defensively the same way.
     let mut phase_push_alive = true;
+    // Mirrors `leave_push_alive` for the lead-report push channel, disarmed
+    // defensively the same way.
+    let mut lead_push_alive = true;
     // Mirrors `leave_push_alive` for the load-state fence-probe push channel,
     // disarmed defensively the same way.
     let mut probe_push_alive = true;
@@ -469,6 +473,20 @@ pub async fn run_slot_link(
                         }
                     }
                     None => phase_push_alive = false,
+                }
+            }
+            // THIS client's lead report in a rollback session, to push down its
+            // reliable control stream. Twice a second, and absolute — each one
+            // restates the whole window — so a repeat is harmless. A write
+            // failure ends the link like every other control-stream write here.
+            pushed = lead_push_rx.recv(), if lead_push_alive => {
+                match pushed {
+                    Some(report) => {
+                        if pushes::push_lead_report(&mut ctx, report).await.is_break() {
+                            break 'serve;
+                        }
+                    }
+                    None => lead_push_alive = false,
                 }
             }
             // A lobby command another member authored (or the replay of an earlier

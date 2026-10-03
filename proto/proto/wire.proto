@@ -442,6 +442,14 @@ message ControlFrame {
     // slot, never to a slot named in the frame, exactly as it stamps a
     // `LobbyCommand` author. See `LoadStateProbeAck`.
     LoadStateProbeAck load_state_probe_ack = 16;
+
+    // How early or late this client's turns have been reaching its home relay
+    // against the session clock (relay → client only, rollback sessions only).
+    // The client paces its game from these reports instead of from a clock of
+    // its own, so a player's link sets only that player's input delay and
+    // rollback. Relay-authored: the relay stamps the arrivals itself, and the
+    // only client input is each turn's seq. See `LeadReport`.
+    LeadReport lead_report = 17;
   }
 }
 
@@ -997,6 +1005,42 @@ message PhaseApplied {
   uint32 delay_us = 1;
 }
 
+// How early or late a client's turns have been reaching its home relay,
+// against the session clock of a rollback session (see `ControlFrame.lead_report`).
+//
+// The session clock makes step `n` due at the relay a fixed step length after
+// step `n - 1`, from the moment the session's lockstep start ended, and stops
+// while the whole session is stalled (a drop wait, an outage). Each player's
+// home relay measures every turn's first arrival against that clock and sends
+// the player its own figures every few steps. Lateness is positive: a turn that
+// arrived after its step was due. The client moves its pacing so its turns make
+// the deadline, and sets how much of its own lateness to cover with input delay
+// rather than rollback.
+//
+// Absolute, like `PhaseDirective`: each report restates the whole window, a
+// newer one replaces an older one, and the relay re-sends the current one to a
+// client that connects. A client that predates it skips the frame.
+message LeadReport {
+  // The newest step whose arrival the window covers.
+  uint64 through_step = 1;
+
+  // The median and the 90th percentile of the lateness of the window's turns,
+  // in microseconds (negative when early).
+  sint32 median_us = 2;
+  sint32 p90_us = 3;
+
+  // How many turns the window holds. Zero when the window has just started
+  // over because the clock stopped: the report then only carries `pause_us`,
+  // and `median_us` and `p90_us` mean nothing.
+  uint32 samples = 4;
+
+  // How long the session clock has spent stopped so far, in microseconds. It
+  // only grows, and it grows exactly when the whole session waited on turns
+  // that weren't coming, so a client moves its pacing later by any increase at
+  // once rather than racing to make up time the session never ran.
+  uint64 pause_us = 5;
+}
+
 // One message on the relay ↔ relay reliable mesh control stream — the channel a
 // relay-pair uses for what its datagram path cannot carry: synced player-leave
 // propagation and oversize-turn divert. Each mesh link carries one
@@ -1231,6 +1275,13 @@ message MeshControlFrame {
     // count. Every other relay ignores it, as does a relay that predates this kind. Not
     // re-broadcast. See `EvictSlot`.
     EvictSlot evict_slot = 18;
+
+    // The authority's session clock for a rollback session, so every relay
+    // measures its own players' turns against the same deadlines. Sent when the
+    // authority anchors the clock, whenever the clock's stopped time grows, and
+    // to a relay that joins after the anchor. Not re-broadcast: the authority
+    // already sent it to every relay. See `SessionClock`.
+    SessionClock session_clock = 19;
   }
 }
 
@@ -1544,6 +1595,23 @@ message EvictSlot {
   // The state hash step whose verdict named the slot, carried so the home's own record of the
   // eviction says which comparison it rested on.
   uint64 sync_ordinal = 2;
+}
+
+// A rollback session's clock as the authority keeps it — see the
+// `session_clock` oneof arm and `LeadReport`. Relays share no timebase, so the
+// anchor travels as an age: the receiving relay places the anchor that long
+// before it received the frame, less half the mesh round trip the frame took.
+message SessionClock {
+  // The step the clock was anchored at: the newest step the authority could
+  // confirm when the session's lockstep start ended.
+  uint64 anchor_step = 1;
+
+  // How long before the authority wrote this frame it anchored the clock, in
+  // microseconds of wall clock. Stopped time travels separately, in `pause_us`.
+  uint64 since_anchor_us = 2;
+
+  // How long the clock has spent stopped so far, in microseconds.
+  uint64 pause_us = 3;
 }
 
 // The home's answer to `FinalizeDrop` — see the `finalize_drop_result` oneof

@@ -58,7 +58,9 @@ use std::time::Duration;
 
 use rally_point_proto::close_codes;
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeaveDirective, Payload, PhaseDirective, RegionLabel};
+use rally_point_proto::messages::{
+    LeadReport, LeaveDirective, Payload, PhaseDirective, RegionLabel,
+};
 use tokio::sync::{Notify, mpsc};
 
 use crate::key::SessionKey;
@@ -100,9 +102,10 @@ pub(crate) use drops::{
     complete_finalized_drop, finalize_evicted_drop, finalize_home_drop, honor_drop_request,
 };
 pub(crate) use fan_out::{
-    broadcast_connectivity, deliver_load_state_probe_to_slot, deliver_phase_directive_to_slot,
-    deliver_region_labels_to_slot, deliver_session_start_to_slot, fan_out, fan_out_connectivity,
-    fan_out_leave, fan_out_phase_directives, fan_out_region_labels, fan_out_session_start,
+    broadcast_connectivity, deliver_lead_report_to_slot, deliver_load_state_probe_to_slot,
+    deliver_phase_directive_to_slot, deliver_region_labels_to_slot, deliver_session_start_to_slot,
+    fan_out, fan_out_connectivity, fan_out_lead_reports, fan_out_leave, fan_out_phase_directives,
+    fan_out_region_labels, fan_out_session_start,
 };
 pub(crate) use lifecycle::{abandon_refused_admission, deliver_session_start, reap_provisional};
 pub(crate) use state_hash::{end_desynced_slot_link, record_desync_eviction};
@@ -139,6 +142,11 @@ const FORWARD_BYTE_BUDGET: usize = MAX_OVERSIZE_TURN_COMMANDS_LEN * FORWARD_CAPA
 /// Depth of a slot's leave-push channel. Leaves are rare (at most one per other
 /// player, and only on a departure), so a small buffer is ample.
 const LEAVE_PUSH_CAPACITY: usize = 16;
+
+/// Depth of a slot's lead-report push channel. A report goes out twice a second, and each one
+/// restates the whole window, so a backlog would only ever hold stale reports: a few slots are
+/// ample, and a full queue just drops one.
+const LEAD_PUSH_CAPACITY: usize = 4;
 
 /// One relay-authored member-connectivity level change: subject slot, level,
 /// and the physical connection generation the level describes.
@@ -328,6 +336,13 @@ pub struct SlotEntry {
     /// there is no session-wide map to share. Each message carries the whole
     /// commanded delay (absolute, newest wins), so a repeat is idempotent.
     phase_push: mpsc::Sender<PhaseDirective>,
+    /// THIS client's lead reports in a rollback session, to push down its
+    /// reliable control stream. Fed by [`fan_out_lead_reports`] and
+    /// [`deliver_lead_report_to_slot`] as its turns are measured and when the
+    /// session clock stops, and by the connect-time re-send; drained by this
+    /// slot's link task, which writes a `LeadReport` frame. Each report restates
+    /// the whole window (absolute, newest wins).
+    lead_push: mpsc::Sender<LeadReport>,
     /// Load-state fence probe ids to push down THIS client's reliable control
     /// stream. Fed by [`deliver_load_state_probe_to_slot`] when this relay is
     /// about to answer a coordinator load-state question and needs to rule out a
@@ -373,6 +388,9 @@ pub struct SlotInbox {
     /// Send-phase directives to push down this client's control stream (see
     /// [`SlotEntry::phase_push`]).
     phase_push_rx: mpsc::Receiver<PhaseDirective>,
+    /// Lead reports to push down this client's control stream (see
+    /// [`SlotEntry::lead_push`]).
+    lead_push_rx: mpsc::Receiver<LeadReport>,
     /// Load-state fence probes to push down this client's control stream (see
     /// [`SlotEntry::probe_push`]).
     probe_push_rx: mpsc::Receiver<u64>,
@@ -448,6 +466,14 @@ impl SlotInbox {
     #[cfg(test)]
     pub(crate) fn try_recv_start(&mut self) -> Option<Option<u32>> {
         self.start_push_rx.try_recv().ok()
+    }
+
+    /// Non-blockingly pulls the next lead report pushed to this slot, for a
+    /// cross-module test asserting a report reached a connected client. `None`
+    /// when nothing is queued.
+    #[cfg(test)]
+    pub(crate) fn try_recv_lead_report(&mut self) -> Option<LeadReport> {
+        self.lead_push_rx.try_recv().ok()
     }
 
     /// Non-blockingly pulls the next load-state fence probe pushed to this slot,

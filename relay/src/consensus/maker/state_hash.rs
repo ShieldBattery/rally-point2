@@ -21,11 +21,16 @@ impl DecisionMaker {
     }
 
     /// Notes that this relay has forwarded `count` of `slot`'s turns without a gap, which starts
-    /// the report deadlines of the steps that became confirmable. Nothing outside a rollback
-    /// session.
-    pub fn note_forwarded_turns(&mut self, slot: SlotId, count: u64, now: Instant) {
+    /// the report deadlines of the steps that became confirmable and, on the authority, moves the
+    /// session clock on, returning any change to it. Nothing outside a rollback session.
+    pub fn note_forwarded_turns(
+        &mut self,
+        slot: SlotId,
+        count: u64,
+        now: Instant,
+    ) -> Option<ClockUpdate> {
         if !self.rollback_enabled {
-            return;
+            return None;
         }
         let observers = &self.observers;
         let departures = &self.departures;
@@ -34,8 +39,10 @@ impl DecisionMaker {
             .iter()
             .copied()
             .filter(|slot| !observers.contains(slot) && !departures.contains_key(slot));
+        let before = self.hashes.confirmable_until();
         self.hashes
             .note_forwarded(&self.key, slot, count, now, required);
+        self.advance_clock(before, self.hashes.confirmable_until(), now)
     }
 
     /// Judges every step whose reports are all in or whose deadline has passed by `now`, if this

@@ -10,6 +10,9 @@ impl DecisionMaker {
     /// delay changed (usually none — the controller self-gates on its own
     /// schedule). Arrivals before the session starts are ignored: pre-start
     /// traffic flows at setup cadence, not the turn cadence a phase lives in.
+    /// A rollback session has no send-phase alignment at all: each client paces
+    /// its sends against the session clock from its lead reports, which a phase
+    /// delay would only fight.
     ///
     /// The caller must feed only this relay's own client-edge receipts, and
     /// only packets that first-delivered exactly one turn — a mesh-forwarded
@@ -23,7 +26,7 @@ impl DecisionMaker {
         seq: u64,
         now: Instant,
     ) -> Vec<(SlotId, u32)> {
-        if !self.started {
+        if !self.started || self.rollback_enabled {
             return Vec::new();
         }
         self.phase.note_arrival(slot, seq, now);

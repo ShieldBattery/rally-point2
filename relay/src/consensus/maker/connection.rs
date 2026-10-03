@@ -150,6 +150,11 @@ impl DecisionMaker {
         if !self.is_authority() {
             return None;
         }
+        // In a rollback session each client sets its own input delay against the session clock,
+        // so the buffer only seeds the lockstep start: the law re-affirms it once and then stops.
+        if self.rollback_enabled && self.initial_directive_sent {
+            return None;
+        }
 
         self.decide()
     }

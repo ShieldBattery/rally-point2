@@ -95,7 +95,7 @@ fn a_mesh_slot_started_marks_the_slot_without_notifying_or_echoing() {
             slot: 3,
         })),
     };
-    dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(frame, RelayId(9), 0, &joined, &sessions, &mesh_state);
 
     assert!(
         makers.has_started(&key, SlotId(3)),

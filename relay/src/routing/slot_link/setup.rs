@@ -88,8 +88,8 @@ pub(super) fn activate_slot(
 }
 
 /// The pushes a slot gets for state the session reached before its link came up:
-/// the region-label map once the release gate has opened, and the send-phase
-/// delay the controller already commanded it.
+/// the region-label map once the release gate has opened, the send-phase delay
+/// the controller already commanded it, and its current lead report.
 pub(super) fn push_connect_time_state(
     sessions: &Sessions,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
@@ -121,6 +121,12 @@ pub(super) fn push_connect_time_state(
                 slew_us_per_s: crate::consensus::phase::SLEW_US_PER_S,
             },
         );
+    }
+    // A slot reconnecting into a rollback session gets its current lead report
+    // at once rather than waiting out the next one: its pacing, and the clock's
+    // stopped time it carries, may have moved while it was away.
+    if let Some(report) = decision_makers.lead_report(key, slot) {
+        deliver_lead_report_to_slot(sessions, key, slot, report);
     }
 }
 

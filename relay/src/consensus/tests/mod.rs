@@ -38,6 +38,7 @@ mod observe_leave;
 mod outages;
 mod region_labels;
 mod seed_departed;
+mod session_clock;
 mod session_start;
 mod shrink;
 mod silence;

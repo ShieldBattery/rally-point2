@@ -50,6 +50,7 @@ mod leave_flow;
 mod link_state;
 mod registries;
 mod seen_gate;
+mod session_clock;
 
 pub(super) fn control_key() -> SessionKey {
     SessionKey {
@@ -150,7 +151,14 @@ impl FinalizeFixture {
     /// Runs one mesh control frame through the dispatch, as a peer relay's
     /// link driver would.
     pub(super) fn dispatch(&self, frame: MeshControlFrame) {
-        dispatch_mesh_control(frame, RelayId(9), &self.joined, &self.sessions, &self.mesh);
+        dispatch_mesh_control(
+            frame,
+            RelayId(9),
+            0,
+            &self.joined,
+            &self.sessions,
+            &self.mesh,
+        );
     }
 
     /// A local survivor (slot 0) whose inbox receives whatever leave the

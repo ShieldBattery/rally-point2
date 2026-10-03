@@ -163,6 +163,20 @@ pub(super) async fn push_phase_directive(
     .await
 }
 
+/// Writes this client's lead report down this client's control stream.
+pub(super) async fn push_lead_report(
+    ctx: &mut SlotLinkCtx,
+    report: rally_point_proto::messages::LeadReport,
+) -> ControlFlow<()> {
+    write_or_break(
+        ctx,
+        "lead report",
+        OnWriteFailure::CloseLink,
+        async |send| rally_point_transport::control::send_control_lead_report(send, report).await,
+    )
+    .await
+}
+
 /// Writes a lobby command another member authored down this client's control stream.
 pub(super) async fn push_lobby(
     ctx: &mut SlotLinkCtx,

@@ -24,9 +24,9 @@ pub(super) async fn handle_received(
         }
     };
     // Stamped before validation, forwarding, and the registry
-    // locks below: the phase controller measures *wire arrival*,
-    // and everything this arm does after this line is relay
-    // processing time that must not leak into the measurement.
+    // locks below: the phase controller and the lead reports measure
+    // *wire arrival*, and everything this arm does after this line is
+    // relay processing time that must not leak into the measurement.
     let received_at = std::time::Instant::now();
     // Only a payload-bearing packet needs an ack in return; owing one for
     // a client's ack-only packet would bounce ack-only packets back and
@@ -76,6 +76,7 @@ pub(super) async fn handle_received(
             Ok(turn) => {
                 let payload = turn.payload;
                 ctx.flight_counters.note_validated(payload.seq);
+                let seq = payload.seq;
                 // NOTE: neither the frame observation nor the
                 // desync comparator is fed here. Both client and
                 // mesh ingress funnel through the session-level
@@ -94,6 +95,19 @@ pub(super) async fn handle_received(
                     ctx.slot,
                     payload,
                 );
+                // In a rollback session, measure this turn against the
+                // session clock: every first arrival counts, a catch-up
+                // burst included, because a turn that arrived in a burst
+                // arrived late. Measured after forwarding, so a turn that
+                // moved the authority's clock (resuming it after a stop) is
+                // measured against the clock it moved. Its report, when one
+                // is due, goes back down this slot's own control stream.
+                if let Some(report) =
+                    ctx.decision_makers
+                        .note_lead_arrival(&ctx.key, ctx.slot, seq, received_at)
+                {
+                    deliver_lead_report_to_slot(&ctx.sessions, &ctx.key, ctx.slot, report);
+                }
             }
             Err(error) => {
                 tracing::warn!(

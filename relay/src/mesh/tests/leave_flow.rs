@@ -47,7 +47,7 @@ async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepte
         session: key.session.0,
         kind: Some(mesh_control_frame::Kind::LeaveDirective(first)),
     };
-    dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(frame, RelayId(9), 0, &joined, &sessions, &mesh_state);
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
         subject_shutdown.notified(),
@@ -80,7 +80,7 @@ async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepte
         session: key.session.0,
         kind: Some(mesh_control_frame::Kind::LeaveDirective(conflicting)),
     };
-    dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(frame, RelayId(9), 0, &joined, &sessions, &mesh_state);
     assert_eq!(
         inbox.try_recv_leave(),
         None,
@@ -94,7 +94,7 @@ async fn a_leave_directive_dispatch_closes_subject_and_forwards_only_the_accepte
         session: key.session.0,
         kind: Some(mesh_control_frame::Kind::LeaveDirective(first)),
     };
-    dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(frame, RelayId(9), 0, &joined, &sessions, &mesh_state);
     assert_eq!(
         inbox.try_recv_leave(),
         None,
@@ -172,7 +172,7 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
             },
         )),
     };
-    dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(frame, RelayId(9), 0, &joined, &sessions, &mesh_state);
 
     assert!(
         !mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),
@@ -213,7 +213,14 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
         )),
     };
 
-    dispatch_mesh_control(connected(11), RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(
+        connected(11),
+        RelayId(9),
+        0,
+        &joined,
+        &sessions,
+        &mesh_state,
+    );
     assert!(mesh_state.session.drop_holds.is_pending(&key, SlotId(0)));
     assert_eq!(inbox.try_recv_connectivity(), None);
 
@@ -224,7 +231,14 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
         .get_mut(&key)
         .expect("maker exists")
         .force_decide_leave(SlotId(0), 0x4000_0006);
-    dispatch_mesh_control(connected(22), RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(
+        connected(22),
+        RelayId(9),
+        0,
+        &joined,
+        &sessions,
+        &mesh_state,
+    );
     assert!(!mesh_state.session.drop_holds.is_pending(&key, SlotId(0)));
     assert_eq!(inbox.try_recv_connectivity(), None);
     assert!(!makers.connection_epoch_matches(&key, SlotId(0), Some(22)));
@@ -283,7 +297,14 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
         };
 
         if true_before_leave {
-            dispatch_mesh_control(connected(22), RelayId(9), &joined, &sessions, &mesh_state);
+            dispatch_mesh_control(
+                connected(22),
+                RelayId(9),
+                0,
+                &joined,
+                &sessions,
+                &mesh_state,
+            );
             assert_eq!(
                 inbox.try_recv_connectivity(),
                 Some((SlotId(0), true)),
@@ -293,7 +314,7 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
         // Model a local E1 drop hold that the peer's final decision outran.
         // The final leave must retire it immediately in either ordering.
         mesh_state.session.drop_holds.hold(key.clone(), SlotId(0));
-        dispatch_mesh_control(leave, RelayId(8), &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(leave, RelayId(8), 0, &joined, &sessions, &mesh_state);
         assert!(inbox.try_recv_leave().is_some());
         assert!(
             !mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),
@@ -301,19 +322,33 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
         );
 
         if !true_before_leave {
-            dispatch_mesh_control(connected(22), RelayId(9), &joined, &sessions, &mesh_state);
+            dispatch_mesh_control(
+                connected(22),
+                RelayId(9),
+                0,
+                &joined,
+                &sessions,
+                &mesh_state,
+            );
             assert_eq!(
                 inbox.try_recv_connectivity(),
                 None,
                 "Leave(E1) makes true(E2) terminal"
             );
         }
-        dispatch_mesh_control(departed, RelayId(9), &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(departed, RelayId(9), 0, &joined, &sessions, &mesh_state);
         assert!(
             !mesh_state.session.drop_holds.is_pending(&key, SlotId(0)),
             "a delayed departed frame may merge terminal metadata but cannot recreate a hold"
         );
-        dispatch_mesh_control(connected(33), RelayId(9), &joined, &sessions, &mesh_state);
+        dispatch_mesh_control(
+            connected(33),
+            RelayId(9),
+            0,
+            &joined,
+            &sessions,
+            &mesh_state,
+        );
         assert_eq!(
             inbox.try_recv_connectivity(),
             None,

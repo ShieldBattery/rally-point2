@@ -11,6 +11,7 @@ use super::*;
 
 mod authority;
 mod buffer;
+mod clock;
 mod connection;
 mod departure;
 mod eviction;
@@ -23,6 +24,7 @@ mod silence;
 mod state_hash;
 mod sync;
 
+pub use clock::ClockUpdate;
 pub use departure::{DepartureStamps, FinalizeOutcome, RecordedDeparture};
 pub use eviction::{DesyncEviction, EvictionCause};
 pub use silence::SilentSlot;
@@ -344,6 +346,13 @@ pub struct DecisionMaker {
     /// hashes on their turns, which `hashes` compares, and send no native sync commands for
     /// `sync` to. Latched at maker creation, like `finalized_drops_enabled`.
     pub(in crate::consensus) rollback_enabled: bool,
+    /// A rollback session's clock: when each turn is due at the relay (see
+    /// [`SessionClock`]). The authority anchors and stops it; every other relay
+    /// adopts the authority's.
+    pub(in crate::consensus) clock: SessionClock,
+    /// How late this relay's home slots' turns have been arriving against
+    /// [`clock`](Self::clock), and the reports made from it.
+    pub(in crate::consensus) lead: LeadTracker,
     /// The state hash comparator of a rollback session. Kept on every relay and across authority
     /// changes, so a promoted authority carries on judging where the old one stopped.
     pub(in crate::consensus) hashes: StateHashTracker,
@@ -499,6 +508,8 @@ impl DecisionMaker {
             resumed: false,
             finalized_drops_enabled: false,
             rollback_enabled: false,
+            clock: SessionClock::default(),
+            lead: LeadTracker::default(),
             hashes: StateHashTracker::default(),
             finalizing_drops: HashSet::new(),
             rehomed_homes: HashSet::new(),

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeaveDirective, Payload};
+use rally_point_proto::messages::{LeadReport, LeaveDirective, Payload};
 use tokio::sync::{mpsc, watch};
 
 use crate::phase::PhaseStatus;
@@ -212,4 +212,11 @@ pub struct TurnChannels {
     /// phases already aligned within the relay's dead-band are never
     /// corrected).
     pub phase_status: watch::Receiver<PhaseStatus>,
+    /// The newest lead report the relay sent in a rollback session: how early
+    /// or late this client's turns have been reaching its home relay against
+    /// the session clock, and how long that clock has spent stopped. The game
+    /// paces its simulation from it. A watch channel rather than a queue: each
+    /// report restates the whole window, so only the newest matters. `None`
+    /// until the first report arrives, and always outside a rollback session.
+    pub lead_report: watch::Receiver<Option<LeadReport>>,
 }

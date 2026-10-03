@@ -313,6 +313,47 @@ pub(crate) fn deliver_phase_directive_to_slot(
     );
 }
 
+/// Pushes each named slot's lead report down that slot's own control stream —
+/// the reports a session clock change carries for every home slot measured
+/// here. Senders are cloned under the lock and the lock dropped before
+/// delivery, as in [`fan_out`]. Best-effort: each report restates the whole
+/// window, so a lost one is replaced by the next, and a slot that already left
+/// needs none.
+pub(crate) fn fan_out_lead_reports(
+    sessions: &Sessions,
+    key: &SessionKey,
+    reports: &[(SlotId, LeadReport)],
+) {
+    let targets: Vec<(SlotId, mpsc::Sender<LeadReport>, LeadReport)> = {
+        let roster = sessions.lock();
+        match roster.get(key) {
+            Some(slots) => reports
+                .iter()
+                .filter_map(|(slot, report)| {
+                    slots
+                        .get(slot)
+                        .map(|entry| (*slot, entry.lead_push.clone(), *report))
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    push_to_slots(key, "lead report", None, targets);
+}
+
+/// Pushes one slot's lead report down its own control stream: the report its
+/// own newest turn made due, or the re-send a slot gets when it (re)connects.
+/// A slot absent from the roster (already gone) is skipped, and a full queue
+/// drops the report, which the next one replaces.
+pub(crate) fn deliver_lead_report_to_slot(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    report: LeadReport,
+) {
+    deliver_to_slot(sessions, key, slot, |entry| entry.lead_push.clone(), report);
+}
+
 /// Pushes a slot-connectivity change down every currently-registered local
 /// slot's control stream in the `key` group, with no exclusion — a connectivity
 /// change is informational for everyone, and a client receiving its own slot's

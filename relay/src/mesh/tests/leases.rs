@@ -85,7 +85,7 @@ fn a_superseded_lease_runs_neither_a_queued_dispatch_nor_a_queued_join() {
     assert!(
         old_lease
             .with_current(|| {
-                dispatch_mesh_control(stale_e1, peer, &joined, &sessions, &mesh);
+                dispatch_mesh_control(stale_e1, peer, 0, &joined, &sessions, &mesh);
             })
             .is_none()
     );

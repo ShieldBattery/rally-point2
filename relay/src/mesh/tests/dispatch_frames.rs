@@ -38,7 +38,7 @@ fn an_oversize_turn_dispatch_marks_seen_observes_and_never_echoes() {
         session: key.session.0,
         kind: Some(mesh_control_frame::Kind::OversizeTurn(payload)),
     };
-    dispatch_mesh_control(frame, RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(frame, RelayId(9), 0, &joined, &sessions, &mesh_state);
 
     // The remote slot's frame fed the consensus coordinate, exactly as a
     // datagram-delivered turn's would.
@@ -92,7 +92,7 @@ fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
     };
 
     // Control: while the session is live, the same frame installs a hold.
-    dispatch_mesh_control(departed(1), RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(departed(1), RelayId(9), 0, &joined, &sessions, &mesh_state);
     assert!(
         mesh_state.session.drop_holds.is_pending(&key, SlotId(1)),
         "a live session's dropped SlotDeparted marks a hold",
@@ -104,7 +104,7 @@ fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
     makers.deregister_maker(&key);
     mesh_state.session.drop_holds.end_session_terminal(&key);
 
-    dispatch_mesh_control(departed(2), RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(departed(2), RelayId(9), 0, &joined, &sessions, &mesh_state);
     assert!(
         !mesh_state.session.drop_holds.is_pending(&key, SlotId(2)),
         "a retired session's straggler frame resurrects nothing",
@@ -118,7 +118,7 @@ fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
     // syncs the maker; model both halves here.
     mesh_state.session.gates.reopen(&key);
     serve();
-    dispatch_mesh_control(departed(3), RelayId(9), &joined, &sessions, &mesh_state);
+    dispatch_mesh_control(departed(3), RelayId(9), 0, &joined, &sessions, &mesh_state);
     assert!(
         mesh_state.session.drop_holds.is_pending(&key, SlotId(3)),
         "a re-served session dispatches normally again",

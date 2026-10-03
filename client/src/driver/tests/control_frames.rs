@@ -98,6 +98,45 @@ async fn released_region_labels_surface_on_the_game_channel() {
 }
 
 #[tokio::test]
+async fn lead_reports_surface_on_the_game_watch_newest_first() {
+    // A rollback session's relay reports how this client's turns are landing
+    // against the session clock; the driver hands each one straight to the
+    // game, which only ever needs the newest.
+    use rally_point_proto::messages::LeadReport;
+    use rally_point_transport::control::send_control_lead_report;
+
+    let mut fixture = DriverFixture::new().await;
+    let mut reports = fixture.chan.lead_report.clone();
+    assert_eq!(*reports.borrow(), None, "nothing before the first report");
+
+    for through_step in [36, 48] {
+        send_control_lead_report(
+            &mut fixture.peer_control,
+            LeadReport {
+                through_step,
+                median_us: -3_000,
+                p90_us: 9_000,
+                samples: 24,
+                pause_us: 0,
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let newest = tokio::time::timeout(
+        Duration::from_secs(5),
+        reports.wait_for(|report| report.as_ref().is_some_and(|x| x.through_step == 48)),
+    )
+    .await
+    .expect("the newest report arrives before the timeout")
+    .expect("the watch stays open")
+    .unwrap();
+    assert_eq!((newest.median_us, newest.p90_us), (-3_000, 9_000));
+
+    fixture.finish().await;
+}
+
+#[tokio::test]
 async fn a_control_frame_kind_this_build_predates_is_skipped_without_ending_the_stream() {
     // A relay running ahead of this client sends a frame kind it has no arm
     // for. The reader must skip it and keep reading, so a rolling deploy never

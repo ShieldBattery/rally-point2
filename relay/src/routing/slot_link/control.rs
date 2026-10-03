@@ -73,6 +73,16 @@ pub(super) fn handle_control_frame(
                 "ignoring unexpected client-sent send-phase control frame",
             );
         }
+        // Lead reports are relay → client only — the relay measures them
+        // itself, and a client-sent one is never an input to anything.
+        Some(ControlInbound::LeadReport(_)) => {
+            tracing::warn!(
+                tenant = ctx.key.tenant.as_ref(),
+                session = ctx.key.session.0,
+                slot = ctx.slot.0,
+                "ignoring unexpected client-sent lead report control frame",
+            );
+        }
         // The client acknowledging that it adopted its send-phase
         // directive. The slot is the authenticated connection's —
         // never a wire claim — and the acknowledgement can release

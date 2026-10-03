@@ -209,7 +209,19 @@ pub(super) fn deliver_turn_to_locals(
         // turn itself because a client picks what it sends and when, so any
         // count or stamp it supplies can be padded; only the turns it actually
         // produced move this prefix.
-        decision_makers.note_forward_advance(key, slot, forwarded.forwarded);
+        // On the authority of a rollback session, the same advance moves the
+        // session clock on: anchoring it once the lockstep start is in, and
+        // stopping it for any time the session spent waiting. Every other relay
+        // adopts the change, and this relay's own players get reports carrying
+        // it at once.
+        if let Some(update) = decision_makers.note_forward_advance(key, slot, forwarded.forwarded) {
+            super::fan_out::fan_out_control(
+                &mesh.links,
+                key,
+                super::frames::session_clock_frame(key.session, update.frame),
+            );
+            routing::fan_out_lead_reports(sessions, key, &update.reports);
+        }
     }
     // The frame observation's one and only feed point, right after the
     // `mark_seen` dedup, for the same reason as the desync comparator just

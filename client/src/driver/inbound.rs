@@ -369,6 +369,13 @@ pub(super) async fn on_control_frame(
         // newest-wins; a repeat (a correction racing the
         // connect-time re-push) is idempotent, and the relay's
         // next measurement cycle corrects any residue.
+        // How early or late this client's turns have been reaching its home
+        // relay against a rollback session's clock. The driver doesn't act on
+        // it: the game paces its simulation from it, so it goes straight to the
+        // game's watch, newest wins.
+        Some(ControlInbound::LeadReport(report)) => {
+            let _ = seam.lead_report.send_replace(Some(report));
+        }
         Some(ControlInbound::PhaseDirective(directive)) => {
             state
                 .phase_slew
