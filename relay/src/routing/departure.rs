@@ -310,7 +310,7 @@ pub(super) fn report_own_presence(
         // A recompute that promotes this relay to authority may make it the one
         // to observe full slot presence: re-evaluate and fire the session-start
         // directive if the accumulated live slots already cover the expected set.
-        maybe_start_session(sessions, &mesh.session.decision_makers, &mesh.links, key);
+        after_authority_change(sessions, &mesh.session.decision_makers, &mesh.links, key);
         // This liveness change may have emptied the session session-wide (arming
         // the abandoned-session timer) or refilled it (cancelling any armed timer).
         reconcile_abandon(sessions, mesh, key);

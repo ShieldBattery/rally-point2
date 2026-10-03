@@ -8,7 +8,7 @@ use std::sync::Arc;
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
     EvictSlot, FinalizeDrop, FinalizeDropResult, GameChat, LeaveDirective, LobbyCommand,
-    MeshControlFrame, Payload, PlayerSkin, mesh_control_frame,
+    MeshControlFrame, Payload, PlayerSkin, SessionClock, mesh_control_frame,
 };
 use tokio::sync::{Notify, mpsc};
 
@@ -357,6 +357,13 @@ pub(crate) fn fan_out_session_start(
         key,
         session_start_frame(key.session, initial_buffer_turns),
     );
+}
+
+/// Broadcasts the authority's rollback session clock to every peer relay serving
+/// `key`, which each adopt (the anchor once, then any growth in its stopped time).
+/// Not re-broadcast by a receiver: the authority sends it to every relay itself.
+pub(crate) fn fan_out_session_clock(links: &MeshLinks, key: &SessionKey, clock: SessionClock) {
+    fan_out_control(links, key, session_clock_frame(key.session, clock));
 }
 
 /// Broadcasts a slot-connectivity change to every peer relay serving `key`, so

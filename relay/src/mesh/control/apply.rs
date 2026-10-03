@@ -346,7 +346,7 @@ impl MeshControl {
                 .unwrap_or_default()
         };
         // A re-note that completes the expected set latches the session started
-        // inside the maker, so the `maybe_start_session` below would then see an
+        // inside the maker, so the `after_authority_change` below would then see an
         // already-started session and deliver nothing. Drive delivery from the
         // note that completed coverage instead: fan the start directive to every
         // local slot and across the mesh, exactly as a live announce's
@@ -374,7 +374,7 @@ impl MeshControl {
         // relay the one to observe full slot presence — re-evaluate and fire the
         // session-start directive if the accumulated live slots already cover the
         // expected set.
-        crate::routing::maybe_start_session(
+        crate::routing::after_authority_change(
             &self.sessions,
             &self.mesh.session.decision_makers,
             &self.mesh.links,

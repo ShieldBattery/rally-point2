@@ -732,7 +732,9 @@ targets.
 - **Copies.** Relays share no timebase. The authority sends its clock over the mesh
   (`SessionClock`: the anchor seq, the anchor's age, the pause); a peer places the anchor at the
   frame's receipt less its age and half the link's RTT, once, and afterwards only adopts a grown
-  pause. A pause change goes out at once, and the relays push every measured player a report
+  pause. The authority sends it when it anchors or stops, at a join, when a peer proves its join
+  with its first presence report, and after any authority change: a relay promoted after a peer
+  joined it announces the copy it holds, since that peer was never sent one. A pause change goes out at once, and the relays push every measured player a report
   carrying it, so clients move their pacing by exactly the stop instead of sprinting. Each player's
   window starts over with it: a turn measured around the stop may have been read against the clock
   from before it, and would count as late by the whole stop.

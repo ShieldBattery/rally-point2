@@ -147,3 +147,51 @@ fn a_stop_on_the_authority_reaches_this_relays_measured_players() {
         "never echoed to the mesh"
     );
 }
+
+/// A relay that adopted the authority's clock and is then promoted (the old authority failed)
+/// announces the clock it holds to every peer relay: one that joined while it wasn't the
+/// authority was never sent it, and during smooth play nothing else would.
+#[test]
+fn a_promoted_relay_announces_the_clock_it_already_holds() {
+    let sessions: routing::Sessions = Arc::default();
+    let mesh = test_mesh_state();
+    let key = control_key();
+    rollback_session(&mesh, &key, crate::consensus::Authority::Peer);
+    let (_forward_rx, mut control_rx) = register_link_channels(&mesh.links, &key);
+    let joined = joined_state(&mesh.links, &key);
+    dispatch_mesh_control(
+        MeshControlFrame {
+            session: key.session.0,
+            kind: Some(mesh_control_frame::Kind::SessionClock(SessionClock {
+                anchor_step: LOCKSTEP_START_STEPS - 1,
+                since_anchor_us: 1_000_000,
+                pause_us: 250_000,
+            })),
+        },
+        RelayId(9),
+        0,
+        &joined,
+        &sessions,
+        &mesh,
+    );
+
+    routing::after_authority_change(&sessions, &mesh.session.decision_makers, &mesh.links, &key);
+    assert!(
+        session_clocks(&mut control_rx).is_empty(),
+        "a relay that isn't the authority announces nothing",
+    );
+
+    rollback_session(&mesh, &key, crate::consensus::Authority::SelfRelay);
+    routing::after_authority_change(&sessions, &mesh.session.decision_makers, &mesh.links, &key);
+    let clocks = session_clocks(&mut control_rx);
+    assert_eq!(
+        clocks.len(),
+        1,
+        "the promoted relay announces its clock: {clocks:?}"
+    );
+    assert_eq!(clocks[0].anchor_step, LOCKSTEP_START_STEPS - 1);
+    assert_eq!(
+        clocks[0].pause_us, 250_000,
+        "with the stopped time it adopted"
+    );
+}

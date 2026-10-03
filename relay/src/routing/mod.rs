@@ -82,8 +82,8 @@ mod state_hash;
 mod tests;
 
 pub use lifecycle::{
-    announce_slot_present, close_slots, close_slots_for_desync, close_slots_for_lobby_violation,
-    close_slots_for_silence, maybe_start_session,
+    after_authority_change, announce_slot_present, close_slots, close_slots_for_desync,
+    close_slots_for_lobby_violation, close_slots_for_silence,
 };
 pub(crate) use lobby::{deliver_lobby_command, report_game_started};
 pub use registry::{

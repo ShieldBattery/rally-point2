@@ -502,7 +502,12 @@ impl LinkDriver {
                         // observe full slot presence: re-evaluate and fire the
                         // session-start directive if it now covers the expected
                         // set (idempotent for already-started sessions).
-                        routing::maybe_start_session(sessions, decision_makers, mesh_links, &key);
+                        routing::after_authority_change(
+                            sessions,
+                            decision_makers,
+                            mesh_links,
+                            &key,
+                        );
                         // The peer's report may have emptied the session
                         // session-wide (the last live relay reporting zero),
                         // arming the abandoned-session timer — or refilled it,

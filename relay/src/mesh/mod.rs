@@ -52,8 +52,9 @@ pub use fan_out::fan_out_to_mesh;
 pub(crate) use fan_out::{
     broadcast_leaves, fan_out_chat, fan_out_delivery_cursors, fan_out_evict_slot,
     fan_out_finalize_drop, fan_out_finalize_drop_result, fan_out_leave_directive,
-    fan_out_lobby_command, fan_out_request_drop, fan_out_session_start, fan_out_skin,
-    fan_out_slot_connectivity, fan_out_slot_departed, fan_out_slot_present, fan_out_slot_started,
+    fan_out_lobby_command, fan_out_request_drop, fan_out_session_clock, fan_out_session_start,
+    fan_out_skin, fan_out_slot_connectivity, fan_out_slot_departed, fan_out_slot_present,
+    fan_out_slot_started,
 };
 pub(crate) use forward::deliver_mesh_turn;
 pub use forward::forward_client_turn;

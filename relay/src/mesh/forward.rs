@@ -215,11 +215,7 @@ pub(super) fn deliver_turn_to_locals(
         // adopts the change, and this relay's own players get reports carrying
         // it at once.
         if let Some(update) = decision_makers.note_forward_advance(key, slot, forwarded.forwarded) {
-            super::fan_out::fan_out_control(
-                &mesh.links,
-                key,
-                super::frames::session_clock_frame(key.session, update.frame),
-            );
+            super::fan_out::fan_out_session_clock(&mesh.links, key, update.frame);
             routing::fan_out_lead_reports(sessions, key, &update.reports);
         }
     }

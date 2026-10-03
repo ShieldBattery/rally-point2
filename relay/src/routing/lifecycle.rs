@@ -28,12 +28,22 @@ pub(crate) fn deliver_session_start(
     crate::mesh::fan_out_session_start(mesh_links, key, initial_buffer_turns);
 }
 
-/// Re-evaluates a session's start condition after an authority change and, if the
-/// newly-promoted authority now covers the expected set, delivers the directive
-/// session-wide. The authority-churn path (point where a promotion may fire a
-/// start the previous authority never got to). A no-op when the condition is not
-/// met — a non-authority relay, an already-started session, or an incomplete set.
-pub fn maybe_start_session(
+/// Does what a relay owes a session after an authority change (a descriptor push or
+/// a presence change that may have promoted it). Two things a promotion can leave
+/// undone:
+///
+/// - The session start: a newly promoted authority that now covers the expected
+///   set fires the start the previous authority never got to, session-wide.
+/// - A rollback session's clock: re-announced to every peer relay, because one that
+///   joined while another relay held the authority was never sent it (the clock
+///   only goes out at a join from the authority, and again when it stops), and
+///   would otherwise have no deadlines to measure its own players against.
+///
+/// Both are no-ops on a relay that isn't the authority, and on an already-started
+/// session or an unanchored clock. A caller can't always tell a promotion from a
+/// push that changed nothing, and needn't: re-announcing an unchanged clock costs
+/// a frame per peer, and adopting one is idempotent.
+pub fn after_authority_change(
     sessions: &Sessions,
     decision_makers: &consensus::DecisionMakers,
     mesh_links: &crate::mesh::MeshLinks,
@@ -41,6 +51,9 @@ pub fn maybe_start_session(
 ) {
     if decision_makers.reevaluate_start(key) {
         deliver_session_start(sessions, decision_makers, mesh_links, key);
+    }
+    if let Some(clock) = decision_makers.session_clock_frame(key) {
+        crate::mesh::fan_out_session_clock(mesh_links, key, clock);
     }
 }
 
