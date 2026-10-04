@@ -23,6 +23,10 @@
 ## Recording: what and bounds
 Events + link-health samples + turn-stream counters — summaries only (seqs,
 frames, slots, counts); raw turn/command bytes and chat are never recorded.
+Rollback sessions add per-slot lead figures (read from consensus by the
+sampler, interval figures reset on each read) and each client's own reported
+statistics (stored on its `SlotCounters`) to the rows; clock-stop events are
+capped per session at `MAX_CLOCK_STOP_EVENTS`.
 Rings are capped (`MAX_EVENTS_PER_SESSION` 1024, `MAX_SAMPLES_PER_SESSION`
 512, oldest-first eviction, drop counts ride the blob).
 

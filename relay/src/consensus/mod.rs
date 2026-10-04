@@ -264,7 +264,8 @@ use crate::key::SessionKey;
 // module depending on nothing else here. The concrete recorder is named once,
 // where the registry is built.
 use crate::observability::events::{
-    BufferDecisionInputs, FlightEvent, FlightEvents, SlotEffRtt, SyncCoverage,
+    BufferDecisionInputs, FlightEvent, FlightEvents, LeadSamples, MAX_CLOCK_STOP_EVENTS,
+    SlotEffRtt, SyncCoverage,
 };
 
 // Every submodule of this one reaches the rest of the module's internals

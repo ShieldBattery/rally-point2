@@ -17,6 +17,19 @@ pub struct ClockUpdate {
     pub reports: Vec<(SlotId, LeadReport)>,
 }
 
+/// The session clock as it stood before a change, for telling afterwards which flight events the
+/// change earns (see [`DecisionMaker::clock_events`]).
+#[derive(Debug, Clone, Copy)]
+pub(in crate::consensus) struct ClockMark {
+    anchored: bool,
+    pause: Duration,
+}
+
+/// A duration in whole microseconds, saturating.
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 impl DecisionMaker {
     /// Measures `slot`'s turn with seq `seq`, which first arrived on this relay's client edge at
     /// `received_at`, and returns the slot's lead report when one is due. Nothing outside a
@@ -36,6 +49,57 @@ impl DecisionMaker {
         }
         let lateness_us = self.clock.lateness_us(seq, received_at)?;
         self.lead.note(slot, seq, lateness_us, self.clock.pause())
+    }
+
+    /// This relay's home slots' lead figures since the previous call, and the clock's stopped time,
+    /// for the flight recorder's sample row. Each slot starts its next interval. `None` outside a
+    /// rollback session.
+    pub fn take_lead_samples(&mut self) -> Option<LeadSamples> {
+        if !self.rollback_enabled {
+            return None;
+        }
+        Some(LeadSamples {
+            clock_pause_us: self.clock.is_anchored().then(|| micros(self.clock.pause())),
+            slots: self.lead.take_samples(),
+        })
+    }
+
+    /// The session clock as it stands, to compare against after a change (see
+    /// [`clock_events`](Self::clock_events)).
+    pub(in crate::consensus) fn clock_mark(&self) -> ClockMark {
+        ClockMark {
+            anchored: self.clock.is_anchored(),
+            pause: self.clock.pause(),
+        }
+    }
+
+    /// The flight events the session clock's change since `mark` earns: its anchoring (`adopted`
+    /// when the anchor came from the authority's clock), and a growth of its stopped time. Stops
+    /// are recorded at most [`MAX_CLOCK_STOP_EVENTS`] times per session, so a session that keeps
+    /// stopping cannot spend its event ring on them.
+    pub(in crate::consensus) fn clock_events(
+        &mut self,
+        mark: ClockMark,
+        adopted: bool,
+    ) -> [Option<FlightEvent>; 2] {
+        let anchored = self
+            .clock
+            .anchor_step()
+            .filter(|_| !mark.anchored)
+            .map(|anchor_step| FlightEvent::SessionClockAnchored {
+                anchor_step,
+                adopted,
+            });
+        let stopped =
+            if self.clock.pause() > mark.pause && self.clock_stop_events < MAX_CLOCK_STOP_EVENTS {
+                self.clock_stop_events += 1;
+                Some(FlightEvent::SessionClockStopped {
+                    pause_us: micros(self.clock.pause()),
+                })
+            } else {
+                None
+            };
+        [anchored, stopped]
     }
 
     /// `slot`'s current lead report, for the re-send a slot gets when it (re)connects.

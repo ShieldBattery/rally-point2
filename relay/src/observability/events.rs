@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use rally_point_proto::control::DepartureKind;
+use rally_point_proto::messages::{LeadReport, RollbackStats};
 
 use crate::key::SessionKey;
 
@@ -269,7 +270,33 @@ pub enum FlightEvent {
         buffer_turns: u32,
         decision_seq: u32,
     },
+    /// The last rollback statistics a slot's client reported on a link that
+    /// has just ended, recorded once per such link, just ahead of its
+    /// [`SlotDisconnected`](Self::SlotDisconnected). The periodic sample rows
+    /// carry the earlier snapshots; this is the one a game-end report lands in,
+    /// since a link that ends with a leave intent has no sample after it.
+    SlotRollbackStats {
+        slot: u8,
+        stats: ClientRollbackStats,
+    },
+    /// The rollback session clock was anchored on this relay: by this relay as
+    /// the session authority once the lockstep start became confirmable
+    /// (`adopted` false), or from the authority's clock (`adopted` true).
+    /// `anchor_step` is the step due at the anchor.
+    SessionClockAnchored { anchor_step: u64, adopted: bool },
+    /// The rollback session clock's stopped time grew, to `pause_us` in total:
+    /// the whole session waited on turns that weren't coming. Recorded on the
+    /// authority when it stops the clock and elsewhere when the authority's
+    /// stop arrives, at most [`MAX_CLOCK_STOP_EVENTS`] times per session; the
+    /// sample rows' `clock_pause_us` keeps tracking it past that.
+    SessionClockStopped { pause_us: u64 },
 }
+
+/// The most [`FlightEvent::SessionClockStopped`] events one session records.
+/// A session that keeps stopping (a long run of drop waits) would otherwise
+/// spend the event ring on them; past this the sample rows' `clock_pause_us`
+/// still shows every stop's effect.
+pub const MAX_CLOCK_STOP_EVENTS: u32 = 32;
 
 /// Why a manual drop request was rejected at the authenticated client edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +405,164 @@ pub struct SyncCoverage {
     pub dormant: bool,
 }
 
+/// A rollback client's own statistics for its game, cumulative from the end of
+/// the game's lockstep start through `through_turn`, as it last reported them
+/// on a `RollbackStats` control frame. Durations are microseconds. Recorded as
+/// the client sent them: the relay checks only their size, never their
+/// plausibility, so they are the client's account and nothing more.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientRollbackStats {
+    pub version: u32,
+    pub through_turn: u32,
+    pub rollback_target: u32,
+    pub prediction_limit: u32,
+    pub ticks: u32,
+    /// Ticks by how far the shown frame was past the newest fully known turn:
+    /// entry `i` counts ticks `i` frames ahead, the last entry that many or
+    /// more.
+    pub rollback_histogram: Vec<u32>,
+    /// Ticks by the client's own input delay in turns: entry `i` counts ticks
+    /// at `i` turns, the last entry that many or more.
+    pub pipe_histogram: Vec<u32>,
+    pub capped_ticks: u32,
+    pub rollbacks: u32,
+    pub resimulated_frames: u32,
+    pub deepest_rollback: u32,
+    pub predicted_steps: u32,
+    pub mispredicted_turns: u32,
+    pub confirmed_predictions: u32,
+    pub caught_up_frames: u32,
+    pub held_back_ticks: u32,
+    pub lead_changes: u32,
+    pub schedule_corrections: u32,
+    pub schedule_corrected_us: i64,
+    pub holds_undone: u32,
+    pub clock_stopped_us: u64,
+    pub lead_reports: u32,
+    pub lead_p90_max_us: i32,
+    pub lead_p90_sum_us: i64,
+    pub worst_tick_us: u64,
+    pub slow_ticks: u32,
+    pub restore_us: u64,
+    pub snapshot_us: u64,
+    pub step_us: u64,
+}
+
+impl From<RollbackStats> for ClientRollbackStats {
+    fn from(stats: RollbackStats) -> Self {
+        Self {
+            version: stats.version,
+            through_turn: stats.through_turn,
+            rollback_target: stats.rollback_target,
+            prediction_limit: stats.prediction_limit,
+            ticks: stats.ticks,
+            rollback_histogram: stats.rollback_histogram,
+            pipe_histogram: stats.pipe_histogram,
+            capped_ticks: stats.capped_ticks,
+            rollbacks: stats.rollbacks,
+            resimulated_frames: stats.resimulated_frames,
+            deepest_rollback: stats.deepest_rollback,
+            predicted_steps: stats.predicted_steps,
+            mispredicted_turns: stats.mispredicted_turns,
+            confirmed_predictions: stats.confirmed_predictions,
+            caught_up_frames: stats.caught_up_frames,
+            held_back_ticks: stats.held_back_ticks,
+            lead_changes: stats.lead_changes,
+            schedule_corrections: stats.schedule_corrections,
+            schedule_corrected_us: stats.schedule_corrected_us,
+            holds_undone: stats.holds_undone,
+            clock_stopped_us: stats.clock_stopped_us,
+            lead_reports: stats.lead_reports,
+            lead_p90_max_us: stats.lead_p90_max_us,
+            lead_p90_sum_us: stats.lead_p90_sum_us,
+            worst_tick_us: stats.worst_tick_us,
+            slow_ticks: stats.slow_ticks,
+            restore_us: stats.restore_us,
+            snapshot_us: stats.snapshot_us,
+            step_us: stats.step_us,
+        }
+    }
+}
+
+/// The upper bounds, in milliseconds of lateness, of the buckets of
+/// [`SlotLeadSample::lateness_histogram`]: a turn falls in the first bucket
+/// whose bound it does not exceed, or past the last bound in one more. So the
+/// ten buckets hold lateness of at most -40, then over -40 to -20, -20 to -10,
+/// -10 to 0, 0 to 10, 10 to 20, 20 to 40, 40 to 80 and 80 to 160 (each
+/// including its upper end), and over 160. Negative lateness is a turn that
+/// arrived early.
+pub const LEAD_LATENESS_BUCKET_BOUNDS_MS: [i32; 9] = [-40, -20, -10, 0, 10, 20, 40, 80, 160];
+
+/// How many buckets [`SlotLeadSample::lateness_histogram`] has.
+pub const LEAD_LATENESS_BUCKETS: usize = LEAD_LATENESS_BUCKET_BOUNDS_MS.len() + 1;
+
+/// One lead report as the relay sent it to a slot's client: the lateness of
+/// the slot's newest turns against the rollback session clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeadReportRecord {
+    /// The newest step whose arrival the report covers.
+    pub through_step: u64,
+    /// The median lateness of the report's window, in microseconds (negative
+    /// when early). Meaningless when `samples` is zero.
+    pub median_us: i32,
+    /// The 90th percentile lateness, like `median_us`.
+    pub p90_us: i32,
+    /// How many turns the window held; zero for a report sent because the
+    /// clock stopped, which only carries `pause_us`.
+    pub samples: u32,
+    /// The session clock's total stopped time when the report was made.
+    pub pause_us: u64,
+}
+
+impl From<&LeadReport> for LeadReportRecord {
+    fn from(report: &LeadReport) -> Self {
+        Self {
+            through_step: report.through_step,
+            median_us: report.median_us,
+            p90_us: report.p90_us,
+            samples: report.samples,
+            pause_us: report.pause_us,
+        }
+    }
+}
+
+/// How late one home slot's turns reached this relay against a rollback
+/// session's clock: figures for the sample interval since the previous row,
+/// plus a histogram cumulative over the whole recording.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotLeadSample {
+    /// Turns measured during the interval.
+    pub turns: u32,
+    /// Lead reports made for the slot during the interval: each one due, and
+    /// each one a clock stop forced. A reconnect's re-send of the current
+    /// report is not a new one.
+    pub reports: u32,
+    /// The newest report made for the slot, during the interval or before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_report: Option<LeadReportRecord>,
+    /// The highest p90 lateness among the interval's reports that carried any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_p90_us: Option<i32>,
+    /// The latest any single turn measured during the interval arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_lateness_us: Option<i32>,
+    /// Every turn measured since the recording began, by lateness, in the
+    /// buckets [`LEAD_LATENESS_BUCKET_BOUNDS_MS`] describes.
+    pub lateness_histogram: Vec<u64>,
+}
+
+/// One rollback session's lead figures at a sampling instant, as the sampler
+/// reads them from the session's decision-maker: each measured home slot's
+/// [`SlotLeadSample`] and the clock's stopped time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeadSamples {
+    /// The session clock's total stopped time, once the clock is anchored.
+    pub clock_pause_us: Option<u64>,
+    /// Each measured home slot's figures, by slot id.
+    pub slots: Vec<(u8, SlotLeadSample)>,
+}
+
 /// One recorded event: what happened and when (unix epoch milliseconds).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventRecord {
@@ -439,6 +624,16 @@ pub struct SlotSample {
     pub cwnd: u64,
     /// Congestion events QUIC has recorded on this client's path.
     pub congestion_events: u64,
+    /// In a rollback session, how late this slot's turns reached this relay,
+    /// its home, against the session clock. Absent for a slot homed elsewhere,
+    /// before its first measured turn, outside a rollback session, and on the
+    /// final flush snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<SlotLeadSample>,
+    /// The latest rollback statistics this slot's client reported to this
+    /// relay. Absent until the first report, and outside a rollback session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_stats: Option<ClientRollbackStats>,
 }
 
 /// One periodic sample row: every live slot's counters + link health at one
@@ -466,6 +661,11 @@ pub struct SampleRecord {
     /// have been retired, and from sessions with no decision-maker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_coverage: Option<SyncCoverage>,
+    /// In a rollback session, the session clock's total stopped time once the
+    /// clock is anchored, in microseconds. Absent otherwise, and from
+    /// final-flush snapshots like [`sync_coverage`](Self::sync_coverage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_pause_us: Option<u64>,
 }
 
 /// One session's flushed recording: the versioned, self-describing envelope a

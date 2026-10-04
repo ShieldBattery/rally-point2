@@ -83,6 +83,11 @@ pub(super) fn handle_control_frame(
                 "ignoring unexpected client-sent lead report control frame",
             );
         }
+        // A rollback client's own statistics for its game so far, for
+        // the flight recording only (see `handle_rollback_stats`).
+        Some(ControlInbound::RollbackStats(stats)) => {
+            super::rollback_stats::handle_rollback_stats(ctx, stats);
+        }
         // The client acknowledging that it adopted its send-phase
         // directive. The slot is the authenticated connection's —
         // never a wire claim — and the acknowledgement can release

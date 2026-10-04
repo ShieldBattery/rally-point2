@@ -42,6 +42,11 @@ impl SessionClock {
         self.anchor.is_some()
     }
 
+    /// The step due at the anchor, once the clock is anchored.
+    pub(in crate::consensus) fn anchor_step(&self) -> Option<u64> {
+        self.anchor.map(|(step, _)| step)
+    }
+
     /// The time the clock has spent stopped.
     pub(in crate::consensus) fn pause(&self) -> Duration {
         self.pause

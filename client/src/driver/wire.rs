@@ -9,6 +9,7 @@
 //! receivers below) directly, so they cannot sit behind a struct the arm
 //! bodies also take by `&mut`.
 
+use rally_point_proto::messages::RollbackStats;
 use rally_point_transport::beacon::{BeaconCursors, BeaconWriter, spawn_beacon_reader};
 use rally_point_transport::control::{ControlInbound, spawn_control_reader};
 use rally_point_transport::{Link, LinkError, noq};
@@ -99,6 +100,16 @@ pub(super) struct Wire {
     /// sender dropping (a `None`), after which `recv()` is an always-ready
     /// `None` that would spin the loop.
     pub(super) request_drop_alive: bool,
+    /// Whether the game's rollback-statistics sender is still live. The game
+    /// publishes snapshots for the whole game; once it drops the sender,
+    /// `changed()` is an always-ready error that would spin the loop. The
+    /// newest snapshot stays readable after that, so the re-send on a new
+    /// stream and the write ahead of the leave intent still find it.
+    pub(super) rollback_stats_alive: bool,
+    /// The rollback statistics snapshot last written on THIS stream, so a
+    /// snapshot is written at most once per stream, and a new stream (which
+    /// starts with none) re-sends the newest.
+    pub(super) rollback_stats_on_stream: Option<RollbackStats>,
     /// The recv half of our own control stream, unused by convention (the relay
     /// writes on the stream *it* opened) and held only so it stays open for the
     /// life of the connection.
@@ -159,6 +170,8 @@ impl Wire {
             chat_out_alive: true,
             skin_out_alive: true,
             request_drop_alive: true,
+            rollback_stats_alive: true,
+            rollback_stats_on_stream: None,
             _our_control_recv: our_control_recv,
         };
         Ok((wire, WireReaders { beacon, control }))

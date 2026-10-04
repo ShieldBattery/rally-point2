@@ -168,6 +168,11 @@ pub(super) async fn on_control_frame(
         Some(ControlInbound::GameStarted) => {
             tracing::warn!("ignoring unexpected relay-sent game-started control frame");
         }
+        // Rollback statistics only ever travel client → relay; a client
+        // never receives them back, so ignore a stray one.
+        Some(ControlInbound::RollbackStats(_)) => {
+            tracing::warn!("ignoring unexpected relay-sent rollback-stats control frame");
+        }
         // A drop request only ever travels client → relay; a client
         // never receives one back, so ignore a stray one.
         Some(ControlInbound::RequestDrop(_)) => {

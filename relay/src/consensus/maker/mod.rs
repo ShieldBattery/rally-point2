@@ -353,6 +353,9 @@ pub struct DecisionMaker {
     /// How late this relay's home slots' turns have been arriving against
     /// [`clock`](Self::clock), and the reports made from it.
     pub(in crate::consensus) lead: LeadTracker,
+    /// How many `SessionClockStopped` flight events this session has recorded here, against
+    /// [`MAX_CLOCK_STOP_EVENTS`].
+    pub(in crate::consensus) clock_stop_events: u32,
     /// The state hash comparator of a rollback session. Kept on every relay and across authority
     /// changes, so a promoted authority carries on judging where the old one stopped.
     pub(in crate::consensus) hashes: StateHashTracker,
@@ -510,6 +513,7 @@ impl DecisionMaker {
             rollback_enabled: false,
             clock: SessionClock::default(),
             lead: LeadTracker::default(),
+            clock_stop_events: 0,
             hashes: StateHashTracker::default(),
             finalizing_drops: HashSet::new(),
             rehomed_homes: HashSet::new(),

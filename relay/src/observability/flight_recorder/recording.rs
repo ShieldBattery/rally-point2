@@ -11,7 +11,9 @@ use parking_lot::Mutex;
 use rally_point_proto::ids::SlotId;
 
 use super::{MAX_EVENTS_PER_SESSION, MAX_SAMPLES_PER_SESSION};
-use crate::observability::events::{EventRecord, SampleRecord, SlotSample, SyncCoverage};
+use crate::observability::events::{
+    ClientRollbackStats, EventRecord, LeadSamples, SampleRecord, SlotSample, SyncCoverage,
+};
 
 /// One slot's turn-stream counters: plain atomics the hot path bumps through a
 /// pre-fetched `Arc` handle — no lock, no allocation per turn. Cumulative for
@@ -28,6 +30,10 @@ pub struct SlotCounters {
     upstream_lost_packets: AtomicU64,
     cwnd: AtomicU64,
     congestion_events: AtomicU64,
+    /// The latest rollback statistics the slot's client reported. Behind a
+    /// lock rather than in atomics because it is one whole snapshot, written
+    /// every half minute or so, never on the per-turn path.
+    rollback_stats: Mutex<Option<ClientRollbackStats>>,
 }
 
 impl SlotCounters {
@@ -61,6 +67,19 @@ impl SlotCounters {
             self.redundant_payloads
                 .fetch_add(count as u64, Ordering::Relaxed);
         }
+    }
+
+    /// Stores the rollback statistics the slot's client just reported,
+    /// replacing any earlier snapshot: each one is cumulative, so the newest
+    /// says everything the earlier ones did. Kept across the slot's
+    /// reconnects, since the statistics describe the game, not the link.
+    pub fn note_rollback_stats(&self, stats: ClientRollbackStats) {
+        *self.rollback_stats.lock() = Some(stats);
+    }
+
+    /// The latest rollback statistics the slot's client reported, if any.
+    pub fn rollback_stats(&self) -> Option<ClientRollbackStats> {
+        self.rollback_stats.lock().clone()
     }
 
     /// Publishes the current link-level gauges for this slot: peer packets that
@@ -174,14 +193,21 @@ impl SessionRecording {
     }
 
     /// Builds one sample row from the current counters plus the given
-    /// conditions snapshot (the slot link's latest published QUIC stats) and
-    /// the session's end-to-end delivery view.
+    /// conditions snapshot (the slot link's latest published QUIC stats), the
+    /// session's end-to-end delivery view, and its lead figures, each merged
+    /// into the row of the slot it describes.
     pub(super) fn sample_row(
         &self,
         conditions: Option<&HashMap<SlotId, SlotConditionsRow>>,
         e2e: (Option<u64>, Option<u32>),
         sync_coverage: Option<SyncCoverage>,
+        lead: Option<LeadSamples>,
     ) -> SampleRecord {
+        let LeadSamples {
+            clock_pause_us,
+            slots: lead_slots,
+        } = lead.unwrap_or_default();
+        let mut lead_slots: HashMap<u8, _> = lead_slots.into_iter().collect();
         let counters = self.counters.lock();
         let mut slots: Vec<SlotSample> = counters
             .iter()
@@ -201,6 +227,8 @@ impl SessionRecording {
                     upstream_lost_packets: c.upstream_lost_packets.load(Ordering::Relaxed),
                     cwnd: c.cwnd.load(Ordering::Relaxed),
                     congestion_events: c.congestion_events.load(Ordering::Relaxed),
+                    lead: lead_slots.remove(&slot.0),
+                    rollback_stats: c.rollback_stats(),
                 }
             })
             .collect();
@@ -211,6 +239,7 @@ impl SessionRecording {
             worst_e2e_lag_turns: e2e.0,
             max_relay_hops: e2e.1,
             sync_coverage,
+            clock_pause_us,
         }
     }
 }

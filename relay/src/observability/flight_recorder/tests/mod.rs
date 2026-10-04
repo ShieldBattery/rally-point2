@@ -1,7 +1,7 @@
 //! Flight-recorder unit tests: shared fixtures (a session key builder, a
-//! capturing sink, and a sink slower than any test deadline) plus the two
+//! capturing sink, and a sink slower than any test deadline) plus the
 //! topic modules below. Split from one inline `mod tests` so each topic
-//! stays a manageable size; every helper here is used by both.
+//! stays a manageable size; the helpers here are shared across them.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -102,4 +102,5 @@ pub(super) fn incompressible_string(len: usize) -> String {
 }
 
 mod recording;
+mod rollback;
 mod sinks;

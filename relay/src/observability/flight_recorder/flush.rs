@@ -44,8 +44,9 @@ impl FlightRecorder {
         // Fold a final counter snapshot in, so a short session that never saw a
         // sampling tick still carries its turn-stream totals. Counters only —
         // the consensus state this flush races may already be gone, so the
-        // e2e view is deliberately absent here (the periodic rows carry it).
-        let final_row = recording.sample_row(None, (None, None), None);
+        // e2e view and the lead figures are deliberately absent here (the
+        // periodic rows carry them).
+        let final_row = recording.sample_row(None, (None, None), None, None);
         recording.push_sample(final_row);
         Some(FlightBlob {
             version: BLOB_VERSION,

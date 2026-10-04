@@ -36,6 +36,11 @@ impl DecisionMaker {
         self.rollback_enabled = enabled;
     }
 
+    /// Whether this session rolls back, as latched when the maker was created.
+    pub fn rollback_enabled(&self) -> bool {
+        self.rollback_enabled
+    }
+
     /// Checks a later descriptor push's `rollback` against the latched value. A session never
     /// changes mode mid-game: its clients were launched in one mode.
     pub fn reconcile_rollback(&self, pushed: bool) {

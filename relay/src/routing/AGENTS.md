@@ -13,7 +13,9 @@
   refused/provisional teardown.
 - `slot_link/` — `run_slot_link`: `mod.rs` has the setup, `SlotLinkCtx` and the
   `select!` skeleton; `setup.rs`/`inbound.rs`/`control.rs`/`pushes.rs`/
-  `maintenance.rs`/`teardown.rs` one arm or phase each.
+  `maintenance.rs`/`teardown.rs` one arm or phase each, and
+  `rollback_stats.rs` the client's statistics reports (rate limit, size
+  bound, the final one recorded as the link ends).
 - `departure.rs`, `drops.rs`, `close.rs` — who left, who decides it, and what
   this relay tears down once its last local slot is gone.
 - `silence.rs` — the relay-wide silent-slot watch: a timer that takes each

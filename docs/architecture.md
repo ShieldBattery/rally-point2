@@ -980,6 +980,20 @@ rather than the network. It **observes only**: no decision logic reads it,
 the per-turn hot path bumps pre-fetched atomics (never a lock), and the rings are size-capped with
 oldest-first eviction plus a drop counter, so a flushed blob says exactly what it lost.
 
+A rollback session adds what it takes to audit one afterwards. Each home slot's row carries its **lead
+figures** against the session clock — the interval's measured turns, reports sent and the newest one, the
+interval's highest report p90 and latest single turn, and a cumulative lateness histogram in ten fixed
+buckets (bounds -40, -20, -10, 0, 10, 20, 40, 80 and 160 ms) — and the row carries the clock's total
+stopped time. The clock's anchor (the authority's own, or a peer's adoption) is an event, and so is each
+growth of its stopped time, capped at 32 per session so a session that keeps stopping cannot spend the
+event ring; the rows keep tracking the stopped time past the cap. The clients also report their own
+statistics (`RollbackStats` on the control stream: rollback and input-delay histograms, mispredictions,
+schedule corrections, frame costs), cumulative from the end of the lockstep start, every half minute and
+once more ahead of the leave intent. The home relay binds a report to the link's own slot, drops one over
+two per five seconds or with a histogram past 64 entries (never closing the link), keeps the slot's
+latest on its row, and records the latest once more as an event when the link ends, since a game-end
+report has no sample after it. They are the client's account, recorded as sent; nothing decides on them.
+
 Client-edge drop-request rejection diagnostics have their own per-session, per-requester token
 budget: two immediate events, then one token replenished every two seconds, shared across all targets
 and rejection reasons. It gates both the flight event and its log line; excess rejections are omitted.

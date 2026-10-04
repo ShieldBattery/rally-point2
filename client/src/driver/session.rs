@@ -93,6 +93,10 @@ impl LinkDriver {
                 ),
             }
         }
+        // Rollback statistics are session state too: the newest snapshot rides
+        // every fresh stream, so the relay serving this connection records it
+        // even if the last stream's write never made it.
+        outbound::send_newest_rollback_stats(&mut wire, state, seam).await;
         // Flush any turns the game produced while the link was down, in seq order,
         // before live turns resume. On a fresh dial the buffer is empty; on a
         // reconnect these are the turns buffered during the outage. Each goes out
@@ -218,6 +222,11 @@ impl LinkDriver {
                 signal = seam.leave_intent.recv(), if wire.leave_intent_alive => {
                     wire.leave_intent_alive = false;
                     if signal.is_some() {
+                        // The game's final statistics snapshot goes ahead of
+                        // the intent: the relay stops reading this stream at
+                        // the intent, and this branch can win the race against
+                        // the snapshot's own.
+                        outbound::send_newest_rollback_stats(&mut wire, state, seam).await;
                         state.announcer.arm(state.timing.leave_intent_timeout);
                         state.announcer.maybe_send(
                             &mut wire.control_send,
@@ -261,6 +270,9 @@ impl LinkDriver {
                 target = seam.request_drop.recv(), if wire.request_drop_alive => {
                     outbound::on_request_drop(target, &mut wire).await;
                 }
+                changed = seam.rollback_stats.changed(), if wire.rollback_stats_alive => {
+                    outbound::on_rollback_stats(changed, &mut wire, state, seam).await;
+                }
                 // Safety timeout: the game signaled its departure but the
                 // outbound queue or unacked window hadn't drained within
                 // the leave-intent timeout. If acks aren't coming the link is
@@ -270,6 +282,7 @@ impl LinkDriver {
                 // turns the moment it sees the intent, so a few turns still
                 // technically unacked changes nothing.
                 _ = sleep_until(leave_deadline), if state.announcer.deadline().is_some() => {
+                    outbound::send_newest_rollback_stats(&mut wire, state, seam).await;
                     state.announcer.force_send(&mut wire.control_send).await?;
                 }
                 // The peer pushed a per-slot delivered-through cursor over the beacon

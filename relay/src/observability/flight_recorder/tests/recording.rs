@@ -50,7 +50,7 @@ fn counter_bumps_fold_into_a_sample_on_the_tick() {
     // Drive the tick body directly with an empty conditions registry and no
     // e2e view.
     let conditions = crate::mesh::new_conditions_registry();
-    recorder.sample_now(&conditions, |_| (None, None), |_| None);
+    recorder.sample_now(&conditions, |_| (None, None), |_| None, |_| None);
 
     let blob = recorder.take_blob(&k, true).expect("a recording exists");
     // One tick sample plus the final flush snapshot.
@@ -81,7 +81,7 @@ fn checksum_coverage_rides_periodic_samples_and_defaults_when_omitted() {
         dormant: false,
     };
 
-    recorder.sample_now(&conditions, |_| (None, None), |_| Some(coverage));
+    recorder.sample_now(&conditions, |_| (None, None), |_| Some(coverage), |_| None);
 
     let blob = recorder.take_blob(&k, true).expect("a recording exists");
     assert_eq!(blob.samples[0].sync_coverage, Some(coverage));
@@ -197,7 +197,7 @@ fn the_sampler_folds_published_link_conditions_into_the_row() {
             connection_epoch: None,
         },
     );
-    recorder.sample_now(&conditions, |_| (Some(17), Some(2)), |_| None);
+    recorder.sample_now(&conditions, |_| (Some(17), Some(2)), |_| None, |_| None);
 
     let blob = recorder.take_blob(&k, true).expect("a recording exists");
     let sample = &blob.samples[0];

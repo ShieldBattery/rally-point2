@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeadReport, LeaveDirective, Payload};
+use rally_point_proto::messages::{LeadReport, LeaveDirective, Payload, RollbackStats};
 use tokio::sync::{mpsc, watch};
 
 use crate::phase::PhaseStatus;
@@ -219,4 +219,21 @@ pub struct TurnChannels {
     /// report restates the whole window, so only the newest matters. `None`
     /// until the first report arrives, and always outside a rollback session.
     pub lead_report: watch::Receiver<Option<LeadReport>>,
+    /// This client's own cumulative rollback statistics, for the relay's flight
+    /// recording. The game publishes a fresh snapshot with
+    /// [`send_replace`](watch::Sender::send_replace) whenever it wants one
+    /// recorded, and the driver writes the newest up the reliable control
+    /// stream as a `RollbackStats` frame. A watch channel rather than a queue:
+    /// each snapshot restates everything since the game's lockstep start, so a
+    /// snapshot superseded before the driver got to it is lost harmlessly.
+    ///
+    /// The driver re-sends the newest snapshot on every new control stream (a
+    /// reconnect or a re-home), and writes any snapshot it has not sent yet
+    /// ahead of the leave intent. So a game that publishes its final snapshot
+    /// *before* signaling [`leave_intent`](Self::leave_intent) gets it recorded
+    /// as the slot's last word. Best-effort throughout: a failed write is logged
+    /// and left to the next stream, and nothing waits on it. Left at `None` (the
+    /// game never publishes, or drops the sender) nothing is sent, which is the
+    /// right outcome outside a rollback session.
+    pub rollback_stats: watch::Sender<Option<RollbackStats>>,
 }

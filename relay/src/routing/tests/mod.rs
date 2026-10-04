@@ -24,6 +24,7 @@ mod finalized_drops;
 mod forward_queue;
 mod phase;
 mod reconnect_races;
+mod rollback_stats;
 mod roster;
 mod session_close;
 mod silence;

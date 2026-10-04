@@ -29,11 +29,16 @@ mod control;
 mod inbound;
 mod maintenance;
 mod pushes;
+mod rollback_stats;
 mod setup;
 mod teardown;
 
 #[cfg(test)]
 pub(in crate::routing) use inbound::should_sample_active_conditions;
+#[cfg(test)]
+pub(in crate::routing) use rollback_stats::{
+    ROLLBACK_STATS_PER_WINDOW, ROLLBACK_STATS_WINDOW, RollbackStatsAdmission,
+};
 pub(in crate::routing) use teardown::end_slot_link;
 
 /// Everything one slot link's serve loop carries across its arms: the session it
@@ -82,6 +87,9 @@ pub(super) struct SlotLinkCtx {
     /// Whether this client has already reported its game loop started on this
     /// link.
     game_started_reported: bool,
+    /// The rate limit on this link's rollback statistics reports, and whether
+    /// it accepted any.
+    rollback_stats: rollback_stats::RollbackStatsAdmission,
 }
 
 /// Drives one authorized client's link until it closes.
@@ -354,6 +362,7 @@ pub async fn run_slot_link(
         pre_start_deadline,
         leave_announced,
         game_started_reported,
+        rollback_stats: rollback_stats::RollbackStatsAdmission::default(),
     };
 
     if setup::apply_resume_anchor(&mut link, &mut ctx, &mut resume_cursors).is_break() {
@@ -625,6 +634,7 @@ pub async fn run_slot_link(
     // own idle timeout instead of freeing promptly.
     link.connection()
         .close(VarInt::from_u32(0), b"slot link ended");
+    rollback_stats::record_final_rollback_stats(&ctx);
     end_slot_link(
         &ctx.sessions,
         &ctx.mesh_for_teardown,

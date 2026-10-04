@@ -127,6 +127,9 @@ pub(super) async fn drain_and_settle(
     // control stream, and that difference is what the caller's error
     // handling (and the operator reading the logs) keys on.
     if !link_gone {
+        // The game's final rollback statistics snapshot, if this stream has not
+        // carried it yet, goes ahead of the intent the relay stops reading at.
+        super::outbound::send_newest_rollback_stats(wire, state, seam).await;
         if let Err(error) = state
             .announcer
             .maybe_send(

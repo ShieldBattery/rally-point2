@@ -380,3 +380,159 @@ fn a_rollback_session_runs_no_send_phase_alignment() {
     }
     assert_eq!(m.commanded_phase_delay(SlotId(1)), None);
 }
+
+#[test]
+fn lead_figures_cover_their_interval_and_the_histogram_the_whole_recording() {
+    let start = Instant::now();
+    let mut m = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut m, &[0, 1], LOCKSTEP_START_STEPS, start);
+    let anchored_at = m.clock.due_at(ANCHOR).unwrap();
+    let due = |seq: u64| anchored_at + steps(seq - ANCHOR);
+
+    // 5 ms late (and the slot's first report), 45 ms early, 200 ms late, and right on time.
+    let _ = m.note_lead_arrival(SlotId(0), ANCHOR + 1, due(ANCHOR + 1) + 5 * MS);
+    let _ = m.note_lead_arrival(SlotId(0), ANCHOR + 2, due(ANCHOR + 2) - 45 * MS);
+    let _ = m.note_lead_arrival(SlotId(0), ANCHOR + 3, due(ANCHOR + 3) + 200 * MS);
+    let _ = m.note_lead_arrival(SlotId(0), ANCHOR + 4, due(ANCHOR + 4));
+
+    let samples = m
+        .take_lead_samples()
+        .expect("a rollback session has figures");
+    assert_eq!(samples.clock_pause_us, Some(0));
+    assert_eq!(samples.slots.len(), 1, "only slot 0 was measured");
+    let (slot, sample) = &samples.slots[0];
+    assert_eq!(*slot, 0);
+    assert_eq!((sample.turns, sample.reports), (4, 1));
+    let last = sample.last_report.expect("the first turn reported");
+    assert_eq!(
+        (last.through_step, last.p90_us, last.samples),
+        (ANCHOR + 1, 5_000, 1)
+    );
+    assert_eq!(sample.max_p90_us, Some(5_000));
+    assert_eq!(sample.max_lateness_us, Some(200_000));
+    // Buckets: at most -40 ms, up to -20, -10, 0, 10, 20, 40, 80, 160, and past 160.
+    assert_eq!(sample.lateness_histogram, [1, 0, 0, 1, 1, 0, 0, 0, 0, 1]);
+
+    // The next sample starts a fresh interval; the histogram and the last report carry on.
+    let samples = m.take_lead_samples().unwrap();
+    let (_, sample) = &samples.slots[0];
+    assert_eq!((sample.turns, sample.reports), (0, 0));
+    assert_eq!((sample.max_p90_us, sample.max_lateness_us), (None, None));
+    assert_eq!(sample.last_report, Some(last));
+    assert_eq!(sample.lateness_histogram, [1, 0, 0, 1, 1, 0, 0, 0, 0, 1]);
+
+    let mut lockstep = maker();
+    assert_eq!(
+        lockstep.take_lead_samples(),
+        None,
+        "nothing outside a rollback session"
+    );
+}
+
+#[test]
+fn a_stop_counts_as_a_report_without_lateness_in_the_figures() {
+    let start = Instant::now();
+    let mut m = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut m, &[0, 1], 100, start);
+    let _ = m.note_lead_arrival(SlotId(0), 90, m.clock.due_at(90).unwrap() + 30 * MS);
+    let _ = m.take_lead_samples();
+
+    let resumed = start + steps(100 - LOCKSTEP_START_STEPS) + Duration::from_secs(10);
+    let update = forward(&mut m, &[0, 1], 101, resumed).expect("stopped");
+    let samples = m.take_lead_samples().unwrap();
+    assert_eq!(samples.clock_pause_us, Some(update.frame.pause_us));
+    let (_, sample) = &samples.slots[0];
+    assert_eq!(sample.reports, 1, "the stop's report was made");
+    assert_eq!(sample.max_p90_us, None, "and it carries no lateness");
+    assert_eq!(sample.last_report.unwrap().samples, 0);
+}
+
+#[test]
+fn the_authoritys_anchor_and_stops_earn_flight_events() {
+    let start = Instant::now();
+    let mut m = rollback(maker(), &[0, 1]);
+    let mark = m.clock_mark();
+    play_on_schedule(&mut m, &[0, 1], 100, start);
+    assert_eq!(
+        m.clock_events(mark, false),
+        [
+            Some(FlightEvent::SessionClockAnchored {
+                anchor_step: ANCHOR,
+                adopted: false,
+            }),
+            None,
+        ],
+    );
+
+    let resumed = start + steps(100 - LOCKSTEP_START_STEPS) + Duration::from_secs(10);
+    let mark = m.clock_mark();
+    let update = forward(&mut m, &[0, 1], 101, resumed).expect("stopped");
+    assert_eq!(
+        m.clock_events(mark, false),
+        [
+            None,
+            Some(FlightEvent::SessionClockStopped {
+                pause_us: update.frame.pause_us,
+            }),
+        ],
+    );
+}
+
+#[test]
+fn an_adopted_clock_records_its_anchor_and_at_most_the_capped_number_of_stops() {
+    let registry = new_decision_makers();
+    let k = key();
+    let _ = registry.sync_maker(
+        &k,
+        MakerSync {
+            expected_slots: [SlotId(0), SlotId(1)].into(),
+            rollback: true,
+            ..MakerSync::new(bounds(0, 20), Authority::Peer)
+        },
+    );
+    let received = Instant::now();
+    let mut frame = SessionClockFrame {
+        anchor_step: ANCHOR,
+        since_anchor_us: 1_000_000,
+        pause_us: 0,
+    };
+    let _ = registry.adopt_session_clock(&k, &frame, received, 20_000);
+    // A session that keeps stopping, past the cap, and a stale repeat that grows nothing.
+    for stop in 1..=u64::from(MAX_CLOCK_STOP_EVENTS) + 5 {
+        frame.pause_us = stop * 1_000_000;
+        let _ = registry.adopt_session_clock(&k, &frame, received, 20_000);
+    }
+    let _ = registry.adopt_session_clock(&k, &frame, received, 20_000);
+
+    let events: Vec<FlightEvent> = registry
+        .flight_recorder()
+        .events(&k)
+        .into_iter()
+        .map(|record| record.event)
+        .collect();
+    assert_eq!(
+        events[0],
+        FlightEvent::SessionClockAnchored {
+            anchor_step: ANCHOR,
+            adopted: true,
+        },
+    );
+    let stops: Vec<u64> = events[1..]
+        .iter()
+        .map(|event| match event {
+            FlightEvent::SessionClockStopped { pause_us } => *pause_us,
+            other => panic!("expected only clock stops after the anchor, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(stops.len(), MAX_CLOCK_STOP_EVENTS as usize);
+    assert_eq!(stops[0], 1_000_000);
+    assert_eq!(
+        stops.last(),
+        Some(&(u64::from(MAX_CLOCK_STOP_EVENTS) * 1_000_000))
+    );
+    // The sample rows still see the whole stopped time past the cap.
+    assert_eq!(
+        registry.take_lead_samples(&k).unwrap().clock_pause_us,
+        Some(frame.pause_us),
+    );
+}

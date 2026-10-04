@@ -450,6 +450,18 @@ message ControlFrame {
     // rollback. Relay-authored: the relay stamps the arrivals itself, and the
     // only client input is each turn's seq. See `LeadReport`.
     LeadReport lead_report = 17;
+
+    // A rollback client's own statistics for the game so far (client → relay
+    // only, rollback sessions only): how much it predicted, rolled back and
+    // stalled, and what its frames cost. Cumulative from the end of the game's
+    // lockstep start, so any two snapshots can be differenced. Sent every half
+    // minute or so and once more at game end, ahead of the leave intent. Purely
+    // for the relay's flight recording: nothing decides on it, and the relay
+    // binds it to the authenticated connection's slot, never to anything the
+    // frame carries. Rate-limited and size-bounded by the relay, which drops a
+    // frame over either limit without closing the link. A relay that predates
+    // it skips the frame. See `RollbackStats`.
+    RollbackStats rollback_stats = 18;
   }
 }
 
@@ -1039,6 +1051,79 @@ message LeadReport {
   // that weren't coming, so a client moves its pacing later by any increase at
   // once rather than racing to make up time the session never ran.
   uint64 pause_us = 5;
+}
+
+// A rollback client's statistics for one game, cumulative from the end of the
+// game's lockstep start until `through_turn` (see `ControlFrame.rollback_stats`).
+// Counts are of game loop ticks, steps, frames or turns as each field says;
+// every duration is in microseconds. A field a sender predates reads as zero
+// and an empty histogram as absent, so a reader treats zero as "not reported"
+// wherever a real zero would be implausible.
+message RollbackStats {
+  // The layout version of these statistics, 1. Bumped when a field's meaning
+  // changes; a field added later just takes a new number.
+  uint32 version = 1;
+  // The turn the statistics run through.
+  uint32 through_turn = 2;
+  // The client's rollback target setting, in frames.
+  uint32 rollback_target = 3;
+  // The client's prediction limit, in frames.
+  uint32 prediction_limit = 4;
+  // Game loop ticks counted.
+  uint32 ticks = 5;
+  // Ticks by how far the shown frame was past the newest fully known turn:
+  // entry `i` counts ticks `i` frames ahead for `i` up to 10, and entry 11
+  // counts 11 or more.
+  repeated uint32 rollback_histogram = 6;
+  // Ticks by this client's own input delay in turns: entry `i` counts ticks
+  // at `i` turns for `i` up to 13, and entry 14 counts 14 or more.
+  repeated uint32 pipe_histogram = 7;
+  // Ticks stalled at the prediction limit.
+  uint32 capped_ticks = 8;
+  // Ticks that restored a snapshot.
+  uint32 rollbacks = 9;
+  // Frames simulated again after a restore.
+  uint32 resimulated_frames = 10;
+  // The most frames one rollback simulated again.
+  uint32 deepest_rollback = 11;
+  // Steps that first ran with at least one turn predicted.
+  uint32 predicted_steps = 12;
+  // Predicted turns a late turn contradicted.
+  uint32 mispredicted_turns = 13;
+  // Predicted turns that turned out right.
+  uint32 confirmed_predictions = 14;
+  // Extra frames stepped to catch up with the schedule.
+  uint32 caught_up_frames = 15;
+  // Ticks whose next step was put off because the client was ahead of the
+  // schedule.
+  uint32 held_back_ticks = 16;
+  // Times the client's controller moved its lead.
+  uint32 lead_changes = 17;
+  // Lead reports that moved the client's schedule.
+  uint32 schedule_corrections = 18;
+  // The net effect of those corrections (negative is earlier).
+  sint64 schedule_corrected_us = 19;
+  // Stall holds undone because the stall turned out to be this client's alone.
+  uint32 holds_undone = 20;
+  // The session clock's total stopped time, as the client last heard it.
+  uint64 clock_stopped_us = 21;
+  // Lead reports received.
+  uint32 lead_reports = 22;
+  // The highest p90 lateness any lead report carried.
+  sint32 lead_p90_max_us = 23;
+  // The sum of the lead reports' p90 lateness; divided by `lead_reports` it
+  // is their mean.
+  sint64 lead_p90_sum_us = 24;
+  // The longest tick that wasn't stalled, start to end.
+  uint64 worst_tick_us = 25;
+  // Ticks that weren't stalled and took over 4 ms.
+  uint32 slow_ticks = 26;
+  // Total time spent restoring snapshots.
+  uint64 restore_us = 27;
+  // Total time spent taking snapshots.
+  uint64 snapshot_us = 28;
+  // Total time spent in logic steps.
+  uint64 step_us = 29;
 }
 
 // One message on the relay ↔ relay reliable mesh control stream — the channel a

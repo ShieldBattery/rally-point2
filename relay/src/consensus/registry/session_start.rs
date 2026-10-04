@@ -65,6 +65,14 @@ impl DecisionMakers {
         }
     }
 
+    /// Whether `key`'s session rolls back. `false` for a session with no maker here, which knows
+    /// nothing of its mode.
+    pub fn rollback_enabled(&self, key: &SessionKey) -> bool {
+        self.lock()
+            .get(key)
+            .is_some_and(|maker| maker.rollback_enabled())
+    }
+
     /// Whether `slot`'s game loop is known to be running for `key` — this relay's own
     /// home client's report or a peer's shared one. `false` for a session with no
     /// maker here, which knows nothing about any slot.

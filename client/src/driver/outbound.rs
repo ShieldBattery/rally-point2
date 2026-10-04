@@ -1,8 +1,8 @@
 //! What the game hands up: its produced turns (sent now, or held out a
 //! send-phase delay first) and the frames it authors for the reliable control
 //! stream — result report, loop-started announcement, lobby commands, chat,
-//! skin blobs, drop requests. Grouped because they all end at the same two
-//! exits, the datagram path and the control stream.
+//! skin blobs, drop requests, rollback statistics. Grouped because they all
+//! end at the same two exits, the datagram path and the control stream.
 
 use std::time::Duration;
 
@@ -11,8 +11,9 @@ use rally_point_proto::messages::{GameChat, LobbyCommand, Payload, PlayerSkin};
 use rally_point_transport::Link;
 use rally_point_transport::control::{
     send_control_chat, send_control_game_result, send_control_game_started, send_control_lobby,
-    send_control_request_drop, send_control_skin,
+    send_control_request_drop, send_control_rollback_stats, send_control_skin,
 };
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use super::send::{OutboundSend, send_game_turn};
@@ -358,5 +359,49 @@ pub(super) async fn on_request_drop(target: Option<SlotId>, wire: &mut Wire) {
             }
         }
         None => wire.request_drop_alive = false,
+    }
+}
+
+/// The game published a rollback statistics snapshot: write the newest up
+/// this stream. Disarmed when the game drops its sender, after which the
+/// newest snapshot is still re-sent on a new stream and ahead of the leave
+/// intent.
+pub(super) async fn on_rollback_stats(
+    changed: Result<(), watch::error::RecvError>,
+    wire: &mut Wire,
+    state: &LoopState,
+    seam: &mut GameSeam,
+) {
+    match changed {
+        Ok(()) => send_newest_rollback_stats(wire, state, seam).await,
+        Err(_) => wire.rollback_stats_alive = false,
+    }
+}
+
+/// Writes the game's newest rollback statistics snapshot up this stream,
+/// unless there is none or this stream already carried it. Nothing once the
+/// leave intent is out: the relay reads nothing past it. Best-effort, like a
+/// result report: the statistics only feed the relay's recording, so a failed
+/// write is logged and left for the next stream to re-send.
+pub(super) async fn send_newest_rollback_stats(
+    wire: &mut Wire,
+    state: &LoopState,
+    seam: &mut GameSeam,
+) {
+    if state.announcer.sent() {
+        return;
+    }
+    let Some(stats) = seam.rollback_stats.borrow_and_update().clone() else {
+        return;
+    };
+    if wire.rollback_stats_on_stream.as_ref() == Some(&stats) {
+        return;
+    }
+    match send_control_rollback_stats(&mut wire.control_send, stats.clone()).await {
+        Ok(()) => wire.rollback_stats_on_stream = Some(stats),
+        Err(error) => tracing::debug!(
+            %error,
+            "rollback-stats send failed; re-sending on the next stream"
+        ),
     }
 }

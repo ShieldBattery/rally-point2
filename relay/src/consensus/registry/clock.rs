@@ -22,6 +22,14 @@ impl DecisionMakers {
             .note_lead_arrival(slot, seq, received_at)
     }
 
+    /// This relay's home slots' lead figures in `key`'s session since the previous call, and the
+    /// clock's stopped time, for the flight recorder's sample row (see
+    /// [`DecisionMaker::take_lead_samples`]). `None` outside a rollback session, or with no maker
+    /// here.
+    pub fn take_lead_samples(&self, key: &SessionKey) -> Option<LeadSamples> {
+        self.lock().get_mut(key)?.take_lead_samples()
+    }
+
     /// `slot`'s current lead report in `key`'s session, for the re-send a slot gets when it
     /// (re)connects.
     pub fn lead_report(&self, key: &SessionKey, slot: SlotId) -> Option<LeadReport> {
@@ -37,7 +45,8 @@ impl DecisionMakers {
     /// Adopts the authority's session clock for `key` from a frame that arrived at `received_at`
     /// over a mesh link with a round trip of `mesh_rtt_us`, returning the lead reports to push
     /// down this relay's home slots when the clock's stopped time grew (see
-    /// [`DecisionMaker::adopt_session_clock`]).
+    /// [`DecisionMaker::adopt_session_clock`]). Records the adoption's anchoring and any growth
+    /// of the stopped time in the flight recording.
     #[must_use]
     pub fn adopt_session_clock(
         &self,
@@ -46,10 +55,17 @@ impl DecisionMakers {
         received_at: Instant,
         mesh_rtt_us: u32,
     ) -> Vec<(SlotId, LeadReport)> {
-        let reports = match self.lock().get_mut(key) {
-            Some(maker) => maker.adopt_session_clock(frame, received_at, mesh_rtt_us),
+        let (reports, events) = match self.lock().get_mut(key) {
+            Some(maker) => {
+                let mark = maker.clock_mark();
+                let reports = maker.adopt_session_clock(frame, received_at, mesh_rtt_us);
+                (reports, maker.clock_events(mark, true))
+            }
             None => return Vec::new(),
         };
+        for event in events.into_iter().flatten() {
+            self.record_event(key, event);
+        }
         if !reports.is_empty() {
             tracing::info!(
                 tenant = key.tenant.as_ref(),

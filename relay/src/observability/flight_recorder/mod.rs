@@ -71,8 +71,9 @@ mod sinks;
 // reaching the recorder's own mesh/session wiring; these re-exports keep the
 // `flight_recorder::FlightEvent` paths every wiring site already uses.
 pub use crate::observability::events::{
-    BufferDecisionInputs, EventRecord, FlightBlob, FlightEvent, FlightEvents, SampleRecord,
-    SlotEffRtt, SlotSample, SyncCoverage,
+    BufferDecisionInputs, ClientRollbackStats, EventRecord, FlightBlob, FlightEvent, FlightEvents,
+    LEAD_LATENESS_BUCKET_BOUNDS_MS, LEAD_LATENESS_BUCKETS, LeadReportRecord, LeadSamples,
+    MAX_CLOCK_STOP_EVENTS, SampleRecord, SlotEffRtt, SlotLeadSample, SlotSample, SyncCoverage,
 };
 pub use recording::{FlushOutcome, RelayWorkSnapshot, SlotCounters};
 pub use sinks::{
@@ -433,12 +434,16 @@ impl FlightRecorder {
     /// end-to-end delivery view (`e2e_for`, typically
     /// [`DecisionMakers::delivery_view`](crate::consensus::DecisionMakers::delivery_view)) into one sample row per live
     /// recording — the sampling tick's body, exposed so tests drive it
-    /// directly.
+    /// directly. `lead_for` (typically
+    /// [`DecisionMakers::take_lead_samples`](crate::consensus::DecisionMakers::take_lead_samples))
+    /// hands over a rollback session's lead figures for the interval since the
+    /// previous call, so each row carries only its own interval's.
     pub fn sample_now(
         &self,
         conditions: &ConditionsRegistry,
         e2e_for: impl Fn(&SessionKey) -> (Option<u64>, Option<u32>),
         sync_coverage_for: impl Fn(&SessionKey) -> Option<SyncCoverage>,
+        lead_for: impl Fn(&SessionKey) -> Option<LeadSamples>,
     ) {
         let recordings: Vec<(SessionKey, Arc<SessionRecording>)> = {
             let state = self.inner.recordings.lock();
@@ -480,7 +485,7 @@ impl FlightRecorder {
                     "checksum comparator coverage",
                 );
             }
-            let row = recording.sample_row(rows.as_ref(), e2e_for(&key), coverage);
+            let row = recording.sample_row(rows.as_ref(), e2e_for(&key), coverage, lead_for(&key));
             recording.push_sample(row);
         }
     }
@@ -518,8 +523,9 @@ impl FlightRecorder {
 }
 
 /// The relay-wide sampling tick: folds counters, link conditions, and each
-/// session's end-to-end delivery view into a sample row per live session every
-/// `interval`. One task per relay, spawned by the binary; never returns.
+/// session's end-to-end delivery view and lead figures into a sample row per
+/// live session every `interval`. One task per relay, spawned by the binary;
+/// never returns.
 pub async fn run_sampler(
     recorder: FlightRecorder,
     conditions: ConditionsRegistry,
@@ -536,6 +542,7 @@ pub async fn run_sampler(
             &conditions,
             |key| makers.delivery_view(key),
             |key| makers.sync_coverage(key),
+            |key| makers.take_lead_samples(key),
         );
     }
 }

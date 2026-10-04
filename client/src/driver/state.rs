@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeadReport, LeaveDirective, Payload};
+use rally_point_proto::messages::{LeadReport, LeaveDirective, Payload, RollbackStats};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -132,6 +132,9 @@ pub(super) struct GameSeam {
     /// The newest lead report, to hand to the game thread (see
     /// [`TurnChannels::lead_report`]).
     pub(super) lead_report: watch::Sender<Option<LeadReport>>,
+    /// The game's newest rollback statistics snapshot, to write up the control
+    /// stream (see [`TurnChannels::rollback_stats`]).
+    pub(super) rollback_stats: watch::Receiver<Option<RollbackStats>>,
 }
 
 impl GameSeam {
@@ -182,6 +185,9 @@ impl GameSeam {
         // Lead reports each restate the whole window, so the newest is the only
         // one the game needs.
         let (lead_report_tx, lead_report_rx) = watch::channel(None);
+        // Rollback statistics are cumulative, so the game's newest snapshot is
+        // the only one worth sending.
+        let (rollback_stats_tx, rollback_stats_rx) = watch::channel(None);
         let seam = Self {
             outbound: outbound_rx,
             inbound: inbound_tx,
@@ -201,6 +207,7 @@ impl GameSeam {
             region_labels: region_labels_tx,
             phase_status: phase_status_tx,
             lead_report: lead_report_tx,
+            rollback_stats: rollback_stats_rx,
         };
         let channels = TurnChannels {
             outbound: outbound_tx,
@@ -222,6 +229,7 @@ impl GameSeam {
             region_labels: region_labels_rx,
             phase_status: phase_status_rx,
             lead_report: lead_report_rx,
+            rollback_stats: rollback_stats_tx,
         };
         (seam, channels, result_expected)
     }

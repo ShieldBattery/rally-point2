@@ -7,6 +7,10 @@
 //! report every [`LEAD_REPORT_EVERY`] turns. The turn path never allocates: each slot's window is a
 //! fixed ring, and a report is computed on the stack.
 //!
+//! Each slot also keeps what the flight recorder's sample rows read: the interval's turn and
+//! report counts and its worst lateness, taken (and reset) by each sample, and a cumulative
+//! histogram of every turn's lateness. All fixed-size, so the turn path stays allocation-free.
+//!
 //! When the clock stops, every window starts over. A turn measured around a stop can have been
 //! measured against the clock from before it (on the authority, a turn that arrived just before the
 //! one that moved the clock; on another relay, any turn that arrived before the authority's frame
@@ -14,6 +18,10 @@
 //! lateness at all, only the stop.
 
 use super::*;
+
+use crate::observability::events::{
+    LEAD_LATENESS_BUCKET_BOUNDS_MS, LEAD_LATENESS_BUCKETS, LeadReportRecord, SlotLeadSample,
+};
 
 /// How many of a slot's newest turns a report covers: one second.
 pub(in crate::consensus) const LEAD_WINDOW_TURNS: usize = 24;
@@ -26,6 +34,28 @@ pub(in crate::consensus) const LEAD_REPORT_EVERY: u64 = 12;
 /// late arrival like any other and is measured; one this far behind can't be told from a copy of
 /// a turn already measured (a resume replay on a new link), and is skipped.
 const LEAD_SEEN_SEQS: u64 = u128::BITS as u64;
+
+/// The bucket of [`LEAD_LATENESS_BUCKET_BOUNDS_MS`] a turn `lateness_us` late falls in: the first
+/// whose bound it does not exceed, or the one past the last bound.
+fn lateness_bucket(lateness_us: i32) -> usize {
+    LEAD_LATENESS_BUCKET_BOUNDS_MS
+        .iter()
+        .take_while(|&&bound_ms| i64::from(lateness_us) > i64::from(bound_ms) * 1_000)
+        .count()
+}
+
+/// What one slot's measurements added up to since the flight recorder last sampled them.
+#[derive(Debug, Default)]
+struct LeadInterval {
+    /// Turns measured.
+    turns: u32,
+    /// Reports made, each one due and each one a clock stop forced.
+    reports: u32,
+    /// The highest p90 among the reports that carried any lateness.
+    max_p90_us: Option<i32>,
+    /// The latest any single turn arrived.
+    max_lateness_us: Option<i32>,
+}
 
 /// One home slot's measurements.
 #[derive(Debug)]
@@ -41,6 +71,12 @@ struct SlotLead {
     next: usize,
     /// The seq at or past which the next report is due.
     report_at: u64,
+    /// The turns and reports since the flight recorder last sampled this slot.
+    interval: LeadInterval,
+    /// The newest report made.
+    last_report: Option<LeadReportRecord>,
+    /// Every turn measured, by lateness, in the buckets of [`LEAD_LATENESS_BUCKET_BOUNDS_MS`].
+    histogram: [u64; LEAD_LATENESS_BUCKETS],
 }
 
 impl SlotLead {
@@ -52,6 +88,9 @@ impl SlotLead {
             len: 0,
             next: 0,
             report_at: seq,
+            interval: LeadInterval::default(),
+            last_report: None,
+            histogram: [0; LEAD_LATENESS_BUCKETS],
         }
     }
 
@@ -81,6 +120,34 @@ impl SlotLead {
         self.window[self.next] = lateness_us;
         self.next = (self.next + 1) % LEAD_WINDOW_TURNS;
         self.len = (self.len + 1).min(LEAD_WINDOW_TURNS);
+        self.interval.turns = self.interval.turns.saturating_add(1);
+        self.interval.max_lateness_us = self.interval.max_lateness_us.max(Some(lateness_us));
+        self.histogram[lateness_bucket(lateness_us)] += 1;
+    }
+
+    /// Makes the slot's report (see [`report`](Self::report)) to send it, counting it toward the
+    /// flight recorder's figures.
+    fn make_report(&mut self, pause: Duration) -> LeadReport {
+        let report = self.report(pause);
+        self.interval.reports = self.interval.reports.saturating_add(1);
+        if report.samples > 0 {
+            self.interval.max_p90_us = self.interval.max_p90_us.max(Some(report.p90_us));
+        }
+        self.last_report = Some(LeadReportRecord::from(&report));
+        report
+    }
+
+    /// The slot's figures for the flight recorder, starting the next interval.
+    fn take_sample(&mut self) -> SlotLeadSample {
+        let interval = std::mem::take(&mut self.interval);
+        SlotLeadSample {
+            turns: interval.turns,
+            reports: interval.reports,
+            last_report: self.last_report,
+            max_p90_us: interval.max_p90_us,
+            max_lateness_us: interval.max_lateness_us,
+            lateness_histogram: self.histogram.to_vec(),
+        }
     }
 
     fn restart(&mut self) {
@@ -141,7 +208,7 @@ impl LeadTracker {
             return None;
         }
         lead.report_at = lead.newest + LEAD_REPORT_EVERY;
-        Some(lead.report(pause))
+        Some(lead.make_report(pause))
     }
 
     /// `slot`'s current report, if it has been measured at all.
@@ -156,8 +223,20 @@ impl LeadTracker {
             .iter_mut()
             .map(|(&slot, lead)| {
                 lead.restart();
-                (slot, lead.report(pause))
+                (slot, lead.make_report(pause))
             })
             .collect()
+    }
+
+    /// Every measured slot's figures for the flight recorder's sample row, by slot id, each slot
+    /// starting its next interval.
+    pub(in crate::consensus) fn take_samples(&mut self) -> Vec<(u8, SlotLeadSample)> {
+        let mut samples: Vec<_> = self
+            .slots
+            .iter_mut()
+            .map(|(slot, lead)| (slot.0, lead.take_sample()))
+            .collect();
+        samples.sort_unstable_by_key(|&(slot, _)| slot);
+        samples
     }
 }

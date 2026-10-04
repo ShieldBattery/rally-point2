@@ -17,17 +17,18 @@
 //! departure. A client also pushes a `GameResult` up with its end-of-game
 //! report, and a `GameStarted` up when its game loop begins running — the latter
 //! being why the relay can push a `LoadStateProbe` down and read the echoed ack
-//! as proof no such report is still queued in the client. The reader skips a
-//! frame kind it doesn't know, so the channel can grow chat/resync frames
-//! without a wire break.
+//! as proof no such report is still queued in the client. A rollback client
+//! also pushes its `RollbackStats` up for the relay's flight recording. The
+//! reader skips a frame kind it doesn't know, so the channel can grow
+//! chat/resync frames without a wire break.
 
 use prost::bytes::Bytes;
 use rally_point_proto::control_stream::encode_frame;
 use rally_point_proto::messages::{
     ControlFrame, GameChat, GameResult, GameStarted, LeadReport, LeaveDirective, LeaveIntent,
     LoadStateProbe, LoadStateProbeAck, LobbyCommand, Payload, PhaseApplied, PhaseDirective,
-    PlayerSkin, RegionLabel, RegionLabels, RequestDrop, SessionStart, SlotConnectivity,
-    control_frame,
+    PlayerSkin, RegionLabel, RegionLabels, RequestDrop, RollbackStats, SessionStart,
+    SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -154,6 +155,11 @@ pub enum ControlInbound {
     /// only the latest. A relay never receives one from a client, so the relay
     /// edge ignores a stray one just as it does a `Leave`.
     LeadReport(LeadReport),
+    /// A rollback client's cumulative statistics for the game so far (client →
+    /// relay only). The relay binds them to the authenticated connection's slot
+    /// and only records them; a client never receives one back, so the client
+    /// edge ignores a stray one just as it does a `LeaveIntent`.
+    RollbackStats(RollbackStats),
 }
 
 /// Depth of the reader-task → driver channel. Oversize turns are rare (the
@@ -253,6 +259,9 @@ pub fn spawn_control_reader(connection: noq::Connection) -> mpsc::Receiver<Contr
                 ControlFrame {
                     kind: Some(control_frame::Kind::LeadReport(report)),
                 } => ControlInbound::LeadReport(report),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::RollbackStats(stats)),
+                } => ControlInbound::RollbackStats(stats),
                 // A frame kind this build predates: skip it, keep the stream.
                 ControlFrame { kind: None } => {
                     tracing::debug!("skipping unknown control frame kind");
@@ -332,6 +341,23 @@ pub async fn send_control_game_result(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::GameResult(GameResult { payload })),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Sends a rollback client's cumulative statistics up the control stream
+/// (client → relay). Best-effort, like a result report: the relay only records
+/// them, a later snapshot restates everything an earlier one said, and the
+/// caller re-sends the latest on its next stream, so an error here (the stream
+/// or connection gone) is logged and needs no recovery.
+pub async fn send_control_rollback_stats(
+    control_send: &mut noq::SendStream,
+    stats: RollbackStats,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::RollbackStats(stats)),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;
@@ -598,4 +624,54 @@ pub async fn send_control_load_state_probe_ack(
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::test_util::{Edge, loopback};
+
+    #[tokio::test]
+    async fn rollback_stats_survive_the_trip_past_a_frame_kind_the_reader_predates() {
+        // A client running ahead of its relay can send a frame kind the
+        // relay's reader has no arm for. The reader must skip it and keep the
+        // framing, so the statistics written straight after still arrive whole.
+        let (client_conn, server_conn, _client_ep, _server_ep) = loopback(Edge::Client).await;
+        let mut inbound = spawn_control_reader(server_conn);
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+
+        // A `ControlFrame` body carrying only an unknown oneof arm (field 99,
+        // length-delimited, empty), behind its length prefix.
+        let body: &[u8] = &[0x9A, 0x06, 0x00];
+        let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(body);
+        send.write_all(&framed).await.unwrap();
+
+        let stats = RollbackStats {
+            version: 1,
+            through_turn: 720,
+            ticks: 1_500,
+            rollback_histogram: vec![900, 400, 150, 50],
+            pipe_histogram: vec![0, 0, 1_500],
+            schedule_corrected_us: -21_000,
+            lead_p90_max_us: -4_000,
+            clock_stopped_us: 84_000,
+            step_us: 3_000_000,
+            ..Default::default()
+        };
+        send_control_rollback_stats(&mut send, stats.clone())
+            .await
+            .unwrap();
+
+        let received = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+            .await
+            .expect("the statistics arrive before the timeout")
+            .expect("the reader is still running");
+        let ControlInbound::RollbackStats(received) = received else {
+            panic!("expected the statistics, got {received:?}");
+        };
+        assert_eq!(received, stats);
+    }
 }

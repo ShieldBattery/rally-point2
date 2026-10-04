@@ -32,6 +32,7 @@ mod reconnect;
 mod recovery;
 mod reorder;
 mod retention;
+mod rollback_stats;
 mod teardown;
 
 /// The windows every driver test here runs on. Each is cut to the shortest span
