@@ -80,8 +80,9 @@ async fn reports_are_kept_for_their_own_slot_within_the_limits_and_recorded_at_t
     let (mut control, _unused_recv) = slot0.connection().open_bi().await.unwrap();
 
     // A histogram past the cap is dropped without spending the rate limit, then
-    // two reports in quick succession (a periodic one and the game-end one) are
-    // both kept, and a third inside the same window is dropped.
+    // two reports in quick succession (a periodic one and the game-end one) both
+    // reach the sample rows, and a third inside the same window is held on the
+    // link instead.
     send_control_rollback_stats(
         &mut control,
         RollbackStats {
@@ -102,7 +103,7 @@ async fn reports_are_kept_for_their_own_slot_within_the_limits_and_recorded_at_t
     assert_eq!(
         stored(&makers, &key, 0),
         Some(1_000),
-        "the oversize report and the one over the rate limit are dropped",
+        "the oversize report is dropped and the one over the rate limit is held back",
     );
     assert_eq!(
         stored(&makers, &key, 1),
@@ -111,11 +112,11 @@ async fn reports_are_kept_for_their_own_slot_within_the_limits_and_recorded_at_t
     );
     assert!(
         slot1.connection().close_reason().is_none() && slot0.connection().close_reason().is_none(),
-        "a dropped report closes nothing",
+        "a dropped or held report closes nothing",
     );
 
-    // The link ends: its last kept report is recorded once, just ahead of the
-    // disconnect.
+    // The link ends: its newest report, the one held over the rate limit, is
+    // recorded once, just ahead of the disconnect.
     send_control_leave_intent(&mut control).await.unwrap();
     expect_closed(&mut slot0).await;
     wait_until("the disconnect was never recorded", || {
@@ -142,7 +143,7 @@ async fn reports_are_kept_for_their_own_slot_within_the_limits_and_recorded_at_t
     let FlightEvent::SlotRollbackStats { slot, stats } = &events[finals[0]] else {
         unreachable!();
     };
-    assert_eq!((*slot, stats.through_turn), (0, 1_000));
+    assert_eq!((*slot, stats.through_turn), (0, 1_001));
     assert_eq!(
         events[finals[0] + 1],
         FlightEvent::SlotDisconnected { slot: 0 },
