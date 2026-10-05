@@ -180,58 +180,60 @@ fn a_stop_on_the_authority_reaches_this_relays_measured_players() {
     );
 }
 
-/// A relay that adopted the authority's clock and is then promoted (the old authority failed)
-/// announces the clock it holds to every peer relay: one that joined while it wasn't the
-/// authority was never sent it, and during smooth play nothing else would.
+/// Every relay sends its copy of the clock to every peer relay, on the heartbeat and after an
+/// authority change, and every relay merges the copies it gets, the authority included: a copy
+/// can know of a stop a former authority made that never reached the relay now deciding.
 #[test]
-fn a_promoted_relay_announces_the_clock_it_already_holds() {
+fn every_relay_sends_its_copy_and_every_relay_merges_them() {
     let sessions: routing::Sessions = Arc::default();
     let mesh = test_mesh_state();
     let key = control_key();
     rollback_session(&mesh, &key, crate::consensus::Authority::Peer);
     let (_forward_rx, mut control_rx) = register_link_channels(&mesh.links, &key);
     let joined = joined_state(&mesh.links, &key);
-    dispatch_mesh_control(
-        MeshControlFrame {
-            session: key.session.0,
-            kind: Some(mesh_control_frame::Kind::SessionClock(SessionClock {
-                final_through: anchored_clock().final_through + 1,
-                stops: vec![ClockStop {
-                    step: anchored_clock().final_through,
-                    pause_us: 250_000,
-                }],
-                ..anchored_clock()
-            })),
-        },
-        RelayId(9),
-        0,
-        &joined,
-        &sessions,
-        &mesh,
-    );
-
-    routing::after_authority_change(&sessions, &mesh.session.decision_makers, &mesh.links, &key);
-    send_session_clocks(&mesh);
-    assert!(
-        session_clocks(&mut control_rx).is_empty(),
-        "a relay that isn't the authority announces nothing",
-    );
-
-    rollback_session(&mesh, &key, crate::consensus::Authority::SelfRelay);
-    routing::after_authority_change(&sessions, &mesh.session.decision_makers, &mesh.links, &key);
-    let clocks = session_clocks(&mut control_rx);
-    assert_eq!(
-        clocks.len(),
-        1,
-        "the promoted relay announces its clock: {clocks:?}"
-    );
-    assert_eq!(clocks[0].anchor_step, ANCHOR);
-    assert_eq!(
-        clocks[0].stops,
-        vec![ClockStop {
+    let dispatch = |clock: SessionClock| {
+        dispatch_mesh_control(
+            MeshControlFrame {
+                session: key.session.0,
+                kind: Some(mesh_control_frame::Kind::SessionClock(clock)),
+            },
+            RelayId(9),
+            0,
+            &joined,
+            &sessions,
+            &mesh,
+        );
+    };
+    let stopped_once = SessionClock {
+        final_through: anchored_clock().final_through + 1,
+        stops: vec![ClockStop {
             step: anchored_clock().final_through,
             pause_us: 250_000,
         }],
-        "with the stop it adopted",
-    );
+        ..anchored_clock()
+    };
+    dispatch(stopped_once.clone());
+
+    // A relay that isn't the authority sends its copy too, on the heartbeat and after an
+    // authority change.
+    send_session_clocks(&mesh);
+    routing::after_authority_change(&sessions, &mesh.session.decision_makers, &mesh.links, &key);
+    let clocks = session_clocks(&mut control_rx);
+    assert_eq!(clocks.len(), 2, "{clocks:?}");
+    assert!(clocks.iter().all(|clock| clock.stops == stopped_once.stops));
+
+    // Promoted, it merges another relay's copy that knows of a second stop.
+    rollback_session(&mesh, &key, crate::consensus::Authority::SelfRelay);
+    let mut stopped_twice = stopped_once.clone();
+    stopped_twice.stops.push(ClockStop {
+        step: stopped_once.final_through,
+        pause_us: 500_000,
+    });
+    stopped_twice.final_through += 1;
+    dispatch(stopped_twice.clone());
+    send_session_clocks(&mesh);
+    let clocks = session_clocks(&mut control_rx);
+    assert_eq!(clocks.len(), 1, "{clocks:?}");
+    assert_eq!(clocks[0].stops, stopped_twice.stops, "with both stops");
+    assert_eq!(clocks[0].final_through, stopped_twice.final_through);
 }

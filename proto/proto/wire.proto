@@ -1373,13 +1373,13 @@ message MeshControlFrame {
     // re-broadcast. See `EvictSlot`.
     EvictSlot evict_slot = 18;
 
-    // The authority's session clock for a rollback session, so every relay
-    // measures its own players' turns against the same deadlines. Each frame
-    // carries the clock's whole state, and a relay adopts only a frame newer
-    // than the one it holds. Sent when the authority anchors the clock, when a
-    // stop ends, every quarter second while the clock is anchored, to a relay
-    // that joins after the anchor, and after an authority change. Not
-    // re-broadcast: the authority already sent it to every relay. See
+    // A relay's copy of a rollback session's clock, so every relay measures its
+    // own players' turns against the same deadlines. Each frame carries the
+    // copy's whole state, and the receiver merges it into its own: for every
+    // step it hasn't made final, the later of the two deadlines. Every relay
+    // sends its copy every quarter second, to a relay that joins after the
+    // anchor, and after an authority change; the authority also sends it when
+    // it anchors the clock and when a stop ends. Not re-broadcast. See
     // `SessionClock`. Tag 19 carried an earlier shape that only grew a total
     // stopped time; a relay that predates this tag skips it.
     SessionClock session_clock = 20;
@@ -1700,14 +1700,17 @@ message EvictSlot {
   uint64 sync_ordinal = 2;
 }
 
-// A rollback session's clock as the authority keeps it — see the
-// `session_clock` oneof arm and `LeadReport`.
+// A relay's copy of a rollback session's clock — see the `session_clock` oneof
+// arm and `LeadReport`. The authority makes the stops; every relay merges the
+// copies it gets into its own.
 //
 // The turn with seq `n` is due `n - anchor_step` steps after the anchor, plus
 // the stopped time of every stop at a step before `n`. The clock stops only
-// at `final_through`, which only grows, so the deadline of every step up to
-// it can no longer change: a relay measures a turn against the clock only
-// once a frame's `final_through` has reached it.
+// at `final_through`, which only grows, so a relay treats the deadline of
+// every step up to it as final: it measures a turn against the clock only once
+// a frame's `final_through` has reached it, and never moves such a deadline
+// afterwards (a stop it learns of later, before that step, it takes in at its
+// own `final_through` instead).
 //
 // Relays share no timebase, so the anchor travels as an age: the receiving
 // relay places the anchor that long before it received the frame, less half

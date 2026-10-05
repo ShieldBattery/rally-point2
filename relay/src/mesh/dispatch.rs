@@ -431,15 +431,16 @@ fn dispatch_mesh_control_frame(
             routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
         }
         Some(mesh_control_frame::Kind::SessionClock(clock)) => {
-            // The authority's session clock. Adopt it — the anchor once, placed
-            // by the frame's age and half this link's round trip, and the rest
-            // whole when the frame is newer than this relay's copy — and push
-            // this relay's own players the reports that calls for: every one,
-            // carrying the stop, when the stopped time grew, so none of them
-            // races to make up time the session never ran, and otherwise those
-            // made due by turns whose deadlines the frame made final. Not
-            // re-broadcast: the authority sent a copy to every relay.
-            let reports = mesh.session.decision_makers.adopt_session_clock(
+            // Another relay's copy of the session clock. Merge it (the anchor
+            // once, placed by the frame's age and half this link's round trip;
+            // then the later deadline of the two for every step this relay
+            // hasn't made final) and push this relay's own players the reports
+            // that calls for: every one, carrying the stop, when the stopped
+            // time grew, so none of them races to make up time the session
+            // never ran, and otherwise those made due by turns whose deadlines
+            // the frame made final. Not re-broadcast: every relay sends its
+            // copy to every other.
+            let reports = mesh.session.decision_makers.merge_session_clock(
                 &key,
                 &clock,
                 std::time::Instant::now(),

@@ -1,5 +1,5 @@
-//! A rollback session's clock on the maker: anchoring and stopping it on the authority, adopting
-//! the authority's elsewhere, and measuring this relay's home slots against it.
+//! A rollback session's clock on the maker: anchoring and stopping it on the authority, merging
+//! every other relay's copy into this one, and measuring this relay's home slots against it.
 
 use super::*;
 
@@ -10,7 +10,8 @@ use rally_point_proto::rollback::LOCKSTEP_START_STEPS;
 /// relay's own home slots.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClockUpdate {
-    /// The clock as the other relays adopt it, when it was just anchored or a stop just ended.
+    /// The clock for every other relay to merge at once, when it was just anchored or a stop
+    /// just ended.
     pub frame: Option<SessionClockFrame>,
     /// Every measured home slot's report when a stop just ended, carrying the clock's new stopped
     /// time; otherwise the reports due from turns whose deadlines just became final.
@@ -34,8 +35,8 @@ impl DecisionMaker {
     /// Measures `slot`'s turn with seq `seq`, which first arrived on this relay's client edge at
     /// `received_at`, and returns the slot's lead report when one is due. A turn whose deadline
     /// isn't final yet is measured once the clock moves far enough on: on the authority as more
-    /// turns become confirmable, elsewhere as its frames arrive
-    /// ([`adopt_session_clock`](Self::adopt_session_clock)). Nothing outside a rollback session,
+    /// turns become confirmable, elsewhere as copies of the clock arrive
+    /// ([`merge_session_clock`](Self::merge_session_clock)). Nothing outside a rollback session,
     /// before the clock is anchored, or for a turn of the lockstep start.
     ///
     /// The caller must feed only this relay's own home slots' client-edge arrivals: a mesh copy
@@ -76,7 +77,7 @@ impl DecisionMaker {
     }
 
     /// The flight events the session clock's change since `mark` earns: its anchoring (`adopted`
-    /// when the anchor came from the authority's clock), and a growth of its stopped time. Stops
+    /// when the anchor came from another relay's copy), and a growth of its stopped time. Stops
     /// are recorded at most [`MAX_CLOCK_STOP_EVENTS`] times per session, so a session that keeps
     /// stopping cannot spend its event ring on them.
     pub(in crate::consensus) fn clock_events(
@@ -109,35 +110,37 @@ impl DecisionMaker {
         self.lead.report(slot, self.clock.pause())
     }
 
-    /// The session clock as the authority sends it: to a relay that joins after the anchor, after
-    /// an authority change, and on the heartbeat that keeps every relay's copy of the limit
-    /// current. `None` on any other relay, or before the anchor.
+    /// This relay's copy of the session clock as it goes to the other relays, which merge it: on
+    /// the heartbeat, to a relay that joins after the anchor, and after an authority change. Every
+    /// relay sends its copy, so a stop isn't lost while any relay knows of it. `None` before the
+    /// anchor, and outside a rollback session.
     pub fn session_clock_frame(&self, now: Instant) -> Option<SessionClockFrame> {
-        if !self.rollback_enabled || !self.is_authority() {
+        if !self.rollback_enabled {
             return None;
         }
         self.clock.to_frame(now)
     }
 
-    /// Adopts the authority's session clock from a frame that arrived at `received_at` over a mesh
-    /// link with a round trip of `mesh_rtt_us`, measuring the turns waiting for deadlines the frame
-    /// made final. Returns the reports to push down this relay's home slots: every measured slot's
-    /// when the clock's stopped time grew, so each client moves its schedule by the stop at once,
-    /// and otherwise those the newly measured turns made due. The authority ignores the frame: its
-    /// own clock is the original (a frame from a former authority can still be in flight after a
-    /// promotion).
+    /// Merges another relay's copy of the session clock, which arrived at `received_at` over a
+    /// mesh link with a round trip of `mesh_rtt_us` (the later deadline of the two for each step,
+    /// except one this relay already holds as final), measuring the turns waiting for deadlines it
+    /// made final. Returns the reports to push down this relay's
+    /// home slots: every measured slot's when the clock's stopped time grew, so each client moves
+    /// its schedule by the stop at once, and otherwise those the newly measured turns made due.
+    /// The authority merges too: a copy can know of a stop that a former authority made and that
+    /// never reached this relay.
     #[must_use]
-    pub fn adopt_session_clock(
+    pub fn merge_session_clock(
         &mut self,
         frame: &SessionClockFrame,
         received_at: Instant,
         mesh_rtt_us: u32,
     ) -> Vec<(SlotId, LeadReport)> {
-        if !self.rollback_enabled || self.is_authority() {
+        if !self.rollback_enabled {
             return Vec::new();
         }
         let pause_before = self.clock.pause();
-        if !self.clock.adopt(frame, received_at, mesh_rtt_us) {
+        if !self.clock.merge(frame, received_at, mesh_rtt_us) {
             return Vec::new();
         }
         let stopped = self.clock.pause() > pause_before;
@@ -162,10 +165,11 @@ impl DecisionMaker {
             if after < LOCKSTEP_START_STEPS {
                 return None;
             }
-            // The turn that completed the count arrived just now, so it is the one due now. Every
-            // client waited for every turn up to here, so this is when the slowest player's start
-            // arrived, and nobody is asked to be earlier than the session has shown it can be.
-            self.clock.anchor(after - 1, now);
+            // The turn that completed the lockstep start arrived just now, so it is the one due
+            // now. Every client waited for every turn up to here, so this is when the slowest
+            // player's start arrived, and nobody is asked to be earlier than the session has shown
+            // it can be.
+            self.clock.anchor(LOCKSTEP_START_STEPS - 1, now);
             return Some(ClockUpdate {
                 frame: self.clock.to_frame(now),
                 reports: Vec::new(),

@@ -1,5 +1,5 @@
 //! A rollback session's clock and lead reports: measuring home slots' arrivals, the authority's
-//! clock changes, another relay adopting them, and the re-sends a (re)connect or a join gets.
+//! clock changes, merging another relay's copy, and the re-sends a (re)connect or a join gets.
 
 use super::*;
 
@@ -46,14 +46,15 @@ impl DecisionMakers {
         self.lock().get(key)?.lead_report(slot)
     }
 
-    /// `key`'s session clock as the authority sends it to a relay that joins after the anchor.
-    /// `None` on any other relay, before the anchor, and outside a rollback session.
+    /// This relay's copy of `key`'s session clock as it goes to the other relays (see
+    /// [`DecisionMaker::session_clock_frame`]). `None` before the anchor, and outside a rollback
+    /// session.
     pub fn session_clock_frame(&self, key: &SessionKey) -> Option<SessionClockFrame> {
         self.lock().get(key)?.session_clock_frame(Instant::now())
     }
 
-    /// The session clock of every rollback session this relay is the authority for, as of now,
-    /// for the heartbeat that keeps every other relay's copy current.
+    /// This relay's copy of every rollback session's clock, as of now, for the heartbeat that
+    /// keeps every relay's copy current.
     pub fn session_clock_frames(&self) -> Vec<(SessionKey, SessionClockFrame)> {
         let now = Instant::now();
         self.lock()
@@ -62,12 +63,12 @@ impl DecisionMakers {
             .collect()
     }
 
-    /// Adopts the authority's session clock for `key` from a frame that arrived at `received_at`
-    /// over a mesh link with a round trip of `mesh_rtt_us`, returning the lead reports to push
-    /// down this relay's home slots (see [`DecisionMaker::adopt_session_clock`]). Records the
-    /// adoption's anchoring and any growth of the stopped time in the flight recording.
+    /// Merges another relay's copy of `key`'s session clock, which arrived at `received_at` over a
+    /// mesh link with a round trip of `mesh_rtt_us`, returning the lead reports to push down this
+    /// relay's home slots (see [`DecisionMaker::merge_session_clock`]). Records the anchoring it
+    /// brought and any growth of the stopped time in the flight recording.
     #[must_use]
-    pub fn adopt_session_clock(
+    pub fn merge_session_clock(
         &self,
         key: &SessionKey,
         frame: &SessionClockFrame,
@@ -77,7 +78,7 @@ impl DecisionMakers {
         let (reports, events) = match self.lock().get_mut(key) {
             Some(maker) => {
                 let mark = maker.clock_mark();
-                let reports = maker.adopt_session_clock(frame, received_at, mesh_rtt_us);
+                let reports = maker.merge_session_clock(frame, received_at, mesh_rtt_us);
                 (reports, maker.clock_events(mark, true))
             }
             None => return Vec::new(),

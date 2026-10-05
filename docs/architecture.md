@@ -732,27 +732,41 @@ targets.
   drop wait, an outage, a shared hiccup), and no client should race to make it up afterwards. A
   player whose own turns run later than the slack still measures about that late, since the clock
   moves on as each of their turns arrives, and keeps getting reports until their pacing catches up.
-- **Final deadlines.** Because the clock only ever stops at its limit, and the limit only grows,
-  every step up to the limit already has its final deadline. A relay measures a turn only once its
-  step is that far; one that arrives earlier (an early turn, or one sent while the clock may still
-  stop) waits in its slot's queue until the limit reaches it. So no measurement is ever read
-  against a deadline that moves afterwards, and a stop needs no reset: windows carry on through it,
-  and the client trusts reports on either side of it.
-- **Copies.** Relays share no timebase. The authority sends its clock's whole state over the mesh
-  (`SessionClock`: the anchor seq and age, the limit, and the stops, those older than any relay
-  still measures folded into one base sum); a peer places the anchor at the first frame's receipt
-  less its age and half the link's RTT, once, and otherwise adopts a frame whole when it is newer
-  than its copy (a further limit, or as far with more stopped time), so frames arriving twice or out
-  of order are harmless. The authority sends it when it anchors, when a stop ends, every 250 ms (the
-  limit moves every step, and a peer measures only up to the limit it has heard of), at a join, when
-  a peer proves its join with its first presence report, and after any authority change: a relay
-  promoted after a peer joined it announces the copy it holds, since that peer was never sent one.
-  A stop goes out at once, and the relays push every measured player a report carrying it, so
-  clients move their pacing by exactly the stop instead of sprinting. A promoted authority first
-  brings the limit it adopted up to the slack past what it has confirmed itself, without a stop,
-  and only then measures one: the last frame it heard can trail its own frontier, and a stop
-  measured against that would move deadlines the other relays already hold as final. Only a stop
-  in progress when the authority failed can be lost, which lead reports absorb.
+- **Final deadlines.** Because the clock only ever stops at its limit, and the limit only grows, a
+  relay treats every deadline up to its limit as final. It measures a turn only once its step is
+  that far; one that arrives earlier (an early turn, or one sent while the clock may still stop)
+  waits in its slot's queue until the limit reaches it. And it never moves a final deadline (see
+  the merge below). So no measurement is ever read against a deadline that moves afterwards, and a
+  stop needs no reset: windows carry on through it, and the client trusts reports on either side
+  of it.
+- **Copies, merged.** Relays share no timebase, and no relay's copy of the clock is the original.
+  Every relay sends its copy's whole state over the mesh (`SessionClock`: the anchor step and age,
+  the limit, and the stops, those older than any relay still measures folded into one base sum)
+  every 250 ms (the limit moves every step, and a relay measures only up to the limit it has heard
+  of), at a join, when a peer proves its join with its first presence report, and after any
+  authority change; the authority also sends it when it anchors the clock and when a stop ends. A
+  relay places the anchor at the first frame's receipt less its age and half the link's RTT, once
+  (every relay anchors at the same step), and **merges** every copy it gets: the stopped time
+  before each step becomes the most either copy knows of, so a step's deadline is the later of
+  the two, except that a deadline the relay already holds as final never moves (stopped time the
+  other copy knows of before its limit is taken in at its limit), and its limit becomes the
+  further of the two. Copies only ever gain stopped time, so that merge is order-free and
+  repeatable: frames arriving late, twice, or from two relays both deciding the clock all leave
+  every relay on the same deadlines ahead.
+- **Authority changes.** Only the authority makes stops, from what it can confirm, but it merges
+  copies like every other relay. So a new authority decides at once from its own copy, and
+  learns any stop it missed (one a former authority made that reached another relay) from the
+  next heartbeat; a relay that still believes it is the authority while descriptors settle keeps
+  deciding too, and the two copies merge. What this gives: no relay ever moves a deadline it holds
+  as final, no stop is lost while any surviving relay knows of it, and every relay converges on
+  the same deadlines ahead within a heartbeat. What it costs: around an authority change a new
+  authority that is behind can stop the clock where the former one wouldn't have (each relay then
+  takes the stop in at its own limit, so every client shifts together, and nobody sprints), and
+  relays can disagree about a few deadlines already behind them. A new authority also first
+  brings the limit it heard up to the slack past what it has confirmed itself, without a stop,
+  which avoids most such needless stops. A stop goes out at once, and the relays push every
+  measured player a report carrying it, so clients move their pacing by exactly the stop instead
+  of sprinting.
 - **Turns complete.** Every packet a relay sends its own client in a rollback session carries
   `turns_complete`: the fewest gap-free turns the relay has forwarded of any in-game slot,
   observers' included (a client's simulation waits on their turns too), and a departed slot's

@@ -18,7 +18,7 @@
   `slot_departed`/`has_departure`, `session_started`/`is_started`, `record_*`/`note_*`)
   the maker's spelling won, so one grep finds a concept everywhere.
   Files by concern: `authority` (descriptor sync + frames + the desync hook),
-  `buffer`, `departure`, `eviction` (maker only), `homing`, `leave`, `phase`,
+  `buffer`, `clock` (a rollback session's clock and lead reports), `departure`, `eviction` (maker only), `homing`, `leave`, `phase`,
   `session_start`, `silence`, `state_hash`, `sync_coverage`; `registry/mod.rs` holds the type itself, the notice builders and
   the `log_*` helpers.
 - Policy lives on the maker, not the registry: the registry sequences lock, record
@@ -46,6 +46,11 @@
 - **Synced leaves** schedule from the *departing* slot's last frame, clamped to a
   reachable ceiling so an inflated claim cannot stall survivors. A promoted relay
   re-broadcasts a cached directive verbatim, re-derives the rest.
+- **No relay's copy of a rollback session's clock is the original.** Every relay sends its
+  copy and merges every copy it gets, the authority included (`SessionClock::merge`: the later
+  deadline per step, but never a deadline the relay already holds as final). The authority only
+  makes the stops. A needless stop from a new authority that was behind is the accepted cost of
+  needing no handoff protocol.
 - **Finalized drops are off** unless the session enables them; finalize seals the
   stamps and fails closed without a cursor.
 - **Silence eviction** names the slot that stopped *strictly* earliest, and blocks

@@ -12,14 +12,19 @@
 //! clock moves on as each of their turns arrives.
 //!
 //! A stop is kept by step: the limit the clock stood at, and for how long. It moves the deadline of
-//! every later step and of no earlier one, whatever order a relay learns things in. And since the
-//! clock only ever stops at its limit, and the limit only grows, every step up to the limit already
-//! has its final deadline: a turn is measured only once its step is that far, so no measurement is
-//! ever read against a deadline that moves afterwards.
+//! every later step and of no earlier one, whatever order a relay learns things in. The clock only
+//! ever stops at its limit, and the limit only grows, so a relay treats every deadline up to its
+//! limit as final: it measures a turn only once its step is that far, and never moves a deadline
+//! it has made final, so no measurement is ever read against a deadline that moves afterwards.
 //!
-//! Relays share no timebase. Each keeps its own copy: the authority's is the original, and every
-//! other relay adopts the authority's `SessionClock` frames whole, placing the anchor once, at the
-//! first frame's receipt less the frame's age and half the mesh round trip it took.
+//! Relays share no timebase, and no relay's copy is the original. The authority makes the stops,
+//! from what it can confirm; every relay sends its copy to the others on a heartbeat and merges
+//! each copy it gets (see [`SessionClock::merge`]): the stopped time before each step is the most
+//! any copy knows of, except that a deadline a relay already holds as final never moves. So a stop
+//! isn't lost while any relay knows of it, the decisions of a new authority (or of two relays that
+//! both believe they are the authority) fold in wherever they land, and every relay converges on
+//! the same deadlines for the steps ahead. Each relay places the anchor once, at the first frame's
+//! receipt less the frame's age and half the mesh round trip it took.
 
 use super::*;
 
@@ -53,6 +58,49 @@ fn whole_micros(duration: Duration) -> u64 {
 struct Stop {
     step: u64,
     pause: Duration,
+}
+
+/// The stops another relay's copy of the clock carries, to merge.
+struct CopiedStops {
+    base_step: u64,
+    base_pause: Duration,
+    /// By step, each at or after `base_step` and before the copy's limit.
+    stops: Vec<Stop>,
+}
+
+impl CopiedStops {
+    fn from_frame(frame: &SessionClockFrame) -> Self {
+        let mut stops: Vec<Stop> = frame
+            .stops
+            .iter()
+            .filter(|stop| stop.step >= frame.base_step && stop.step < frame.final_through)
+            .map(|stop| Stop {
+                step: stop.step,
+                pause: Duration::from_micros(stop.pause_us),
+            })
+            .collect();
+        stops.sort_unstable_by_key(|stop| stop.step);
+        Self {
+            base_step: frame.base_step,
+            base_pause: Duration::from_micros(frame.base_pause_us),
+            stops,
+        }
+    }
+
+    /// The stopped time this copy knows of before `step`: none before its base, where it only
+    /// knows a sum.
+    fn pause_before(&self, step: u64) -> Duration {
+        if step < self.base_step {
+            return Duration::ZERO;
+        }
+        self.base_pause
+            + self
+                .stops
+                .iter()
+                .take_while(|stop| stop.step < step)
+                .map(|stop| stop.pause)
+                .sum::<Duration>()
+    }
 }
 
 /// One relay's copy of a rollback session's clock. Unanchored until the lockstep start ends (on
@@ -100,13 +148,19 @@ impl SessionClock {
         if seq > self.final_through || seq < self.base_step {
             return None;
         }
-        let stopped = self
-            .stops
-            .iter()
-            .filter(|stop| stop.step < seq)
-            .map(|stop| stop.pause)
-            .sum::<Duration>();
-        Some(at + self.base_pause + stopped + steps_duration(after))
+        Some(at + self.pause_before(seq) + steps_duration(after))
+    }
+
+    /// The stopped time before step `step`, counting every stop kept only as the base's sum: what
+    /// moves that step's deadline, final or not.
+    pub(in crate::consensus) fn pause_before(&self, step: u64) -> Duration {
+        self.base_pause
+            + self
+                .stops
+                .iter()
+                .filter(|stop| stop.step < step)
+                .map(|stop| stop.pause)
+                .sum::<Duration>()
     }
 
     /// How late the turn with seq `seq` was when it arrived at `arrived`, in microseconds
@@ -119,8 +173,9 @@ impl SessionClock {
         })
     }
 
-    /// Anchors the clock with the turn with seq `seq` due at `at`, unless it already is. Returns
-    /// whether it anchored.
+    /// Anchors the clock with the turn with seq `seq` due at `at`, unless it already is. Every relay
+    /// anchors at the same step, so their copies' stopped times line up. Returns whether it
+    /// anchored.
     pub(in crate::consensus) fn anchor(&mut self, seq: u64, at: Instant) -> bool {
         if self.anchor.is_some() {
             return false;
@@ -139,10 +194,9 @@ impl SessionClock {
     /// The limit is first brought up to the slack past `newest_before`, with no stop. An authority
     /// that has held the clock all along already has it there, but a newly promoted one holds the
     /// limit of the last frame it heard, which can trail what it has confirmed itself: measuring a
-    /// stop against that would stop the clock where the former authority never did, and move
-    /// deadlines other relays already hold as final. A limit that doesn't grow (a newly promoted
-    /// authority confirming steps the former one already had) leaves the clock as it is, stopped
-    /// or not.
+    /// stop against that would stop the clock where the former authority never did. A limit that
+    /// doesn't grow (a newly promoted authority confirming steps the former one already had) leaves
+    /// the clock as it is, stopped or not.
     pub(in crate::consensus) fn note_confirmable(
         &mut self,
         newest_before: Option<u64>,
@@ -171,17 +225,23 @@ impl SessionClock {
             });
         self.stops.extend(stop);
         self.final_through = limit;
-        let base = limit.saturating_sub(KEPT_STOP_STEPS);
+        self.fold();
+        stop.is_some()
+    }
+
+    /// Keeps the stops too far behind the limit for any relay to measure a turn by them only as
+    /// the base's sum.
+    fn fold(&mut self) {
+        let base = self.final_through.saturating_sub(KEPT_STOP_STEPS);
         while let Some(stop) = self.stops.front().filter(|stop| stop.step < base) {
             self.base_pause += stop.pause;
             self.stops.pop_front();
         }
         self.base_step = self.base_step.max(base);
-        stop.is_some()
     }
 
-    /// The clock as the authority sends it at `now`: its whole state, with the anchor as its age.
-    /// `None` before the anchor.
+    /// This copy of the clock as it goes to the other relays at `now`: its whole state, with the
+    /// anchor as its age. `None` before the anchor.
     pub(in crate::consensus) fn to_frame(&self, now: Instant) -> Option<SessionClockFrame> {
         let (anchor_step, at) = self.anchor?;
         Some(SessionClockFrame {
@@ -201,44 +261,79 @@ impl SessionClock {
         })
     }
 
-    /// Adopts the authority's clock on another relay, from a frame that arrived at `received_at`
-    /// over a mesh link with a round trip of `mesh_rtt_us`. The anchor is placed once, from the
-    /// first frame, so later frames don't move every deadline by the jitter of their own trip.
-    /// The rest is taken whole from a frame newer than this copy: one whose limit is further on,
-    /// or as far with more stopped time. An older frame (a duplicate, or one delayed across a
-    /// reconnect) changes nothing. Returns whether anything changed.
-    pub(in crate::consensus) fn adopt(
+    /// Merges another relay's copy of the clock, `frame`, which arrived at `received_at` over a
+    /// mesh link with a round trip of `mesh_rtt_us`. Returns whether this copy changed.
+    ///
+    /// Copies only ever gain stopped time, so of two copies, the one that knows of more stopped
+    /// time before a step has that step's deadline right, and the merge takes, for each step, the
+    /// later of the two deadlines. That makes merging order-free and repeatable: frames arriving
+    /// late, twice, or from two relays both deciding the clock all converge on the same deadlines.
+    /// Except that a deadline this copy already holds as final never moves, since a turn may have
+    /// been measured against it: stopped time the other copy knows of before this copy's limit is
+    /// taken in at the limit, moving only the steps past it. Then the limit becomes the further of
+    /// the two.
+    ///
+    /// The anchor is placed once, from the first frame, so later frames don't move every deadline
+    /// by the jitter of their own trip. A frame anchored at another step is ignored.
+    pub(in crate::consensus) fn merge(
         &mut self,
         frame: &SessionClockFrame,
         received_at: Instant,
         mesh_rtt_us: u32,
     ) -> bool {
-        let first = self.anchor.is_none();
-        if first {
+        let theirs = CopiedStops::from_frame(frame);
+        let Some((anchor_step, _)) = self.anchor else {
             let age = Duration::from_micros(frame.since_anchor_us)
                 + Duration::from_micros(u64::from(mesh_rtt_us) / 2);
             let at = received_at.checked_sub(age).unwrap_or(received_at);
             self.anchor = Some((frame.anchor_step, at));
-        }
-        let base_pause = Duration::from_micros(frame.base_pause_us);
-        let mut stops: Vec<Stop> = frame
-            .stops
-            .iter()
-            .filter(|stop| stop.step >= frame.base_step && stop.step < frame.final_through)
-            .map(|stop| Stop {
-                step: stop.step,
-                pause: Duration::from_micros(stop.pause_us),
-            })
-            .collect();
-        stops.sort_unstable_by_key(|stop| stop.step);
-        let pause = base_pause + stops.iter().map(|stop| stop.pause).sum::<Duration>();
-        if !first && (frame.final_through, pause) <= (self.final_through, self.pause()) {
+            self.final_through = frame.final_through;
+            self.base_step = theirs.base_step;
+            self.base_pause = theirs.base_pause;
+            self.stops = theirs.stops.into();
+            return true;
+        };
+        if frame.anchor_step != anchor_step {
             return false;
         }
-        self.final_through = frame.final_through;
-        self.base_step = frame.base_step;
-        self.base_pause = base_pause;
-        self.stops = stops.into();
-        true
+        let frontier = self.final_through;
+        // The steps after which the merged stopped time can grow: the frontier itself (the other
+        // copy may know of more stopped time before it than this one does), and every later step
+        // after which either copy's grows.
+        let mut steps: Vec<u64> = self
+            .stops
+            .iter()
+            .chain(&theirs.stops)
+            .map(|stop| stop.step)
+            .chain(theirs.base_step.checked_sub(1))
+            .chain([frontier])
+            .filter(|&step| step >= frontier)
+            .collect();
+        steps.sort_unstable();
+        steps.dedup();
+        let mut merged: VecDeque<Stop> = self
+            .stops
+            .iter()
+            .filter(|stop| stop.step < frontier)
+            .copied()
+            .collect();
+        let mut before = self.pause_before(frontier);
+        for step in steps {
+            let after = self
+                .pause_before(step + 1)
+                .max(theirs.pause_before(step + 1));
+            if after > before {
+                merged.push_back(Stop {
+                    step,
+                    pause: after - before,
+                });
+                before = after;
+            }
+        }
+        let changed = merged != self.stops || frame.final_through > frontier;
+        self.stops = merged;
+        self.final_through = frontier.max(frame.final_through);
+        self.fold();
+        changed
     }
 }

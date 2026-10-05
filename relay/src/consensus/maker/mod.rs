@@ -350,8 +350,8 @@ pub struct DecisionMaker {
     /// `sync` to. Latched at maker creation, like `finalized_drops_enabled`.
     pub(in crate::consensus) rollback_enabled: bool,
     /// A rollback session's clock: when each turn is due at the relay (see
-    /// [`SessionClock`]). The authority anchors and stops it; every other relay
-    /// adopts the authority's.
+    /// [`SessionClock`]). The authority anchors and stops it; every relay merges
+    /// the other relays' copies into its own.
     pub(in crate::consensus) clock: SessionClock,
     /// How late this relay's home slots' turns have been arriving against
     /// [`clock`](Self::clock), and the reports made from it.

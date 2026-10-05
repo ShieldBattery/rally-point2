@@ -34,15 +34,14 @@ pub(crate) fn deliver_session_start(
 ///
 /// - The session start: a newly promoted authority that now covers the expected
 ///   set fires the start the previous authority never got to, session-wide.
-/// - A rollback session's clock: re-announced to every peer relay, because one that
-///   joined while another relay held the authority was never sent it (the clock
-///   only goes out at a join from the authority, and again when it stops), and
-///   would otherwise have no deadlines to measure its own players against.
+/// - A rollback session's clock: this relay's copy goes to every peer relay at
+///   once, so a newly promoted authority hears every stop the others know of
+///   before the next heartbeat would bring it.
 ///
-/// Both are no-ops on a relay that isn't the authority, and on an already-started
-/// session or an unanchored clock. A caller can't always tell a promotion from a
-/// push that changed nothing, and needn't: re-announcing an unchanged clock costs
-/// a frame per peer, and adopting one is idempotent.
+/// The start is a no-op on a relay that isn't the authority and on an already
+/// started session; the clock, on an unanchored one. A caller can't always tell a
+/// promotion from a push that changed nothing, and needn't: re-announcing an
+/// unchanged clock costs a frame per peer, and merging one is idempotent.
 pub fn after_authority_change(
     sessions: &Sessions,
     decision_makers: &consensus::DecisionMakers,
