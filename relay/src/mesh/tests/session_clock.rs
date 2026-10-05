@@ -1,11 +1,27 @@
 //! A rollback session's clock across the mesh: the authority's forward path anchors it and sends
-//! it to every peer relay, and a peer relay that learns the clock stopped longer gives its own
-//! measured players reports carrying the stop.
+//! it to every peer relay, its heartbeat keeps sending it, and a peer relay that learns the clock
+//! stopped longer gives its own measured players reports carrying the stop.
 
 use super::*;
 
-use rally_point_proto::messages::SessionClock;
+use rally_point_proto::messages::{ClockStop, SessionClock};
 use rally_point_proto::rollback::LOCKSTEP_START_STEPS;
+
+use super::super::clock_heartbeat::send_session_clocks;
+
+/// The anchor step of a clock anchored once the lockstep start is in.
+const ANCHOR: u64 = LOCKSTEP_START_STEPS - 1;
+
+/// A clock as the authority sends it right after anchoring, a second ago, with a limit six steps
+/// on.
+fn anchored_clock() -> SessionClock {
+    SessionClock {
+        anchor_step: ANCHOR,
+        since_anchor_us: 1_000_000,
+        final_through: ANCHOR + 6,
+        ..Default::default()
+    }
+}
 
 /// A rollback session of slots 0 and 5, with slot 5 homed here and this relay's authority role
 /// as given.
@@ -67,8 +83,24 @@ fn the_authority_sends_its_anchor_to_every_peer_relay_once_the_start_is_confirma
     deliver(5, LOCKSTEP_START_STEPS - 1);
     let clocks = session_clocks(&mut control_rx);
     assert_eq!(clocks.len(), 1, "the anchor goes out once: {clocks:?}");
-    assert_eq!(clocks[0].anchor_step, LOCKSTEP_START_STEPS - 1);
-    assert_eq!(clocks[0].pause_us, 0);
+    assert_eq!(clocks[0].anchor_step, ANCHOR);
+    assert!(clocks[0].stops.is_empty());
+    let anchored_limit = clocks[0].final_through;
+
+    // Playing on moves the limit without a frame of its own; the heartbeat carries it.
+    for seq in LOCKSTEP_START_STEPS..LOCKSTEP_START_STEPS + 3 {
+        deliver(0, seq);
+        deliver(5, seq);
+    }
+    assert!(session_clocks(&mut control_rx).is_empty());
+    send_session_clocks(&mesh);
+    let clocks = session_clocks(&mut control_rx);
+    assert_eq!(clocks.len(), 1, "one heartbeat frame: {clocks:?}");
+    assert_eq!(
+        clocks[0].final_through,
+        anchored_limit + 3,
+        "the heartbeat carries the limit as it stands",
+    );
 
     // A relay joining after the anchor is sent the clock too.
     assert!(
@@ -104,12 +136,8 @@ fn a_stop_on_the_authority_reaches_this_relays_measured_players() {
         );
     };
 
-    let anchor = SessionClock {
-        anchor_step: LOCKSTEP_START_STEPS - 1,
-        since_anchor_us: 1_000_000,
-        pause_us: 0,
-    };
-    dispatch(anchor);
+    let anchor = anchored_clock();
+    dispatch(anchor.clone());
     assert_eq!(
         inbox.try_recv_lead_report(),
         None,
@@ -130,14 +158,18 @@ fn a_stop_on_the_authority_reaches_this_relays_measured_players() {
     assert_eq!(first.pause_us, 0);
 
     dispatch(SessionClock {
-        pause_us: 4_000_000,
+        final_through: anchor.final_through + 1,
+        stops: vec![ClockStop {
+            step: anchor.final_through,
+            pause_us: 4_000_000,
+        }],
         ..anchor
     });
     let report = inbox
         .try_recv_lead_report()
         .expect("the stop reaches the measured player at once");
     assert_eq!(report.pause_us, 4_000_000);
-    assert_eq!(report.samples, 0, "the window starts over with the stop");
+    assert_eq!(report.samples, 1, "the window carries on through the stop");
     assert!(
         echo_forward_rx.try_recv().is_err(),
         "never echoed to the mesh"
@@ -163,9 +195,12 @@ fn a_promoted_relay_announces_the_clock_it_already_holds() {
         MeshControlFrame {
             session: key.session.0,
             kind: Some(mesh_control_frame::Kind::SessionClock(SessionClock {
-                anchor_step: LOCKSTEP_START_STEPS - 1,
-                since_anchor_us: 1_000_000,
-                pause_us: 250_000,
+                final_through: anchored_clock().final_through + 1,
+                stops: vec![ClockStop {
+                    step: anchored_clock().final_through,
+                    pause_us: 250_000,
+                }],
+                ..anchored_clock()
             })),
         },
         RelayId(9),
@@ -176,6 +211,7 @@ fn a_promoted_relay_announces_the_clock_it_already_holds() {
     );
 
     routing::after_authority_change(&sessions, &mesh.session.decision_makers, &mesh.links, &key);
+    send_session_clocks(&mesh);
     assert!(
         session_clocks(&mut control_rx).is_empty(),
         "a relay that isn't the authority announces nothing",
@@ -189,9 +225,13 @@ fn a_promoted_relay_announces_the_clock_it_already_holds() {
         1,
         "the promoted relay announces its clock: {clocks:?}"
     );
-    assert_eq!(clocks[0].anchor_step, LOCKSTEP_START_STEPS - 1);
+    assert_eq!(clocks[0].anchor_step, ANCHOR);
     assert_eq!(
-        clocks[0].pause_us, 250_000,
-        "with the stopped time it adopted"
+        clocks[0].stops,
+        vec![ClockStop {
+            step: anchored_clock().final_through,
+            pause_us: 250_000,
+        }],
+        "with the stop it adopted",
     );
 }

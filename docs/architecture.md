@@ -724,20 +724,32 @@ targets.
   start reached the authority, so no player is asked to be earlier than the session has shown it can
   be.
 - **Stopping.** The clock may not run more than `STALL_SLACK_STEPS` (12, the client's prediction
-  limit plus a margin) past the newest turn the authority can confirm for every player; time beyond
-  that accumulates as `pause` and pushes every later deadline back. Past the prediction limit every
-  player is stalled anyway, so that time is the whole session waiting (a drop wait, an outage), and
-  no client should race to make it up afterwards. A player whose own turns run later than the slack
-  still measures that late, since only the time past the slack is taken up.
-- **Copies.** Relays share no timebase. The authority sends its clock over the mesh
-  (`SessionClock`: the anchor seq, the anchor's age, the pause); a peer places the anchor at the
-  frame's receipt less its age and half the link's RTT, once, and afterwards only adopts a grown
-  pause. The authority sends it when it anchors or stops, at a join, when a peer proves its join
-  with its first presence report, and after any authority change: a relay promoted after a peer
-  joined it announces the copy it holds, since that peer was never sent one. A pause change goes out at once, and the relays push every measured player a report
-  carrying it, so clients move their pacing by exactly the stop instead of sprinting. Each player's
-  window starts over with it: a turn measured around the stop may have been read against the clock
-  from before it, and would count as late by the whole stop.
+  limit plus a margin) past the newest turn the authority can confirm for every player. That step is the clock's *limit*:
+  when the clock reaches the limit's deadline before the next step is confirmable, it stands still
+  there until one is, and the stop `(step, length)` pushes back every later deadline and no earlier
+  one. Past the slack every player is stalled anyway, so that time is the whole session waiting (a
+  drop wait, an outage, a shared hiccup), and no client should race to make it up afterwards. A
+  player whose own turns run later than the slack still measures about that late, since the clock
+  moves on as each of their turns arrives, and keeps getting reports until their pacing catches up.
+- **Final deadlines.** Because the clock only ever stops at its limit, and the limit only grows,
+  every step up to the limit already has its final deadline. A relay measures a turn only once its
+  step is that far; one that arrives earlier (an early turn, or one sent while the clock may still
+  stop) waits in its slot's queue until the limit reaches it. So no measurement is ever read
+  against a deadline that moves afterwards, and a stop needs no reset: windows carry on through it,
+  and the client trusts reports on either side of it.
+- **Copies.** Relays share no timebase. The authority sends its clock's whole state over the mesh
+  (`SessionClock`: the anchor seq and age, the limit, and the stops, those older than any relay
+  still measures folded into one base sum); a peer places the anchor at the first frame's receipt
+  less its age and half the link's RTT, once, and otherwise adopts a frame whole when it is newer
+  than its copy (a further limit, or as far with more stopped time), so frames arriving twice or out
+  of order are harmless. The authority sends it when it anchors, when a stop ends, every 250 ms (the
+  limit moves every step, and a peer measures only up to the limit it has heard of), at a join, when
+  a peer proves its join with its first presence report, and after any authority change: a relay
+  promoted after a peer joined it announces the copy it holds, since that peer was never sent one.
+  A stop goes out at once, and the relays push every measured player a report carrying it, so
+  clients move their pacing by exactly the stop instead of sprinting. A promoted authority keeps
+  the limit it adopted, so it never stops the clock behind a step its predecessor had made final;
+  only a stop in progress when the authority failed can be lost, which lead reports absorb.
 - **Turns complete.** Every packet a relay sends its own client in a rollback session carries
   `turns_complete`: the fewest gap-free turns the relay has forwarded of any in-game slot,
   observers' included (a client's simulation waits on their turns too), and a departed slot's

@@ -360,8 +360,9 @@ pub(crate) fn fan_out_session_start(
 }
 
 /// Broadcasts the authority's rollback session clock to every peer relay serving
-/// `key`, which each adopt (the anchor once, then any growth in its stopped time).
-/// Not re-broadcast by a receiver: the authority sends it to every relay itself.
+/// `key`, which each adopt (the anchor once, the rest whenever the frame is newer
+/// than its copy). Not re-broadcast by a receiver: the authority sends it to
+/// every relay itself.
 pub(crate) fn fan_out_session_clock(links: &MeshLinks, key: &SessionKey, clock: SessionClock) {
     fan_out_control(links, key, session_clock_frame(key.session, clock));
 }

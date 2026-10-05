@@ -210,12 +210,15 @@ pub(super) fn deliver_turn_to_locals(
         // count or stamp it supplies can be padded; only the turns it actually
         // produced move this prefix.
         // On the authority of a rollback session, the same advance moves the
-        // session clock on: anchoring it once the lockstep start is in, and
-        // stopping it for any time the session spent waiting. Every other relay
-        // adopts the change, and this relay's own players get reports carrying
-        // it at once.
+        // session clock on: anchoring it once the lockstep start is in, moving
+        // its limit, and keeping any stop it made while the session waited.
+        // Every other relay adopts an anchor or a stop at once, and this relay's
+        // own players get the reports a stop or their newly measured turns call
+        // for.
         if let Some(update) = decision_makers.note_forward_advance(key, slot, forwarded.forwarded) {
-            super::fan_out::fan_out_session_clock(&mesh.links, key, update.frame);
+            if let Some(frame) = update.frame {
+                super::fan_out::fan_out_session_clock(&mesh.links, key, frame);
+            }
             routing::fan_out_lead_reports(sessions, key, &update.reports);
         }
     }

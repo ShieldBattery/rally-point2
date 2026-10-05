@@ -52,11 +52,20 @@ impl DecisionMakers {
         self.lock().get(key)?.session_clock_frame(Instant::now())
     }
 
+    /// The session clock of every rollback session this relay is the authority for, as of now,
+    /// for the heartbeat that keeps every other relay's copy current.
+    pub fn session_clock_frames(&self) -> Vec<(SessionKey, SessionClockFrame)> {
+        let now = Instant::now();
+        self.lock()
+            .iter()
+            .filter_map(|(key, maker)| Some((key.clone(), maker.session_clock_frame(now)?)))
+            .collect()
+    }
+
     /// Adopts the authority's session clock for `key` from a frame that arrived at `received_at`
     /// over a mesh link with a round trip of `mesh_rtt_us`, returning the lead reports to push
-    /// down this relay's home slots when the clock's stopped time grew (see
-    /// [`DecisionMaker::adopt_session_clock`]). Records the adoption's anchoring and any growth
-    /// of the stopped time in the flight recording.
+    /// down this relay's home slots (see [`DecisionMaker::adopt_session_clock`]). Records the
+    /// adoption's anchoring and any growth of the stopped time in the flight recording.
     #[must_use]
     pub fn adopt_session_clock(
         &self,
@@ -73,36 +82,38 @@ impl DecisionMakers {
             }
             None => return Vec::new(),
         };
-        for event in events.into_iter().flatten() {
-            self.record_event(key, event);
-        }
-        if !reports.is_empty() {
-            tracing::info!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                pause_us = frame.pause_us,
-                "session clock stopped longer on the authority; re-sending lead reports",
-            );
-        }
+        self.record_clock_events(key, events);
         reports
     }
 
-    /// Logs a change the authority made to `key`'s session clock.
-    pub(in crate::consensus) fn log_clock_update(key: &SessionKey, update: &ClockUpdate) {
-        if update.reports.is_empty() && update.frame.pause_us == 0 {
-            tracing::info!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                anchor_step = update.frame.anchor_step,
-                "anchored the session clock",
-            );
-        } else {
-            tracing::info!(
-                tenant = key.tenant.as_ref(),
-                session = key.session.0,
-                pause_us = update.frame.pause_us,
-                "session clock stopped while the session waited on turns",
-            );
+    /// Logs and records the flight events a change to `key`'s session clock earned (see
+    /// [`DecisionMaker::clock_events`], which caps how many stops a session records).
+    pub(in crate::consensus) fn record_clock_events(
+        &self,
+        key: &SessionKey,
+        events: [Option<FlightEvent>; 2],
+    ) {
+        for event in events.into_iter().flatten() {
+            match &event {
+                FlightEvent::SessionClockAnchored {
+                    anchor_step,
+                    adopted,
+                } => tracing::info!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    anchor_step,
+                    adopted,
+                    "anchored the session clock",
+                ),
+                FlightEvent::SessionClockStopped { pause_us } => tracing::info!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    pause_us,
+                    "session clock stopped while the session waited on turns",
+                ),
+                _ => {}
+            }
+            self.record_event(key, event);
         }
     }
 }

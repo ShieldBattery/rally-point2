@@ -9,6 +9,7 @@
   `&mesh.session`.
 - `seen.rs` forward-once gate · `links.rs` link registry, provenance lease, RTT
   cache · `conditions.rs` outgoing sidecar samples · `frames.rs` frame builders ·
+  `clock_heartbeat.rs` the authority's periodic rollback session clock frames ·
   `fan_out.rs` what leaves this relay · `forward.rs` turn delivery both ways ·
   `dispatch.rs` + `dispatch_finalize.rs` what arrives on the peer control stream
   · `join.rs` the Join-time reconcile re-sends.

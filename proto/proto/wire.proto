@@ -1041,7 +1041,9 @@ message PhaseApplied {
 // newer one replaces an older one, and the relay re-sends the current one to a
 // client that connects. A client that predates it skips the frame.
 message LeadReport {
-  // The newest step whose arrival the window covers.
+  // The newest step whose arrival the window covers. A turn is measured only
+  // once the clock's deadline for it is final, so this can trail the newest
+  // turn the relay has.
   uint64 through_step = 1;
 
   // The median and the 90th percentile of the lateness of the window's turns,
@@ -1049,15 +1051,17 @@ message LeadReport {
   sint32 median_us = 2;
   sint32 p90_us = 3;
 
-  // How many turns the window holds. Zero when the window has just started
-  // over because the clock stopped: the report then only carries `pause_us`,
-  // and `median_us` and `p90_us` mean nothing.
+  // How many turns the window holds. Zero before any turn has been measured:
+  // the report then only carries `pause_us`, and `median_us` and `p90_us`
+  // mean nothing.
   uint32 samples = 4;
 
   // How long the session clock has spent stopped so far, in microseconds. It
-  // only grows, and it grows exactly when the whole session waited on turns
-  // that weren't coming, so a client moves its pacing later by any increase at
-  // once rather than racing to make up time the session never ran.
+  // grows exactly when the whole session waited on turns that weren't coming,
+  // so a client moves its pacing later by any increase at once rather than
+  // racing to make up time the session never ran. A stop sends the client a
+  // report at once. Every turn is measured against a deadline no later stop
+  // moves, so the figures read the same on either side of a change.
   uint64 pause_us = 5;
 }
 
@@ -1370,12 +1374,18 @@ message MeshControlFrame {
     EvictSlot evict_slot = 18;
 
     // The authority's session clock for a rollback session, so every relay
-    // measures its own players' turns against the same deadlines. Sent when the
-    // authority anchors the clock, whenever the clock's stopped time grows, and
-    // to a relay that joins after the anchor. Not re-broadcast: the authority
-    // already sent it to every relay. See `SessionClock`.
-    SessionClock session_clock = 19;
+    // measures its own players' turns against the same deadlines. Each frame
+    // carries the clock's whole state, and a relay adopts only a frame newer
+    // than the one it holds. Sent when the authority anchors the clock, when a
+    // stop ends, every quarter second while the clock is anchored, to a relay
+    // that joins after the anchor, and after an authority change. Not
+    // re-broadcast: the authority already sent it to every relay. See
+    // `SessionClock`. Tag 19 carried an earlier shape that only grew a total
+    // stopped time; a relay that predates this tag skips it.
+    SessionClock session_clock = 20;
   }
+
+  reserved 19;
 }
 
 // One destination client's end-to-end delivered-through cursors: for each
@@ -1691,20 +1701,54 @@ message EvictSlot {
 }
 
 // A rollback session's clock as the authority keeps it — see the
-// `session_clock` oneof arm and `LeadReport`. Relays share no timebase, so the
-// anchor travels as an age: the receiving relay places the anchor that long
-// before it received the frame, less half the mesh round trip the frame took.
+// `session_clock` oneof arm and `LeadReport`.
+//
+// The turn with seq `n` is due `n - anchor_step` steps after the anchor, plus
+// the stopped time of every stop at a step before `n`. The clock stops only
+// at `final_through`, which only grows, so the deadline of every step up to
+// it can no longer change: a relay measures a turn against the clock only
+// once a frame's `final_through` has reached it.
+//
+// Relays share no timebase, so the anchor travels as an age: the receiving
+// relay places the anchor that long before it received the frame, less half
+// the mesh round trip the frame took. Stops travel by step, so which turns a
+// stop moves never depends on when a relay learned of it.
 message SessionClock {
   // The step the clock was anchored at: the newest step the authority could
   // confirm when the session's lockstep start ended.
   uint64 anchor_step = 1;
 
   // How long before the authority wrote this frame it anchored the clock, in
-  // microseconds of wall clock. Stopped time travels separately, in `pause_us`.
+  // microseconds of wall clock. Stopped time is not taken out of it.
   uint64 since_anchor_us = 2;
 
-  // How long the clock has spent stopped so far, in microseconds.
-  uint64 pause_us = 3;
+  // The newest step whose deadline is final: the farthest the clock may run
+  // past the newest step the authority can confirm for every player. The
+  // clock stands still here whenever it reaches this step's deadline before
+  // the next step becomes confirmable.
+  uint64 final_through = 3;
+
+  // Stops at steps before `base_step` are carried only as their sum,
+  // `base_pause_us`. No relay measures a turn that far behind, and a turn at
+  // or after `base_step` is moved by every one of them.
+  uint64 base_step = 4;
+
+  // The stopped time of every stop at a step before `base_step`, in
+  // microseconds.
+  uint64 base_pause_us = 5;
+
+  // Every finished stop at or after `base_step`, in step order.
+  repeated ClockStop stops = 6;
+}
+
+// One finished stop of a rollback session's clock — see `SessionClock.stops`.
+message ClockStop {
+  // The step the clock stood at: this step's deadline is unmoved, and every
+  // later step's is moved by `pause_us`.
+  uint64 step = 1;
+
+  // How long the clock stood still, in microseconds.
+  uint64 pause_us = 2;
 }
 
 // The home's answer to `FinalizeDrop` — see the `finalize_drop_result` oneof

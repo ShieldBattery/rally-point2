@@ -5,15 +5,15 @@ use super::*;
 
 use rally_point_proto::rollback::LOCKSTEP_START_STEPS;
 
-/// A change to the session clock the authority made, for its caller to send to every other relay
-/// and to push the carried reports down this relay's own home slots.
+/// What moving the authority's session clock on calls for: a frame to send every other relay
+/// when the clock changed in a way they should hear of at once, and reports to push down this
+/// relay's own home slots.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClockUpdate {
-    /// The clock as the other relays adopt it.
-    pub frame: SessionClockFrame,
-    /// A report for every home slot measured here, carrying the clock's new stopped time and no
-    /// lateness, since each slot's window starts over (none when the clock was only just
-    /// anchored).
+    /// The clock as the other relays adopt it, when it was just anchored or a stop just ended.
+    pub frame: Option<SessionClockFrame>,
+    /// Every measured home slot's report when a stop just ended, carrying the clock's new stopped
+    /// time; otherwise the reports due from turns whose deadlines just became final.
     pub reports: Vec<(SlotId, LeadReport)>,
 }
 
@@ -32,8 +32,11 @@ fn micros(duration: Duration) -> u64 {
 
 impl DecisionMaker {
     /// Measures `slot`'s turn with seq `seq`, which first arrived on this relay's client edge at
-    /// `received_at`, and returns the slot's lead report when one is due. Nothing outside a
-    /// rollback session, before the clock is anchored, or for a turn of the lockstep start.
+    /// `received_at`, and returns the slot's lead report when one is due. A turn whose deadline
+    /// isn't final yet is measured once the clock moves far enough on: on the authority as more
+    /// turns become confirmable, elsewhere as its frames arrive
+    /// ([`adopt_session_clock`](Self::adopt_session_clock)). Nothing outside a rollback session,
+    /// before the clock is anchored, or for a turn of the lockstep start.
     ///
     /// The caller must feed only this relay's own home slots' client-edge arrivals: a mesh copy
     /// times another relay's hop, not the player's.
@@ -47,8 +50,7 @@ impl DecisionMaker {
         if !self.rollback_enabled {
             return None;
         }
-        let lateness_us = self.clock.lateness_us(seq, received_at)?;
-        self.lead.note(slot, seq, lateness_us, self.clock.pause())
+        self.lead.note(slot, seq, received_at, &self.clock)
     }
 
     /// This relay's home slots' lead figures since the previous call, and the clock's stopped time,
@@ -107,8 +109,9 @@ impl DecisionMaker {
         self.lead.report(slot, self.clock.pause())
     }
 
-    /// The session clock as the authority sends it to a relay that joins after the anchor. `None`
-    /// on any other relay, or before the anchor.
+    /// The session clock as the authority sends it: to a relay that joins after the anchor, after
+    /// an authority change, and on the heartbeat that keeps every relay's copy of the limit
+    /// current. `None` on any other relay, or before the anchor.
     pub fn session_clock_frame(&self, now: Instant) -> Option<SessionClockFrame> {
         if !self.rollback_enabled || !self.is_authority() {
             return None;
@@ -117,11 +120,11 @@ impl DecisionMaker {
     }
 
     /// Adopts the authority's session clock from a frame that arrived at `received_at` over a mesh
-    /// link with a round trip of `mesh_rtt_us`, returning the reports to push down this relay's
-    /// home slots when the clock's stopped time grew (each slot's window starting over, since a
-    /// turn that arrived before the frame was measured against the clock from before the stop).
-    /// The authority ignores the frame: its own
-    /// clock is the original (a frame from a former authority can still be in flight after a
+    /// link with a round trip of `mesh_rtt_us`, measuring the turns waiting for deadlines the frame
+    /// made final. Returns the reports to push down this relay's home slots: every measured slot's
+    /// when the clock's stopped time grew, so each client moves its schedule by the stop at once,
+    /// and otherwise those the newly measured turns made due. The authority ignores the frame: its
+    /// own clock is the original (a frame from a former authority can still be in flight after a
     /// promotion).
     #[must_use]
     pub fn adopt_session_clock(
@@ -134,17 +137,18 @@ impl DecisionMaker {
             return Vec::new();
         }
         let pause_before = self.clock.pause();
-        if !self.clock.adopt(frame, received_at, mesh_rtt_us) || self.clock.pause() == pause_before
-        {
+        if !self.clock.adopt(frame, received_at, mesh_rtt_us) {
             return Vec::new();
         }
-        self.lead.restart(self.clock.pause())
+        let stopped = self.clock.pause() > pause_before;
+        self.lead.settle(&self.clock, stopped)
     }
 
     /// Moves the authority's clock on as the newest turn it can confirm for every player advances
     /// from count `before` to count `after` at `now`: anchors it once the lockstep start is
-    /// confirmable, and afterwards stops it for any time it ran too far past what was confirmable.
-    /// Returns the change for the other relays and this relay's home slots, if there was one.
+    /// confirmable, and afterwards moves its limit on, keeping the stop if it had stood still at
+    /// the old one, and measures the turns waiting for deadlines that are now final. Returns what
+    /// that calls for, if anything.
     pub(in crate::consensus) fn advance_clock(
         &mut self,
         before: u64,
@@ -163,17 +167,23 @@ impl DecisionMaker {
             // arrived, and nobody is asked to be earlier than the session has shown it can be.
             self.clock.anchor(after - 1, now);
             return Some(ClockUpdate {
-                frame: self.clock.to_frame(now)?,
+                frame: self.clock.to_frame(now),
                 reports: Vec::new(),
             });
         }
-        // `before` turns of every player were confirmable, so the newest was seq `before - 1`.
-        if before == 0 || !self.clock.note_confirmable_advance(before - 1, now) {
+        // `after` turns of every player are confirmable, so the newest is seq `after - 1`.
+        let stopped = self.clock.note_confirmable(after - 1, now);
+        let reports = self.lead.settle(&self.clock, stopped);
+        if !stopped && reports.is_empty() {
             return None;
         }
         Some(ClockUpdate {
-            frame: self.clock.to_frame(now)?,
-            reports: self.lead.restart(self.clock.pause()),
+            frame: if stopped {
+                self.clock.to_frame(now)
+            } else {
+                None
+            },
+            reports,
         })
     }
 }

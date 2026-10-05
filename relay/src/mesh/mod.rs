@@ -31,6 +31,7 @@ pub mod control;
 pub mod dialer;
 pub mod edge;
 
+mod clock_heartbeat;
 mod conditions;
 mod dispatch;
 mod dispatch_finalize;
@@ -44,6 +45,7 @@ mod link_run;
 mod links;
 mod seen;
 
+pub use clock_heartbeat::{SESSION_CLOCK_HEARTBEAT, run_session_clock_heartbeat};
 pub use conditions::{
     ConditionsRegistry, activate_conditions, new_conditions_registry, publish_conditions,
     snapshot_conditions, unpublish_conditions,

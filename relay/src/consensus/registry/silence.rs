@@ -40,11 +40,10 @@ impl DecisionMakers {
     /// session to `forwarded` turns, stamping the slot's stop clock (see
     /// [`DecisionMaker::note_forward_advance`]) and, in a rollback session, starting the report
     /// deadlines of the steps that became confirmable and moving the authority's session clock
-    /// on (see [`DecisionMaker::note_forwarded_turns`]). Returns a change the authority made to
-    /// the clock, for the caller to send to the other relays and push the carried reports down
-    /// this relay's home slots. The change's anchoring or stop is recorded in the flight
-    /// recording. Called from the forward gate's fan-out choke point, once per turn that genuinely
-    /// extends the prefix.
+    /// on (see [`DecisionMaker::note_forwarded_turns`]). Returns what moving the clock calls for: a
+    /// frame for the caller to send the other relays, and reports to push down this relay's home
+    /// slots. The clock's anchoring or stop is recorded in the flight recording. Called from the
+    /// forward gate's fan-out choke point, once per turn that genuinely extends the prefix.
     #[must_use]
     pub fn note_forward_advance(
         &self,
@@ -61,10 +60,7 @@ impl DecisionMakers {
             let update = maker.note_forwarded_turns(slot, forwarded, now)?;
             (update, maker.clock_events(mark, false))
         };
-        Self::log_clock_update(key, &update);
-        for event in events.into_iter().flatten() {
-            self.record_event(key, event);
-        }
+        self.record_clock_events(key, events);
         Some(update)
     }
 

@@ -25,7 +25,8 @@ impl DecisionMaker {
     /// Notes that this relay has forwarded `count` of `slot`'s turns without a gap, which starts
     /// the report deadlines of the steps that became confirmable, updates
     /// [`turns_complete`](Self::turns_complete_handle) and, on the authority, moves the session
-    /// clock on, returning any change to it. Nothing outside a rollback session.
+    /// clock on, returning the frame and reports that calls for. Nothing outside a rollback
+    /// session.
     pub fn note_forwarded_turns(
         &mut self,
         slot: SlotId,
