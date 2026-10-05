@@ -748,9 +748,11 @@ targets.
   a peer proves its join with its first presence report, and after any authority change: a relay
   promoted after a peer joined it announces the copy it holds, since that peer was never sent one.
   A stop goes out at once, and the relays push every measured player a report carrying it, so
-  clients move their pacing by exactly the stop instead of sprinting. A promoted authority keeps
-  the limit it adopted, so it never stops the clock behind a step its predecessor had made final;
-  only a stop in progress when the authority failed can be lost, which lead reports absorb.
+  clients move their pacing by exactly the stop instead of sprinting. A promoted authority first
+  brings the limit it adopted up to the slack past what it has confirmed itself, without a stop,
+  and only then measures one: the last frame it heard can trail its own frontier, and a stop
+  measured against that would move deadlines the other relays already hold as final. Only a stop
+  in progress when the authority failed can be lost, which lead reports absorb.
 - **Turns complete.** Every packet a relay sends its own client in a rollback session carries
   `turns_complete`: the fewest gap-free turns the relay has forwarded of any in-game slot,
   observers' included (a client's simulation waits on their turns too), and a departed slot's

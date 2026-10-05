@@ -171,8 +171,11 @@ impl DecisionMaker {
                 reports: Vec::new(),
             });
         }
-        // `after` turns of every player are confirmable, so the newest is seq `after - 1`.
-        let stopped = self.clock.note_confirmable(after - 1, now);
+        // `before` turns of every player were confirmable and `after` are, so the newest went
+        // from seq `before - 1` to seq `after - 1`.
+        let stopped = self
+            .clock
+            .note_confirmable(before.checked_sub(1), after - 1, now);
         let reports = self.lead.settle(&self.clock, stopped);
         if !stopped && reports.is_empty() {
             return None;

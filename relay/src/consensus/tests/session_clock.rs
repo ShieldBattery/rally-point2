@@ -539,6 +539,61 @@ fn another_relay_adopts_frames_whole_and_ignores_older_ones() {
 }
 
 #[test]
+fn a_promoted_relay_holding_an_older_limit_stops_nowhere_the_former_authority_did_not() {
+    let start = Instant::now();
+    let mut former = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut former, &[0, 1], 100, start);
+    let older = former.session_clock_frame(on_time(start, 99)).unwrap();
+    play_on_schedule(&mut former, &[0, 1], 104, start);
+    let newer = former.session_clock_frame(on_time(start, 103)).unwrap();
+    assert_eq!(older.final_through, 99 + STALL_SLACK_STEPS);
+    assert_eq!(newer.final_through, 103 + STALL_SLACK_STEPS);
+
+    // One relay has confirmed as far as the authority did, but last heard its older limit; another
+    // heard the newer one.
+    let mut promoted = rollback(peer_maker(), &[0, 1]);
+    play_on_schedule(&mut promoted, &[0, 1], 104, start);
+    let _ = promoted.adopt_session_clock(&older, on_time(start, 99), 0);
+    let mut other = rollback(peer_maker(), &[0, 1]);
+    let _ = other.adopt_session_clock(&older, on_time(start, 99), 0);
+    let _ = other.adopt_session_clock(&newer, on_time(start, 103), 0);
+    let final_before = other.clock.due_at(103 + STALL_SLACK_STEPS);
+
+    // The authority fails, the first relay takes over, and the next step becomes confirmable a
+    // little late, but well inside the limit the former authority had set.
+    let _ = promoted.set_authority(Authority::SelfRelay, &HashSet::new());
+    let at = on_time(start, 107);
+    let update = forward(&mut promoted, &[0, 1], 105, at);
+    assert_eq!(
+        update.and_then(|update| update.frame),
+        None,
+        "no stop: the clock hadn't reached its limit"
+    );
+    assert_eq!(promoted.clock.pause(), Duration::ZERO);
+    assert_eq!(
+        promoted.clock.final_through(),
+        Some(104 + STALL_SLACK_STEPS)
+    );
+    // The former authority, had it carried on, would have the same clock.
+    let _ = forward(&mut former, &[0, 1], 105, at);
+    for seq in ANCHOR..=104 + STALL_SLACK_STEPS {
+        assert_eq!(
+            promoted.clock.due_at(seq),
+            former.clock.due_at(seq),
+            "seq {seq}"
+        );
+    }
+
+    // The other relay adopts the new authority's clock without any deadline it held as final
+    // moving.
+    let frame = promoted.session_clock_frame(at).unwrap();
+    let _ = other.adopt_session_clock(&frame, at, 0);
+    assert_eq!(other.clock.final_through(), Some(104 + STALL_SLACK_STEPS));
+    assert_eq!(other.clock.due_at(103 + STALL_SLACK_STEPS), final_before);
+    assert_eq!(other.clock.pause(), Duration::ZERO);
+}
+
+#[test]
 fn another_relay_measures_a_turn_that_arrived_before_it_heard_of_the_stop() {
     let start = Instant::now();
     let mut authority = rollback(maker(), &[0, 1]);

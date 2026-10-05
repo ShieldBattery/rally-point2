@@ -130,16 +130,35 @@ impl SessionClock {
         true
     }
 
-    /// Notes, on the authority, that the newest step it can confirm for every player became
-    /// `newest` at `now`, which moves the limit on to [`STALL_SLACK_STEPS`] past it. If the clock
-    /// had already reached the old limit's deadline, it stood still there until now, and that
-    /// stop is kept. Returns whether there was one.
+    /// Notes, on the authority, that the newest step it can confirm for every player went from
+    /// `newest_before` (`None` when nothing was) to `newest` at `now`, which moves the limit on to
+    /// [`STALL_SLACK_STEPS`] past it. If the clock had already reached the deadline of the limit
+    /// `newest_before` set, it stood still there until now, and that stop is kept. Returns whether
+    /// there was one.
     ///
-    /// A limit that doesn't grow (a newly promoted authority confirming steps the former one
-    /// already had) leaves the clock as it is, stopped or not.
-    pub(in crate::consensus) fn note_confirmable(&mut self, newest: u64, now: Instant) -> bool {
+    /// The limit is first brought up to the slack past `newest_before`, with no stop. An authority
+    /// that has held the clock all along already has it there, but a newly promoted one holds the
+    /// limit of the last frame it heard, which can trail what it has confirmed itself: measuring a
+    /// stop against that would stop the clock where the former authority never did, and move
+    /// deadlines other relays already hold as final. A limit that doesn't grow (a newly promoted
+    /// authority confirming steps the former one already had) leaves the clock as it is, stopped
+    /// or not.
+    pub(in crate::consensus) fn note_confirmable(
+        &mut self,
+        newest_before: Option<u64>,
+        newest: u64,
+        now: Instant,
+    ) -> bool {
+        if self.anchor.is_none() {
+            return false;
+        }
+        if let Some(before) = newest_before {
+            self.final_through = self
+                .final_through
+                .max(before.saturating_add(STALL_SLACK_STEPS));
+        }
         let limit = newest.saturating_add(STALL_SLACK_STEPS);
-        if self.anchor.is_none() || limit <= self.final_through {
+        if limit <= self.final_through {
             return false;
         }
         let stop = self
