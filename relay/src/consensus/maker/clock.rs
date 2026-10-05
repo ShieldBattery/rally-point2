@@ -26,11 +26,11 @@ pub(in crate::consensus) struct ClockMark {
     pause: Duration,
 }
 
-/// The furthest count of confirmable turns at which an authority that saw the lockstep start
-/// completed still anchors the clock: a slow player's turns can complete the start several steps
-/// at once, but a count further on than two lockstep starts' worth is a relay that is only now
-/// hearing of a session long under way.
-const LATEST_ANCHORING_COUNT: u64 = 2 * LOCKSTEP_START_STEPS;
+/// How long an authority that didn't start the session waits, without the clock and without any
+/// relay's copy of it, before it anchors the clock itself: four of the quarter-second heartbeats
+/// every relay sends its copy on, so only a session where no reachable relay has the clock is
+/// anchored twice.
+pub const CLOCK_ANCHOR_QUIET: Duration = Duration::from_secs(1);
 
 /// A duration in whole microseconds, saturating.
 fn micros(duration: Duration) -> u64 {
@@ -153,6 +153,25 @@ impl DecisionMaker {
         self.lead.settle(&self.clock, stopped)
     }
 
+    /// Whether this relay, the authority with no clock yet, anchors it from its own view at `now`.
+    ///
+    /// The clock has one anchor, and its copies' stopped times only line up against that one. The
+    /// authority that started the session (and has been the authority since) can be sure no other
+    /// relay anchored it, so it anchors once the lockstep start is confirmable. Any other
+    /// authority (promoted, or a relay that took the session over) may be missing a turn of the
+    /// lockstep start that the relay that started the session had long ago, and an anchor of its
+    /// own would carry whatever stopped time the clock has had since. So it waits for another
+    /// relay's copy, which brings the anchor, and anchors itself only once it has gone
+    /// [`CLOCK_ANCHOR_QUIET`] without one: then no reachable relay has the clock, so no stop
+    /// exists yet either.
+    fn may_anchor_clock(&mut self, now: Instant) -> bool {
+        if self.started_session_as_authority {
+            return true;
+        }
+        let since = *self.unanchored_authority_since.get_or_insert(now);
+        now.saturating_duration_since(since) >= CLOCK_ANCHOR_QUIET
+    }
+
     /// Moves the authority's clock on as the newest turn it can confirm for every player advances
     /// from count `before` to count `after` at `now`: anchors it once the lockstep start is
     /// confirmable, and afterwards moves its limit on, keeping the stop if it had stood still at
@@ -168,19 +187,13 @@ impl DecisionMaker {
             return None;
         }
         if !self.clock.is_anchored() {
-            // Only an authority that saw the lockstep start completed anchors the clock from its
-            // own view. One that missed it (promoted, or joined, later) waits for another relay's
-            // copy instead: the clock may have stopped since, and an anchor of its own would
-            // carry that stopped time no copy's stops could line up with.
-            if before >= LOCKSTEP_START_STEPS
-                || !(LOCKSTEP_START_STEPS..=LATEST_ANCHORING_COUNT).contains(&after)
-            {
+            if after < LOCKSTEP_START_STEPS || !self.may_anchor_clock(now) {
                 return None;
             }
-            // The turn that completed the lockstep start arrived just now, so it is the one due
-            // now. Every client waited for every turn up to here, so this is when the slowest
-            // player's start arrived, and nobody is asked to be earlier than the session has shown
-            // it can be.
+            // The newest confirmable turn arrived just now, so it is the one due now. Every client
+            // waited for every turn of the lockstep start, so on the authority that started the
+            // session this is when the slowest player's start arrived, and nobody is asked to be
+            // earlier than the session has shown it can be.
             self.clock.anchor(after - 1, now);
             return Some(ClockUpdate {
                 frame: self.clock.to_frame(now),

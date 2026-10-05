@@ -25,8 +25,8 @@
 //! both believe they are the authority) fold in wherever they land, and every relay converges on
 //! the same deadlines for the steps ahead. The authority's own record of a wait is folded in the
 //! same way, as a least stopped time, so no wait is counted twice. There is one anchor: the relay
-//! that saw the lockstep start completed sets it, and every other relay places it once, at the
-//! first frame's receipt less the frame's age and half the mesh round trip it took.
+//! that started the session as the authority sets it, and every other relay places it once, at
+//! the first frame's receipt less the frame's age and half the mesh round trip it took.
 
 use super::*;
 
@@ -182,9 +182,9 @@ impl SessionClock {
     /// Anchors the clock, unless it already is, so that the turn with seq `newest` is due at `now`:
     /// the authority seeing the lockstep start become confirmable, with `newest` its newest
     /// confirmable step. Every relay anchors at [`ANCHOR_STEP`], so copies' stopped times line
-    /// up, and only the relay that saw the start completed anchors from its own view, at the time
-    /// that step corresponds to; the rest place that same anchor from its copies. Returns whether
-    /// it anchored.
+    /// up, and only one relay anchors from its own view (see `DecisionMaker::may_anchor_clock`),
+    /// at the time that step corresponds to; the rest place that same anchor from its copies.
+    /// Returns whether it anchored.
     pub(in crate::consensus) fn anchor(&mut self, newest: u64, now: Instant) -> bool {
         if self.anchor.is_some() {
             return false;

@@ -27,7 +27,7 @@ mod silence;
 mod state_hash;
 mod sync;
 
-pub use clock::ClockUpdate;
+pub use clock::{CLOCK_ANCHOR_QUIET, ClockUpdate};
 pub use departure::{DepartureStamps, FinalizeOutcome, RecordedDeparture};
 pub use eviction::{DesyncEviction, EvictionCause};
 pub use silence::SilentSlot;
@@ -359,6 +359,12 @@ pub struct DecisionMaker {
     /// How many `SessionClockStopped` flight events this session has recorded here, against
     /// [`MAX_CLOCK_STOP_EVENTS`].
     pub(in crate::consensus) clock_stop_events: u32,
+    /// Whether this relay, as the authority, started the session and has been the authority
+    /// since: the one relay that anchors the session clock from its own view at once.
+    pub(in crate::consensus) started_session_as_authority: bool,
+    /// When this relay, an authority that didn't start the session, began waiting for a copy of
+    /// the clock to anchor its own.
+    pub(in crate::consensus) unanchored_authority_since: Option<Instant>,
     /// The state hash comparator of a rollback session. Kept on every relay and across authority
     /// changes, so a promoted authority carries on judging where the old one stopped.
     pub(in crate::consensus) hashes: StateHashTracker,
@@ -523,6 +529,8 @@ impl DecisionMaker {
             clock: SessionClock::default(),
             lead: LeadTracker::default(),
             clock_stop_events: 0,
+            started_session_as_authority: false,
+            unanchored_authority_since: None,
             hashes: StateHashTracker::default(),
             turns_complete: Arc::default(),
             finalizing_drops: HashSet::new(),

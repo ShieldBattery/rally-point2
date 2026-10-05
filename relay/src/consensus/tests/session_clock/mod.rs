@@ -30,6 +30,10 @@ fn us(duration: Duration) -> i64 {
 fn rollback(mut maker: DecisionMaker, slots: &[u8]) -> DecisionMaker {
     maker.latch_rollback(true);
     maker.set_expected_slots(slots.iter().map(|&x| SlotId(x)).collect());
+    // Every slot shows up, which starts the session on the authority.
+    for &slot in slots {
+        let _ = maker.note_slot_present(SlotId(slot));
+    }
     maker
 }
 

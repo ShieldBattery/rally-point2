@@ -107,6 +107,8 @@ fn join_reconcile_re_sends_the_authoritys_session_clock() {
             )
         },
     );
+    // The slot shows up, which starts the session on this relay, the authority.
+    let _ = makers.note_slot_present(&key, SlotId(0));
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     reconcile_session_clock_on_join(&makers, &control_tx, &key);
     assert!(control_rx.try_recv().is_err(), "no clock before the anchor");

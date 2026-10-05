@@ -39,6 +39,10 @@ fn rollback_session(mesh: &MeshState, key: &SessionKey, authority: crate::consen
             )
         },
     );
+    // Both slots show up, which starts the session on the authority.
+    for slot in [SlotId(0), SlotId(5)] {
+        let _ = mesh.session.decision_makers.note_slot_present(key, slot);
+    }
 }
 
 fn session_clocks(control_rx: &mut mpsc::UnboundedReceiver<MeshControlFrame>) -> Vec<SessionClock> {

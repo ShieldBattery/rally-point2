@@ -745,10 +745,14 @@ targets.
   every 250 ms (the limit moves every step, and a relay measures only up to the limit it has heard
   of), at a join, when a peer proves its join with its first presence report, and after any
   authority change; the authority also sends it when it anchors the clock and when a stop ends.
-  There is one anchor: only the authority that saw the lockstep start completed anchors the clock
-  from its own view (with its newest confirmable step due then), and every other relay, a newly
-  promoted one included, places that anchor at the first copy's receipt less its age and half the
-  link's RTT, once. A relay **merges** every copy it gets: the stopped time before each step
+  There is one anchor: the authority that started the session, and has been the authority since,
+  anchors the clock once the lockstep start is confirmable (with its newest confirmable step due
+  then), and every other relay, a newly promoted one included, places that anchor at the first
+  copy's receipt less its age and half the link's RTT, once. An authority that didn't start the
+  session anchors the clock itself only after `CLOCK_ANCHOR_QUIET` (1 s) without any copy, when no
+  reachable relay has the clock (and so no stop exists either); a local count of the start is no
+  evidence, since a relay missing a turn of the start can complete it seconds after it completed
+  elsewhere. A relay **merges** every copy it gets: the stopped time before each step
   becomes the most either copy knows of, so a step's deadline is the later of the two, except that
   a deadline the relay already holds as final never moves (stopped time the other copy knows of
   before its limit is taken in at its limit), and its limit becomes the further of the two. The

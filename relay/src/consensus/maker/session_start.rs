@@ -223,6 +223,7 @@ impl DecisionMaker {
         }
         if self.expected_slots.is_subset(&self.live_slots) {
             self.latch_started();
+            self.started_session_as_authority = true;
             let depth = self.compute_initial_depth();
             self.buffer = BufferSize(depth);
             self.initial_buffer_turns = Some(depth);

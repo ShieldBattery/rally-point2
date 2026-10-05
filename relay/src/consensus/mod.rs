@@ -280,8 +280,8 @@ use sync::*;
 
 pub use law::ControlLaw;
 pub use maker::{
-    ClockUpdate, DecisionMaker, DepartureStamps, DesyncEviction, EvictionCause, FinalizeOutcome,
-    RecordedDeparture, SilentSlot,
+    CLOCK_ANCHOR_QUIET, ClockUpdate, DecisionMaker, DepartureStamps, DesyncEviction, EvictionCause,
+    FinalizeOutcome, RecordedDeparture, SilentSlot,
 };
 pub use registry::LobbyCommandVerdict;
 

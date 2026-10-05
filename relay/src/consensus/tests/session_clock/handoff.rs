@@ -331,3 +331,65 @@ fn a_relay_that_missed_the_start_takes_the_anchor_from_a_copy_rather_than_anchor
         .expect("stopped");
     assert_eq!(frame.stops.last().map(|stop| stop.step), Some(through));
 }
+
+#[test]
+fn a_promoted_relay_missing_a_turn_of_the_start_takes_the_anchor_from_a_copy() {
+    let start = Instant::now();
+    // The relay that started the session anchors the clock as the lockstep start completes, and
+    // another relay holds its copy, a stop included by the time anything else happens.
+    let mut authority = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut authority, &[0, 1], 100, start);
+    let limit = 99 + STALL_SLACK_STEPS;
+    let resumed = on_time(start, limit) + 500 * MS;
+    let _ = forward(&mut authority, &[0, 1], 101, resumed);
+    let mut other = rollback(peer_maker(), &[0, 1]);
+    let _ = other.merge_session_clock(&authority.session_clock_frame(resumed).unwrap(), resumed, 0);
+    // A relay missing one of slot 0's turns of the lockstep start, and never sent a copy, is
+    // promoted while its own count of the start still stands at 23.
+    let mut promoted = rollback(peer_maker(), &[0, 1]);
+    let _ = promoted.note_forwarded_turns(SlotId(0), LOCKSTEP_START_STEPS - 1, start);
+    let _ = promoted.note_forwarded_turns(SlotId(1), 101, resumed);
+    let _ = promoted.set_authority(Authority::SelfRelay, &HashSet::new());
+
+    // The missing turn arrives seconds later and completes its count of the start. It doesn't
+    // anchor the clock: the session started elsewhere, and its anchor would carry the time since.
+    let late = start + Duration::from_secs(3);
+    assert_eq!(promoted.note_forwarded_turns(SlotId(0), 101, late), None);
+    assert!(!promoted.clock.is_anchored());
+
+    // The other relay's copy anchors it on that relay's deadlines.
+    let heartbeat = late + 100 * MS;
+    let _ =
+        promoted.merge_session_clock(&other.session_clock_frame(heartbeat).unwrap(), heartbeat, 0);
+    let through = other.clock.final_through().unwrap();
+    for seq in ANCHOR..=through {
+        assert_eq!(
+            promoted.clock.due_at(seq),
+            other.clock.due_at(seq),
+            "seq {seq}"
+        );
+    }
+}
+
+#[test]
+fn an_authority_no_copy_reaches_anchors_the_clock_itself_after_a_quiet_second() {
+    let start = Instant::now();
+    // The relay that started the session failed before any relay heard its clock: nobody has
+    // one when this relay is promoted.
+    let mut promoted = rollback(peer_maker(), &[0, 1]);
+    play_on_schedule(&mut promoted, &[0, 1], 100, start);
+    let _ = promoted.set_authority(Authority::SelfRelay, &HashSet::new());
+    let first = on_time(start, 100);
+    assert_eq!(forward(&mut promoted, &[0, 1], 101, first), None);
+    assert_eq!(
+        forward(&mut promoted, &[0, 1], 102, first + CLOCK_ANCHOR_QUIET - MS),
+        None,
+        "still waiting for a copy",
+    );
+    // A second without one: no reachable relay has the clock, so it anchors its own, with its
+    // newest confirmable step due now.
+    let quiet = first + CLOCK_ANCHOR_QUIET;
+    let update = forward(&mut promoted, &[0, 1], 103, quiet).expect("anchored");
+    assert_eq!(update.frame.map(|frame| frame.anchor_step), Some(ANCHOR));
+    assert_eq!(promoted.clock.due_at(102), Some(quiet));
+}

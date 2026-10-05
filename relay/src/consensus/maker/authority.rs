@@ -271,6 +271,11 @@ impl DecisionMaker {
         }
         let promoting = self.authority == Authority::Peer && authority == Authority::SelfRelay;
         self.authority = authority;
+        // Whichever way the authority moved, this relay is no longer the one that started the
+        // session as the authority and stayed it, so it no longer anchors the session clock on
+        // its own (see `may_anchor_clock`).
+        self.started_session_as_authority = false;
+        self.unanchored_authority_since = None;
         if authority == Authority::Peer {
             // Only the authority stamps buffer changes; a demoted relay stops.
             // Its cached leaves and recorded departures are deliberately kept --
