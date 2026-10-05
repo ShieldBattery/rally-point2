@@ -23,13 +23,18 @@
 //! any copy knows of, except that a deadline a relay already holds as final never moves. So a stop
 //! isn't lost while any relay knows of it, the decisions of a new authority (or of two relays that
 //! both believe they are the authority) fold in wherever they land, and every relay converges on
-//! the same deadlines for the steps ahead. Each relay places the anchor once, at the first frame's
-//! receipt less the frame's age and half the mesh round trip it took.
+//! the same deadlines for the steps ahead. The authority's own record of a wait is folded in the
+//! same way, as a least stopped time, so no wait is counted twice. There is one anchor: the relay
+//! that saw the lockstep start completed sets it, and every other relay places it once, at the
+//! first frame's receipt less the frame's age and half the mesh round trip it took.
 
 use super::*;
 
 use rally_point_proto::messages::ClockStop;
-use rally_point_proto::rollback::STEP_DURATION_US;
+use rally_point_proto::rollback::{LOCKSTEP_START_STEPS, STEP_DURATION_US};
+
+/// The step every relay anchors the clock at: the last of the lockstep start.
+pub(in crate::consensus) const ANCHOR_STEP: u64 = LOCKSTEP_START_STEPS - 1;
 
 /// How far the clock may run past the newest step the authority can confirm before it stops:
 /// where clients stall. A client runs at most its prediction limit (8 steps) past the newest step
@@ -64,7 +69,8 @@ struct Stop {
 struct CopiedStops {
     base_step: u64,
     base_pause: Duration,
-    /// By step, each at or after `base_step` and before the copy's limit.
+    /// By step, each at or after `base_step` and at or before the copy's limit (a stop at the
+    /// limit is one a merge took in there).
     stops: Vec<Stop>,
 }
 
@@ -73,7 +79,7 @@ impl CopiedStops {
         let mut stops: Vec<Stop> = frame
             .stops
             .iter()
-            .filter(|stop| stop.step >= frame.base_step && stop.step < frame.final_through)
+            .filter(|stop| stop.step >= frame.base_step && stop.step <= frame.final_through)
             .map(|stop| Stop {
                 step: stop.step,
                 pause: Duration::from_micros(stop.pause_us),
@@ -114,7 +120,7 @@ pub(in crate::consensus) struct SessionClock {
     /// Stops at steps before this one are kept only as their sum, `base_pause`.
     base_step: u64,
     base_pause: Duration,
-    /// Every finished stop at or after `base_step`, by step.
+    /// Every finished stop at or after `base_step`, by step, none past the limit.
     stops: VecDeque<Stop>,
 }
 
@@ -173,23 +179,27 @@ impl SessionClock {
         })
     }
 
-    /// Anchors the clock with the turn with seq `seq` due at `at`, unless it already is. Every relay
-    /// anchors at the same step, so their copies' stopped times line up. Returns whether it
-    /// anchored.
-    pub(in crate::consensus) fn anchor(&mut self, seq: u64, at: Instant) -> bool {
+    /// Anchors the clock, unless it already is, so that the turn with seq `newest` is due at `now`:
+    /// the authority seeing the lockstep start become confirmable, with `newest` its newest
+    /// confirmable step. Every relay anchors at [`ANCHOR_STEP`], so copies' stopped times line
+    /// up, and only the relay that saw the start completed anchors from its own view, at the time
+    /// that step corresponds to; the rest place that same anchor from its copies. Returns whether
+    /// it anchored.
+    pub(in crate::consensus) fn anchor(&mut self, newest: u64, now: Instant) -> bool {
         if self.anchor.is_some() {
             return false;
         }
-        self.anchor = Some((seq, at));
-        self.final_through = seq.saturating_add(STALL_SLACK_STEPS);
+        let since = steps_duration(newest.saturating_sub(ANCHOR_STEP));
+        self.anchor = Some((ANCHOR_STEP, now.checked_sub(since).unwrap_or(now)));
+        self.final_through = newest.max(ANCHOR_STEP).saturating_add(STALL_SLACK_STEPS);
         true
     }
 
     /// Notes, on the authority, that the newest step it can confirm for every player went from
     /// `newest_before` (`None` when nothing was) to `newest` at `now`, which moves the limit on to
     /// [`STALL_SLACK_STEPS`] past it. If the clock had already reached the deadline of the limit
-    /// `newest_before` set, it stood still there until now, and that stop is kept. Returns whether
-    /// there was one.
+    /// `newest_before` set, it stood still there until now, and the stop there is made at least
+    /// that long (see [`stand_at_limit`](Self::stand_at_limit)). Returns whether it grew.
     ///
     /// The limit is first brought up to the slack past `newest_before`, with no stop. An authority
     /// that has held the clock all along already has it there, but a newly promoted one holds the
@@ -215,18 +225,35 @@ impl SessionClock {
         if limit <= self.final_through {
             return false;
         }
-        let stop = self
+        let stood = self
             .due_at(self.final_through)
             .and_then(|due| now.checked_duration_since(due))
-            .filter(|pause| !pause.is_zero())
-            .map(|pause| Stop {
-                step: self.final_through,
-                pause,
-            });
-        self.stops.extend(stop);
+            .unwrap_or_default();
+        let stopped = self.stand_at_limit(stood);
         self.final_through = limit;
         self.fold();
-        stop.is_some()
+        stopped
+    }
+
+    /// Notes that the clock stood still at its limit for `stood`: the stopped time past the limit
+    /// becomes at least that much more than before it. Like a merge, this only ever raises the
+    /// stopped time to a bound, never adds to it, so a stop a merge already took in at the limit
+    /// (another relay's record of the same wait) isn't counted twice. Returns whether it grew.
+    fn stand_at_limit(&mut self, stood: Duration) -> bool {
+        let limit = self.final_through;
+        let at_least = self.pause_before(limit) + stood;
+        let past = self.pause_before(limit + 1);
+        if at_least <= past {
+            return false;
+        }
+        match self.stops.back_mut() {
+            Some(stop) if stop.step == limit => stop.pause += at_least - past,
+            _ => self.stops.push_back(Stop {
+                step: limit,
+                pause: at_least - past,
+            }),
+        }
+        true
     }
 
     /// Keeps the stops too far behind the limit for any relay to measure a turn by them only as

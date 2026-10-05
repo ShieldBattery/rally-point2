@@ -26,6 +26,12 @@ pub(in crate::consensus) struct ClockMark {
     pause: Duration,
 }
 
+/// The furthest count of confirmable turns at which an authority that saw the lockstep start
+/// completed still anchors the clock: a slow player's turns can complete the start several steps
+/// at once, but a count further on than two lockstep starts' worth is a relay that is only now
+/// hearing of a session long under way.
+const LATEST_ANCHORING_COUNT: u64 = 2 * LOCKSTEP_START_STEPS;
+
 /// A duration in whole microseconds, saturating.
 fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
@@ -162,14 +168,20 @@ impl DecisionMaker {
             return None;
         }
         if !self.clock.is_anchored() {
-            if after < LOCKSTEP_START_STEPS {
+            // Only an authority that saw the lockstep start completed anchors the clock from its
+            // own view. One that missed it (promoted, or joined, later) waits for another relay's
+            // copy instead: the clock may have stopped since, and an anchor of its own would
+            // carry that stopped time no copy's stops could line up with.
+            if before >= LOCKSTEP_START_STEPS
+                || !(LOCKSTEP_START_STEPS..=LATEST_ANCHORING_COUNT).contains(&after)
+            {
                 return None;
             }
             // The turn that completed the lockstep start arrived just now, so it is the one due
             // now. Every client waited for every turn up to here, so this is when the slowest
             // player's start arrived, and nobody is asked to be earlier than the session has shown
             // it can be.
-            self.clock.anchor(LOCKSTEP_START_STEPS - 1, now);
+            self.clock.anchor(after - 1, now);
             return Some(ClockUpdate {
                 frame: self.clock.to_frame(now),
                 reports: Vec::new(),

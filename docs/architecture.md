@@ -744,15 +744,19 @@ targets.
   the limit, and the stops, those older than any relay still measures folded into one base sum)
   every 250 ms (the limit moves every step, and a relay measures only up to the limit it has heard
   of), at a join, when a peer proves its join with its first presence report, and after any
-  authority change; the authority also sends it when it anchors the clock and when a stop ends. A
-  relay places the anchor at the first frame's receipt less its age and half the link's RTT, once
-  (every relay anchors at the same step), and **merges** every copy it gets: the stopped time
-  before each step becomes the most either copy knows of, so a step's deadline is the later of
-  the two, except that a deadline the relay already holds as final never moves (stopped time the
-  other copy knows of before its limit is taken in at its limit), and its limit becomes the
-  further of the two. Copies only ever gain stopped time, so that merge is order-free and
-  repeatable: frames arriving late, twice, or from two relays both deciding the clock all leave
-  every relay on the same deadlines ahead.
+  authority change; the authority also sends it when it anchors the clock and when a stop ends.
+  There is one anchor: only the authority that saw the lockstep start completed anchors the clock
+  from its own view (with its newest confirmable step due then), and every other relay, a newly
+  promoted one included, places that anchor at the first copy's receipt less its age and half the
+  link's RTT, once. A relay **merges** every copy it gets: the stopped time before each step
+  becomes the most either copy knows of, so a step's deadline is the later of the two, except that
+  a deadline the relay already holds as final never moves (stopped time the other copy knows of
+  before its limit is taken in at its limit), and its limit becomes the further of the two. The
+  authority's own record of a wait works the same way: the clock having stood at its limit for a
+  while raises the stop there to at least that long, never adds to a stop a merge already took in.
+  Copies only ever gain stopped time, so all of this is order-free and repeatable: frames arriving
+  late, twice, or from two relays both deciding the clock leave every relay on the same deadlines
+  ahead.
 - **Authority changes.** Only the authority makes stops, from what it can confirm, but it merges
   copies like every other relay. So a new authority decides at once from its own copy, and
   learns any stop it missed (one a former authority made that reached another relay) from the

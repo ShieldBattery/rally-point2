@@ -411,3 +411,80 @@ fn a_merged_clock_records_its_anchor_and_at_most_the_capped_number_of_stops() {
         Some(stops * 1_000_000),
     );
 }
+
+#[test]
+fn a_stop_taken_in_at_the_limit_is_not_counted_again_when_the_clock_moves_on() {
+    let start = Instant::now();
+    let mut authority = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut authority, &[0, 1], 100, start);
+    let limit = 99 + STALL_SLACK_STEPS;
+    // Another relay recorded the session's ten-second wait as a stop before this relay's limit,
+    // and this relay takes it in at its limit.
+    let mut copy = authority.session_clock_frame(on_time(start, 99)).unwrap();
+    copy.final_through = 101;
+    copy.stops = vec![ClockStop {
+        step: 100,
+        pause_us: 10_210_000,
+    }];
+    let resumed = on_time(start, limit) + Duration::from_secs(10);
+    let _ = authority.merge_session_clock(&copy, resumed, 0);
+    assert_eq!(authority.clock.pause(), 10_210 * MS);
+
+    // Turns resume: this relay saw the clock stand at its limit for the same wait, ten seconds
+    // of it, which the stop it took in already covers.
+    let update = forward(&mut authority, &[0, 1], 101, resumed);
+    assert_eq!(update.and_then(|update| update.frame), None, "nothing new");
+    assert_eq!(authority.clock.pause(), 10_210 * MS);
+    assert_eq!(
+        authority.clock.due_at(limit + 1),
+        Some(on_time(start, limit + 1) + 10_210 * MS)
+    );
+
+    // A wait longer than any record of it raises the stop to it, rather than adding to it.
+    let mut other = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut other, &[0, 1], 100, start);
+    let _ = other.merge_session_clock(&copy, resumed, 0);
+    let _ = forward(
+        &mut other,
+        &[0, 1],
+        101,
+        on_time(start, limit) + Duration::from_secs(12),
+    );
+    assert_eq!(other.clock.pause(), Duration::from_secs(12));
+}
+
+#[test]
+fn a_stop_taken_in_at_the_limit_reaches_every_relay_that_merges_the_copy() {
+    let start = Instant::now();
+    let mut authority = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut authority, &[0, 1], 100, start);
+    let frame = authority.session_clock_frame(on_time(start, 99)).unwrap();
+    let mut relay = rollback(peer_maker(), &[0, 1]);
+    let _ = relay.merge_session_clock(&frame, on_time(start, 99), 0);
+    // An older copy knows of a stop this relay doesn't, and its limit is no further on: the
+    // relay takes the stop in at its own limit, which stays where it was.
+    let mut older = frame.clone();
+    older.final_through = 101;
+    older.stops = vec![ClockStop {
+        step: 100,
+        pause_us: 10_210_000,
+    }];
+    let _ = relay.merge_session_clock(&older, on_time(start, 99), 0);
+    let limit = 99 + STALL_SLACK_STEPS;
+    assert_eq!(relay.clock.final_through(), Some(limit));
+    assert_eq!(relay.clock.pause(), 10_210 * MS);
+
+    // Its copy carries the stop at its limit, and a third relay merging it gets it too.
+    let copy = relay.session_clock_frame(on_time(start, 99)).unwrap();
+    assert_eq!(
+        copy.stops,
+        vec![ClockStop {
+            step: limit,
+            pause_us: 10_210_000,
+        }],
+    );
+    let mut third = rollback(peer_maker(), &[0, 1]);
+    let _ = third.merge_session_clock(&frame, on_time(start, 99), 0);
+    let _ = third.merge_session_clock(&copy, on_time(start, 99), 0);
+    assert_eq!(third.clock.pause(), 10_210 * MS);
+}
