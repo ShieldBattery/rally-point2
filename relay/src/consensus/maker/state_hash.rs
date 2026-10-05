@@ -45,17 +45,32 @@ impl DecisionMaker {
         let before = self.hashes.confirmable_until();
         self.hashes
             .note_forwarded(&self.key, slot, count, now, required);
-        // Unlike what is confirmable, an observer's turns count: a client's simulation waits on
-        // every slot's turn, an observer's too.
         let complete = self
             .expected_slots
             .iter()
-            .filter(|slot| !departures.contains_key(slot))
-            .map(|&slot| self.hashes.forwarded_count(slot))
+            .filter_map(|&slot| self.turns_still_awaited(slot))
             .min()
             .unwrap_or(0);
         self.turns_complete.store(complete, Ordering::Release);
         self.advance_clock(before, self.hashes.confirmable_until(), now)
+    }
+
+    /// How many of `slot`'s turns this relay has forwarded without a gap, as far as
+    /// [`turns_complete`](Self::turns_complete_handle) goes, or `None` once a client's simulation
+    /// no longer waits on any turn of the slot's that this relay lacks. Unlike what is confirmable,
+    /// an observer's turns count: a client waits on them too. So does a departed slot's until its
+    /// leave is decided (a held drop is still required by every client), and after that until this
+    /// relay holds every turn up to the leave's count; a leave decided without a count applies
+    /// once its directive reaches the client, which nothing but that client's downlink holds up.
+    fn turns_still_awaited(&self, slot: SlotId) -> Option<u64> {
+        let forwarded = self.hashes.forwarded_count(slot);
+        match self.decided_leaves.get(&slot) {
+            None => Some(forwarded),
+            Some(leave) => match leave.final_turn_count {
+                Some(count) if forwarded < count => Some(forwarded),
+                _ => None,
+            },
+        }
     }
 
     /// The count of every in-game slot's turns this relay has forwarded without a gap, as the

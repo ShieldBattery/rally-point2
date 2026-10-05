@@ -445,3 +445,34 @@ fn backoff_next_delay_jitters_within_half_of_base_and_advances_each_attempt() {
     let first = backoff.next_delay();
     assert!(first >= RECONNECT_BACKOFF_INITIAL / 2 && first <= RECONNECT_BACKOFF_INITIAL);
 }
+
+#[tokio::test]
+async fn a_new_connection_starts_the_turns_complete_stamp_over() {
+    // The stamp speaks for the relay that sent it; a re-homed connection's relay can hold fewer
+    // turns than the last one did, so an old, higher stamp must not outlive its connection.
+    let (mut sessions, chan) = ReconnectSessions::start().await;
+    let mut complete = chan.turns_complete.clone();
+    let wait = Duration::from_secs(2);
+
+    sessions.peer.set_turns_complete(Some(100));
+    sessions.peer.send(None).unwrap();
+    tokio::time::timeout(wait, complete.wait_for(|&x| x == 100))
+        .await
+        .expect("the first relay's stamp never arrived")
+        .unwrap();
+
+    let mut sessions = sessions.reconnect().await;
+    tokio::time::timeout(wait, complete.wait_for(|&x| x == 0))
+        .await
+        .expect("the stamp outlived its connection")
+        .unwrap();
+    sessions.peer.set_turns_complete(Some(80));
+    sessions.peer.send(None).unwrap();
+    tokio::time::timeout(wait, complete.wait_for(|&x| x == 80))
+        .await
+        .expect("the new relay's lower stamp never arrived")
+        .unwrap();
+
+    drop(chan);
+    let _ = sessions.session.await;
+}

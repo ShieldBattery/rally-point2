@@ -36,17 +36,70 @@ fn it_counts_the_turns_every_in_game_slot_has_forwarded_observers_included() {
     }
 }
 
-#[test]
-fn a_departed_slot_no_longer_holds_it_back() {
-    let now = Instant::now();
+/// Slots 0 and 1 playing with slot 2 observing, having forwarded 50, 40 and 50 turns.
+fn forwarded_50_40_50(now: Instant) -> DecisionMaker {
     let mut m = with_observer(Authority::SelfRelay);
-    for (slot, count) in [(0, 40), (1, 12), (2, 40)] {
+    for (slot, count) in [(0, 50), (1, 40), (2, 50)] {
         m.note_forwarded_turns(SlotId(slot), count, now);
     }
-    assert_eq!(complete(&m), 12);
-    m.decide_leave(SlotId(1), LEAVE_REASON_LEFT);
-    m.note_forwarded_turns(SlotId(0), 41, now);
     assert_eq!(complete(&m), 40);
+    m
+}
+
+#[test]
+fn a_held_drop_still_holds_it_back() {
+    // Every client still needs slot 1's turn 40 until its leave is decided, so a client stalled on
+    // it is waiting on the session, not its own downlink.
+    let now = Instant::now();
+    let mut m = forwarded_50_40_50(now);
+    m.record_departure(SlotId(1), DepartureStamps::default(), LEAVE_REASON_DROPPED);
+    m.note_forwarded_turns(SlotId(0), 51, now);
+    assert_eq!(complete(&m), 40);
+}
+
+#[test]
+fn a_counted_leave_holds_it_back_until_its_last_turn_is_in() {
+    let now = Instant::now();
+    let mut m = forwarded_50_40_50(now);
+    m.finalized_drops_enabled = true;
+    let _ = m.observe_leave(&LeaveDirective {
+        finalized: true,
+        slot: 1,
+        reason: LEAVE_REASON_DROPPED,
+        apply_at_frame: 45,
+        leave_seq: 1,
+        final_turn_count: Some(45),
+    });
+    m.note_forwarded_turns(SlotId(0), 51, now);
+    assert_eq!(
+        complete(&m),
+        40,
+        "slot 1's turns up to its leave aren't all here"
+    );
+    m.note_forwarded_turns(SlotId(1), 45, now);
+    assert_eq!(
+        complete(&m),
+        50,
+        "and once they are, it waits on nobody's turns past it"
+    );
+}
+
+#[test]
+fn a_leave_without_a_count_stops_holding_it_back_once_decided() {
+    // A client applies it as soon as the directive reaches it, which only its own downlink can
+    // hold up.
+    let now = Instant::now();
+    let mut m = forwarded_50_40_50(now);
+    let _ = m.observe_leave(&LeaveDirective {
+        finalized: false,
+        slot: 1,
+        reason: LEAVE_REASON_LEFT,
+        apply_at_frame: 41,
+        leave_seq: 1,
+        final_turn_count: None,
+    });
+    m.note_forwarded_turns(SlotId(0), 51, now);
+    assert_eq!(complete(&m), 50);
 }
 
 #[test]

@@ -49,6 +49,10 @@ impl LinkDriver {
         // fresh here as the `Wire`. The two reader receivers stay outside both:
         // the `select!` below polls them directly.
         let (mut wire, mut readers) = Wire::open(link, state.timing).await?;
+        // A `turns_complete` stamp speaks for the relay that sent it, and this connection's relay
+        // can hold less than the last one did (a re-home), so the newest stamp starts over with
+        // each connection. Within one, a packet reordered behind newer ones never moves it back.
+        seam.turns_complete.send_replace(0);
 
         // Re-carry any oversize turns a resume deferred to this connection's control
         // stream. Too large to ride a datagram, they were kept out of the unacked
