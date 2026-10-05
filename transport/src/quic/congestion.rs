@@ -12,8 +12,8 @@
 //! for the path: the turns are tiny next to whatever else is filling it.
 //!
 //! So the window never drops below [`MIN_CONGESTION_WINDOW`], which carries the largest session's
-//! turn stream over a slow round trip. Above it Cubic governs exactly as it would alone, which is
-//! where a mesh link's aggregated traffic and every connection's slow start live.
+//! turn stream over a slow, lossy round trip. Above it Cubic governs exactly as it would alone,
+//! which is where a mesh link's aggregated traffic and every connection's slow start live.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -22,10 +22,18 @@ use std::time::{Duration, Instant};
 use noq::congestion::{Controller, ControllerFactory, ControllerMetrics, CubicConfig};
 use noq_proto::RttEstimator;
 
-/// The smallest congestion window a link's controller holds, in bytes: the turns of a twelve-slot
-/// session's eleven peers, 24 a second each and up to about 450 bytes with their re-carried
-/// redundancy, over a 400 ms round trip.
-pub const MIN_CONGESTION_WINDOW: u64 = 48 * 1024;
+/// The smallest congestion window a link's controller holds, in bytes.
+///
+/// The heaviest stream it must carry is a twelve-slot session's eleven peers' turns, 24 a second
+/// each, as packets of up to about 500 bytes (a turn with its re-carried redundancy, plus QUIC's
+/// header, frame and AEAD tag): 132 KB a second. The window has to cover more than that stream's
+/// bytes per round trip, which is all that a lossless path holds in flight. A lost packet counts as
+/// in flight until loss detection declares it lost, about another round trip later, and acks arrive
+/// up to the ack delay late; at 10% loss over a 400 ms round trip, the stream holds about 62 KB in
+/// flight. The controller also refuses a send that would bring the bytes in flight up to the
+/// window, reserving a full-size packet. A window at the bare estimate still starves at its peaks
+/// and queues turns for seconds, so the floor is twice it.
+pub const MIN_CONGESTION_WINDOW: u64 = 128 * 1024;
 
 /// Builds the controller every link runs (see the module docs).
 #[derive(Debug, Default)]

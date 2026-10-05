@@ -61,3 +61,5 @@ fn above_the_floor_cubic_governs_alone() {
     assert!(backed_off < 4 * MIN_CONGESTION_WINDOW && backed_off > MIN_CONGESTION_WINDOW);
     assert_eq!(controller.window(), backed_off);
 }
+
+mod impaired_path;
