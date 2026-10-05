@@ -723,8 +723,9 @@ targets.
   confirmable: the turn that completed it is due when it arrived. That is when the slowest player's
   start reached the authority, so no player is asked to be earlier than the session has shown it can
   be.
-- **Stopping.** The clock may not run more than `STALL_SLACK_STEPS` (12, the client's prediction
-  limit plus a margin) past the newest turn the authority can confirm for every player. That step is the clock's *limit*:
+- **Stopping.** The clock may not run more than `STALL_SLACK_STEPS` (6, about where a client
+  stalls: its prediction limit less the couple of steps of rollback it steadily runs behind) past
+  the newest turn the authority can confirm for every player. That step is the clock's *limit*:
   when the clock reaches the limit's deadline before the next step is confirmable, it stands still
   there until one is, and the stop `(step, length)` pushes back every later deadline and no earlier
   one. Past the slack every player is stalled anyway, so that time is the whole session waiting (a

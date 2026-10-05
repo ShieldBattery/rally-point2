@@ -26,9 +26,11 @@ use super::*;
 use rally_point_proto::messages::ClockStop;
 use rally_point_proto::rollback::STEP_DURATION_US;
 
-/// How far the clock may run past the newest step the authority can confirm before it stops: the
-/// game client's prediction limit (8 steps) and a margin of 4.
-pub(in crate::consensus) const STALL_SLACK_STEPS: u64 = 12;
+/// How far the clock may run past the newest step the authority can confirm before it stops:
+/// where clients stall. A client runs at most its prediction limit (8 steps) past the newest step
+/// it knows every turn of, and steadily a couple of steps of rollback behind that, so it stalls
+/// about 6 steps past what is confirmable.
+pub(in crate::consensus) const STALL_SLACK_STEPS: u64 = 6;
 
 /// How far behind its limit the clock keeps each stop by step. A relay measures a slot's turns up
 /// to [`LEAD_SEEN_SEQS`] behind the slot's newest, and a player the session waits on is never more
