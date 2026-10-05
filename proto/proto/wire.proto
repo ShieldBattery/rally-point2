@@ -31,6 +31,14 @@ message Packet {
   // The freshly-produced payload plus redundant still-unacked ones. Empty for an
   // ack-only packet (one sent purely to carry acks).
   repeated Payload payloads = 4;
+
+  // On a packet a relay sends its own client in a rollback session: how many of
+  // every in-game slot's turns (observers' included) the relay has received
+  // without a gap. A client waiting on a turn below this count lacks it only
+  // because its own downlink hasn't delivered it yet; above it, the session is
+  // waiting on whoever hasn't sent theirs. Absent outside rollback sessions,
+  // before the relay has any, on mesh packets, and on packets clients send.
+  optional uint64 turns_complete = 5;
 }
 
 // One mesh datagram on a relay ↔ relay link. A relay-pair shares one QUIC

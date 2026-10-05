@@ -39,6 +39,7 @@ async fn a_mid_packet_out_of_window_payload_rolls_back_the_whole_packets_dedup_c
                 ..Default::default()
             },
         ],
+        turns_complete: None,
     };
     match link.process_incoming(packet) {
         Err(LinkError::PayloadOutOfWindow { slot, seq }) => {
@@ -72,6 +73,7 @@ async fn a_mid_packet_out_of_window_payload_rolls_back_the_whole_packets_dedup_c
             commands: vec![0xAA].into(),
             ..Default::default()
         }],
+        turns_complete: None,
     };
     let received = link.process_incoming(retry).unwrap();
     assert_eq!(received.fresh.len(), 1, "the payload is deliverable again");
@@ -105,6 +107,7 @@ async fn a_trailing_malformed_slot_rolls_back_an_earlier_valid_slots_commit_too(
                 ..Default::default()
             },
         ],
+        turns_complete: None,
     };
     match link.process_incoming(packet) {
         Err(LinkError::MalformedSlot(300)) => {}
@@ -144,6 +147,7 @@ async fn a_non_ingress_link_keeps_per_wire_slot_demux() {
                 ..Default::default()
             },
         ],
+        turns_complete: None,
     };
     let received = link.process_incoming(packet).unwrap();
     assert_eq!(received.fresh.len(), 2);
@@ -168,6 +172,7 @@ async fn carried_payloads_distinguishes_an_ack_only_packet_from_an_all_redundant
         ack: None,
         ack_bits: 0,
         payloads: Vec::new(),
+        turns_complete: None,
     };
     let received = link.process_incoming(ack_only).unwrap();
     assert!(received.fresh.is_empty());
@@ -178,6 +183,7 @@ async fn carried_payloads_distinguishes_an_ack_only_packet_from_an_all_redundant
         ack: None,
         ack_bits: 0,
         payloads: vec![turn(0, 0, 0xA0)],
+        turns_complete: None,
     };
     let received = link.process_incoming(fresh).unwrap();
     assert_eq!(received.fresh.len(), 1);
@@ -190,6 +196,7 @@ async fn carried_payloads_distinguishes_an_ack_only_packet_from_an_all_redundant
         ack: None,
         ack_bits: 0,
         payloads: vec![turn(0, 0, 0xA0)],
+        turns_complete: None,
     };
     let received = link.process_incoming(all_redundant).unwrap();
     assert!(received.fresh.is_empty());
@@ -237,6 +244,7 @@ async fn same_relay_resume_on_a_nonzero_slot_accepts_a_wire_slot_zero_stream() {
             ack: None,
             ack_bits: 0,
             payloads: vec![wire_turn(seq)],
+            turns_complete: None,
         };
         let received = relay.process_incoming(packet).unwrap();
         assert_eq!(received.fresh.len(), 1);
@@ -256,6 +264,7 @@ async fn same_relay_resume_on_a_nonzero_slot_accepts_a_wire_slot_zero_stream() {
         ack: None,
         ack_bits: 0,
         payloads: vec![wire_turn(8000)],
+        turns_complete: None,
     };
     match buggy.process_incoming(packet) {
         Err(LinkError::PayloadOutOfWindow { slot, seq }) => {

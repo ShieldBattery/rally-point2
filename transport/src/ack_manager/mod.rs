@@ -93,6 +93,9 @@ pub struct AckManager {
     received_packets: ReceivedPacketHistory,
     /// How the redundancy refill spends bytes and rotates coverage.
     policy: RecarryPolicy,
+    /// The `turns_complete` every packet built from now on carries (see
+    /// [`set_turns_complete`](Self::set_turns_complete)).
+    turns_complete: Option<u64>,
 }
 
 impl AckManager {
@@ -110,7 +113,15 @@ impl AckManager {
             unacked_payload_wire_len: Some(0),
             received_packets: ReceivedPacketHistory::default(),
             policy,
+            turns_complete: None,
         }
+    }
+
+    /// Sets the `turns_complete` every packet built from now on carries: a relay's
+    /// count of every in-game slot's turns it has received without a gap, on the
+    /// packets it sends its own client in a rollback session. `None` leaves it off.
+    pub fn set_turns_complete(&mut self, count: Option<u64>) {
+        self.turns_complete = count;
     }
 
     /// Resets the state bound to one QUIC connection, keeping the still-unacked

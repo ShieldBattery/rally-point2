@@ -90,6 +90,24 @@ pub(super) struct SlotLinkCtx {
     /// The rate limit on this link's rollback statistics reports, and whether
     /// it accepted any.
     rollback_stats: rollback_stats::RollbackStatsAdmission,
+    /// The session's count of every in-game slot's turns this relay has forwarded
+    /// without a gap, which every packet to this client carries as `turns_complete`
+    /// (see `DecisionMaker::turns_complete_handle`). Taken from the decision-maker
+    /// once it exists, so a send reads an atomic rather than taking its lock.
+    turns_complete: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl SlotLinkCtx {
+    /// The `turns_complete` stamp for the next packet to this client, or `None` while
+    /// there is none to give: outside a rollback session, or before every slot has
+    /// had a turn forwarded.
+    fn turns_complete_stamp(&self) -> Option<u64> {
+        let count = self
+            .turns_complete
+            .as_ref()?
+            .load(std::sync::atomic::Ordering::Acquire);
+        (count != 0).then_some(count)
+    }
 }
 
 /// Drives one authorized client's link until it closes.
@@ -338,6 +356,7 @@ pub async fn run_slot_link(
     // it observes the session started, so post-start sampling is never doubled.
     let pre_start_sampling = !decision_makers.is_started(&key);
     let pre_start_deadline = Instant::now() + PRE_START_SAMPLE_INTERVAL;
+    let turns_complete = decision_makers.turns_complete_handle(&key);
 
     let mut ctx = SlotLinkCtx {
         key,
@@ -363,6 +382,7 @@ pub async fn run_slot_link(
         leave_announced,
         game_started_reported,
         rollback_stats: rollback_stats::RollbackStatsAdmission::default(),
+        turns_complete,
     };
 
     if setup::apply_resume_anchor(&mut link, &mut ctx, &mut resume_cursors).is_break() {

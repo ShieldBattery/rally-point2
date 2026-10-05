@@ -738,6 +738,16 @@ targets.
   carrying it, so clients move their pacing by exactly the stop instead of sprinting. Each player's
   window starts over with it: a turn measured around the stop may have been read against the clock
   from before it, and would count as late by the whole stop.
+- **Turns complete.** Every packet a relay sends its own client in a rollback session carries
+  `turns_complete`: the fewest gap-free turns the relay has forwarded of any in-game slot,
+  observers' included (a client's simulation waits on their turns too), a departed slot's not. A
+  client stalled on a turn below it is waiting on its own downlink, which nobody else is; it keeps
+  sending its own turns on schedule, so its stall stays its own instead of stalling the session
+  when its turns stop. A client stalled on a turn above it is waiting on a player who hasn't sent
+  theirs, along with everyone else, and holds. The stamp rides the same downlink as the turns it
+  describes, so it is never staler than they are, and a downlink delivering nothing delivers no
+  stamp either: the client then holds, and a dead downlink ends up in the ordinary drop path
+  rather than keeping a player who can see nothing in the game.
 - **What it replaces.** In a rollback session the buffer law re-affirms the start's buffer once and
   then decides nothing (the buffer only seeds the lockstep start), and send-phase alignment never
   runs: the report sets each client's send timing outright, and a phase delay would only fight it.

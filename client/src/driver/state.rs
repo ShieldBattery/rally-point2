@@ -132,6 +132,9 @@ pub(super) struct GameSeam {
     /// The newest lead report, to hand to the game thread (see
     /// [`TurnChannels::lead_report`]).
     pub(super) lead_report: watch::Sender<Option<LeadReport>>,
+    /// The highest `turns_complete` stamp received, to hand to the game thread (see
+    /// [`TurnChannels::turns_complete`]).
+    pub(super) turns_complete: watch::Sender<u64>,
     /// The game's newest rollback statistics snapshot, to write up the control
     /// stream (see [`TurnChannels::rollback_stats`]).
     pub(super) rollback_stats: watch::Receiver<Option<RollbackStats>>,
@@ -185,6 +188,8 @@ impl GameSeam {
         // Lead reports each restate the whole window, so the newest is the only
         // one the game needs.
         let (lead_report_tx, lead_report_rx) = watch::channel(None);
+        // The relay's count only matters at its newest, and only grows.
+        let (turns_complete_tx, turns_complete_rx) = watch::channel(0);
         // Rollback statistics are cumulative, so the game's newest snapshot is
         // the only one worth sending.
         let (rollback_stats_tx, rollback_stats_rx) = watch::channel(None);
@@ -207,6 +212,7 @@ impl GameSeam {
             region_labels: region_labels_tx,
             phase_status: phase_status_tx,
             lead_report: lead_report_tx,
+            turns_complete: turns_complete_tx,
             rollback_stats: rollback_stats_rx,
         };
         let channels = TurnChannels {
@@ -229,6 +235,7 @@ impl GameSeam {
             region_labels: region_labels_rx,
             phase_status: phase_status_rx,
             lead_report: lead_report_rx,
+            turns_complete: turns_complete_rx,
             rollback_stats: rollback_stats_tx,
         };
         (seam, channels, result_expected)

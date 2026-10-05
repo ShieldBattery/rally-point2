@@ -219,7 +219,12 @@ pub(super) async fn handle_forwarded(
             // stream, so push the flush out; if it carried none (a
             // near-MTU turn), leave the timer so the flush
             // retransmits them.
-            match send_packet(link, Some(payload), &ctx.flight_counters) {
+            match send_packet(
+                link,
+                Some(payload),
+                &ctx.flight_counters,
+                ctx.turns_complete_stamp(),
+            ) {
                 Ok(carried_redundancy) => {
                     ctx.acks_owed = false;
                     if carried_redundancy {
@@ -297,8 +302,9 @@ pub(super) fn handle_beacon_cursor(
     ControlFlow::Continue(())
 }
 
-/// Sends one packet, returning whether it re-carried any still-unacked turn — if so,
-/// retransmission is already riding the forward stream and the flush can rest.
+/// Sends one packet carrying `turns_complete` (see `SlotLinkCtx::turns_complete_stamp`),
+/// returning whether it re-carried any still-unacked turn — if so, retransmission is
+/// already riding the forward stream and the flush can rest.
 ///
 /// A refused datagram (`PayloadTooLarge`) here is a *bundle* that outgrew a
 /// path-MTU shrink between sizing and sending — a recoverable loss the next,
@@ -310,7 +316,9 @@ pub(super) fn send_packet(
     link: &mut Link,
     payload: Option<Payload>,
     counters: &crate::observability::flight_recorder::SlotCounters,
+    turns_complete: Option<u64>,
 ) -> Result<bool, LinkError> {
+    link.set_turns_complete(turns_complete);
     match link.send(payload) {
         Ok(redundant) => {
             counters.note_redundancy(redundant);

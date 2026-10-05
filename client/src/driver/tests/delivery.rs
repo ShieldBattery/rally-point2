@@ -126,6 +126,7 @@ async fn delivers_reordered_payloads_to_the_game_in_seq_order() {
                 commands: vec![byte].into(),
                 ..Default::default()
             }],
+            turns_complete: None,
         }
         .encode_to_vec()
     };
@@ -179,6 +180,7 @@ async fn a_datagram_turn_with_an_out_of_range_slot_ends_the_link_as_a_failure() 
             commands: vec![0xEE].into(),
             ..Default::default()
         }],
+        turns_complete: None,
     }
     .encode_to_vec();
     fixture.peer.connection().send_datagram(raw.into()).unwrap();
@@ -260,6 +262,36 @@ async fn envelope_metadata_survives_delivery_to_the_game() {
 
     let delivered = fixture.chan.inbound.recv().await.unwrap();
     assert_eq!(delivered, stamped);
+
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn the_relays_turns_complete_stamp_surfaces_on_the_game_watch_and_only_grows() {
+    let mut fixture = DriverFixture::new().await;
+    let mut complete = fixture.chan.turns_complete.clone();
+    assert_eq!(*complete.borrow(), 0);
+
+    let stamp = |fixture: &mut DriverFixture, count| {
+        fixture.peer.set_turns_complete(Some(count));
+        fixture.peer.send(None).unwrap();
+    };
+    stamp(&mut fixture, 7);
+    tokio::time::timeout(Duration::from_secs(2), complete.wait_for(|&x| x == 7))
+        .await
+        .expect("the stamp reaches the game")
+        .unwrap();
+
+    // An older packet arriving late doesn't move it back.
+    stamp(&mut fixture, 5);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(*complete.borrow(), 7);
+
+    stamp(&mut fixture, 9);
+    tokio::time::timeout(Duration::from_secs(2), complete.wait_for(|&x| x == 9))
+        .await
+        .expect("a newer stamp reaches the game")
+        .unwrap();
 
     fixture.finish().await;
 }

@@ -38,6 +38,9 @@ impl SessionLink {
         Ok(Received {
             fresh: packet.payloads,
             carried_payloads,
+            // Only a relay's packets to its own client carry the stamp; a mesh
+            // peer's would describe that relay, not this one.
+            turns_complete: None,
         })
     }
 }

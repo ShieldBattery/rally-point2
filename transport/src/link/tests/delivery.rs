@@ -31,6 +31,26 @@ async fn delivers_each_payload_once_and_retires_on_ack() {
 }
 
 #[tokio::test]
+async fn carries_the_turns_complete_stamp_on_every_packet_once_set() {
+    let (mut relay, mut client, _relay_ep, _client_ep) = connected_links().await;
+
+    relay.send(Some(turn(0, 0, 0xA0))).unwrap();
+    assert_eq!(client.recv().await.unwrap().turns_complete, None);
+
+    // Turn-carrying and ack-only packets alike carry the newest stamp.
+    relay.set_turns_complete(Some(40));
+    relay.send(Some(turn(0, 1, 0xA1))).unwrap();
+    assert_eq!(client.recv().await.unwrap().turns_complete, Some(40));
+    relay.set_turns_complete(Some(41));
+    relay.send(None).unwrap();
+    assert_eq!(client.recv().await.unwrap().turns_complete, Some(41));
+
+    relay.set_turns_complete(None);
+    relay.send(None).unwrap();
+    assert_eq!(client.recv().await.unwrap().turns_complete, None);
+}
+
+#[tokio::test]
 async fn preserves_payload_annotations_across_send_and_recv() {
     // The payload envelope is opaque to the link: it dedups and retires by
     // (slot, seq) alone and must carry every other field through verbatim —
@@ -106,6 +126,7 @@ async fn delivers_a_redundant_low_seq_carried_after_a_high_fresh_one() {
                 ..Default::default()
             },
         ],
+        turns_complete: None,
     };
 
     let delivered = server.process_incoming(packet).unwrap().fresh;

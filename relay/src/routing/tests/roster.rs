@@ -8,18 +8,21 @@ fn active_conditions_sampling_requires_a_fresh_delivery() {
     let ack_only = Received {
         fresh: Vec::new(),
         carried_payloads: false,
+        turns_complete: None,
     };
     assert!(!should_sample_active_conditions(&ack_only));
 
     let all_redundant = Received {
         fresh: Vec::new(),
         carried_payloads: true,
+        turns_complete: None,
     };
     assert!(!should_sample_active_conditions(&all_redundant));
 
     let fresh = Received {
         fresh: vec![payload()],
         carried_payloads: true,
+        turns_complete: None,
     };
     assert!(should_sample_active_conditions(&fresh));
 }

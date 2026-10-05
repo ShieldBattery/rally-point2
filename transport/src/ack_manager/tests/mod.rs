@@ -61,6 +61,7 @@ fn incoming(seq: u32, ack: Option<u32>, acked: &[u32]) -> Packet {
         ack,
         ack_bits,
         payloads: Vec::new(),
+        turns_complete: None,
     }
 }
 

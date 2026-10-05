@@ -37,6 +37,7 @@ async fn a_mid_packet_malformed_slot_rolls_back_the_session_link_too() {
                     ..Default::default()
                 },
             ],
+            turns_complete: None,
         }),
         conditions: None,
         tenant: None,
@@ -64,6 +65,7 @@ async fn a_mid_packet_malformed_slot_rolls_back_the_session_link_too() {
             ack: None,
             ack_bits: 0,
             payloads: vec![turn(0, 0, 0xAA)],
+            turns_complete: None,
         }),
         conditions: None,
         tenant: None,
@@ -93,6 +95,7 @@ fn session_receive_compacts_fresh_payloads_in_the_decoded_vector() {
             turn(0, 0, 0xD0),
             turn(1, 0, 0xC0),
         ],
+        turns_complete: None,
     };
     let allocation = packet.payloads.as_ptr();
     let capacity = packet.payloads.capacity();
@@ -186,6 +189,7 @@ async fn a_mesh_session_accepts_a_mid_stream_first_contact_far_past_the_window()
                 ack: None,
                 ack_bits: 0,
                 payloads: seqs.iter().map(|&seq| turn(0, seq, seq as u8)).collect(),
+                turns_complete: None,
             }),
             conditions: None,
             tenant: None,
@@ -242,6 +246,7 @@ async fn anchor_receive_window_resumes_a_mesh_session_at_its_cursor() {
                 turn(0, 5001, 0x02),
                 turn(0, 5002, 0x03),
             ],
+            turns_complete: None,
         }),
         conditions: None,
         tenant: None,

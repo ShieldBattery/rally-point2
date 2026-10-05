@@ -462,6 +462,15 @@ impl Link {
         }
     }
 
+    /// Sets the `turns_complete` stamp every packet this link sends from now on
+    /// carries: on a relay's link to its own client in a rollback session, how many
+    /// of every in-game slot's turns the relay has received without a gap. A client
+    /// stalled on a turn below it is waiting on its own downlink, not on the
+    /// session. `None` leaves the stamp off.
+    pub fn set_turns_complete(&mut self, count: Option<u64>) {
+        self.acks.set_turns_complete(count);
+    }
+
     /// Awaits the next datagram, folds its acks into the manager, and returns what
     /// it delivered: the payloads not seen before (redundant copies dropped, in
     /// ascending seq order within each slot) plus whether the packet carried any
@@ -507,6 +516,7 @@ impl Link {
             // second vector.
             fresh: packet.payloads,
             carried_payloads,
+            turns_complete: packet.turns_complete,
         })
     }
 }
@@ -522,6 +532,10 @@ pub struct Received {
     /// so the receiver must not schedule an ack in return, or two idle links would
     /// ack each other's acks forever.
     pub carried_payloads: bool,
+    /// The sending relay's count of every in-game slot's turns it has received
+    /// without a gap, when the packet carried one (see
+    /// [`set_turns_complete`](Link::set_turns_complete)).
+    pub turns_complete: Option<u64>,
 }
 
 #[cfg(test)]

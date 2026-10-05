@@ -103,6 +103,7 @@ fn ack_history(c: &mut Criterion) {
                 ack: None,
                 ack_bits: 0,
                 payloads: Vec::new(),
+                turns_complete: None,
             })
             .expect("synthetic receive history is valid");
     }

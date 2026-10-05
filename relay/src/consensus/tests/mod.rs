@@ -44,6 +44,7 @@ mod shrink;
 mod silence;
 mod state_hash;
 mod target;
+mod turns_complete;
 
 /// The session shape almost every test here runs on: this relay decides,
 /// the bounds are wide enough that clamping never interferes, and no slot

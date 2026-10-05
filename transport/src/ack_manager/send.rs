@@ -70,6 +70,7 @@ impl AckManager {
             ack: self.last_seen_remote().map(|s| s as u32),
             ack_bits: self.ack_bits(),
             payloads: Vec::new(),
+            turns_complete: self.turns_complete,
         };
         self.packet_seq = advanced;
 

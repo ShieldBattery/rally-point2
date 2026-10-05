@@ -117,6 +117,7 @@ fn rejects_inconsistent_ack_state() {
                 ack: Some(1),
                 ack_bits: 0,
                 payloads: Vec::new(),
+                turns_complete: None,
             },
             AckError::AckAheadOfSent { ack: 1, sent: 1 },
         ),
@@ -127,6 +128,7 @@ fn rejects_inconsistent_ack_state() {
                 ack: None,
                 ack_bits: 0b1,
                 payloads: Vec::new(),
+                turns_complete: None,
             },
             AckError::AckBitsWithoutAck,
         ),
@@ -137,6 +139,7 @@ fn rejects_inconsistent_ack_state() {
                 ack: Some(0),
                 ack_bits: 0b1,
                 payloads: Vec::new(),
+                turns_complete: None,
             },
             AckError::AckBitsOutOfRange {
                 ack: 0,

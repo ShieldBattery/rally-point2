@@ -128,6 +128,11 @@ impl StateHashTracker {
         self.confirmable_until
     }
 
+    /// How many of `slot`'s turns this relay has forwarded without a gap.
+    pub(in crate::consensus) fn forwarded_count(&self, slot: SlotId) -> u64 {
+        self.forwarded.get(&slot).copied().unwrap_or(0)
+    }
+
     /// Notes that this relay has forwarded `count` of `slot`'s turns without a gap, as of `now`,
     /// and starts the deadline of every report step that has become confirmable. `required` yields
     /// the slots whose turns a step needs. Runs for every forwarded turn, so it allocates nothing

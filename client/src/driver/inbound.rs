@@ -75,6 +75,14 @@ pub(super) async fn on_received(
     if received.carried_payloads {
         wire.acks_owed = true;
     }
+    if let Some(count) = received.turns_complete {
+        // Packets can arrive out of order, so an older, lower stamp never moves it back.
+        seam.turns_complete.send_if_modified(|newest| {
+            let grew = count > *newest;
+            *newest = (*newest).max(count);
+            grew
+        });
+    }
     match ingest_fresh_turns(received.fresh, &mut state.reorder, &seam.inbound) {
         Release::Delivered => {}
         Release::GameClosed => return ArmFlow::Teardown,

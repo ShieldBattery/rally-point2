@@ -30,6 +30,16 @@ impl DecisionMakers {
         self.lock().get_mut(key)?.take_lead_samples()
     }
 
+    /// The shared count `key`'s session stamps as `turns_complete` on every packet to this relay's
+    /// own clients (see [`DecisionMaker::turns_complete_handle`]), or `None` before the session
+    /// has a decision-maker here.
+    pub fn turns_complete_handle(
+        &self,
+        key: &SessionKey,
+    ) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        Some(self.lock().get(key)?.turns_complete_handle())
+    }
+
     /// `slot`'s current lead report in `key`'s session, for the re-send a slot gets when it
     /// (re)connects.
     pub fn lead_report(&self, key: &SessionKey, slot: SlotId) -> Option<LeadReport> {

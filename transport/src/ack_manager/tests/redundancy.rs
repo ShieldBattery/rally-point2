@@ -90,6 +90,7 @@ fn all_fit_refill_carries_every_candidate_and_increments_each_once() {
         payloads: std::iter::once(fresh.clone())
             .chain(candidates.iter().cloned())
             .collect(),
+        turns_complete: None,
     }
     .encoded_len();
     let packet = build_sent(&mut manager, Some(fresh.clone()), exact_budget);
@@ -221,6 +222,9 @@ fn a_permanently_tight_budget_spreads_redundancy_coverage_across_slots() {
     // ranking, so the spacing schedule (which would legitimately let
     // well-covered payloads sit out rounds) is disabled.
     let mut manager = AckManager::with_policy(RecarryPolicy::unbounded());
+    // Headers as wide as the worst case `lone_packet_len` sizes the budget for
+    // below, so that budget holds one payload, not a stampless header's spare.
+    manager.set_turns_complete(Some(u64::MAX));
     // Four slots, each with one unacked payload that is never touched
     // again as "fresh" -- from here on each is purely along for the
     // redundancy ride, competing for the same tight budget.

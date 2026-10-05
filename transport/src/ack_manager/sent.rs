@@ -107,7 +107,8 @@ pub(super) fn payload_element_len(payload_len: usize) -> usize {
 pub const GUARANTEED_DATAGRAM_BUDGET: usize = 1024;
 
 /// The encoded size of a packet carrying `payload` alone, assuming worst-case
-/// header state (maximal seq/ack varints, full ack bitfield). If this exceeds
+/// header state (maximal seq/ack varints, full ack bitfield, the widest
+/// `turns_complete` stamp). If this exceeds
 /// [`GUARANTEED_DATAGRAM_BUDGET`], some packet in the connection's lifetime
 /// may be unable to carry the payload — the caller's signal to refuse it up
 /// front (or divert it to a reliable stream) rather than register it as
@@ -119,6 +120,7 @@ pub(crate) fn lone_packet_len(payload: &Payload) -> usize {
         ack: Some(u32::MAX),
         ack_bits: u32::MAX,
         payloads: Vec::new(),
+        turns_complete: Some(u64::MAX),
     };
     header.encoded_len() + payload_element_len(payload.encoded_len())
 }

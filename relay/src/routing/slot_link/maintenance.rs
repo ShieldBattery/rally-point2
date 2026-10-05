@@ -17,8 +17,14 @@ pub(super) fn maintenance_flush(link: &mut Link, ctx: &mut SlotLinkCtx) -> Contr
     // retransmits a forwarded turn the fresh stream can't re-carry, and
     // what acks a client with no return traffic; it stays silent when
     // nothing is unacked and nothing is owed.
+    // A link set up before its session had a decision-maker picks up the shared
+    // count here, off the per-packet path.
+    if ctx.turns_complete.is_none() {
+        ctx.turns_complete = ctx.decision_makers.turns_complete_handle(&ctx.key);
+    }
     if ctx.acks_owed || link.payloads_in_flight() > 0 {
-        if let Err(error) = send_packet(link, None, &ctx.flight_counters) {
+        let stamp = ctx.turns_complete_stamp();
+        if let Err(error) = send_packet(link, None, &ctx.flight_counters, stamp) {
             log_link_closed(&ctx.key, ctx.slot, &error);
             return ControlFlow::Break(());
         }

@@ -9,6 +9,9 @@
 
 use super::*;
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+
 mod authority;
 mod buffer;
 mod clock;
@@ -359,6 +362,12 @@ pub struct DecisionMaker {
     /// The state hash comparator of a rollback session. Kept on every relay and across authority
     /// changes, so a promoted authority carries on judging where the old one stopped.
     pub(in crate::consensus) hashes: StateHashTracker,
+    /// In a rollback session, how many of every in-game slot's turns (observers' included, a
+    /// departed slot's not) this relay has forwarded without a gap: the `turns_complete` stamp on
+    /// every packet to this relay's own clients, which tells a stalled client whether the turn it
+    /// waits on is stuck on its own downlink or not here at all. Shared with those links, so the
+    /// per-packet read takes no lock. Zero until every slot has forwarded a turn.
+    pub(in crate::consensus) turns_complete: Arc<AtomicU64>,
     /// Slots whose drop is being (or has been) home-finalized here: admission
     /// is refused while a slot is in this set, which is what makes the
     /// finalization snapshot's ingress cut real. Populated only on the
@@ -515,6 +524,7 @@ impl DecisionMaker {
             lead: LeadTracker::default(),
             clock_stop_events: 0,
             hashes: StateHashTracker::default(),
+            turns_complete: Arc::default(),
             finalizing_drops: HashSet::new(),
             rehomed_homes: HashSet::new(),
             close_reported: false,

@@ -219,6 +219,13 @@ pub struct TurnChannels {
     /// report restates the whole window, so only the newest matters. `None`
     /// until the first report arrives, and always outside a rollback session.
     pub lead_report: watch::Receiver<Option<LeadReport>>,
+    /// In a rollback session, the highest count the home relay has stamped on its
+    /// packets of every in-game slot's turns it holds without a gap: every turn
+    /// below it has reached the relay. A game stalled waiting on a turn below it is
+    /// waiting on its own downlink, which the rest of the session is not; above it,
+    /// the session is waiting on a player who hasn't sent theirs. Zero until the
+    /// first stamped packet arrives, and always outside a rollback session.
+    pub turns_complete: watch::Receiver<u64>,
     /// This client's own cumulative rollback statistics, for the relay's flight
     /// recording. The game publishes a fresh snapshot with
     /// [`send_replace`](watch::Sender::send_replace) whenever it wants one

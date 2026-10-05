@@ -147,6 +147,7 @@ async fn rejects_a_packet_with_a_zero_session_id() {
             ack: None,
             ack_bits: 0,
             payloads: vec![turn(0, 0, 0xA0)],
+            turns_complete: None,
         }),
         conditions: None,
         tenant: None,
