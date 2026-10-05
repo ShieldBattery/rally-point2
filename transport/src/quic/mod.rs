@@ -26,6 +26,10 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
+mod congestion;
+
+pub use congestion::MIN_CONGESTION_WINDOW;
+
 /// ALPN protocol id negotiated on every client ↔ relay QUIC connection. The
 /// trailing number is bumped on any change an older peer can't interoperate
 /// with — the datagram wire framing, the connection-binding handshake, or the
@@ -106,7 +110,8 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// elicit ACKs, resetting both idle timers), so the accept side needs no change.
 const MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Builds a `TransportConfig` with keepalive (to prevent idle disconnects during
+/// Builds a `TransportConfig` running the floored congestion controller (see
+/// [`floored_transport_config`]), with keepalive (to prevent idle disconnects during
 /// silences) and a shorter-than-default idle timeout (to detect dead peers fast).
 /// Applied to every dial side — mesh ([`mesh_client_config`]) *and* client edge
 /// ([`client_config`]). On the client edge it is load-bearing: when a player
@@ -118,11 +123,21 @@ const MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// as the minimum of both ends, so setting it on the dial side governs without
 /// touching `server_config`, and one side's keepalive keeps both idle timers reset.
 fn keepalive_transport_config() -> noq::TransportConfig {
-    let mut config = noq::TransportConfig::default();
+    let mut config = floored_transport_config();
     config.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
     config.max_idle_timeout(Some(
         noq::IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("10s fits in a VarInt"),
     ));
+    config
+}
+
+/// A default `TransportConfig` running the floored Cubic controller (see
+/// [`MIN_CONGESTION_WINDOW`]). Every side of every link starts from this: each
+/// endpoint's controller governs only what that endpoint sends, so the floor has
+/// to be set on the relay's accept side as well as on each dialer.
+fn floored_transport_config() -> noq::TransportConfig {
+    let mut config = noq::TransportConfig::default();
+    config.congestion_controller_factory(Arc::new(congestion::FlooredCubicConfig::default()));
     config
 }
 
@@ -310,7 +325,11 @@ pub fn server_config(
     tls.alpn_protocols = vec![ALPN.to_vec(), MESH_ALPN.to_vec()];
 
     let server = QuicServerConfig::try_from(tls)?;
-    Ok(noq::ServerConfig::with_crypto(Arc::new(server)))
+    let mut config = noq::ServerConfig::with_crypto(Arc::new(server));
+    // Only the congestion controller differs from the defaults here: keepalive and
+    // the idle timeout are the dialer's to set (see `keepalive_transport_config`).
+    config.transport_config(Arc::new(floored_transport_config()));
+    Ok(config)
 }
 
 /// Builds the client-edge QUIC config, trusting the given root certificates to

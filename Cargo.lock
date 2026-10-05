@@ -2918,6 +2918,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "noq",
+ "noq-proto",
  "prost",
  "rally-point-proto",
  "rcgen 0.14.10",

@@ -23,6 +23,9 @@ thiserror = { workspace = true }
 # 32-bit game DLL without a C/NASM toolchain.
 noq = { workspace = true }
 rustls = { workspace = true }
+# Only for the `RttEstimator` type the congestion controller wrapper in `quic`
+# forwards to noq's Cubic (noq doesn't re-export it).
+noq-proto = { workspace = true }
 # Only for `quic::cert_fingerprint` (the SHA-256 the mesh-accept path pins a
 # dialing peer's certificate against). Already compiled into this crate
 # transitively as rustls's pinned crypto provider (see the provider note
