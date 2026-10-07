@@ -141,9 +141,9 @@ impl DecisionMakers {
     }
 
     /// Every slot of `key` whose current connection generation is Up, with that
-    /// generation's epoch (see [`DecisionMaker::connected_slots`]). Empty when
-    /// no maker exists.
-    pub fn connected_slots(&self, key: &SessionKey) -> Vec<(SlotId, u64)> {
+    /// generation's epoch, in slot order, leaving out any slot with a recorded
+    /// departure or a decided leave. Empty when no maker exists.
+    pub(crate) fn connected_slots(&self, key: &SessionKey) -> Vec<(SlotId, u64)> {
         self.lock()
             .get(key)
             .map(|maker| maker.connected_slots())
