@@ -588,6 +588,9 @@ closing the local race where an old task finishes after its replacement publishe
 epoch remains tombstoned for the rest of the session. The set is deliberately not age- or count-bounded:
 epochs have equality-only semantics and cross-channel delivery supplies no safe point after which an old
 reliable frame could be reinterpreted as a new generation.
+A client whose link comes up is sent `connected=true(E)` for every other member whose generation E is
+Up at that relay right then, since the live level changes reached only the links registered when they
+happened. The client's own copy of the epoch fence orders this snapshot against any live change racing it.
 
 A fresh mesh link reliably replays every active `connected=true` epoch. Registry mutation and replay enqueue
 are serialized, so the link receives either the old replay followed by the new transition or the new replay;

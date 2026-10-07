@@ -102,10 +102,11 @@ pub(crate) use drops::{
     complete_finalized_drop, finalize_evicted_drop, finalize_home_drop, honor_drop_request,
 };
 pub(crate) use fan_out::{
-    broadcast_connectivity, deliver_lead_report_to_slot, deliver_load_state_probe_to_slot,
-    deliver_phase_directive_to_slot, deliver_region_labels_to_slot, deliver_session_start_to_slot,
-    fan_out, fan_out_connectivity, fan_out_lead_reports, fan_out_leave, fan_out_phase_directives,
-    fan_out_region_labels, fan_out_session_start,
+    broadcast_connectivity, deliver_connectivity_to_slot, deliver_lead_report_to_slot,
+    deliver_load_state_probe_to_slot, deliver_phase_directive_to_slot,
+    deliver_region_labels_to_slot, deliver_session_start_to_slot, fan_out, fan_out_connectivity,
+    fan_out_lead_reports, fan_out_leave, fan_out_phase_directives, fan_out_region_labels,
+    fan_out_session_start,
 };
 pub(crate) use lifecycle::{abandon_refused_admission, deliver_session_start, reap_provisional};
 pub(crate) use state_hash::{end_desynced_slot_link, record_desync_eviction};

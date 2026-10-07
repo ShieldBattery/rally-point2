@@ -354,6 +354,21 @@ pub(crate) fn deliver_lead_report_to_slot(
     deliver_to_slot(sessions, key, slot, |entry| entry.lead_push.clone(), report);
 }
 
+/// Pushes each of `changes` down one named slot's connectivity channel, in
+/// order, as [`deliver_to_slot`] does for a single value.
+pub(crate) fn deliver_connectivity_to_slot(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    changes: impl IntoIterator<Item = ConnectivityChange>,
+) {
+    if let Some(tx) = slot_sender(sessions, key, slot, |entry| entry.conn_push.clone()) {
+        for change in changes {
+            let _ = tx.try_send(change);
+        }
+    }
+}
+
 /// Pushes a slot-connectivity change down every currently-registered local
 /// slot's control stream in the `key` group, with no exclusion — a connectivity
 /// change is informational for everyone, and a client receiving its own slot's

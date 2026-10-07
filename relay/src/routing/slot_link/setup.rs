@@ -88,14 +88,31 @@ pub(super) fn activate_slot(
 }
 
 /// The pushes a slot gets for state the session reached before its link came up:
-/// the region-label map once the release gate has opened, the send-phase delay
-/// the controller already commanded it, and its current lead report.
+/// which other members are connected right now, the region-label map once the
+/// release gate has opened, the send-phase delay the controller already
+/// commanded it, and its current lead report.
 pub(super) fn push_connect_time_state(
     sessions: &Sessions,
     decision_makers: &Arc<crate::consensus::DecisionMakers>,
     key: &SessionKey,
     slot: SlotId,
 ) {
+    // Each member's connect is broadcast only to the slots registered at that
+    // moment, so a slot arriving later would never learn who was already here.
+    // Restate every other member's live generation to it. A live change racing
+    // this snapshot is ordered against it by the client's epoch fence: a stale
+    // Up(E) after Down(E), or after a newer generation, is refused there, and a
+    // duplicate of the current Up(E) is a no-op.
+    deliver_connectivity_to_slot(
+        sessions,
+        key,
+        slot,
+        decision_makers
+            .connected_slots(key)
+            .into_iter()
+            .filter(|&(member, _)| member != slot)
+            .map(|(member, epoch)| (member, true, Some(epoch))),
+    );
     // A session whose release gate opened before this slot's link came up has
     // labels every other member already holds, and no later gate opening will
     // fire for it — so push the map straight down this slot. The gate's own
