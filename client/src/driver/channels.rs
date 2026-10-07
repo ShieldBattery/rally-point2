@@ -159,12 +159,14 @@ pub struct TurnChannels {
     pub session_start: mpsc::Receiver<Option<u32>>,
     /// Slot-connectivity changes, each carrying `(slot, connected)`: a member's
     /// link died (`false`) or (re)registered (`true`). Best-effort and
-    /// informational — the game uses it to drive a "player X disconnected" display,
-    /// independent of the synced player-leave that actually removes a slot from
-    /// lockstep (which arrives on [`leaves`](Self::leaves)). No replay and no
-    /// ordering guarantee against the leave path: a change that flowed before this
-    /// stream came up is simply never seen, and an unknown slot is a no-op for the
-    /// game.
+    /// informational — the game uses it to drive "player X connecting" and "player X
+    /// disconnected" displays, independent of the synced player-leave that actually
+    /// removes a slot from lockstep (which arrives on [`leaves`](Self::leaves)). No
+    /// ordering guarantee against the leave path, and no history: when this
+    /// client's link comes up, the relay restates every other member it holds as
+    /// connected right then (`true` only), and changes after that arrive live. A
+    /// member that came and went before this link was up is never seen, and an
+    /// unknown slot is a no-op for the game.
     ///
     /// Two sources feed this one channel:
     ///

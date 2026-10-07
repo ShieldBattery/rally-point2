@@ -140,6 +140,16 @@ impl DecisionMakers {
             .is_none_or(|maker| maker.connection_epoch_matches(slot, epoch))
     }
 
+    /// Every slot of `key` whose current connection generation is Up, with that
+    /// generation's epoch, in slot order, leaving out any slot with a recorded
+    /// departure or a decided leave. Empty when no maker exists.
+    pub(crate) fn connected_slots(&self, key: &SessionKey) -> Vec<(SlotId, u64)> {
+        self.lock()
+            .get(key)
+            .map(|maker| maker.connected_slots())
+            .unwrap_or_default()
+    }
+
     /// Epoch-fenced live-state removal for a connection teardown.
     #[must_use]
     pub fn remove_slot_for_epoch(

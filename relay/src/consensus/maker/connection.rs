@@ -404,6 +404,26 @@ impl DecisionMaker {
         }
     }
 
+    /// Every slot whose current connection generation is Up, with that
+    /// generation's epoch, in slot order. A slot with a recorded departure or a
+    /// decided leave is left out even if its generation was never marked down:
+    /// it is not a member a client should show as connected.
+    pub(in crate::consensus) fn connected_slots(&self) -> Vec<(SlotId, u64)> {
+        let mut slots: Vec<(SlotId, u64)> = self
+            .connection_states
+            .iter()
+            .filter(|(slot, _)| {
+                !self.departures.contains_key(slot) && !self.decided_leaves.contains_key(slot)
+            })
+            .filter_map(|(&slot, &state)| match state {
+                ConnectionState::Up(epoch) => Some((slot, epoch)),
+                ConnectionState::Down(_) => None,
+            })
+            .collect();
+        slots.sort_by_key(|&(slot, _)| slot);
+        slots
+    }
+
     /// Whether `slot` currently has a live (Up) connection generation.
     pub(in crate::consensus) fn connection_is_up(&self, slot: SlotId) -> bool {
         matches!(
