@@ -183,6 +183,10 @@ pub(super) enum EventKind {
     CwndRelease(f64),
     /// The receiver's delivered-prefix cursors reach the sender.
     BeaconArrive(Vec<(SlotId, u64)>),
+    /// The sender's maintenance flush may be due. Each push of the deadline
+    /// schedules one of these, so one that finds the deadline moved later is
+    /// stale and does nothing.
+    SenderFlush,
 }
 
 pub(super) struct Event {

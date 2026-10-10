@@ -23,6 +23,37 @@ pub(super) struct Scenario {
     pub(super) episode_window: Option<(f64, f64)>,
     pub(super) forward: fn() -> PathModel,
     pub(super) reverse: fn() -> PathModel,
+    pub(super) sender: SenderModel,
+}
+
+/// How the sender produces packets beyond its fresh turns.
+#[derive(Clone, Copy)]
+pub(super) struct SenderModel {
+    /// Stall once the newest turn would run more than this many turns past the
+    /// receiver's delivered prefix, as the sender last heard it from the
+    /// beacon: a game whose own lost turns hold up every peer stops getting
+    /// their turns and stops stepping. `None` produces a turn every tick.
+    pub(super) stall_lag_turns: Option<u64>,
+    /// Send maintenance flushes the way the drivers do: one falls due a
+    /// flush interval after the last send that re-carried anything, and goes
+    /// out if anything is still unacked. `None` sends fresh packets only.
+    pub(super) flush_interval_ms: Option<f64>,
+}
+
+impl SenderModel {
+    /// A turn every tick and no flushes: the uninterrupted stream the tuning
+    /// scenarios measure the refill against.
+    pub(super) const CONTINUOUS: Self = Self {
+        stall_lag_turns: None,
+        flush_interval_ms: None,
+    };
+
+    /// A rollback client: stalls a prediction limit plus a few turns of pipe
+    /// past the delivered prefix, and flushes at the drivers' interval.
+    pub(super) const STALLING: Self = Self {
+        stall_lag_turns: Some(12),
+        flush_interval_ms: Some(150.0),
+    };
 }
 
 /// What one run measured.
@@ -47,6 +78,10 @@ pub(super) struct RunStats {
     /// For blackout scenarios: milliseconds from the end of the outage until
     /// every payload created before it had been delivered.
     pub(super) backlog_clear_after_ms: Option<f64>,
+    /// Maintenance flushes sent, their total encoded bytes, and the largest.
+    pub(super) flush_packets: u64,
+    pub(super) flush_bytes: f64,
+    pub(super) max_flush_packet_bytes: usize,
 }
 
 pub(super) fn percentile(values: &[f64], p: f64) -> f64 {
@@ -78,6 +113,13 @@ impl RunStats {
         self.episode_fwd_bytes / self.episode_fwd_packets as f64
     }
 
+    pub(super) fn mean_bytes_per_flush(&self) -> f64 {
+        if self.flush_packets == 0 {
+            return 0.0;
+        }
+        self.flush_bytes / self.flush_packets as f64
+    }
+
     /// Folds another seed's run into this one: latencies pool, counters sum,
     /// maxima take the worse run.
     pub(super) fn merge(&mut self, other: RunStats) {
@@ -95,6 +137,11 @@ impl RunStats {
         self.queue_drops += other.queue_drops;
         self.wire_losses += other.wire_losses;
         self.max_prefix_lag_turns = self.max_prefix_lag_turns.max(other.max_prefix_lag_turns);
+        self.flush_packets += other.flush_packets;
+        self.flush_bytes += other.flush_bytes;
+        self.max_flush_packet_bytes = self
+            .max_flush_packet_bytes
+            .max(other.max_flush_packet_bytes);
         self.backlog_clear_after_ms =
             match (self.backlog_clear_after_ms, other.backlog_clear_after_ms) {
                 (Some(a), Some(b)) => Some(a.max(b)),
@@ -121,6 +168,7 @@ pub(super) fn scenarios() -> Vec<Scenario> {
             episode_window: None,
             forward: clean_path,
             reverse: clean_path,
+            sender: SenderModel::CONTINUOUS,
         },
         Scenario {
             name: "iid-2pct",
@@ -134,6 +182,7 @@ pub(super) fn scenarios() -> Vec<Scenario> {
                 bottleneck: None,
             },
             reverse: clean_path,
+            sender: SenderModel::CONTINUOUS,
         },
         Scenario {
             name: "bursty-fade",
@@ -153,6 +202,7 @@ pub(super) fn scenarios() -> Vec<Scenario> {
                 bottleneck: None,
             },
             reverse: clean_path,
+            sender: SenderModel::CONTINUOUS,
         },
         Scenario {
             name: "blackout-500ms",
@@ -170,6 +220,7 @@ pub(super) fn scenarios() -> Vec<Scenario> {
                 bottleneck: None,
             },
             reverse: clean_path,
+            sender: SenderModel::CONTINUOUS,
         },
         // The production episode: for 30s the last mile bloats (+140ms one-way,
         // matching the observed ~300ms smoothed RTT) and loses ~3% of packets,
@@ -207,6 +258,7 @@ pub(super) fn scenarios() -> Vec<Scenario> {
                 }),
             },
             reverse: clean_path,
+            sender: SenderModel::CONTINUOUS,
         },
         // An outage-grade squeeze: deeper bufferbloat and heavier loss push
         // effective capacity below what the fresh turn stream needs, so every
@@ -246,6 +298,7 @@ pub(super) fn scenarios() -> Vec<Scenario> {
                 }),
             },
             reverse: clean_path,
+            sender: SenderModel::CONTINUOUS,
         },
         // The same squeeze on a client uplink (one fresh payload per tick).
         Scenario {
@@ -278,8 +331,80 @@ pub(super) fn scenarios() -> Vec<Scenario> {
                 }),
             },
             reverse: clean_path,
+            sender: SenderModel::CONTINUOUS,
+        },
+        // A rollback client's uplink blacks out: its turns stop reaching the
+        // session, so within a prediction limit the client stalls and sends
+        // nothing but flushes until the path returns. What players feel is how
+        // long after the outage the backlog lands ("clear ms").
+        Scenario {
+            name: "stall-blackout-1500ms",
+            duration_ms: 60_000.0,
+            fresh_per_tick: 1,
+            episode_window: Some((BLACKOUT_FROM_MS, BLACKOUT_FROM_MS + 1_500.0)),
+            forward: uplink_blackout::<1_500>,
+            reverse: clean_path,
+            sender: SenderModel::STALLING,
+        },
+        // The same outage on an uplink already squeezed (bloated, lossy, its
+        // congestion window crushed), where flush bytes compete with the
+        // backlog for a path that can barely carry the turn stream.
+        Scenario {
+            name: "stall-squeeze-blackout",
+            duration_ms: 60_000.0,
+            fresh_per_tick: 1,
+            episode_window: Some((BLACKOUT_FROM_MS, BLACKOUT_FROM_MS + 1_500.0)),
+            forward: squeezed_uplink_blackout::<1_500>,
+            reverse: clean_path,
+            sender: SenderModel::STALLING,
         },
     ]
+}
+
+/// When the blackout scenarios' outage begins.
+pub(super) const BLACKOUT_FROM_MS: f64 = 30_000.0;
+
+/// A client uplink that loses every packet for `MS` milliseconds from
+/// [`BLACKOUT_FROM_MS`], with light background loss around it.
+pub(super) fn uplink_blackout<const MS: u32>() -> PathModel {
+    PathModel {
+        owd_ms: 15.0,
+        bloat: None,
+        loss: LossModel::Blackout {
+            from_ms: BLACKOUT_FROM_MS,
+            to_ms: BLACKOUT_FROM_MS + f64::from(MS),
+            base: 0.003,
+        },
+        bottleneck: None,
+    }
+}
+
+/// [`uplink_blackout`] inside a 30-second squeeze around it: +140 ms of
+/// one-way bloat and a congestion window crushed to Cubic's floor.
+pub(super) fn squeezed_uplink_blackout<const MS: u32>() -> PathModel {
+    PathModel {
+        owd_ms: 15.0,
+        bloat: Some((20_000.0, 50_000.0, 140.0)),
+        loss: LossModel::Blackout {
+            from_ms: BLACKOUT_FROM_MS,
+            to_ms: BLACKOUT_FROM_MS + f64::from(MS),
+            base: 0.01,
+        },
+        bottleneck: Some(Bottleneck {
+            cwnd_bytes: |now_ms| {
+                if (20_000.0..50_000.0).contains(&now_ms) {
+                    2904.0
+                } else {
+                    100_000.0
+                }
+            },
+            queue: VecDeque::new(),
+            queue_bytes: 0.0,
+            queue_cap_bytes: 60_000.0,
+            in_flight_bytes: 0.0,
+            dropped: 0,
+        }),
+    }
 }
 
 /// One policy per bounding regime: no bounds at all, the byte budget alone,

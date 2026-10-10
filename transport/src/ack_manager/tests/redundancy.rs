@@ -317,8 +317,9 @@ fn a_stalled_senders_flushes_keep_re_carrying_its_oldest_lost_turn() {
     }
 
     // Then the sender stalls and only flushes go out.
+    let flushes = 24u32;
     let mut carried_in: Vec<u32> = Vec::new();
-    for flush_index in 0..24u32 {
+    for flush_index in 0..flushes {
         let flush = build_sent(&mut manager, None, MTU);
         if flush.payloads.iter().any(|p| p.seq == 0) {
             carried_in.push(flush_index);
@@ -326,7 +327,9 @@ fn a_stalled_senders_flushes_keep_re_carrying_its_oldest_lost_turn() {
     }
 
     // The window outgrows one flush's budget, so the flushes rotate through
-    // it: seq 0 waits at most one rotation between carries.
+    // it: seq 0 waits at most one rotation before its first carry, between
+    // carries, and after its last one to the end of the run, so an early
+    // carry followed by starvation fails too.
     let budget = RecarryPolicy::default()
         .redundancy_byte_budget
         .expect("the shipped policy has a byte budget");
@@ -337,14 +340,16 @@ fn a_stalled_senders_flushes_keep_re_carrying_its_oldest_lost_turn() {
         "the window must outgrow one flush for this test to exercise the rotation",
     );
     let first = *carried_in.first().expect("seq 0 rode a flush");
+    let last = *carried_in.last().expect("seq 0 rode a flush");
     let max_gap = carried_in
         .windows(2)
         .map(|w| w[1] - w[0])
         .max()
         .unwrap_or(0);
     assert!(
-        first < rotation && max_gap <= rotation,
-        "seq 0 rode flushes {carried_in:?}; expected at least one carry every {rotation}",
+        first < rotation && max_gap <= rotation && flushes - last <= rotation,
+        "seq 0 rode flushes {carried_in:?} of {flushes}; expected at least one carry \
+         every {rotation}",
     );
 }
 

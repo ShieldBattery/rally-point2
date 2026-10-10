@@ -32,6 +32,13 @@
 //!   shipped back periodically and force-retires the sender's window
 //!   ([`AckManager::retire_payloads_through`]), exactly as the reliable
 //!   beacon stream does in production.
+//! - **Sender model**: the tuning scenarios send a fresh turn every tick and
+//!   nothing else, the uninterrupted stream the refill is tuned against. The
+//!   stalling scenarios model a rollback client instead: it stops producing
+//!   turns once it runs a prediction limit past the delivered prefix the
+//!   beacon reports, and sends maintenance flushes on the drivers' rule (due
+//!   a flush interval after the last send that re-carried anything), which
+//!   is how a client blacked out on its uplink recovers.
 //!
 //! `cargo test -p rally-point-transport recarry_sim -- --ignored --nocapture`
 //! prints the per-scenario policy comparison tables for tuning sessions; the
@@ -49,7 +56,8 @@ use crate::ack_manager::{AckManager, RecarryPolicy};
 
 use model::{Bottleneck, EventKind, LossModel, Net, PathModel, PrefixTracker, Rng, turn_payload};
 use scenarios::{
-    RunStats, Scenario, clean_path, percentile, policies, representative_policies, scenarios,
+    RunStats, Scenario, SenderModel, clean_path, percentile, policies, representative_policies,
+    scenarios, squeezed_uplink_blackout, uplink_blackout,
 };
 
 /// One game turn at the SC:R rate, in milliseconds.
@@ -94,11 +102,22 @@ fn run(scenario: &Scenario, policy: RecarryPolicy, seed: u64) -> RunStats {
             wire_losses: 0,
             max_prefix_lag_turns: 0,
             backlog_clear_after_ms: None,
+            flush_packets: 0,
+            flush_bytes: 0.0,
+            max_flush_packet_bytes: 0,
         },
     };
 
     net.push(0.0, EventKind::SenderTick);
     net.push(TURN_MS / 2.0, EventKind::ReceiverTick);
+
+    // The stall model's view of the session: slot 0's delivered prefix as the
+    // latest beacon told the sender, as a count of turns.
+    let mut heard_delivered_turns = 0u64;
+    let mut flush_deadline_ms = scenario.sender.flush_interval_ms;
+    if let Some(deadline) = flush_deadline_ms {
+        net.push(deadline, EventKind::SenderFlush);
+    }
 
     // For the blackout recovery metric: the outage window, when one exists.
     let blackout_window = match (scenario.forward)().loss {
@@ -115,7 +134,12 @@ fn run(scenario: &Scenario, policy: RecarryPolicy, seed: u64) -> RunStats {
         let now_ms = event.at_us as f64 / 1000.0;
         match event.kind {
             EventKind::SenderTick => {
-                for slot in 0..scenario.fresh_per_tick {
+                let stalled = scenario
+                    .sender
+                    .stall_lag_turns
+                    .is_some_and(|lag| next_seq[0] > heard_delivered_turns + lag);
+                let fresh_this_tick = if stalled { 0 } else { scenario.fresh_per_tick };
+                for slot in 0..fresh_this_tick {
                     let seq = next_seq[slot as usize];
                     next_seq[slot as usize] += 1;
                     let payload = turn_payload(slot as u8, seq, &mut net.rng);
@@ -127,11 +151,21 @@ fn run(scenario: &Scenario, policy: RecarryPolicy, seed: u64) -> RunStats {
                     // The simulated QUIC endpoint accepts every datagram (loss
                     // and queueing happen beyond it), so every build records.
                     sender.record_sent(&packet);
+                    // A send that re-carried anything pushes the flush out,
+                    // as the drivers do.
+                    if packet.payloads.len() > 1
+                        && let Some(interval) = scenario.sender.flush_interval_ms
+                    {
+                        let deadline = now_ms + interval;
+                        flush_deadline_ms = Some(deadline);
+                        net.push(deadline, EventKind::SenderFlush);
+                    }
                     net.dispatch_forward(now_ms, packet);
                 }
                 // Track the worst prefix lag: newest created seq vs slot 0's
-                // delivered prefix, in turns (one seq per tick).
-                let newest = next_seq[0] - 1;
+                // delivered prefix, in turns (one seq per tick while the
+                // sender isn't stalled).
+                let newest = next_seq[0].saturating_sub(1);
                 let prefix = prefixes
                     .get(&0)
                     .and_then(|p| p.delivered_through)
@@ -204,7 +238,37 @@ fn run(scenario: &Scenario, policy: RecarryPolicy, seed: u64) -> RunStats {
             EventKind::BeaconArrive(cursors) => {
                 for (slot, through) in cursors {
                     sender.retire_payloads_through(slot, through);
+                    if slot == SlotId(0) {
+                        heard_delivered_turns = heard_delivered_turns.max(through + 1);
+                    }
                 }
+            }
+            EventKind::SenderFlush => {
+                let (Some(deadline), Some(interval)) =
+                    (flush_deadline_ms, scenario.sender.flush_interval_ms)
+                else {
+                    continue;
+                };
+                // Compared in the event clock's microseconds, which truncate.
+                if event.at_us < (deadline * 1000.0) as u64 {
+                    continue;
+                }
+                if sender.payloads_in_flight() > 0 {
+                    use prost::Message;
+                    let packet = sender
+                        .build_outgoing(None, DATAGRAM_BUDGET)
+                        .expect("seq space is ample for a sim run");
+                    sender.record_sent(&packet);
+                    let encoded = packet.encoded_len();
+                    net.stats.flush_packets += 1;
+                    net.stats.flush_bytes += encoded as f64;
+                    net.stats.max_flush_packet_bytes =
+                        net.stats.max_flush_packet_bytes.max(encoded);
+                    net.dispatch_forward(now_ms, packet);
+                }
+                let next = now_ms + interval;
+                flush_deadline_ms = Some(next);
+                net.push(next, EventKind::SenderFlush);
             }
         }
     }
@@ -232,7 +296,7 @@ fn dump_policy_comparison() {
     for scenario in scenarios() {
         println!("\n=== {} === (3 seeds pooled)", scenario.name);
         println!(
-            "{:<26} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>9} {:>7} {:>7} {:>7} {:>9}",
+            "{:<26} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:>9} {:>7} {:>7} {:>7} {:>9} {:>8} {:>8}",
             "policy",
             "lat p50",
             "p99",
@@ -246,6 +310,8 @@ fn dump_policy_comparison() {
             "qdrops",
             "lagmax",
             "clear ms",
+            "flushes",
+            "fl B/pk",
         );
         for (name, policy) in policies() {
             let mut stats = run(&scenario, policy, 0xC0FFEE);
@@ -253,7 +319,7 @@ fn dump_policy_comparison() {
                 stats.merge(run(&scenario, policy, seed));
             }
             println!(
-                "{:<26} {:>7.2} {:>7.2} {:>7.2} {:>8.2} {:>8.2} {:>8.1} {:>8} {:>9.1} {:>7} {:>7} {:>7} {:>9}",
+                "{:<26} {:>7.2} {:>7.2} {:>7.2} {:>8.2} {:>8.2} {:>8.1} {:>8} {:>9.1} {:>7} {:>7} {:>7} {:>9} {:>8} {:>8.1}",
                 name,
                 stats.percentile(0.50),
                 stats.percentile(0.99),
@@ -269,14 +335,186 @@ fn dump_policy_comparison() {
                 stats
                     .backlog_clear_after_ms
                     .map_or("-".to_string(), |ms| format!("{ms:.0}")),
+                stats.flush_packets,
+                stats.mean_bytes_per_flush(),
             );
         }
+    }
+}
+
+/// One uplink blackout length of the stalled-sender sweep, with the plain and
+/// the squeezed path that black out for it.
+struct StallBlackout {
+    ms: u32,
+    plain: fn() -> PathModel,
+    squeezed: fn() -> PathModel,
+}
+
+/// Uplink blackouts of these lengths, on a plain and a squeezed path, for the
+/// stalled-sender sweep. The lengths are spaced off the 150 ms flush grid so
+/// the path returns at a different point in the flush cycle each time.
+const STALL_BLACKOUTS: [StallBlackout; 7] = [
+    StallBlackout {
+        ms: 300,
+        plain: uplink_blackout::<300>,
+        squeezed: squeezed_uplink_blackout::<300>,
+    },
+    StallBlackout {
+        ms: 700,
+        plain: uplink_blackout::<700>,
+        squeezed: squeezed_uplink_blackout::<700>,
+    },
+    StallBlackout {
+        ms: 1_100,
+        plain: uplink_blackout::<1_100>,
+        squeezed: squeezed_uplink_blackout::<1_100>,
+    },
+    StallBlackout {
+        ms: 1_500,
+        plain: uplink_blackout::<1_500>,
+        squeezed: squeezed_uplink_blackout::<1_500>,
+    },
+    StallBlackout {
+        ms: 1_900,
+        plain: uplink_blackout::<1_900>,
+        squeezed: squeezed_uplink_blackout::<1_900>,
+    },
+    StallBlackout {
+        ms: 2_300,
+        plain: uplink_blackout::<2_300>,
+        squeezed: squeezed_uplink_blackout::<2_300>,
+    },
+    StallBlackout {
+        ms: 2_700,
+        plain: uplink_blackout::<2_700>,
+        squeezed: squeezed_uplink_blackout::<2_700>,
+    },
+];
+
+/// A stalling rollback client on `forward`, run long enough past the outage
+/// for everything to settle.
+fn stall_scenario(name: &'static str, forward: fn() -> PathModel) -> Scenario {
+    Scenario {
+        name,
+        duration_ms: 40_000.0,
+        fresh_per_tick: 1,
+        episode_window: None,
+        forward,
+        reverse: clean_path,
+        sender: SenderModel::STALLING,
+    }
+}
+
+/// Prints how long a stalled sender's backlog takes to land after uplink
+/// blackouts of each swept length, and what its flushes cost. Tuning aid:
+/// `cargo test -p rally-point-transport recarry_sim -- --ignored --nocapture`.
+#[test]
+#[ignore = "tuning aid: prints the stalled-sender sweep"]
+fn dump_stall_recovery() {
+    println!(
+        "\n=== stalled sender, shipped policy (3 seeds, worst) ===\n{:<10} {:>12} {:>14} {:>12} {:>14}",
+        "blackout", "clear ms", "squeeze clear", "flush B max", "squeeze fl max",
+    );
+    for StallBlackout {
+        ms,
+        plain,
+        squeezed,
+    } in STALL_BLACKOUTS
+    {
+        let mut plain_stats = run(
+            &stall_scenario("plain", plain),
+            RecarryPolicy::default(),
+            0xC0FFEE,
+        );
+        let mut squeezed_stats = run(
+            &stall_scenario("squeezed", squeezed),
+            RecarryPolicy::default(),
+            0xC0FFEE,
+        );
+        for seed in [0xBEEF_u64, 0xF00D_5EED] {
+            plain_stats.merge(run(
+                &stall_scenario("plain", plain),
+                RecarryPolicy::default(),
+                seed,
+            ));
+            squeezed_stats.merge(run(
+                &stall_scenario("squeezed", squeezed),
+                RecarryPolicy::default(),
+                seed,
+            ));
+        }
+        println!(
+            "{:<10} {:>12.0} {:>14.0} {:>12} {:>14}",
+            ms,
+            plain_stats.backlog_clear_after_ms.unwrap_or(f64::NAN),
+            squeezed_stats.backlog_clear_after_ms.unwrap_or(f64::NAN),
+            plain_stats.max_flush_packet_bytes,
+            squeezed_stats.max_flush_packet_bytes,
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
 // Pinned properties
 // ---------------------------------------------------------------------------
+
+/// A sender stalled behind its own lost turns sends nothing but flushes, and
+/// every peer waits on its oldest lost turn. Once the uplink returns, the
+/// backlog must land within a couple of flush intervals plus the path's
+/// one-way delay, whatever the blackout's length or where it ends in the
+/// flush cycle, on a plain uplink and a squeezed one alike. Gating flushes
+/// by the turn-rate spacing schedule instead left the backlog waiting up to
+/// `max_spacing` flush intervals: 0.8-1.9 s across this sweep. The flushes
+/// that do it stay inside the byte budget and never overflow the squeezed
+/// path's queue.
+#[test]
+fn a_stalled_senders_backlog_lands_promptly_after_an_uplink_blackout() {
+    let policy = RecarryPolicy::default();
+    let budget = policy
+        .redundancy_byte_budget
+        .expect("the shipped policy carries a byte budget");
+    let flush_interval = SenderModel::STALLING
+        .flush_interval_ms
+        .expect("the stalling sender flushes");
+    for StallBlackout {
+        ms,
+        plain,
+        squeezed,
+    } in STALL_BLACKOUTS
+    {
+        for (path, forward) in [("plain", plain), ("squeezed", squeezed)] {
+            // The worst one-way delay the path has when the outage ends.
+            let owd = forward().owd_at(scenarios::BLACKOUT_FROM_MS + f64::from(ms));
+            let bound = 2.0 * flush_interval + owd;
+            for seed in [0xC0FFEE_u64, 0xBEEF, 0xF00D_5EED] {
+                let stats = run(&stall_scenario(path, forward), policy, seed);
+                let clear = stats
+                    .backlog_clear_after_ms
+                    .expect("a blackout scenario measures its backlog");
+                assert!(
+                    clear <= bound,
+                    "{path} {ms} ms blackout, seed {seed}: the backlog landed {clear:.0} ms \
+                     after the uplink returned (bound {bound:.0} ms)",
+                );
+                assert_eq!(
+                    stats.undelivered, 0,
+                    "{path} {ms} ms blackout, seed {seed}: payloads left undelivered",
+                );
+                assert_eq!(
+                    stats.queue_drops, 0,
+                    "{path} {ms} ms blackout, seed {seed}: the flushes overflowed the queue",
+                );
+                // A packet header plus the byte budget: a flush has no fresh
+                // payload, so redundancy is all it carries.
+                assert!(
+                    stats.max_flush_packet_bytes <= 16 + budget,
+                    "{path} {ms} ms blackout, seed {seed}: a {}-byte flush exceeds the budget",
+                    stats.max_flush_packet_bytes,
+                );
+            }
+        }
+    }
+}
 
 /// Every bounding regime — unbounded, byte budget alone, and the shipped
 /// budget plus spacing — must deliver every payload under sustained random
@@ -296,6 +534,7 @@ fn every_policy_delivers_everything_under_sustained_loss() {
             bottleneck: None,
         },
         reverse: clean_path,
+        sender: SenderModel::CONTINUOUS,
     };
     for (name, policy) in representative_policies() {
         let stats = run(&scenario, policy, 7);
@@ -331,6 +570,7 @@ fn a_byte_budget_bounds_every_bundle() {
             }),
         },
         reverse: clean_path,
+        sender: SenderModel::CONTINUOUS,
     };
     let policy = RecarryPolicy::default();
     let budget = policy
@@ -389,6 +629,7 @@ fn spacing_still_recovers_isolated_loss_within_dense_carries() {
             bottleneck: None,
         },
         reverse: clean_path,
+        sender: SenderModel::CONTINUOUS,
     };
     let stats = run(&scenario, RecarryPolicy::default(), 23);
     assert_eq!(stats.undelivered, 0);
