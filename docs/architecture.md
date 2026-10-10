@@ -127,7 +127,8 @@ redundantly-packed payloads.
 - A **maintenance flush** retransmits during the gaps the fresh stream can't cover: when an outbound
   turn re-carries unacked payloads (the common case) the flush timer is pushed out and never fires, so
   it costs no extra packets; it fires only when a near-MTU turn left no room for redundancy, or the
-  link is idle, and re-carries the unacked payloads then.
+  link is idle, and re-carries the unacked payloads then — all of them the byte budget allows, since
+  the carry spacing gates only packets that carry a fresh payload.
 - Under *sustained* loss where redundancy can't keep up, the unacked window is **capped** rather than
   grown without bound. Two mechanisms keep it bounded, each for a distinct failure:
 
@@ -1768,7 +1769,12 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   Accepted trade:
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
-  both priced by the buffer law's loss terms. Parameters live in `RecarryPolicy::default`; the bench
+  both priced by the buffer law's loss terms. The spacing counts turn-rate packets, so it gates only
+  packets carrying a fresh payload; a maintenance flush carries whatever the budget allows. A sender
+  stalled behind its own lost turns sends nothing but flushes, and gating them would stretch its
+  oldest lost turn's re-carry cadence to `max_spacing` flush intervals (1.2 s) after the path
+  recovers, while every peer waits on exactly that turn. Parameters live in
+  `RecarryPolicy::default`; the bench
   for any retune is `transport/src/recarry_sim/`, which drives real `AckManager` pairs through
   fade/burst/blackout scenarios and prints the comparison tables
   (`cargo test -p rally-point-transport recarry_sim -- --ignored --nocapture`).

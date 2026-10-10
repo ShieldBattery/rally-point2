@@ -25,9 +25,10 @@ impl AckManager {
     /// under its spacing schedule compete, its byte budget caps what they may
     /// collectively spend (the first element exempt, so a wide payload stays
     /// re-carryable), and `max_packet_len` bounds everything. If `payload` is
-    /// `None`, there is no fresh payload, but due payloads are packed as
-    /// redundancy the same way. The result is truly ack-only only when nothing
-    /// is due (or none of it fits).
+    /// `None`, the packet is a maintenance flush: every unacked payload counts
+    /// as due regardless of the spacing schedule, packed under the same byte
+    /// budget and ranking. The result is truly ack-only only when nothing is
+    /// unacked (or none of it fits).
     ///
     /// `max_packet_len` is the live datagram budget (e.g. noq's
     /// `max_datagram_size()`); pass the current value each call so the bundle
@@ -113,7 +114,22 @@ impl AckManager {
             Some(budget) => max_packet_len.min(used.saturating_add(budget)),
             None => max_packet_len,
         };
-        let spacing = self.policy.spacing;
+        // Spacing gates only packets that carry a fresh payload. A fresh-free
+        // packet is a maintenance flush, which every driver sends only once
+        // the stream has gone a flush interval without re-carrying anything,
+        // so flushes are already further apart than the spacing schedule's
+        // gaps are meant to be in time. Counting them as spacing packets
+        // would stretch a payload's re-carry cadence to `max_spacing` flush
+        // intervals: a sender stalled behind its own lost turns sends nothing
+        // but flushes, and the oldest lost turn, the one every peer waits on,
+        // would sit out over a second after the path recovers. The byte
+        // budget still bounds a flush, and the waiting-age ranking still
+        // rotates a window too large for it.
+        let spacing = if fresh.is_some() {
+            self.policy.spacing
+        } else {
+            None
+        };
         let building_seq = packet.seq;
 
         // When no spacing schedule filters the window and the whole window fits

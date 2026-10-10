@@ -43,7 +43,10 @@ pub struct RecarryPolicy {
     /// packet is this budget plus at most one payload.
     pub redundancy_byte_budget: Option<usize>,
     /// Minimum packets between carries of one payload, as a function of how
-    /// often it has been carried. `None` re-carries every packet.
+    /// often it has been carried. `None` re-carries every packet. Only packets
+    /// carrying a fresh payload are gated: the gaps are counted in turn-rate
+    /// packets, and a maintenance flush, paced far slower, carries whatever
+    /// the byte budget allows.
     pub spacing: Option<CarrySpacing>,
 }
 

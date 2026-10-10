@@ -267,6 +267,87 @@ fn a_permanently_tight_budget_spreads_redundancy_coverage_across_slots() {
     );
 }
 
+/// The spacing schedule counts turn-rate packets, so it gates only packets
+/// carrying a fresh payload: a maintenance flush re-carries a payload the
+/// schedule is holding back from the turn stream.
+#[test]
+fn a_flush_re_carries_a_payload_its_spacing_holds_back_from_fresh_packets() {
+    let mut manager = AckManager::new();
+    // Seq 0 is never acked, so it rides fresh packets until the schedule
+    // spaces it out.
+    build_sent(&mut manager, Some(test_payload(0, 0)), MTU);
+    let mut next_seq = 1u64;
+    let mut carries = 1u32;
+    while carries < 5 {
+        let packet = build_sent(&mut manager, Some(test_payload(0, next_seq)), MTU);
+        next_seq += 1;
+        if packet.payloads[1..].iter().any(|p| p.seq == 0) {
+            carries += 1;
+        }
+    }
+
+    // Just carried for the fifth time, so the schedule wants a gap of
+    // several packets: the next fresh packet leaves it out ...
+    let fresh = build_sent(&mut manager, Some(test_payload(0, next_seq)), MTU);
+    assert!(
+        !fresh.payloads[1..].iter().any(|p| p.seq == 0),
+        "the spacing schedule should hold seq 0 back from the turn stream",
+    );
+    // ... but a flush carries it.
+    let flush = build_sent(&mut manager, None, MTU);
+    assert!(
+        flush.payloads.iter().any(|p| p.seq == 0),
+        "a flush should re-carry seq 0 regardless of its spacing gap",
+    );
+}
+
+/// A sender stalled behind its own lost turns sends nothing but flushes, and
+/// its oldest lost turn is the one every peer waits on. The flushes must keep
+/// re-carrying it at the cadence the byte budget allows, rotating through a
+/// window too large for one flush, rather than at spacing gaps that would run
+/// to `max_spacing` flush intervals.
+#[test]
+fn a_stalled_senders_flushes_keep_re_carrying_its_oldest_lost_turn() {
+    let mut manager = AckManager::new();
+    // An outage swallows a run of turns: each rides its fresh packet and the
+    // turn stream's re-carries, and nothing is acked.
+    let lost_turns = 30u64;
+    for seq in 0..lost_turns {
+        build_sent(&mut manager, Some(test_payload_sized(0, seq, 20)), MTU);
+    }
+
+    // Then the sender stalls and only flushes go out.
+    let mut carried_in: Vec<u32> = Vec::new();
+    for flush_index in 0..24u32 {
+        let flush = build_sent(&mut manager, None, MTU);
+        if flush.payloads.iter().any(|p| p.seq == 0) {
+            carried_in.push(flush_index);
+        }
+    }
+
+    // The window outgrows one flush's budget, so the flushes rotate through
+    // it: seq 0 waits at most one rotation between carries.
+    let budget = RecarryPolicy::default()
+        .redundancy_byte_budget
+        .expect("the shipped policy has a byte budget");
+    let element = payload_element_len(test_payload_sized(0, 0, 20).encoded_len());
+    let rotation = (lost_turns as usize * element).div_ceil(budget / element * element) as u32;
+    assert!(
+        rotation > 1,
+        "the window must outgrow one flush for this test to exercise the rotation",
+    );
+    let first = *carried_in.first().expect("seq 0 rode a flush");
+    let max_gap = carried_in
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .max()
+        .unwrap_or(0);
+    assert!(
+        first < rotation && max_gap <= rotation,
+        "seq 0 rode flushes {carried_in:?}; expected at least one carry every {rotation}",
+    );
+}
+
 #[test]
 fn redundancy_respects_size_budget() {
     let mut manager = AckManager::new();
