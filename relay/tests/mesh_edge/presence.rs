@@ -207,3 +207,149 @@ async fn first_peer_presence_forces_exactly_one_current_reply() -> Result<(), An
     drop(peer_control_tx);
     Ok(())
 }
+
+/// A resuming Join's resume ask can reach a peer that has not joined the
+/// session yet, which drops it unanswered; the accept side of a redial usually
+/// reads the dialer's ask before its own Join lands. The peer's first presence
+/// report proves it has joined, so a resuming Join asks again then, once. A
+/// first Join's ask asks for nothing and is never repeated, even when local
+/// turns gave the session forward-gate history after the Join.
+///
+/// The peer here is hand-driven: it never answers the first ask, exactly what
+/// an unjoined peer's drop amounts to, and its presence reports are fed
+/// straight into the driver so their order against the asks is deterministic.
+#[tokio::test]
+async fn first_peer_presence_repeats_a_resuming_joins_resume_ask() -> Result<(), AnyError> {
+    use rally_point_proto::messages::mesh_control_frame::Kind;
+    use rally_point_proto::messages::{MeshControlFrame, MeshResumeCursors};
+
+    /// The next resume ask the driver wrote, skipping the other Join-time
+    /// reconcile frames.
+    async fn next_resume_ask(
+        frames: &mut mpsc::Receiver<MeshControlFrame>,
+    ) -> (u64, MeshResumeCursors) {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+                .await
+                .expect("a mesh control frame arrived within 2s")
+                .expect("the driver's control stream stayed open");
+            if let Some(Kind::MeshResumeCursors(resume)) = frame.kind {
+                return (frame.session, resume);
+            }
+        }
+    }
+    fn cursors(resume: &MeshResumeCursors) -> Vec<(u32, u64)> {
+        resume
+            .cursors
+            .iter()
+            .map(|c| (c.origin_slot, c.next_seq))
+            .collect()
+    }
+
+    let key = |session| SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session: SessionId(session),
+    };
+    let resumed = key(50);
+    let fresh = key(51);
+
+    let sessions: Sessions = Arc::default();
+    let mesh_state = mesh::MeshState::default();
+    let seen = mesh_state.seen.clone();
+    // History from before the link died: slot 1's seq 0 already reached this
+    // relay's locals, so a Join of `resumed` asks for slot 1 from seq 1.
+    mesh::mark_seen(&seen, &resumed, SlotId(1), 0);
+
+    let (local_link, peer_link, _local_endpoint, _peer_endpoint) = mesh_link_pair().await;
+    let local_connection = local_link.connection().clone();
+    let peer_connection = peer_link.connection().clone();
+    let presence_send = local_connection.open_uni().await?;
+    let (peer_presence_tx, peer_presence_rx) = mpsc::channel::<MeshPresence>(8);
+    let (mut control_send, _unused_control_recv) = local_connection.open_bi().await?;
+    rally_point_transport::mesh_control_stream::establish_mesh_control(&mut control_send).await?;
+    let mut outbound_control =
+        rally_point_transport::mesh_control_stream::spawn_mesh_control_reader_accepting(
+            peer_connection.clone(),
+        );
+    let (peer_control_tx, peer_control_rx) = mpsc::channel::<MeshControlFrame>(8);
+    let attempt = mesh::new_mesh_link_attempt();
+    let lease = mesh::claim_mesh_link(&mesh_state, RelayId(9), &attempt)
+        .expect("the test driver claims its peer lease");
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    let driver = tokio::spawn(mesh::run_mesh_link(
+        local_link,
+        mesh::MeshLinkIo {
+            presence: rally_point_relay::session::presence::PresenceIo {
+                peer_id: RelayId(9),
+                tx: presence_send,
+                rx: peer_presence_rx,
+            },
+            control: mesh::MeshControlIo {
+                tx: control_send,
+                rx: peer_control_rx,
+            },
+            lease,
+        },
+        commands_rx,
+        Arc::clone(&sessions),
+        mesh_state,
+        mesh::IDLE_TIMEOUT,
+    ));
+
+    commands_tx.send(mesh::MeshCommand::Join(resumed.clone()))?;
+    let (session, ask) = next_resume_ask(&mut outbound_control).await;
+    assert_eq!(session, resumed.session.0);
+    assert!(ask.resuming, "a Join with forward-gate history is resuming");
+    assert_eq!(cursors(&ask), vec![(1, 1)]);
+
+    commands_tx.send(mesh::MeshCommand::Join(fresh.clone()))?;
+    let (session, ask) = next_resume_ask(&mut outbound_control).await;
+    assert_eq!(session, fresh.session.0);
+    assert!(!ask.resuming, "a Join with no history is a first join");
+    // A local turn after the Join gives `fresh` history of its own, which must
+    // not turn its first join into a resuming one at the peer's presence.
+    mesh::mark_seen(&seen, &fresh, SlotId(0), 0);
+
+    // Neither ask is answered. `fresh`'s report goes first, so a re-ask for it
+    // would be written ahead of `resumed`'s.
+    for session in [fresh.session, resumed.session] {
+        peer_presence_tx
+            .send(MeshPresence {
+                session,
+                live_players: 1,
+            })
+            .await?;
+    }
+    let (session, ask) = next_resume_ask(&mut outbound_control).await;
+    assert_eq!(
+        session, resumed.session.0,
+        "only the resuming Join asks again on the peer's first presence",
+    );
+    assert!(ask.resuming);
+    assert_eq!(cursors(&ask), vec![(1, 1)]);
+
+    // A later report is not a first presence. The driver handles ready presence
+    // before commands, so a second re-ask would precede the barrier Join's ask.
+    peer_presence_tx
+        .send(MeshPresence {
+            session: resumed.session,
+            live_players: 2,
+        })
+        .await?;
+    let barrier = key(52);
+    commands_tx.send(mesh::MeshCommand::Join(barrier.clone()))?;
+    let (session, _) = next_resume_ask(&mut outbound_control).await;
+    assert_eq!(
+        session, barrier.session.0,
+        "the resume ask is repeated once, not on every presence report",
+    );
+
+    drop(commands_tx);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), driver).await??,
+        mesh::MeshLinkExit::CommandChannelClosed,
+    );
+    drop(peer_presence_tx);
+    drop(peer_control_tx);
+    Ok(())
+}

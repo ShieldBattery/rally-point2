@@ -358,6 +358,7 @@ fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
         JoinedSession {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
+            resumed: false,
             _registration: register_mesh_link(
                 &mesh.links,
                 key.clone(),
@@ -429,6 +430,7 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
         JoinedSession {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
+            resumed: false,
             _registration: register_mesh_link(
                 &mesh.links,
                 key.clone(),

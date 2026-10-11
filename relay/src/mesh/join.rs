@@ -131,7 +131,10 @@ pub(super) fn reconcile_session_clock_on_join(
 /// transport state otherwise leaves: turns in flight or queued at the moment
 /// the old link died are gone from that link's own state, but this session's
 /// forward-gate cursors survive it (see [`resume_cursor_snapshot`]), so the
-/// fresh link can still ask for exactly what's missing. Every Join sends one.
+/// fresh link can still ask for exactly what's missing. Every Join sends one,
+/// and a Join that resumed existing history sends another on the peer's first
+/// presence report: a peer that had not joined the session yet drops the
+/// first ask unanswered.
 ///
 /// The frame's `resuming` flag ([`has_resumable_state`]) is what keeps a
 /// first join and a real mid-game recovery from being confused with each

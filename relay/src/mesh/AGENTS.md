@@ -32,7 +32,10 @@
 - A Join anchors receive windows from the forward-gate cursors and asks the peer
   to replay from them. `resuming` separates a first join (ask for nothing) from a
   recovery whose slots are all gapped (ask for everything) — both send an empty
-  cursor list.
+  cursor list. A peer drops an ask for a session it has not joined, and the
+  accept side of a redial usually reads the dialer's ask before its own Join
+  lands, so a resuming Join asks again on the peer's first presence report.
+  Anything replayed on a peer's Join-time arrival must also be re-sent there.
 - Every inline reliable-stream write is deadline-bounded; a peer that stops
   reading would otherwise suspend the loop for every session on the pair. The
   unacked-window cap and a full forward queue both reset the link on purpose:

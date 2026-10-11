@@ -172,6 +172,7 @@ fn bare_session_state(key: SessionKey) -> JoinedSession {
     JoinedSession {
         key,
         flush_deadline: tokio::time::Instant::now(),
+        resumed: false,
         _registration: registration,
     }
 }

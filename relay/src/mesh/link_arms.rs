@@ -24,8 +24,8 @@ use super::fan_out::{apply_ack_cursors, fold_oversize_into_link, reconcile_ack_c
 use super::forward::{resume_replay_for_frame, send_resume_replay};
 use super::join::{
     SentPresence, local_presence, presence_catch_up, presence_statement, presence_updates,
-    push_presence_updates, reconcile_local_slots_on_join, reconcile_session_clock_on_join,
-    reconcile_started_slots_on_join,
+    push_presence_updates, reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
+    reconcile_session_clock_on_join, reconcile_started_slots_on_join,
 };
 use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};
 use super::links::{
@@ -460,6 +460,7 @@ impl LinkDriver {
             sessions,
             mesh_links,
             mesh_for_dispatch,
+            seen_registries,
             ..
         } = self;
         match received {
@@ -470,11 +471,28 @@ impl LinkDriver {
                     // unjoined session has no key to record under.
                     let state = joined.get(&report.session)?;
                     let key = state.key.clone();
+                    let resumed = state.resumed;
                     let first_peer_presence = peer_presence_seen.insert(report.session);
                     if first_peer_presence {
                         reconcile_local_slots_on_join(conditions, control_forward_tx, &key);
                         reconcile_started_slots_on_join(decision_makers, control_forward_tx, &key);
                         reconcile_session_clock_on_join(decision_makers, control_forward_tx, &key);
+                        // The resume ask this relay's Join sent is dropped
+                        // unanswered by a peer that had not joined yet, which
+                        // is the usual order on the accept side of a redial:
+                        // the dialer's control frames arrive right behind its
+                        // hello. Turns the old link lost toward this relay
+                        // would then never come back, and a lockstep session
+                        // waiting on them stalls for good. Asking again here
+                        // reaches a peer that has joined; a replay the peer
+                        // already answered is dropped by the forward gate.
+                        if resumed {
+                            reconcile_resume_cursors_on_join(
+                                seen_registries,
+                                control_forward_tx,
+                                &key,
+                            );
+                        }
                     }
                     if crate::session::presence::record_peer(
                         presence,

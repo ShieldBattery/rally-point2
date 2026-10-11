@@ -346,3 +346,109 @@ async fn a_full_queue_reset_recovers_via_the_redialed_links_resume_cursor_exchan
     drop(relay_a);
     Ok(())
 }
+
+/// The same recovery with the roles swapped, in the order a production redial
+/// actually takes: the lost turn originates on the accept side (B), and the
+/// dial side's (A's) Join, with its resume ask, lands before B's own. B drops
+/// an ask for a session it has not joined, so the Join-time ask alone never
+/// brings the turn back; A has to ask again once B's first presence report
+/// proves B has joined.
+///
+/// In the field the dialer always gets there first: it claims the link and
+/// re-joins its sessions as soon as the handshake completes, and its control
+/// frames arrive at the acceptor right behind the hello, before the acceptor's
+/// own Join has gone through its collector task. Losing that race left a
+/// lockstep session stalled for good on the turns the dying link swallowed.
+#[tokio::test]
+async fn an_acceptor_origin_turn_lost_to_a_reset_recovers_when_the_dialer_joins_first()
+-> Result<(), AnyError> {
+    let tenant = make_default_tenant();
+    let session = SessionId(9);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+
+    let relay_a = Relay::start(&tenant, 1);
+    let mut relay_b = Relay::start(&tenant, 2);
+    let mut links_b = accept_on(&mut relay_b, empty_fleet_peers(), false);
+    let mut links_a = dial_a_to_b(&relay_a, &relay_b);
+
+    let (_peer_a1, _generation_a1, cmds_a1) = next_link(&mut links_a, "A's first link").await?;
+    let (_peer_b1, _generation_b1, cmds_b1) = next_link(&mut links_b, "B's first link").await?;
+
+    // B's replay ring only records once B's session has started.
+    seed_authority(&relay_b.mesh.session.decision_makers, &key)
+        .bounds(1, 6)
+        .apply();
+    relay_b.mesh.session.decision_makers.mark_started(&key);
+
+    cmds_a1.send(mesh::MeshCommand::Join(key.clone()))?;
+    cmds_b1.send(mesh::MeshCommand::Join(key.clone()))?;
+
+    let mut client_a = connect_client(&relay_a, &tenant, session, SlotId(0)).await?;
+    let mut client_b = connect_client(&relay_b, &tenant, session, SlotId(1)).await?;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    wait_for_mesh_link(&relay_b.mesh, &key).await;
+
+    // A live baseline turn gives A forward-gate history for slot 1, which is
+    // what makes A's later Join a resuming one.
+    client_b.send(Some(turn(1, 0)))?;
+    let received = tokio::time::timeout(Duration::from_secs(2), client_a.recv())
+        .await
+        .map_err(|_| "client A did not receive the baseline turn within 2s")?
+        .map_err(|e| format!("client A link error: {e}"))?;
+    assert_eq!(received.fresh.len(), 1);
+    assert_eq!(received.fresh[0].seq, 0, "the baseline turn arrived live");
+
+    // Fill B's forward queue so the tracked turn's own fan-out trips B's
+    // reset; see the dial-side test above for why this is deterministic.
+    let lost_seq = 1u64;
+    for _ in 0..FORWARD_CAPACITY {
+        mesh::fan_out_to_mesh(&relay_b.mesh.links, &key, turn(1, 0));
+    }
+    mesh::forward_client_turn(
+        &relay_b.sessions,
+        &relay_b.mesh,
+        &key,
+        SlotId(1),
+        turn(1, lost_seq),
+    );
+
+    let (_peer_a2, _generation_a2, cmds_a2) = next_link(&mut links_a, "A's redialed link").await?;
+    let (_peer_b2, _generation_b2, cmds_b2) =
+        next_link(&mut links_b, "B's link to the redial").await?;
+
+    // A joins first and its resume ask goes out at once.
+    cmds_a2.send(mesh::MeshCommand::Join(key.clone()))?;
+    wait_for_mesh_link(&relay_a.mesh, &key).await;
+    // B drops the ask without a trace, so its arrival can't be polled for.
+    // Loopback carries it in well under a millisecond once A's driver writes
+    // it; 200ms leaves room for a loaded runner to schedule that write. If
+    // the window ever proves too short, B joins first and this test passes
+    // without exercising the race, rather than flaking. The ordering itself is
+    // pinned deterministically, at the driver level, by mesh_edge's
+    // `first_peer_presence_repeats_a_resuming_joins_resume_ask`.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    cmds_b2.send(mesh::MeshCommand::Join(key.clone()))?;
+
+    let mut seen = std::collections::HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !seen.contains(&lost_seq) && tokio::time::Instant::now() < deadline {
+        let Ok(Ok(received)) = tokio::time::timeout(Duration::from_secs(2), client_a.recv()).await
+        else {
+            break;
+        };
+        for payload in received.fresh {
+            assert_eq!(payload.slot, 1, "only slot 1 is in play on this link");
+            seen.insert(payload.seq);
+        }
+    }
+    assert!(
+        seen.contains(&lost_seq),
+        "the acceptor-origin turn lost to the reset did not arrive after resume; got seqs {seen:?}",
+    );
+
+    drop(relay_a);
+    Ok(())
+}

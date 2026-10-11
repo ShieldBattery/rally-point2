@@ -445,6 +445,13 @@ fn deregister_mesh_link(links: &MeshLinks, key: &SessionKey, id: u64) {
 pub(super) struct JoinedSession {
     pub(super) key: SessionKey,
     pub(super) flush_deadline: tokio::time::Instant,
+    /// Whether this Join resumed a session the relay already had forward-gate
+    /// history for, i.e. it sent the peer a resume ask that can be missing turns
+    /// the old link lost. The peer drops an ask that arrives before its own Join,
+    /// so a resuming Join asks again once the peer's first presence proves it
+    /// has joined. A first Join's ask asks for nothing, so losing it costs
+    /// nothing and it is never repeated.
+    pub(super) resumed: bool,
     /// Deregisters this session's mesh forward channel when the `JoinedSession` is
     /// dropped — on a `Leave`, a normal wind-down, or the driver task being
     /// cancelled. Never read; its `Drop` is the point.

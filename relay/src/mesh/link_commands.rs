@@ -23,7 +23,7 @@ use super::link_run::{MeshCommand, defer_flush_after_send};
 use super::links::{
     JoinedSession, LeaseAwait, MESH_STREAM_WRITE_TIMEOUT, MeshLinkExit, await_while_current,
 };
-use super::seen::resume_cursor_snapshot;
+use super::seen::{has_resumable_state, resume_cursor_snapshot};
 use super::{mesh_session_key, register_mesh_link};
 
 impl LinkDriver {
@@ -213,7 +213,10 @@ impl LinkDriver {
                     // Ask the peer, over the same fresh registration, to
                     // replay whatever this relay's forward-gate is still
                     // missing for the session — the resume-cursor mesh
-                    // counterpart of the leave re-sync just above.
+                    // counterpart of the leave re-sync just above. The peer
+                    // may not have joined yet, so a resuming Join asks again
+                    // on the peer's first presence.
+                    let resumed = has_resumable_state(seen_registries, &key);
                     reconcile_resume_cursors_on_join(seen_registries, control_forward_tx, &key);
                     let joined_at = tokio::time::Instant::now();
                     joined.insert(
@@ -221,6 +224,7 @@ impl LinkDriver {
                         JoinedSession {
                             key,
                             flush_deadline: joined_at + routing::FLUSH_INTERVAL,
+                            resumed,
                             _registration: registration,
                         },
                     );
