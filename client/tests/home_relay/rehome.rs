@@ -115,6 +115,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
         })),
         escalate_after: Some(Duration::from_millis(50)),
         escalate_retry: Some(Duration::from_millis(50)),
+        fresh_port_redials: true,
     };
     let reconnect1 = Reconnect {
         endpoint: ep1,
@@ -131,6 +132,7 @@ async fn a_group_re_homes_to_a_replacement_relay_when_the_home_dies() {
         })),
         escalate_after: Some(Duration::from_millis(50)),
         escalate_retry: Some(Duration::from_millis(50)),
+        fresh_port_redials: true,
     };
     let task0 = tokio::spawn(driver0.run_reconnecting(reconnect0));
     let task1 = tokio::spawn(driver1.run_reconnecting(reconnect1));

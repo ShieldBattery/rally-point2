@@ -53,6 +53,7 @@ async fn a_dropped_client_reconnects_and_replays_the_missed_turns_exactly_once()
         rehome: None,
         escalate_after: None,
         escalate_retry: None,
+        fresh_port_redials: true,
     };
     let task0 = tokio::spawn(driver0.run_reconnecting(reconnect0));
 

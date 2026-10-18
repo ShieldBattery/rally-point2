@@ -450,11 +450,21 @@ as the relay the driver believes is dead, and advanced to the replacement's id o
 dial — never on a guess and never on a failed dial, so the provider can never name a live replacement as dead
 and get wedged on a `Stay`. The provider is where the embedder does the coordinator round-trip and builds a
 fresh endpoint pinning the replacement relay's cert — the driver never touches certs. `Stay` resumes same-relay
-backoff; `Unavailable` keeps it and re-escalates periodically; `NewTarget` re-dials the replacement with the
+backoff; `Unavailable` keeps it and re-escalates periodically; `Departed` (the embedder learned the slot's
+departure is already recorded) ends the loop as a slot-departed refusal, for a client that can't reach the
+relay to be refused by it; `NewTarget` re-dials the replacement with the
 same identity, resume cursors, and own-slot window anchor, rebinds the link in place (preserving the receive
 dedup so the re-home is a resume, not a restart), re-injects the retention ring, and points subsequent drops
 (and the owned relay id) at the new relay. This same reconnect infrastructure also covers a client's own
 transient disconnects (a same-relay resume, no re-home).
+
+**Fresh ports for re-dials.** The first re-dial after a drop goes out from the session's own UDP port; every
+re-dial after a failed one rebinds the endpoint to a fresh ephemeral port first. A NAT can keep translating a
+live flow to the public address it had before an IP change, so the client's datagrams still reach the relay
+while every reply is lost, and the client's own re-dials keep that stale mapping alive indefinitely. A new
+source port is a new flow the NAT maps from scratch. The relay authenticates a slot by its token, never by
+source address, so the port change costs nothing. Embedders pinning the port for port-filtering tools turn
+this off, since a fresh port would escape the filter.
 
 ### Latency buffer
 

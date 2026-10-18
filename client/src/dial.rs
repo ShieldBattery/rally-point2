@@ -143,15 +143,7 @@ impl ClientEndpoint {
     /// Must be called from within a tokio runtime, which drives the endpoint.
     pub fn bind_on_port(roots: rustls::RootCertStore, port: u16) -> Result<Self, EndpointError> {
         let config = quic::client_config(roots)?;
-
-        // std's UdpSocket can't clear IPV6_V6ONLY (set by default on Windows), and
-        // a v6-only socket can't reach IPv4 relays — so build the dual-stack socket
-        // by hand and hand it to noq.
-        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
-        socket.set_only_v6(false)?;
-        let bind: SocketAddr = (Ipv6Addr::UNSPECIFIED, port).into();
-        socket.bind(&bind.into())?;
-
+        let socket = udp_socket((Ipv6Addr::UNSPECIFIED, port).into())?;
         let runtime = noq::default_runtime().ok_or(EndpointError::NoRuntime)?;
         let endpoint =
             noq::Endpoint::new(noq::EndpointConfig::default(), None, socket.into(), runtime)?;
@@ -168,6 +160,23 @@ impl ClientEndpoint {
     /// The underlying QUIC endpoint.
     pub fn endpoint(&self) -> &noq::Endpoint {
         &self.endpoint
+    }
+
+    /// Moves the endpoint onto a freshly bound ephemeral UDP port on the same local
+    /// address, returning the new local address. Every handle cloned from the same
+    /// [`noq::Endpoint`] moves with it.
+    ///
+    /// A new source port is a new flow to every NAT and stateful firewall on the
+    /// path, so this gets a dial past a mapping that went bad under the old port —
+    /// one a public IP change left translating to the old address, say, where
+    /// datagrams still leave but replies never come back, and that the client's own
+    /// re-dials keep alive. An IPv6 socket is rebound dual-stack, as
+    /// [`bind`](Self::bind) builds it. On error the endpoint keeps its old socket.
+    pub fn rebind_fresh_port(&self) -> std::io::Result<SocketAddr> {
+        let mut local = self.endpoint.local_addr()?;
+        local.set_port(0);
+        self.endpoint.rebind(udp_socket(local)?.into())?;
+        self.endpoint.local_addr()
     }
 
     /// Dials `relay_addr`, runs the authorization handshake as `identity`, and
@@ -290,6 +299,18 @@ impl ClientEndpoint {
     }
 }
 
+/// Binds a UDP socket at `local`. An IPv6 socket is made dual-stack: std's
+/// UdpSocket can't clear IPV6_V6ONLY (set by default on Windows), and a v6-only
+/// socket can't reach IPv4 relays, so the socket is built by hand for noq.
+fn udp_socket(local: SocketAddr) -> std::io::Result<Socket> {
+    let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    if local.is_ipv6() {
+        socket.set_only_v6(false)?;
+    }
+    socket.bind(&local.into())?;
+    Ok(socket)
+}
+
 /// Whether the relay closed `connection` with its slot-departed application code —
 /// the terminal "the game moved on without you" refusal, as opposed to a live
 /// double-connect refusal or any transport-level failure.
@@ -389,6 +410,23 @@ mod tests {
             ClientEndpoint::bind_on_port(rustls::RootCertStore::empty(), port),
             Err(EndpointError::Bind(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn rebind_fresh_port_moves_to_a_new_port_on_the_same_address() {
+        for local in [
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        ] {
+            let endpoint = noq::Endpoint::client(local).unwrap();
+            let endpoint = ClientEndpoint::from_endpoint(endpoint);
+            let before = endpoint.endpoint().local_addr().unwrap();
+
+            let after = endpoint.rebind_fresh_port().unwrap();
+            assert_eq!(after.ip(), before.ip(), "rebinding keeps the local address");
+            assert_ne!(after.port(), before.port(), "rebinding takes a new port");
+            assert_eq!(endpoint.endpoint().local_addr().unwrap(), after);
+        }
     }
 
     #[test]

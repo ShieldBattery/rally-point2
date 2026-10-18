@@ -82,6 +82,7 @@ impl LinkDriver {
             rehome,
             escalate_after,
             escalate_retry,
+            fresh_port_redials,
         } = reconnect;
         // The driver knows its own slot from its token; it labels the
         // self-connectivity signal with it.
@@ -101,6 +102,7 @@ impl LinkDriver {
             rehome,
             escalate_after: escalate_after.unwrap_or(ESCALATE_AFTER),
             escalate_retry: escalate_retry.unwrap_or(ESCALATE_RETRY),
+            fresh_port_redials,
         };
         let (mut link, mut seam, mut state) = self.into_parts();
         let mut backoff = Backoff::new();

@@ -35,6 +35,7 @@ async fn a_classified_link_failure_closes_the_old_connection_before_the_re_dial(
         rehome: None,
         escalate_after: None,
         escalate_retry: None,
+        fresh_port_redials: true,
     };
     let task = tokio::spawn(driver_a.run_reconnecting(reconnect));
 
@@ -78,6 +79,7 @@ async fn an_eviction_ends_the_driver_without_a_re_dial() {
             rehome: None,
             escalate_after: None,
             escalate_retry: None,
+            fresh_port_redials: true,
         };
         let task = tokio::spawn(driver_a.run_reconnecting(reconnect));
 
@@ -177,6 +179,7 @@ async fn escalating_driver(
         rehome: Some(provider),
         escalate_after: Some(escalate_after),
         escalate_retry: Some(escalate_retry),
+        fresh_port_redials: true,
     };
     let task = tokio::spawn(driver_a.run_reconnecting(reconnect));
 
@@ -301,6 +304,37 @@ async fn a_hung_rehome_provider_does_not_freeze_the_reconnect_loop() {
         joined.is_ok(),
         "a game teardown during the ask ends the driver cleanly: {joined:?}",
     );
+}
+
+/// A provider reporting that this client's departure is already on record.
+struct DepartedAnswer;
+
+impl RehomeProvider for DepartedAnswer {
+    fn rehome(&self, _dead_relay_id: u64) -> RehomeFuture<'_> {
+        Box::pin(std::future::ready(RehomeOutcome::Departed))
+    }
+}
+
+#[tokio::test]
+async fn a_departed_answer_ends_the_driver_as_slot_departed() {
+    // A client that can't reach its relay never hears the relay refuse it, so the
+    // provider's word that its departure is recorded is the only way it learns the
+    // game went on without it.
+    let (task, chan) = escalating_driver(
+        Arc::new(DepartedAnswer),
+        Duration::ZERO,
+        Duration::from_secs(4),
+    )
+    .await;
+    let ended = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("a departed answer ends the driver")
+        .unwrap();
+    assert!(
+        matches!(ended, Err(DriverError::SlotDeparted)),
+        "ends as slot-departed: {ended:?}",
+    );
+    drop(chan);
 }
 
 #[tokio::test]

@@ -12,7 +12,8 @@
 //! control-stream broadcasts; `reconnect_and_leaves` covers a dropped link's
 //! reconnect-and-replay and a survivor's manual drop of a disconnected peer;
 //! `rehome` covers failover to a replacement relay; `address_fallback` covers
-//! re-dialing past a relay address whose path died to its next one.
+//! re-dialing past a relay address whose path died to its next one; `stale_mapping`
+//! covers re-dialing from a fresh local port past a NAT mapping gone stale.
 
 mod helpers;
 
@@ -21,3 +22,4 @@ mod connect_and_turns;
 mod directives;
 mod reconnect_and_leaves;
 mod rehome;
+mod stale_mapping;

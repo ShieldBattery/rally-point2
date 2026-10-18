@@ -66,6 +66,11 @@ pub enum RehomeOutcome {
     /// coordinator). Keep the same-relay backoff and let the driver re-ask on the
     /// `ESCALATE_RETRY` cadence.
     Unavailable,
+    /// This client's departure from the game is already on record — a survivor's
+    /// drop was honored while it was unreachable — so no relay will take the slot
+    /// back. Ends the reconnect loop as [`DriverError::SlotDeparted`], the same as the
+    /// relay's own refusal would, for a client that can't reach the relay to hear it.
+    Departed,
 }
 
 /// A boxed future a [`RehomeProvider::rehome`] returns — the manual async-trait
@@ -136,6 +141,13 @@ pub struct Reconnect {
     /// How often the driver re-escalates while the provider answers `Unavailable` or
     /// a re-home dial keeps failing. `None` uses `ESCALATE_RETRY`.
     pub escalate_retry: Option<Duration>,
+    /// Whether each re-dial after a failed one goes out from a freshly bound local UDP
+    /// port (see [`ClientEndpoint::rebind_fresh_port`]). The first re-dial after a drop
+    /// reuses the port the session ran on; one that fails leaves that port suspect, as
+    /// a NAT mapping gone bad under it fails every dial made through it. Turn this off
+    /// only when the port is pinned for tooling that filters traffic by port, which a
+    /// fresh port would slip out of.
+    pub fresh_port_redials: bool,
 }
 
 /// The current re-dial target, mutable across sessions so a successful re-home
@@ -201,6 +213,7 @@ pub(super) struct ReconnectDriver {
     pub(super) rehome: Option<Arc<dyn RehomeProvider>>,
     pub(super) escalate_after: Duration,
     pub(super) escalate_retry: Duration,
+    pub(super) fresh_port_redials: bool,
 }
 
 /// Whether a session ended on a link/stream failure the reconnect loop should
@@ -256,7 +269,8 @@ pub(super) enum Reconnected {
 /// noticing a teardown), presents the resume cursors, and on success rebinds `link`
 /// in place so the receive dedup and unacked window carry over. A slot-departed
 /// refusal or an expired token ends it terminally; every other dial failure is
-/// retried under a growing backoff.
+/// retried under a growing backoff, from a fresh local port when
+/// `rc.fresh_port_redials` is set.
 ///
 /// **Escalation.** Once the game has started (`state.game_started`) and a
 /// [`RehomeProvider`] is configured, a run of failed same-relay dials escalates to
@@ -264,7 +278,8 @@ pub(super) enum Reconnected {
 /// fresh cert, which no same-relay retry can pass), otherwise after
 /// [`ESCALATE_AFTER`]. [`RehomeOutcome::Stay`] resumes the same-relay backoff and
 /// resets the window; [`RehomeOutcome::Unavailable`] keeps it and re-escalates on
-/// the [`ESCALATE_RETRY`] cadence; [`RehomeOutcome::NewTarget`] dials the
+/// the [`ESCALATE_RETRY`] cadence; [`RehomeOutcome::Departed`] ends the loop as a
+/// slot-departed refusal; [`RehomeOutcome::NewTarget`] dials the
 /// replacement relay with the same identity and cursors, and on success rebinds,
 /// re-injects the retained turns, and updates `target` so subsequent drops
 /// reconnect there.
@@ -430,6 +445,12 @@ pub(super) async fn reconnect_link(
                                         "re-home escalation: no relay available yet; re-asking later",
                                     );
                                 }
+                                RehomeOutcome::Departed => {
+                                    tracing::info!(
+                                        "re-home escalation: this slot's departure is on record",
+                                    );
+                                    return Reconnected::Terminal(DriverError::SlotDeparted);
+                                }
                                 RehomeOutcome::NewTarget {
                                     relay_id,
                                     endpoint,
@@ -516,6 +537,17 @@ pub(super) async fn reconnect_link(
                     }
                 }
                 tracing::info!(%error, relay = %addr, "re-dial attempt failed; backing off");
+                if rc.fresh_port_redials {
+                    match rc.target.endpoint.rebind_fresh_port() {
+                        Ok(local) => {
+                            tracing::info!(%local, "next re-dial goes out from a fresh port")
+                        }
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "binding a fresh port failed; re-dialing from the current one",
+                        ),
+                    }
+                }
             }
         }
     }

@@ -54,6 +54,7 @@ async fn a_re_dial_moves_past_an_unreachable_address_to_the_relays_next_one() {
         rehome: None,
         escalate_after: None,
         escalate_retry: None,
+        fresh_port_redials: true,
     };
     let task0 = tokio::spawn(driver0.run_reconnecting(reconnect0));
 
@@ -149,6 +150,7 @@ async fn a_re_home_dials_the_replacements_next_address_when_its_first_is_unreach
         })),
         escalate_after: Some(Duration::from_millis(50)),
         escalate_retry: Some(Duration::from_millis(50)),
+        fresh_port_redials: true,
     };
     let task0 = tokio::spawn(driver0.run_reconnecting(reconnect0));
 
