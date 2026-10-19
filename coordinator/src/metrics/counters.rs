@@ -71,7 +71,8 @@ pub(crate) fn relay_launch_failed(region: &RegionId) {
 }
 
 /// Records a relay retired by a reconcile sweep. `reason` is one of the fixed
-/// words `launch_deadline`, `vanished`, or `orphan`.
+/// words `launch_deadline`, `vanished`, `orphan`, or `max_age` (an aged relay
+/// stopped once its last session ended).
 pub(crate) fn relay_reaped(region: Option<&RegionId>, reason: &str) {
     RELAY_REAPED.incr((region_label(region), reason.to_owned()));
 }

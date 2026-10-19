@@ -284,7 +284,7 @@ async fn scale_down_spares_a_relay_that_gained_a_session_in_the_race() {
 
     // The drain sequence marks it, re-checks, sees the session, and spares it.
     let mut h = h;
-    let drained = h.provision.try_drain_one(id, generation).await;
+    let drained = h.provision.try_drain_one(&east, 0, id, generation).await;
     assert!(!drained, "a relay that gained a session is spared");
     assert!(
         registry::is_available(&h.reg, id),
@@ -311,11 +311,29 @@ async fn a_stale_generation_drain_is_a_no_op() {
         hello(id.0, 14_900 + id.0 as u16).with_region(east.clone()),
     );
 
-    let drained = h.provision.try_drain_one(id, stale_generation).await;
+    let drained = h
+        .provision
+        .try_drain_one(&east, 0, id, stale_generation)
+        .await;
     assert!(!drained, "a stale-generation drain does not apply");
     assert!(
         registry::is_available(&h.reg, id),
         "the reconnected relay stays available",
     );
+    assert!(h.fake.stops().is_empty());
+}
+
+#[tokio::test]
+async fn a_drain_that_would_take_the_region_below_target_is_refused() {
+    let (mut h, east) = Harness::with_grace(5);
+    let (a, a_generation) = h.seed_live_relay(&east, 1_000);
+    let (b, b_generation) = h.seed_live_relay(&east, 1_000);
+    // The tick's snapshot showed two relays against a target of one, but `b`
+    // began draining before `a`'s drain ran.
+    assert!(registry::mark_draining(&h.reg, b, b_generation));
+
+    let drained = h.provision.try_drain_one(&east, 1, a, a_generation).await;
+    assert!(!drained, "the region's last placeable relay is spared");
+    assert!(registry::is_available(&h.reg, a));
     assert!(h.fake.stops().is_empty());
 }

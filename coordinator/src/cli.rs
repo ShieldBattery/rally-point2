@@ -267,6 +267,14 @@ pub(super) struct Cli {
     #[arg(long, env = "COORDINATOR_RELAY_IDLE_SECS", default_value_t = 600)]
     pub(super) relay_idle_secs: u64,
 
+    /// How long, in seconds, a provisioned relay may run (from launch, jittered
+    /// ±1/12 per relay) before it stops taking new sessions and is replaced. Its
+    /// running games finish first; the task stops once they have. Keeps busy
+    /// relays from outliving deploys and host maintenance. 0 disables. Default
+    /// 43200 (12h).
+    #[arg(long, env = "COORDINATOR_RELAY_MAX_AGE_SECS", default_value_t = 43_200)]
+    pub(super) relay_max_age_secs: u64,
+
     /// How long, in seconds, a shutdown waits for queued tenant webhooks to
     /// deliver before persisting its final state and exiting. Keep it under the
     /// container runtime's stop timeout (Docker's default is 10 s) so the final

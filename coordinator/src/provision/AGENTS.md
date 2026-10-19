@@ -3,10 +3,10 @@
 ## File map
 - `mod.rs` — substrate contract only (`Provisioner`, `LaunchSpec`, `TaskId`,
   `TaskState`, `ProvisionError`, the `Arc<P>` blanket impl). No policy.
-- `reconcile/` — the loop, split across three `impl<P: Provisioner>
+- `reconcile/` — the loop, split across four `impl<P: Provisioner>
   ProvisionLoop<P>` blocks: `mod.rs` (`new`/`run`/`tick`), `scaling.rs` (idle
-  tracking, coverage-bootstrap demand, scale up/down), `sweeps.rs` (the
-  fleet-wide cleanups).
+  tracking, coverage-bootstrap demand, scale up/down), `retirement.rs`
+  (max-age replacement), `sweeps.rs` (the fleet-wide cleanups).
 - `warm.rs` — `WarmTargets`: per-region warm demand with a TTL deadline.
   Independent of `reconcile`.
 - `coverage.rs` — `CoverageStatus`: the coverage phase the loop publishes out,
@@ -19,12 +19,30 @@
 - `process.rs` — the local child-process `Provisioner`, for dev/tests.
 
 ## Tick order (why)
-`refresh_idle` → per-region `scale_up`/`scale_down` (target =
-`max(warm, coverage)`, never their sum) → `resolve_pending` →
+`refresh_idle` → `aged_relays` → per-region `scale_up` → `retire_aged` →
+`scale_down` (target = `max(warm, coverage)`, never their sum) → `resolve_pending` →
 `launch_deadline_sweep` → `vanished_task_sweep` → `orphan_sweep`. Scaling runs
 first so a launch made this tick is never swept as an orphan (`pending`
 entries are exempt). The sweeps' relative order doesn't matter — each is an
 independent full re-derivation from the ledger/registry.
+
+## Max-age retirement
+Two relay counts per region, and mixing them up breaks make-before-break.
+`scale_up` counts only *fresh* (non-draining, not aged) relays, so an aged
+relay's replacement launches while it still serves. `scale_down` counts every
+non-draining relay *after* `retire_aged` has run. `retire_aged` flips
+`draining` in the tick's `enrolled` snapshot for each relay it marks, so an
+aged relay with no enrolled replacement still counts as live there and drains
+by the idle path when its region has no demand. A busy aged relay stays marked;
+never route it through `try_drain_one`, which un-marks a relay it finds busy.
+
+## Snapshots go stale within a tick
+Scaling awaits provisioner calls between decisions, so the tick's `enrolled`
+snapshot can be wrong by the time a relay is drained: another relay in the
+region may have disconnected or begun its own drain. Every decision that removes
+a placeable relay re-checks the live registry under the assignment lock first.
+`retire_aged` requires a still-available replacement, and `try_drain_one`
+requires the region to still be over target. A new drain path must do the same.
 
 ## Coverage backoff
 A region demands one relay per uncovered pair for `COVERAGE_HOLD_SECS`; still

@@ -44,6 +44,7 @@
 //! - `sessions` — storage for the restart-surviving session state (opaque
 //!   per-session records and relay boot ids); `crate::persist` owns the meaning.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
@@ -539,6 +540,23 @@ impl RelayLedger {
             )
             .optional()?;
         Ok(arn.flatten())
+    }
+
+    /// The launch instant (Unix seconds) of every id that is not retired, keyed by
+    /// id. The reconcile loop measures each relay's age from it to retire relays
+    /// that have run past their maximum lifetime; an id this coordinator never
+    /// minted has no row and so never ages out.
+    pub(crate) fn launch_times(&self) -> Result<HashMap<RelayId, u64>, LedgerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT relay_id, launched_at FROM provisioned_relays WHERE retired_at IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((RelayId(as_u64(row.get(0)?)), as_u64(row.get::<_, i64>(1)?)))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        Ok(rows)
     }
 
     /// Records `rtt_ms` for one direction of the canonical region pair

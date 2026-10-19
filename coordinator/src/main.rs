@@ -306,12 +306,15 @@ async fn main() -> Result<()> {
             tick_interval: Duration::from_secs(cli.provision_tick_secs),
             launch_deadline: Duration::from_secs(cli.provision_launch_deadline_secs),
             idle_grace: Duration::from_secs(cli.relay_idle_secs),
+            max_relay_age: (cli.relay_max_age_secs > 0)
+                .then(|| Duration::from_secs(cli.relay_max_age_secs)),
         };
         tracing::info!(
             regions = config.regions.len(),
             tick_secs = cli.provision_tick_secs,
             launch_deadline_secs = cli.provision_launch_deadline_secs,
             relay_idle_secs = cli.relay_idle_secs,
+            relay_max_age_secs = cli.relay_max_age_secs,
             "starting the relay provisioning loop",
         );
         if let Some(relay_bin) = cli.provision_relay_bin {

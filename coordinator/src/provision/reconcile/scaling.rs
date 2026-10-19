@@ -242,7 +242,10 @@ impl<P: Provisioner> ProvisionLoop<P> {
             if live <= target {
                 break;
             }
-            if self.try_drain_one(relay_id, generation).await {
+            if self
+                .try_drain_one(region, target, relay_id, generation)
+                .await
+            {
                 // Not counted toward the drain metric here: stopping the task makes
                 // the relay announce Draining on its control connection, and that
                 // announcement is where every drain — scale-down or relay-initiated
@@ -261,10 +264,26 @@ impl<P: Provisioner> ProvisionLoop<P> {
     /// session-free, does it stop the task and retire the id — outside the lock,
     /// since stopping awaits the task's death. Returns whether the relay was
     /// drained.
-    pub(super) async fn try_drain_one(&mut self, relay_id: RelayId, generation: u64) -> bool {
+    ///
+    /// Under the same lock it first re-counts `region`'s placeable relays from the
+    /// live registry and refuses to go below `target`. The caller's count comes
+    /// from the tick's snapshot, and every drain before this one awaited a task
+    /// stop. In that time another relay in the region may have disconnected or
+    /// begun its own drain (a mark also taken under the assignment lock).
+    /// Trusting the snapshot would then drain the region's last placeable relay.
+    pub(super) async fn try_drain_one(
+        &mut self,
+        region: &RegionId,
+        target: u32,
+        relay_id: RelayId,
+        generation: u64,
+    ) -> bool {
         let proceed = {
             let _assignment = self.setup.lock_assignment();
-            if !registry::mark_draining(self.setup.registry(), relay_id, generation) {
+            if registry::available_in_region(self.setup.registry(), region) <= target as usize {
+                // The region is no longer over target: spare the relay.
+                false
+            } else if !registry::mark_draining(self.setup.registry(), relay_id, generation) {
                 // The relay reconnected or left between selection and the mark.
                 false
             } else if self.setup.session_count_for_relay(relay_id) != 0 {
@@ -278,6 +297,16 @@ impl<P: Provisioner> ProvisionLoop<P> {
         if !proceed {
             return false;
         }
+        self.stop_and_retire(relay_id).await;
+        true
+    }
+
+    /// Stops a drained relay's task and retires its id, forgetting its idle timer.
+    /// The caller has already marked the relay draining and confirmed it
+    /// session-free under the assignment lock. Each step is logged and skipped on
+    /// failure rather than aborting: a task that failed to stop is caught by the
+    /// orphan sweep once its id is retired.
+    pub(super) async fn stop_and_retire(&mut self, relay_id: RelayId) {
         match self.ledger.task_arn(relay_id) {
             Ok(Some(arn)) => {
                 if let Err(error) = self.provisioner.stop(&TaskId(arn)).await {
@@ -306,6 +335,5 @@ impl<P: Provisioner> ProvisionLoop<P> {
             tracing::warn!(relay_id = relay_id.0, %error, "retiring a drained relay failed");
         }
         self.idle_since.remove(&relay_id);
-        true
     }
 }

@@ -187,6 +187,16 @@ struct Harness {
 
 impl Harness {
     fn new(regions: Vec<RegionId>, idle_grace: Duration, launch_deadline: Duration) -> Self {
+        Self::with_config(ProvisionConfig {
+            regions,
+            tick_interval: Duration::from_secs(5),
+            launch_deadline,
+            idle_grace,
+            max_relay_age: None,
+        })
+    }
+
+    fn with_config(config: ProvisionConfig) -> Self {
         let reg = registry::RelayRegistry::new();
         let setup = SessionSetup::new(reg.clone(), tenant_store());
         let ledger =
@@ -194,12 +204,6 @@ impl Harness {
         let warm = WarmTargets::new();
         let pair_rtts = crate::pair_rtts::PairRttStore::new();
         let fake = FakeProvisioner::new();
-        let config = ProvisionConfig {
-            regions,
-            tick_interval: Duration::from_secs(5),
-            launch_deadline,
-            idle_grace,
-        };
         let provision = ProvisionLoop::new(
             config,
             setup.clone(),
@@ -271,5 +275,6 @@ impl Harness {
 }
 
 mod coverage;
+mod retirement;
 mod scaling;
 mod sweeps;

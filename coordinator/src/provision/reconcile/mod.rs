@@ -19,6 +19,14 @@
 //!   re-checked against the placement race before its task is stopped and its id
 //!   retired.
 //!
+//! A relay past its maximum age (launch-relative, jittered per relay) stops
+//! counting toward the target, so a replacement launches while it keeps serving;
+//! once a younger relay has enrolled in its region it is marked draining, and its
+//! task is stopped the moment its last session ends. Without this, a region with
+//! steady traffic would keep its oldest relay forever — placement prefers the
+//! lowest id — leaving it behind every deploy and in the way of host maintenance.
+//! See [`ProvisionLoop::retire_aged`].
+//!
 //! Coverage-bootstrap demand asks for one relay while some configured pair
 //! involving the region has no measured backbone RTT, so a fresh fleet fills its
 //! own pair table instead of waiting for games to happen everywhere. It is
@@ -35,6 +43,8 @@
 //! - `mod.rs` (this file) — config, loop state, `new`/`run`/`tick`.
 //! - `scaling` — the second `impl<P: Provisioner> ProvisionLoop<P>` block:
 //!   idle tracking, coverage demand, and scale up/down.
+//! - `retirement` — max-age retirement: which relays have aged out, and the
+//!   make-before-break drain that replaces them.
 //! - `sweeps` — the fleet-wide sweeps `tick` runs after scaling: expired
 //!   launches, vanished tasks, and ledger orphans.
 
@@ -67,6 +77,10 @@ pub struct ProvisionConfig {
     /// How long an enrolled relay must be continuously session-free before a
     /// scale-down may drain it.
     pub idle_grace: Duration,
+    /// How long a relay may run, measured from its launch, before it stops taking
+    /// new sessions and is replaced (see [`ProvisionLoop::retire_aged`]). `None`
+    /// lets a busy relay run indefinitely.
+    pub max_relay_age: Option<Duration>,
 }
 
 /// A launched task whose addresses have not been recorded yet — the loop polls it
@@ -257,8 +271,9 @@ impl<P: Provisioner> ProvisionLoop<P> {
     /// One reconcile pass at `now` (Unix seconds). Public so a test — or the e2e —
     /// can drive ticks deterministically rather than sleeping through real time.
     pub async fn tick(&mut self, now: u64) {
-        let enrolled = registry::enrolled_relays(self.setup.registry());
+        let mut enrolled = registry::enrolled_relays(self.setup.registry());
         self.refresh_idle(&enrolled, now);
+        let aged = self.aged_relays(&enrolled, now);
 
         // The pairs that currently hold a value, snapshotted once so each region's
         // coverage check is a set lookup rather than a fresh lock per pair.
@@ -279,12 +294,26 @@ impl<P: Provisioner> ProvisionLoop<P> {
             // `live` would hide a real gap behind a relay that is on its way out —
             // scale-up would stay suppressed for as long as the drain takes to finish
             // (up to a full game's remaining length) even though nothing placeable
-            // covers the target.
+            // covers the target. Aged relays are excluded from scale-up's count for
+            // the same reason — they are on their way out — so their replacements
+            // launch while they still serve.
+            let fresh = enrolled
+                .iter()
+                .filter(|r| {
+                    !r.draining && r.region.as_ref() == Some(region) && !aged.contains(&r.relay_id)
+                })
+                .count() as u32;
+            self.scale_up(region, fresh, target, now).await;
+            // Retirement marks aged relays draining in `enrolled` as it goes, so the
+            // scale-down below neither counts nor picks a relay it just retired —
+            // but an aged relay with no replacement yet still counts as live there,
+            // so an idle one in a region with no demand still drains by the idle
+            // path.
+            self.retire_aged(region, &mut enrolled, &aged).await;
             let live = enrolled
                 .iter()
                 .filter(|r| !r.draining && r.region.as_ref() == Some(region))
                 .count() as u32;
-            self.scale_up(region, live, target, now).await;
             self.scale_down(region, &enrolled, live, target, now).await;
         }
 
@@ -295,6 +324,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
     }
 }
 
+mod retirement;
 mod scaling;
 mod sweeps;
 

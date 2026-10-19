@@ -1263,6 +1263,21 @@ The drain mark also steers re-home: a draining relay is never chosen as a re-hom
 taking work), though a draining relay *still serving* a session it is named dead for correctly reads as a
 false-alarm `stay` — drain blocks only new assignments, and a serving relay is alive.
 
+**Max-age retirement.** Placement homes a region's slots on its lowest-id relay, which is its oldest.
+So in a region that never goes quiet, the oldest relay never reaches its idle grace. Left alone, it would
+outlive every deploy and run into the substrate's host maintenance, while the younger relays a surge
+brought up idle out instead. The provisioning loop therefore gives each relay a maximum age, measured from
+its launch (default 12h, jittered ±1/12 per relay id so a surge's relays don't retire together). The
+retirement is make-before-break. An aged relay stops counting toward its region's target, so its
+replacement launches, but it stays placeable until a younger relay has *enrolled* in the region. Marking
+it any sooner would leave the region with nowhere to place a game, and creates would hold or fall back
+cross-region for a launch's worth of time. After that the coordinator marks it draining, under the
+assignment lock, and stops its task once its last session ends. Running games are never cut short.
+Busy relays are left marked rather than spared, unlike a scale-down's race check. The age is re-derived
+every tick from the ledger's launch times, so a coordinator restart, or a reconnect that clears the mark,
+is corrected on the next tick. A region with no demand launches no replacement; its aged relay drains by
+the ordinary idle path.
+
 **Logical push, physical pull.** The coordinator decides a relay's mesh membership and the relay
 applies it — the data flows coordinator→relay. But the relay is what *opens* the connection, rather than
 the coordinator reaching into a relay that churns under scale-to-zero and may sit behind a firewall.

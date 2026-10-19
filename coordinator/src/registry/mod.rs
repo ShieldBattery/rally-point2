@@ -360,6 +360,20 @@ pub fn is_available(registry: &RelayRegistry, id: RelayId) -> bool {
     registry.relays.lock().get(&id).is_some_and(|r| !r.draining)
 }
 
+/// How many relays tagged with `region` are enrolled and available for a new
+/// session assignment (see [`is_available`]).
+pub fn available_in_region(
+    registry: &RelayRegistry,
+    region: &rally_point_proto::control::RegionId,
+) -> usize {
+    registry
+        .relays
+        .lock()
+        .values()
+        .filter(|r| !r.draining && r.entry.region.as_ref() == Some(region))
+        .count()
+}
+
 /// Whether `id` is currently enrolled at all — draining or not. Distinct from
 /// [`is_available`], which excludes a draining relay: the reconcile sweeps ask
 /// only whether a relay is present (a bound ledger id whose relay is still
