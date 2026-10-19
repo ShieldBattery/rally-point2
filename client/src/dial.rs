@@ -103,9 +103,10 @@ pub enum DialError {
     /// connection-binding proof can't be produced.
     #[error("deriving the connection's channel binding failed")]
     ChannelBinding,
-    /// The dial did not finish within its deadline: the relay accepted the
-    /// connection but stalled during the handshake instead of completing or
-    /// rejecting it. The connection has been closed.
+    /// The dial did not finish within its deadline: either nothing answered the
+    /// QUIC handshake at all (a filtered or black-holed path looks exactly like
+    /// this), or the relay accepted the connection and then stalled instead of
+    /// completing or rejecting the authorization. The connection has been closed.
     #[error("dial timed out after {timeout:?}")]
     TimedOut { timeout: Duration },
     /// The relay refused a re-dial because this slot's leave was already decided —
@@ -207,8 +208,9 @@ impl ClientEndpoint {
     /// the QUIC handshake plus the authorization exchange.
     ///
     /// On expiry the connection is closed and [`DialError::TimedOut`] is returned,
-    /// so a relay that accepts the connection and then goes silent surfaces a
-    /// bounded error instead of blocking the game-launch path indefinitely.
+    /// so a relay that never answers, or accepts the connection and then goes
+    /// silent, surfaces a bounded error instead of blocking the game-launch path
+    /// indefinitely.
     pub async fn connect_with_timeout(
         &self,
         relay_addr: SocketAddr,
