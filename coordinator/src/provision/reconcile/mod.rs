@@ -78,7 +78,7 @@ pub struct ProvisionConfig {
     /// scale-down may drain it.
     pub idle_grace: Duration,
     /// How long a relay may run, measured from its launch, before it stops taking
-    /// new sessions and is replaced (see [`ProvisionLoop::retire_aged`]). `None`
+    /// new sessions and is replaced (see `ProvisionLoop::retire_aged`). `None`
     /// lets a busy relay run indefinitely.
     pub max_relay_age: Option<Duration>,
 }
