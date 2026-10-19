@@ -8,3 +8,9 @@
 # Saved plans embed variable values — including sensitive ones — so they must
 # never be committed.
 *.tfplan
+
+# Coordinator config rendered from `terraform output` (ecs_json / regions_json)
+# on its way to the coordinator box. It's generated per environment from state,
+# so a copy left in the repo is always stale.
+ecs.json
+regions.json
