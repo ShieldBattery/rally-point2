@@ -11,7 +11,8 @@ use rally_point_proto::control::{CoordinatorToRelay, ENROLL_POP_CONTEXT, RelayTo
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::version::{
     CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
-    CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
+    CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_RETIRED,
+    CONTROL_CLOSE_UNKNOWN_REGION,
 };
 use rally_point_transport::rustls::pki_types::PrivateKeyDer;
 use tokio::sync::watch;
@@ -59,11 +60,17 @@ pub(super) enum ControlDisconnect {
     /// same [`VERSION_REFUSED_RECONNECT_DELAY`] as a version, region, or identity
     /// refusal.
     EnrollUnauthorized,
+    /// The coordinator retired this relay's id (close code
+    /// [`CONTROL_CLOSE_RETIRED`]) — the ordinary end of its life, normally just
+    /// ahead of the task platform's stop signal. The id is tombstoned, so the
+    /// loop never redials.
+    Retired,
 }
 
 /// Holds the coordinator control connection open and drives the Join source,
-/// reconnecting whenever it drops. Spawned as a task on the relay when a
-/// coordinator URL is configured; never returns.
+/// reconnecting whenever it drops — until the coordinator retires this relay,
+/// after which it flips `apply_targets.retired` and parks. Spawned as a task on
+/// the relay when a coordinator URL is configured; never returns.
 ///
 /// The relay dials `enroll.coordinator_url`, enrolls with `enroll.relay_hello`, and
 /// proves possession of `enroll.identity_key` when the coordinator challenges — a
@@ -163,6 +170,16 @@ pub async fn run_descriptor_subscriber_with(
                 | ControlDisconnect::IdentityUnproven
                 | ControlDisconnect::EnrollUnauthorized,
             ) => backoff.version_refused,
+            Ok(ControlDisconnect::Retired) => {
+                // A tombstoned id can only be refused again, so stop dialing for
+                // good. Parking (rather than returning) keeps every handle this
+                // task owns alive for the drain sequence and the idle self-exit,
+                // which reads the dropped connection as one half of its backstop
+                // should the stop signal never come.
+                let _ = control_connected.send(false);
+                let _ = apply_targets.retired.send(true);
+                std::future::pending().await
+            }
             Err(error) => {
                 tracing::warn!(
                     %error,
@@ -458,6 +475,13 @@ pub(super) fn classify_control_close(
                 "coordinator refused our relay id as already enrolled under a different certificate; retrying",
             );
             ControlDisconnect::Ordinary
+        }
+        CONTROL_CLOSE_RETIRED => {
+            tracing::info!(
+                relay_id = relay_id.0,
+                "coordinator retired this relay; no longer redialing, awaiting shutdown",
+            );
+            ControlDisconnect::Retired
         }
         _ => ControlDisconnect::Ordinary,
     }

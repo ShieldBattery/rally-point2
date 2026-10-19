@@ -162,7 +162,16 @@ async fn main() -> Result<()> {
     // the handshake and waits on local idleness alone.
     let drain_timeout = Duration::from_secs(cli.drain_timeout_secs);
     let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
-    let (drain_acked_tx, mut drain_acked_rx) = tokio::sync::watch::channel(false);
+    let (drain_acked_tx, drain_acked_rx) = tokio::sync::watch::channel(false);
+    // Flipped by the coordinator client when the coordinator retires this relay —
+    // the normal end of its life, landing just ahead of the platform's stop
+    // signal — so the drain sequence knows no `DrainAck` will follow.
+    let (retired_tx, retired_rx) = tokio::sync::watch::channel(false);
+    let mut drain_handshake = shutdown::DrainHandshake {
+        request: drain_tx,
+        acked: drain_acked_rx,
+        retired: retired_rx,
+    };
     // The last-applied session set, shared between the coordinator client (which
     // reconciles it on every descriptor push) and the drain sequence (which reads
     // it to tell an assigned-but-not-yet-dialed session from a provably unassigned
@@ -488,6 +497,7 @@ async fn main() -> Result<()> {
                         .expect("coordinator mode constructs a shared tenant-key registry"),
                     region_targets: region_targets.clone(),
                     drain_acked: drain_acked_tx.clone(),
+                    retired: retired_tx.clone(),
                 },
                 coordinator::client::OutboundQueues::new(notices_rx, flight_rx, control_conn_stats),
                 coordinator::client::HeartbeatSources {
@@ -555,8 +565,7 @@ async fn main() -> Result<()> {
         _ = shutdown::shutdown_signal() => {
             shutdown::drain_and_exit(
                 has_coordinator,
-                &drain_tx,
-                &mut drain_acked_rx,
+                &mut drain_handshake,
                 &sessions_for_drain,
                 &applied,
                 &flight,

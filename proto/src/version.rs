@@ -222,6 +222,19 @@ pub const CONTROL_CLOSE_DUPLICATE_RELAY_ID: u16 = 4004;
 /// loopback) never sends this code — it accepts the id claim as presented.
 pub const CONTROL_CLOSE_ENROLL_UNAUTHORIZED: u16 = 4005;
 
+/// WebSocket close code the coordinator sends on an *enrolled* relay's control
+/// connection when it retires that relay's id — the ordinary end of a relay's
+/// life (an idle scale-in, issued just after the coordinator asks the task
+/// platform to stop the task). Unlike its 4001–4005 siblings this is not an
+/// enroll refusal: nothing is wrong, the relay is simply done.
+///
+/// A cross-component contract: the id is tombstoned and will never enroll
+/// again, so the relay's coordinator client stops redialing (a redial could
+/// only earn [`CONTROL_CLOSE_ENROLL_UNAUTHORIZED`]) and its drain sequence
+/// stops waiting for a `DrainAck` no coordinator will send. The relay keeps
+/// serving whatever it still holds until the platform's stop signal arrives.
+pub const CONTROL_CLOSE_RETIRED: u16 = 4006;
+
 /// QUIC application close code a mesh *acceptor* uses to refuse a dialing relay
 /// whose advertised protocol version does not [`negotiate`] against its own.
 /// Sent before the link driver is ever spawned, so an incompatible pair never

@@ -19,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::StreamExt;
-use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::stream::SplitStream;
 use rally_point_proto::control::{CoordinatorToRelay, RelayToCoordinator};
 use rally_point_proto::version::ProtocolVersion;
 
@@ -97,8 +97,8 @@ pub(super) async fn relay_control(
 ///
 /// Once enrolled, the connection serves descriptors and watches liveness
 /// ([`push_and_watch`]) until it ends — the relay closes, the socket errors, the
-/// relay goes silent past `liveness_timeout`, or the coordinator's outbox is
-/// dropped (shutdown).
+/// relay goes silent past `liveness_timeout`, or the relay's id is retired (the
+/// writer then closes with `CONTROL_CLOSE_RETIRED`).
 ///
 /// When the connection drops, the relay is deregistered — but only if this
 /// connection is still the current one ([`registry::remove_if_current`]): a relay
@@ -227,9 +227,6 @@ async fn send_close(socket: &mut WebSocket, close: ControlClose) {
         .await;
 }
 
-/// The send half of a relay's split control socket — every coordinator→relay
-/// frame goes out through this, owned solely by the writer.
-pub(super) type ControlWrite = SplitSink<WebSocket, Message>;
 /// The receive half of a relay's split control socket — every relay→coordinator
 /// frame comes in through this, owned solely by the reader.
 pub(super) type ControlRead = SplitStream<WebSocket>;
@@ -245,8 +242,8 @@ pub(super) struct DrainSend;
 /// Serves an enrolled relay's control connection by splitting the socket into a
 /// reader and a writer that run until either ends. Returns when the connection is
 /// over — the relay closes, the socket errors, the relay goes silent past
-/// `liveness_timeout`, a send stalls past `liveness_timeout`, or the coordinator's
-/// outbox is dropped on shutdown — so the caller then runs the single
+/// `liveness_timeout`, a send stalls past `liveness_timeout`, or the relay's id is
+/// retired — so the caller then runs the single
 /// deregistration path.
 ///
 /// The split lets reading and writing proceed independently: a relay that stops

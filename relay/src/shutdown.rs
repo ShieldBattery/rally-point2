@@ -55,6 +55,15 @@ pub(crate) async fn shutdown_signal() {
     }
 }
 
+/// The relay's half of the coordinated-drain exchange with its coordinator
+/// client: the drain request it raises, and the two answers that end its wait —
+/// the coordinator's `DrainAck`, or the retirement that means none will come.
+pub(crate) struct DrainHandshake {
+    pub(crate) request: tokio::sync::watch::Sender<bool>,
+    pub(crate) acked: tokio::sync::watch::Receiver<bool>,
+    pub(crate) retired: tokio::sync::watch::Receiver<bool>,
+}
+
 /// The coordinated-drain sequence, run once a shutdown signal arrives while the
 /// server keeps serving: ask the coordinator to stop assigning us new sessions,
 /// wait (bounded) for its `DrainAck`, then wait for the relay to go idle before
@@ -77,8 +86,7 @@ pub(crate) async fn shutdown_signal() {
 /// coordinator-mediated failover.
 pub(crate) async fn drain_and_exit(
     has_coordinator: bool,
-    drain_tx: &tokio::sync::watch::Sender<bool>,
-    drain_acked_rx: &mut tokio::sync::watch::Receiver<bool>,
+    handshake: &mut DrainHandshake,
     sessions: &Sessions,
     applied: &coordinator::client::AppliedSessions,
     flight: &FlightRecorder,
@@ -88,12 +96,36 @@ pub(crate) async fn drain_and_exit(
 
     if has_coordinator {
         // Ask the coordinator to stop assigning us new sessions.
-        let _ = drain_tx.send(true);
+        let _ = handshake.request.send(true);
+        // A retired relay's id is tombstoned, so its coordinator will never ack —
+        // and needn't: retirement already guarantees nothing new is assigned. The
+        // retirement close usually lands just before the stop signal, but may
+        // trail it, so it races the ack rather than being checked once.
+        let retired = async {
+            if handshake
+                .retired
+                .wait_for(|retired| *retired)
+                .await
+                .is_err()
+            {
+                // No coordinator client left to announce a retirement.
+                std::future::pending::<()>().await;
+            }
+        };
         // Wait for the DrainAck, but never let a down/older coordinator wedge us.
-        match tokio::time::timeout(DRAIN_ACK_TIMEOUT, drain_acked_rx.changed()).await {
-            Ok(Ok(())) => tracing::info!("coordinator acknowledged drain"),
-            Ok(Err(_)) => tracing::warn!("drain-ack channel closed before an ack; proceeding"),
-            Err(_) => tracing::warn!("timed out waiting for a drain ack; proceeding"),
+        tokio::select! {
+            outcome = tokio::time::timeout(DRAIN_ACK_TIMEOUT, handshake.acked.changed()) => {
+                match outcome {
+                    Ok(Ok(())) => tracing::info!("coordinator acknowledged drain"),
+                    Ok(Err(_)) => {
+                        tracing::warn!("drain-ack channel closed before an ack; proceeding")
+                    }
+                    Err(_) => tracing::warn!("timed out waiting for a drain ack; proceeding"),
+                }
+            }
+            () = retired => {
+                tracing::info!("coordinator retired this relay; skipping the drain ack");
+            }
         }
     } else {
         tracing::info!("no coordinator configured; skipping the drain handshake");

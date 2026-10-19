@@ -1,12 +1,16 @@
 //! The drain exchange: a relay asking to drain gets its current descriptor set
 //! pushed as a full set (never a delta) and then an ack, is excluded from new
 //! session assignment while draining, and steady-state deltas resume correctly
-//! against the baseline the drain refreshed.
+//! against the baseline the drain refreshed. A retired relay is told so with a
+//! close code rather than a silently dropped socket.
 
+use futures_util::StreamExt;
 use rally_point_coordinator::api::ControlAuth;
 use rally_point_coordinator::registry;
 use rally_point_proto::control::{CoordinatorToRelay, DescriptorKey, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::version::CONTROL_CLOSE_RETIRED;
+use tokio_tungstenite::tungstenite::Message;
 
 use crate::common::{ControlSocket, connect_and_send_hello, prove_identity, relay_key};
 use crate::helpers::*;
@@ -121,4 +125,36 @@ async fn enroll_over_socket(base_url: &str, id: u64, port: u16) -> ControlSocket
     let mut socket = connect_and_send_hello(base_url, relay_hello(id, port)).await;
     prove_identity(&mut socket, &relay_key(id)).await;
     socket
+}
+
+#[tokio::test]
+async fn a_retired_relay_is_told_with_a_close_rather_than_a_dropped_socket() {
+    // An idle scale-in retires the relay's id just after stopping its task. The
+    // relay must read that as the end of its life, not a fault worth redialing,
+    // so the connection ends with the retirement close code.
+    let (base_url, setup) = serve_coordinator_returning_setup(ControlAuth::Open).await;
+    let mut socket = connect_and_send_hello(&base_url, relay_hello(1, 14900)).await;
+    prove_identity(&mut socket, &relay_key(1)).await;
+    let _ = read_to_descriptor_update(&mut socket).await;
+
+    setup.forget_relay(RelayId(1));
+
+    let close = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match socket
+                .next()
+                .await
+                .expect("the socket stays open until the close")
+            {
+                Ok(Message::Close(close)) => break close,
+                // The rest of the connect-time lead may still be in flight.
+                Ok(_) => continue,
+                Err(error) => panic!("the socket failed instead of closing: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("the coordinator closes promptly")
+    .expect("the close carries a frame");
+    assert_eq!(u16::from(close.code), CONTROL_CLOSE_RETIRED);
 }

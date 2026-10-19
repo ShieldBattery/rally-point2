@@ -420,6 +420,10 @@ pub struct ControlApplyTargets {
     /// Because the read half applies inbound frames in arrival order, the pre-ack
     /// descriptor push has already reconciled `applied` by the time this fires.
     pub drain_acked: watch::Sender<bool>,
+    /// Flipped to `true` when the coordinator closes with `CONTROL_CLOSE_RETIRED`:
+    /// the id is tombstoned, so no `DrainAck` will ever come and the drain
+    /// sequence stops waiting for one.
+    pub retired: watch::Sender<bool>,
 }
 
 /// The relay's outbound work queues and the stats handle that reports their

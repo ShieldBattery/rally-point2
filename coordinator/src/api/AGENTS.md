@@ -11,8 +11,7 @@ Public paths (`api::CoordinatorState`, `router`, `ControlAuth`,
 - `queries.rs` presence, flight blob reads, warm, pubkey, regions
 - `request_auth.rs` bearer check + tenant request signatures
 - `control.rs` the endpoint, the socket loop that drives the enroll handshake,
-  and the socket/channel types both halves share (`ControlRead`,
-  `ControlWrite`, `DrainSend`)
+  and the socket/channel types both halves share (`ControlRead`, `DrainSend`)
 - `control_enroll.rs` the enroll sequence itself as a typed state machine
   (`EnrollHandshake` / `EnrollStep`), plus the pending-Hello gate's size and the
   close code a saturated gate sends

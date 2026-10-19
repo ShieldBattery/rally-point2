@@ -1,6 +1,6 @@
 //! Dialing and redialing: the control URL the upgrade request targets, and which
 //! coordinator close codes buy the long refusal backoff rather than a prompt
-//! retry.
+//! retry, and the retirement close that ends redialing for good.
 
 use super::*;
 
@@ -174,4 +174,49 @@ async fn a_close_that_resolves_on_its_own_redials_at_the_normal_delay() {
              not the refusal backoff (observed gap: {gap:?})",
         );
     }
+}
+
+#[tokio::test]
+async fn a_retired_close_stops_redialing_and_flips_the_retired_signal() {
+    use tokio::net::TcpListener;
+
+    // A retirement lands on an enrolled connection, so the stand-in completes the
+    // enroll handshake first, then closes the way an idle scale-in does.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (dials_tx, mut dials_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let _ = dials_tx.send(());
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                continue;
+            };
+            let _hello = accept_enroll(&mut ws).await;
+            let _ = ws
+                .close(Some(refusal(CONTROL_CLOSE_RETIRED, "relay retired")))
+                .await;
+            while let Some(Ok(_)) = ws.next().await {}
+        }
+    });
+
+    let (retired, mut retired_rx) = watch::channel(false);
+    SubscriberFixture {
+        retired,
+        // Any redial would come within ~20ms; there must be none at all.
+        backoff: backoff(Duration::from_millis(20), Duration::from_millis(20)),
+        ..Default::default()
+    }
+    .spawn(addr);
+
+    tokio::time::timeout(Duration::from_secs(5), retired_rx.wait_for(|r| *r))
+        .await
+        .expect("the retired close flips the retired signal")
+        .unwrap();
+    dials_rx.recv().await.expect("the first dial was recorded");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), dials_rx.recv())
+            .await
+            .is_err(),
+        "a retired relay's id is tombstoned, so it must never redial",
+    );
 }

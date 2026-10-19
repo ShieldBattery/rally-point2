@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use axum::extract::ws::Message;
+use axum::extract::ws::{CloseFrame, Message};
 use futures_util::SinkExt;
 use rally_point_proto::control::{
     CoordinatorToRelay, DescriptorKey, MeshPeerIdentity, RegionBeaconTarget, SessionDescriptor,
@@ -14,7 +14,7 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::RelayId;
 use rally_point_proto::time::unix_millis;
-use rally_point_proto::version::ProtocolVersion;
+use rally_point_proto::version::{CONTROL_CLOSE_RETIRED, ProtocolVersion};
 
 use crate::attest::LoadStateAsk;
 use crate::descriptors::SlotClose;
@@ -23,7 +23,7 @@ use crate::registry;
 use crate::session::SessionSetup;
 use crate::tenant;
 
-use super::control::{ControlWrite, DrainSend};
+use super::control::DrainSend;
 
 /// The writer half's outbound sources: the per-relay descriptor and reap outboxes,
 /// the fleet mesh-peer watch, the reader's drain-exchange directives, and the
@@ -100,7 +100,8 @@ impl WriterSources {
 /// session its teardown; a load-state question is tenant-driven, arrives in bursts,
 /// and is cheap for its caller to repeat, so it yields to all of them — and a
 /// question whose waiter has since gone is dropped rather than sent. Returns (ending
-/// the connection) when a send stalls or errors, a watch closes on shutdown, or the
+/// the connection) when a send stalls or errors, the relay's id is retired (after a
+/// [`CONTROL_CLOSE_RETIRED`] close), the mesh-peer watch closes on shutdown, or the
 /// reader ends.
 ///
 /// The connect-time descriptor set is always the full set (it seeds the relay's
@@ -108,13 +109,19 @@ impl WriterSources {
 /// [`CoordinatorToRelay::DescriptorDelta`] — to a relay whose `negotiated` version
 /// supports it, falling back to the full set for an older relay. `last_sent` tracks
 /// the set the relay currently holds so each delta diffs against exactly that.
-pub(super) async fn run_writer(
-    write_half: &mut ControlWrite,
+///
+/// Generic over the sink, like [`writer_send`], so a test can watch which frames
+/// a given ending sends; the connection itself passes its socket's write half.
+pub(super) async fn run_writer<S>(
+    write_half: &mut S,
     sources: &mut WriterSources,
     relay_id: RelayId,
     liveness_timeout: Duration,
     negotiated: ProtocolVersion,
-) {
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
     // Split the sources into the individual channels + payloads the loop drives;
     // they are disjoint fields, so each arm borrows its own.
     let WriterSources {
@@ -197,7 +204,7 @@ pub(super) async fn run_writer(
         return;
     }
 
-    loop {
+    let exit = loop {
         tokio::select! {
             biased;
 
@@ -205,7 +212,7 @@ pub(super) async fn run_writer(
                 // The reader marked the relay draining and asked for the exchange's
                 // send half. `None` means the reader ended, so this half ends too.
                 if directive.is_none() {
-                    break;
+                    break LoopExit::SourceClosed;
                 }
                 // Set before ack. `borrow_and_update` reads the latest set — which
                 // already reflects every descriptor staged before the reader's
@@ -225,7 +232,7 @@ pub(super) async fn run_writer(
                 )
                 .await
                 {
-                    break;
+                    break LoopExit::SendFailed;
                 }
                 last_sent = index_descriptors(&set);
                 if !writer_send(
@@ -237,12 +244,13 @@ pub(super) async fn run_writer(
                 )
                 .await
                 {
-                    break;
+                    break LoopExit::SendFailed;
                 }
             }
             changed = rx.changed() => {
                 if changed.is_err() {
-                    break; // the outbox was dropped: coordinator shutting down
+                    // Retired: the close goes out below the loop.
+                    break LoopExit::SourceClosed;
                 }
                 let set = rx.borrow_and_update().clone();
                 if !send_descriptor_change(
@@ -255,12 +263,13 @@ pub(super) async fn run_writer(
                 )
                 .await
                 {
-                    break;
+                    break LoopExit::SendFailed;
                 }
             }
             changed = mesh_peers_rx.changed() => {
                 if changed.is_err() {
-                    break; // the registry's mesh-peer channel was dropped: shutting down
+                    // The registry's mesh-peer channel was dropped: shutting down.
+                    break LoopExit::SourceClosed;
                 }
                 let peers = mesh_peers_rx.borrow_and_update().clone();
                 if !writer_send(
@@ -272,14 +281,14 @@ pub(super) async fn run_writer(
                 )
                 .await
                 {
-                    break;
+                    break LoopExit::SendFailed;
                 }
             }
             grant = grants_rx.recv() => {
                 // A ready flight-upload grant or refusal the reader (or a presign it
                 // spawned) minted. `None` means every sender is gone — the reader ended
                 // and no presign is still in flight — so this half ends too.
-                let Some(grant) = grant else { break };
+                let Some(grant) = grant else { break LoopExit::SourceClosed };
                 if !writer_send(
                     write_half,
                     control_frame(&grant),
@@ -289,23 +298,25 @@ pub(super) async fn run_writer(
                 )
                 .await
                 {
-                    break;
+                    break LoopExit::SendFailed;
                 }
             }
             first = reaps.recv() => {
                 // The reap outbox never closes on its own (the sender lives in the
-                // shared outbox), so `None` here would only mean a replaced
-                // subscription — treat it as end-of-stream and stop selecting.
-                let Some(first) = first else { break };
+                // shared outbox), so `None` here means a replaced subscription or
+                // a retirement — end-of-stream either way; the exit check below
+                // tells them apart.
+                let Some(first) = first else { break LoopExit::SourceClosed };
                 if !send_coalesced_reaps(write_half, reaps, first, relay_id, liveness_timeout).await
                 {
-                    break;
+                    break LoopExit::SendFailed;
                 }
             }
             ask = load_state_rx.recv() => {
                 // A load-state question for this relay, from a tenant read blocked on
                 // the answer. `None` means the broker replaced this connection's
-                // channel (a reconnect took over) or is gone, so this half ends too.
+                // channel (a reconnect took over) or the relay was retired, so this
+                // half ends too.
                 //
                 // Ranked LAST deliberately. Every arm above it is the fleet's own
                 // machinery — a drain exchange, the descriptor set, the mesh-peer
@@ -313,7 +324,7 @@ pub(super) async fn run_writer(
                 // costs a relay correctness or a session its teardown. A load-state
                 // read is tenant-driven, arrives in bursts, and is cheap to repeat,
                 // so it yields to all of them.
-                let Some(ask) = ask else { break };
+                let Some(ask) = ask else { break LoopExit::SourceClosed };
                 // A question nobody is waiting for is not worth a frame or the
                 // relay's fence: the read that made it timed out, or its HTTP
                 // request was cancelled, and either retires the request as it
@@ -331,11 +342,41 @@ pub(super) async fn run_writer(
                 if !writer_send(write_half, frame, relay_id, liveness_timeout, "load-state-request")
                     .await
                 {
-                    break;
+                    break LoopExit::SendFailed;
                 }
             }
         }
+    };
+
+    // The descriptor channel outlives every connection and only `forget` closes
+    // it, so a closed one at exit means this relay's id was just retired. Say so
+    // rather than dropping the socket, so the relay reads the end of its life as
+    // one and not as a fault to redial. Checked here, not in the descriptor arm,
+    // because `forget` also closes the reap and load-state channels, and on a
+    // multi-thread runtime either may be observed first: `biased` orders the
+    // polls within one pass, not the channels' closures between them. A replaced
+    // subscription leaves the descriptor channel open, so it still ends bare.
+    if matches!(exit, LoopExit::SourceClosed) && rx.has_changed().is_err() {
+        let _ = writer_send(
+            write_half,
+            Message::Close(Some(CloseFrame {
+                code: CONTROL_CLOSE_RETIRED,
+                reason: "relay retired".into(),
+            })),
+            relay_id,
+            liveness_timeout,
+            "retired-close",
+        )
+        .await;
     }
+}
+
+/// Why [`run_writer`]'s steady-state loop ended: a source it drains closed (the
+/// reader ended, a subscription was replaced, or the relay was retired), or a send
+/// failed or stalled — after which the socket is not worth another send.
+enum LoopExit {
+    SourceClosed,
+    SendFailed,
 }
 
 /// Coalesces a burst of reap nudges into one `CloseSlot` frame per session, then
@@ -345,13 +386,17 @@ pub(super) async fn run_writer(
 /// most complete — collapsing a teardown storm's hundreds of redundant nudges into
 /// at most one frame per session per wake. Returns whether the connection should
 /// keep running.
-async fn send_coalesced_reaps(
-    write_half: &mut ControlWrite,
+async fn send_coalesced_reaps<S>(
+    write_half: &mut S,
     reaps: &mut tokio::sync::mpsc::UnboundedReceiver<SlotClose>,
     first: SlotClose,
     relay_id: RelayId,
     liveness_timeout: Duration,
-) -> bool {
+) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
     let mut received: u64 = 1;
     let mut latest: std::collections::BTreeMap<(String, u64), SlotClose> =
         std::collections::BTreeMap::new();
@@ -404,14 +449,18 @@ fn descriptors_frame(descriptors: Vec<SessionDescriptor>) -> Message {
 /// existed. `last_sent` advances to the current set only after a delta send
 /// succeeds, so it always mirrors what the relay actually holds. Returns whether the
 /// connection should keep running.
-async fn send_descriptor_change(
-    write_half: &mut ControlWrite,
+async fn send_descriptor_change<S>(
+    write_half: &mut S,
     last_sent: &mut std::collections::HashMap<DescriptorKey, SessionDescriptor>,
     set: Vec<SessionDescriptor>,
     negotiated: ProtocolVersion,
     relay_id: RelayId,
     liveness_timeout: Duration,
-) -> bool {
+) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
     if negotiated < ProtocolVersion::DESCRIPTOR_DELTA_MIN {
         // An older relay decodes a DescriptorDelta as an unknown frame and would
         // silently drift, so it always gets the whole current set. Its baseline is
@@ -523,8 +572,8 @@ pub(super) fn index_descriptors(
 /// or a socket error, which ends it. `what` names the frame for the log line.
 ///
 /// Generic over the sink so the bound can be asserted against a send that never
-/// completes, which a real socket cannot be made to do on demand; every caller
-/// passes the connection's own [`ControlWrite`].
+/// completes, which a real socket cannot be made to do on demand; the connection
+/// itself passes its socket's write half.
 pub(super) async fn writer_send<S>(
     write_half: &mut S,
     message: Message,

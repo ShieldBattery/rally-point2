@@ -127,3 +127,81 @@ async fn a_send_that_never_completes_ends_the_connection_at_the_stall_bound() {
         "the send is abandoned exactly at its own bound",
     );
 }
+
+/// A sink that accepts every frame at once and keeps it, so a test can read
+/// back exactly what the writer sent.
+#[derive(Default)]
+struct RecordingSink(Vec<Message>);
+
+impl futures_util::Sink<Message> for RecordingSink {
+    type Error = axum::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+        self.0.push(item);
+        Ok(())
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// Runs relay 1's writer to its end with its reader already gone (the drain and
+/// grant channels closed), optionally retiring the relay first, and returns
+/// every frame it sent. The drain arm is polled ahead of the descriptor arm, so
+/// a retirement here is seen first by an arm other than the descriptor one —
+/// the same position a multi-thread runtime can put the reap or load-state arm
+/// in when the retirement lands between two arms' polls.
+async fn frames_sent_once_the_reader_is_gone(retire: bool) -> Vec<Message> {
+    let state = state_with_relay_and_tenant();
+    let (drain_tx, drain) = tokio::sync::mpsc::unbounded_channel();
+    let (grants_tx, grants) = tokio::sync::mpsc::unbounded_channel();
+    let mut sources = WriterSources::new(&state.setup, RelayId(1), &state.regions, drain, grants);
+    drop((drain_tx, grants_tx));
+    if retire {
+        state.setup.forget_relay(RelayId(1));
+    }
+    let mut sink = RecordingSink::default();
+    run_writer(
+        &mut sink,
+        &mut sources,
+        RelayId(1),
+        Duration::from_secs(5),
+        rally_point_proto::version::ProtocolVersion::CURRENT,
+    )
+    .await;
+    sink.0
+}
+
+#[tokio::test]
+async fn a_retirement_seen_through_another_arm_still_closes_as_retired() {
+    let frames = frames_sent_once_the_reader_is_gone(true).await;
+    let Some(Message::Close(Some(close))) = frames.last() else {
+        panic!("a retired relay's writer must end on a close, sent {frames:?}");
+    };
+    assert_eq!(
+        close.code,
+        rally_point_proto::version::CONTROL_CLOSE_RETIRED
+    );
+}
+
+#[tokio::test]
+async fn an_ending_without_a_retirement_sends_no_retired_close() {
+    // A replaced subscription or a departed reader leaves the descriptor channel
+    // open; the relay may well reconnect, so it must not be told it is retired.
+    let frames = frames_sent_once_the_reader_is_gone(false).await;
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| matches!(frame, Message::Close(_))),
+        "an un-retired relay's connection ends without a close, sent {frames:?}",
+    );
+}

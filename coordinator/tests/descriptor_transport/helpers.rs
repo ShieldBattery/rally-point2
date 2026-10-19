@@ -81,6 +81,8 @@ pub(crate) fn apply_targets(control: MeshControl) -> coordinator::client::Contro
         verifying_keys: SharedRegistry::default(),
         region_targets: region_ping::RegionPingTargets::default(),
         drain_acked: no_drain_ack(),
+        // Nothing awaits a retirement either; a throwaway sender is enough.
+        retired: watch::channel(false).0,
     }
 }
 

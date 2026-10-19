@@ -26,7 +26,8 @@ use rally_point_proto::control::{
 use rally_point_proto::ids::SessionId;
 use rally_point_proto::version::{
     CONTROL_CLOSE_DUPLICATE_RELAY_ID, CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
-    CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_UNKNOWN_REGION,
+    CONTROL_CLOSE_IDENTITY_UNPROVEN, CONTROL_CLOSE_PROTOCOL_MISMATCH, CONTROL_CLOSE_RETIRED,
+    CONTROL_CLOSE_UNKNOWN_REGION,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
@@ -108,6 +109,7 @@ struct SubscriberFixture {
     applied: AppliedSessions,
     fleet: FleetMeshPeers,
     drain_acked: watch::Sender<bool>,
+    retired: watch::Sender<bool>,
     notices: UnboundedReceiver<RelayNotice>,
     flight: Receiver<FlightShipment>,
     stats: ControlConnStats,
@@ -125,6 +127,7 @@ impl Default for SubscriberFixture {
             fleet: FleetMeshPeers::default(),
             // A throwaway sender: an ack `send` on it is a harmless no-op.
             drain_acked: watch::channel(false).0,
+            retired: watch::channel(false).0,
             // Both pipes' send halves drop here, so the loop's notice and flight
             // arms disable themselves rather than spinning on a closed channel.
             notices: mpsc::unbounded_channel().1,
@@ -150,6 +153,7 @@ impl SubscriberFixture {
                 verifying_keys: SharedRegistry::default(),
                 region_targets: RegionPingTargets::default(),
                 drain_acked: self.drain_acked,
+                retired: self.retired,
             },
             OutboundQueues::new(self.notices, self.flight, self.stats),
             self.heartbeat,
