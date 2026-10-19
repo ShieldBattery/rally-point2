@@ -92,5 +92,6 @@ pub(crate) mod test_support;
 pub mod validation;
 
 /// Default UDP port the relay listens on for client + mesh QUIC connections.
-// TODO: reconcile with the Fargate task def.
+/// The fleet's `relay_port` Terraform variable and the coordinator's ECS
+/// provisioner assume this same port, so change them together.
 pub const DEFAULT_PORT: u16 = 14_900;
