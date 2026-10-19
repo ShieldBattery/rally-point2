@@ -41,6 +41,8 @@
 //!   `RelayLedger` impl blocks (mint/enroll, then task/ip bookkeeping).
 //! - `schema` — schema versioning/migration (including `open`) and the small
 //!   storage helpers (row parsing, the clock read, digests, int reinterpretation).
+//! - `sessions` — storage for the restart-surviving session state (opaque
+//!   per-session records and relay boot ids); `crate::persist` owns the meaning.
 
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
@@ -57,6 +59,9 @@ use crate::digest::{constant_time_eq, sha256};
 use crate::pair_rtts::DirectionRttRow;
 
 mod schema;
+mod sessions;
+
+pub(crate) use sessions::{SessionStateWrite, StoredSession};
 
 use schema::{LedgerRow, TOKEN_BYTES, as_i64, as_u64, parse_expected_ips, row_to_provisioned_task};
 // Test-only: not needed by this file's own code, only by `tests`' `use

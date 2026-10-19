@@ -85,8 +85,10 @@ use crate::flight_store::S3FlightStore;
 use crate::ledger::RelayLedger;
 use crate::lifecycle::Lifecycle;
 use crate::pair_rtts::{self, PairRttStore};
+use crate::persist::SessionStore;
 use crate::regions::RegionsConfig;
 use crate::session::SessionSetup;
+use crate::shutdown::Shutdown;
 
 mod control;
 mod control_enroll;
@@ -296,6 +298,14 @@ pub struct CoordinatorState {
     ///
     /// [`new`]: CoordinatorState::new
     pub pending_hellos: Arc<tokio::sync::Semaphore>,
+    /// The restart-surviving session store, when the coordinator runs a ledger.
+    /// Present ⇒ a create or re-home flushes it before answering, so no client
+    /// ever holds a token for a session a crash right after would forget. Absent ⇒
+    /// the in-memory posture, where a restart forgets every session.
+    pub session_store: Option<Arc<SessionStore>>,
+    /// The process shutdown latch. Every relay control connection closes when it
+    /// trips, so the shutdown's final flush is not raced by fresh notices.
+    pub shutdown: Shutdown,
 }
 
 impl CoordinatorState {
@@ -323,6 +333,8 @@ impl CoordinatorState {
             pending_hellos: Arc::new(tokio::sync::Semaphore::new(
                 control_enroll::MAX_PENDING_CONTROL_HELLOS,
             )),
+            session_store: None,
+            shutdown: Shutdown::new(),
         }
     }
 }

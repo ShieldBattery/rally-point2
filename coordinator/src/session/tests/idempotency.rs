@@ -30,6 +30,50 @@ fn a_duplicate_create_mints_no_new_session() {
 }
 
 #[test]
+fn the_commit_hook_runs_before_the_create_becomes_replayable_and_never_for_a_replay() {
+    // What the hook attaches (the session's lifecycle) must exist before any
+    // concurrent identical create can replay the response; both run under the
+    // assignment lock, so "not yet replayable inside the hook" is the whole claim.
+    let setup = two_relay_fleet();
+    let game = SessionRequest {
+        external_id: Some("game-1".to_owned()),
+        ..request(two_players())
+    };
+    let key = (tid(), "game-1".to_owned());
+    let mut seen = None;
+    let first = create_or_provision_session_with_commit(
+        &setup,
+        game.clone(),
+        ExpiresAt(u64::MAX),
+        |session, serving| {
+            assert!(
+                !setup.create_idempotency.lock().contains_key(&key),
+                "nothing can replay the create while its commit hook runs",
+            );
+            seen = Some((session, serving.to_vec()));
+        },
+    )
+    .unwrap();
+    let CreateOutcome::Created(first) = first else {
+        panic!("an immediate-region create places");
+    };
+    assert_eq!(
+        seen,
+        Some((
+            first.response.session,
+            setup.serving_relays(&tid(), first.response.session)
+        )),
+    );
+
+    let replay =
+        create_or_provision_session_with_commit(&setup, game, ExpiresAt(u64::MAX), |_, _| {
+            panic!("a replay must not re-run the commit hook")
+        })
+        .unwrap();
+    assert!(matches!(replay, CreateOutcome::Created(created) if created.replayed));
+}
+
+#[test]
 fn no_external_id_is_never_idempotent() {
     // Neither "no external_id at all" nor "a different external_id" is a
     // replay: both mint a genuinely fresh session with fresh tokens.

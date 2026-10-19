@@ -25,15 +25,17 @@
 //!   latter paths retire membership directly so stale descriptors cannot pin an
 //!   otherwise idle relay fleet above zero.
 //!
-//! Coordinator-restart amnesia is accepted: this state is in-memory, so a restart
-//! forgets a session's accounting and serving set. A departure/result webhook for
-//! a forgotten session still delivers (a webhook-only queue is created lazily),
+//! A coordinator with a ledger persists each registered session's accumulated
+//! facts (see `persist.rs` and `crate::persist`) and restores them at startup,
+//! so a restart keeps the session's accounting, reaps, and `sessionClosed`. One
+//! without a ledger accepts restart amnesia: a departure/result webhook for a
+//! forgotten session still delivers (a webhook-only queue is created lazily),
 //! but its `sessionClosed` and reaps do not fire — the tenant's batch liveness
 //! probe is the backstop for those.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -412,6 +414,11 @@ struct Inner {
     /// object graph, in production and in tests alike — because the ingest that
     /// claims an entry and the retirement that drops it are both here.
     notices: NoticeDedup,
+    /// Webhook jobs accepted onto any session's dispatch queue and not yet
+    /// delivered or given up on — what a shutdown waits on before exiting (see
+    /// [`Lifecycle::drain_webhooks`]). Counted up before a push and down after
+    /// its dispatch returns (or the push failed), so it never under-counts.
+    pending_webhooks: Arc<AtomicUsize>,
 }
 
 /// A scrape-time census of the lifecycle map, produced by
@@ -501,6 +508,7 @@ impl Lifecycle {
                 next_empty_timer_token: AtomicU64::new(1),
                 tunables,
                 notices: NoticeDedup::new(),
+                pending_webhooks: Arc::new(AtomicUsize::new(0)),
             }),
         }
     }
@@ -529,15 +537,22 @@ fn abort_timers(state: &SessionState) {
 /// Drains one session's ordered dispatch queue, delivering each webhook to
 /// completion (its full retry span) before the next. Exits when every sender is
 /// dropped — the session state was reaped — after the last job is delivered.
-async fn drain_queue(mut rx: mpsc::Receiver<WebhookJob>, tenants: TenantStore) {
+/// Each finished dispatch releases the job's count in `pending`.
+async fn drain_queue(
+    mut rx: mpsc::Receiver<WebhookJob>,
+    tenants: TenantStore,
+    pending: Arc<AtomicUsize>,
+) {
     while let Some(job) = rx.recv().await {
         notify::dispatch(tenants.clone(), job.tenant, job.config, job.body, job.kind).await;
+        pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 mod close;
 mod heartbeat;
 mod notices;
+mod persist;
 mod reaps;
 mod relays;
 mod sessions;
@@ -548,6 +563,7 @@ pub use heartbeat::{
 pub(crate) use heartbeat::{RegionRttIngest, RelayHeartbeat, bound_session_slot_lists};
 pub(crate) use notices::NoticeKey;
 pub use notices::SessionNotice;
+pub(crate) use persist::LifecycleFacts;
 
 #[cfg(test)]
 mod tests;

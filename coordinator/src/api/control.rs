@@ -27,6 +27,7 @@ use crate::lifecycle::RegionRttIngest;
 use crate::presence;
 use crate::regions::RegionsConfig;
 use crate::registry;
+use crate::shutdown::Shutdown;
 
 use super::control_enroll::{ControlClose, EnrollContext, EnrollHandshake, EnrollStep};
 use super::control_hello::{read_hello, read_relay_frame};
@@ -123,6 +124,7 @@ async fn serve_relay_control(
         pair_rtts,
         flight_store,
         pending_hellos,
+        shutdown,
         ..
     } = state;
     let context = EnrollContext::new(&setup, &lifecycle, &regions, ledger.as_deref(), peer_ip);
@@ -194,6 +196,7 @@ async fn serve_relay_control(
         &regions,
         liveness_timeout,
         enrolled.negotiated,
+        &shutdown,
     )
     .await;
 
@@ -242,9 +245,9 @@ pub(super) struct DrainSend;
 /// Serves an enrolled relay's control connection by splitting the socket into a
 /// reader and a writer that run until either ends. Returns when the connection is
 /// over — the relay closes, the socket errors, the relay goes silent past
-/// `liveness_timeout`, a send stalls past `liveness_timeout`, or the relay's id is
-/// retired — so the caller then runs the single
-/// deregistration path.
+/// `liveness_timeout`, a send stalls past `liveness_timeout`, the relay's id is
+/// retired, or the coordinator is shutting down — so the caller then runs the
+/// single deregistration path.
 ///
 /// The split lets reading and writing proceed independently: a relay that stops
 /// reading can back-pressure the writer's sends without also blocking the reader,
@@ -260,6 +263,7 @@ async fn push_and_watch(
     regions: &RegionsConfig,
     liveness_timeout: Duration,
     negotiated: ProtocolVersion,
+    shutdown: &Shutdown,
 ) {
     let (mut write_half, mut read_half) = socket.split();
     let setup = inbound.setup;
@@ -285,5 +289,8 @@ async fn push_and_watch(
     tokio::select! {
         () = run_writer(&mut write_half, &mut sources, relay_id, liveness_timeout, negotiated) => {}
         () = run_reader(&mut read_half, inbound, liveness_timeout, &drain_tx, grants_tx) => {}
+        // A shutting-down coordinator drops the connection: the relay redials the
+        // next process, keeping any notice it has not sent yet for that one.
+        () = shutdown.wait() => {}
     }
 }

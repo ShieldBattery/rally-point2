@@ -267,6 +267,13 @@ pub(super) struct Cli {
     #[arg(long, env = "COORDINATOR_RELAY_IDLE_SECS", default_value_t = 600)]
     pub(super) relay_idle_secs: u64,
 
+    /// How long, in seconds, a shutdown waits for queued tenant webhooks to
+    /// deliver before persisting its final state and exiting. Keep it under the
+    /// container runtime's stop timeout (Docker's default is 10 s) so the final
+    /// flush is never cut off by `SIGKILL`. Default 5.
+    #[arg(long, env = "COORDINATOR_SHUTDOWN_DRAIN_SECS", default_value_t = 5)]
+    pub(super) shutdown_drain_secs: u64,
+
     /// How often, in seconds, the provisioning loop reconciles each region's relay
     /// count against warm demand. Default 5.
     #[arg(long, env = "COORDINATOR_PROVISION_TICK_SECS", default_value_t = 5)]

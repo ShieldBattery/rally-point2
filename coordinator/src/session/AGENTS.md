@@ -12,6 +12,8 @@
 - `create.rs` / `placement.rs` — the create body and where each slot homes.
 - `rehome.rs` — failover off a relay, and the resumed-descriptor refresh.
 - `descriptor.rs` — building a relay's `SessionDescriptor` from recorded state.
+- `persist.rs` — `SetupRecord`: every per-session map captured as one value
+  (`export_records`) and put back at startup (`restore_records`).
 
 ## Easy to break
 
@@ -25,7 +27,9 @@
   rehome cleanup — it is what a racing `rehome` re-validates against. Both
   lifecycle close paths call it, so a new map keyed by session belongs inside
   it, not at a call site. `forget_relay` is its
-  per-relay twin and is only safe for a ledger-tombstoned id.
+  per-relay twin and is only safe for a ledger-tombstoned id. The same new map
+  must also join `SetupRecord` in `persist.rs`, or a coordinator restart
+  silently drops it for every running game.
 - `rehome_inner` re-validates membership *under the `session_relays` lock* after
   picking a replacement. Drop that re-read and a close racing mid-rehome leaves a
   recorded rehome or a resumed descriptor for a dead session.
@@ -35,6 +39,11 @@
 - Idempotent replay is keyed `(tenant, external_id)` but gated on a matching
   `CreateFingerprint`: same id + different roster is a conflict, never a replay.
   A new request field that shapes the session must join the fingerprint.
+- Anything a replay's answer depends on must be attached in the create's
+  `on_commit` hook (`create_or_provision_session_with_commit`), which runs under
+  the assignment lock before the idempotency entry exists. The API registers the
+  session's lifecycle there; doing it after the create returns lets an identical
+  concurrent create replay tokens for a session persistence does not capture.
 - Re-home compares the relay's **cert fingerprint**, not its enroll generation:
   a generation bump also happens on a benign reconnect, where `Stay` is correct.
 - A session's relays must stay inside one finalized-drop capability cohort even

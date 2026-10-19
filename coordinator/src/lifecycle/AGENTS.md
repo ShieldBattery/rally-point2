@@ -19,6 +19,8 @@ spread across these files, so grep by method name, not by file.
   reported X" (authorize the reporter, record the fact, enqueue the webhook),
   and the notice dedup sets the lifecycle holds.
 - `reaps.rs` — every arm/fire timer pair plus the re-evaluation entry points.
+- `persist.rs` — restart survival: `LifecycleFacts` export/restore for
+  `crate::persist`, and the shutdown's bounded webhook drain.
 - `tests/mod.rs` — shared fixtures; topic modules beside it.
 
 ## Invariants that are easy to break
@@ -52,6 +54,23 @@ spread across these files, so grep by method name, not by file.
   so a stale task can't consume a re-armed timer's evidence), **webhook-only**
   (idle orphan state, re-armed by each webhook enqueued). A fired timer re-checks
   its condition under the lock; the abort alone is not trusted to win the race.
+- A restart restores only what `LifecycleFacts` carries. A new *accumulated*
+  fact on `SessionState` (something a relay will not restate on its next beat)
+  must join it, with a `serde(default)` reading for records written before it;
+  timers and heartbeat evidence stay out — restore re-derives them.
+- Close removes the lifecycle state *before* `retire_session` takes membership,
+  and create registers *inside* its commit (the `on_commit` hook, under the
+  assignment lock, before the replayable idempotency entry). `crate::persist`
+  writes only sessions live in both halves and relies on exactly that ordering;
+  registering after the create returns lets a concurrent replay hand out tokens
+  for a session no capture includes.
+- Enrollment records a relay's boot id and runs `on_relay_lineage_break` inside
+  one hold of the assignment lock, and persistence captures facts and boot ids
+  under one hold too. Split either and a restart can restore an `attestable`
+  claim beside the boot id that should have cleared it.
+- `pending_webhooks` counts a job up before its push and down after its
+  dispatch (or a failed push); a new push path must do the same or a shutdown's
+  drain exits early.
 
 ## Tests
 

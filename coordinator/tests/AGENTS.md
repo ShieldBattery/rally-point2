@@ -13,6 +13,9 @@ port) driven over real WebSocket control connections — no direct handler calls
   tokenless bound-cert reconnect, retirement.
 - `load_state_lineage.rs` — a session's load-record completeness claim turns
   on every serving relay reconnecting under the same `boot_id`.
+- `restart_adoption.rs` — a session survives a coordinator restart: two
+  coordinators over one ledger, the relay re-synced to its running session by
+  the second (and, without the store, to the empty set that would end it).
 
 ## common/
 
@@ -23,7 +26,8 @@ needs:
   ephemeral loopback port). Defaults are the dev/loopback posture; a test names
   only what it configures (`with_regions`/`with_ledger`/`with_liveness`/
   `with_hello_timeout`/`with_relays`/`with_relay_hello`/`with_tenant`/
-  `with_control_auth`/`with_connect_info`/`with_pending_hello_limit`). Never
+  `with_control_auth`/`with_connect_info`/`with_pending_hello_limit`/
+  `with_session_store`). Never
   hand-roll a `CoordinatorState` literal or a listener here — a new state field
   should land in one place.
 - `with_connect_info` serves the way `main.rs` does, so the handler reads a real

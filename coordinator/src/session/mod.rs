@@ -27,16 +27,21 @@
 mod create;
 mod descriptor;
 mod gate;
+mod persist;
 mod placement;
 mod rehome;
 mod setup;
 
-pub use create::{create_or_provision_session, create_or_provision_session_at, create_session};
+pub use create::{
+    create_or_provision_session, create_or_provision_session_at,
+    create_or_provision_session_with_commit, create_session,
+};
 pub use descriptor::{build_descriptor, descriptor_for, relay_region_for, session_refs};
 pub use gate::ProvisionGate;
 pub use rehome::{recorded_rehome, rehome, rehome_evicting, rehome_with_assignment_commit};
 pub use setup::SessionSetup;
 
+pub(crate) use persist::SetupRecord;
 pub(crate) use rehome::{refresh_resumed_descriptors, session_capable_cohort};
 
 use std::collections::HashMap;
@@ -68,7 +73,13 @@ type SessionRefsStore =
 /// The correlation ids a tenant attached to one session: the session's own id
 /// and the per-slot player ids. Both are optional — a request from an app server
 /// that predates the fields carries neither, and the webhook simply omits them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Also part of the coordinator's persisted session record (see
+/// `crate::persist`), so a field added here must deserialize from a record
+/// written before it existed — the container-level `serde(default)` covers that
+/// for any field whose `Default` is the right reading of "absent".
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SessionRefs {
     /// The tenant's own id for the session (ShieldBattery's `gameId`).
     pub external_id: Option<String>,

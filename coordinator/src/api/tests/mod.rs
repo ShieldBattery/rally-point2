@@ -42,6 +42,7 @@ mod control_writer;
 mod flight;
 mod load_state;
 mod notices;
+mod persistence;
 mod presence_query;
 mod regions;
 mod rehome;

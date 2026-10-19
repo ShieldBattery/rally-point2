@@ -52,9 +52,14 @@ This is the reference for **how netcode v2 works and why it is shaped this way**
 >   replacement with its existing token + resume cursors, and re-injects a retained ring of its own sent turns
 >   so the new relay's empty turn ring still fans them out (see [Failover and reconnect](#failover-and-reconnect)).
 >
-> Still designed but not built: coordinator **HA / persistence** (a restart still forgets the registry,
-> tenant keys, and session accounting), and **ECS-metadata address discovery** (dual-stack advertise is
-> built — explicit flags carry the address set; deriving it from the cloud substrate is what remains).
+> - **Coordinator restart adoption.** A ledger-backed coordinator persists every live session (setup
+>   state + accumulated lifecycle facts) and restores it at startup, so a restarted or redeployed
+>   coordinator re-syncs each reconnecting relay to the descriptor set it already holds and its games run
+>   to completion (see [Session lifecycle and reaps](#session-lifecycle-and-reaps)).
+>
+> Still designed but not built: coordinator **hot standby** (one restart-tolerant instance is the HA
+> posture), and **ECS-metadata address discovery** (dual-stack advertise is built — explicit flags carry
+> the address set; deriving it from the cloud substrate is what remains).
 
 > **Read this before "fixing" the transport.** The data plane is deliberately **not** a standard
 > reliable-ordered protocol (TCP, QUIC streams). Reviewers — human and automated — repeatedly
@@ -1426,12 +1431,31 @@ window. A re-home reopens terminal evidence for both the departed assignment and
 installs that lifecycle boundary under the assignment lock before publishing resumed descriptors. A close
 therefore belongs wholly to the old or new assignment, never an ambiguous gap. All four paths release
 session membership and therefore let an idle Fargate relay reach an empty descriptor set and scale to zero.
-This state is in-memory: a coordinator restart forgets a
-session's accounting, so a departure/result webhook for a forgotten session still delivers (a webhook-only
-queue is created lazily) but its `sessionClosed` and reaps do not re-arm — the tenant's **batch liveness
-probe** (`POST
-/sessions/alive`, asking which of a set of sessions the coordinator still holds) is the backstop that
-force-reconciles the ones it no longer does.
+**Restart survival.** A relay's descriptor set is declarative — every reconnect re-syncs the full set and
+the relay ends any session absent from it — so a coordinator that came back with no memory would end
+every running game the moment its relays redialed, and the tenant's **batch liveness probe** (`POST
+/sessions/alive`, asking which of a set of sessions the coordinator still holds) would then
+force-reconcile them. A ledger-backed coordinator therefore persists each live session into the ledger:
+its setup half (membership, correlation ids, the create-idempotency entry, every relay's staged descriptor
+and pending slot-closes, recorded re-homes) and its lifecycle half (accounting, departure seeds, the
+load-state sets, started), plus each relay's last boot id so lineage still judges a relay that restarted
+while the coordinator was down. Only a session live in *both* halves is written — a create registers its
+lifecycle inside its commit, before the response becomes replayable to a concurrent identical create; a
+close removes the lifecycle before it retires membership — so a restart can neither resurrect a closing
+session nor restore one without its accounting, and no answer ever names a session a capture would skip. Timers and
+heartbeat evidence are not kept: restore re-arms every reap from the facts with a fresh grace, and the
+relays' next beats rebuild emptiness evidence. Writes are a diff of the live state against the last flush:
+every second, synchronously before a create or re-home answers (a failed write refuses with a retryable
+`503`, whose retry replays the already-committed answer, so no client ever holds a token or a replacement
+relay a crash would forget), and once more at shutdown, after `SIGTERM` has closed every control connection
+and queued webhooks have had a bounded drain. Each capture reads setup, lifecycle facts, and boot ids under
+one hold of the assignment lock, which enrollment also holds while it records a new boot id and clears the
+completeness claims that boot broke — so no persisted claim can outlive the lineage break it should have
+recorded. A crash loses at most a second of facts, most of which the next beat restates. A restore is all
+or nothing: an unreadable record refuses startup and stays stored, since restoring around it would end that
+game. A coordinator with no ledger keeps the old amnesia: a departure/result webhook for a
+forgotten session still delivers (a webhook-only queue is created lazily) but its `sessionClosed` and
+reaps do not re-arm, and the liveness probe force-reconciles it.
 
 Beside it sits the **load-state pull** (`POST /session/load-state`), which answers one session's accumulated
 load progress: when it started, which slots ever connected, and which ever reported their game loop running.
@@ -1656,7 +1680,13 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   targeted attacks materialize.
 - **Coordinator HA is a single restart-tolerant instance** (container restart policy). Running
   games survive an outage — relays run the live game, and an idle+unenrolled relay reaps itself —
-  while create/re-home/presence pause until restart and relays re-enroll. Hot standby stays a
+  while create/re-home/presence pause until restart and relays re-enroll. The restarted process
+  **adopts** its fleet from the sessions it persisted to the ledger rather than letting relays drain
+  their games out first: adoption keeps re-home, the liveness probe, results and `sessionClosed`
+  working for those games, which a drain-out would not. A failed or partial restore (any unreadable
+  record) refuses startup — a down coordinator leaves running games alone, an amnesiac one ends
+  them — and a create/re-home whose state cannot be persisted is refused (`503`) rather than
+  answered: restart safety outranks accepting new work on a broken store. Hot standby stays a
   documented future option.
 - **A 1v1 checksum divergence voids** (no-majority by construction — and deliberately
   unattributable, since a loss-dodger could self-desync); team games discard the diverged minority

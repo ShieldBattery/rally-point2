@@ -217,6 +217,28 @@ pub fn forget_boot_id(registry: &RelayRegistry, id: RelayId) {
     registry.boot_ids.lock().remove(&id);
 }
 
+/// Every remembered relay process identity, sorted by relay id — what the
+/// coordinator's session persistence stores so a restart can still tell a relay
+/// that merely redialed from one that restarted while the coordinator was down.
+pub(crate) fn export_boot_ids(registry: &RelayRegistry) -> Vec<(RelayId, Option<u64>)> {
+    let mut ids: Vec<_> = registry
+        .boot_ids
+        .lock()
+        .iter()
+        .map(|(&id, &boot)| (id, boot))
+        .collect();
+    ids.sort_by_key(|(id, _)| id.0);
+    ids
+}
+
+/// Seeds the remembered process identities from a previous coordinator
+/// lifetime's [`export_boot_ids`]. Called once at startup, before any relay
+/// enrolls, so the first enroll after a restart is judged against the process
+/// that was enrolled before it rather than read as a first-ever enroll.
+pub(crate) fn seed_boot_ids(registry: &RelayRegistry, ids: Vec<(RelayId, Option<u64>)>) {
+    registry.boot_ids.lock().extend(ids);
+}
+
 /// Refusal from [`try_enroll`]: the id is already enrolled by a live control
 /// connection bound to a different certificate — a second relay process
 /// colliding on the id, not the same relay reconnecting.

@@ -94,7 +94,30 @@ pub(super) async fn create_session(
     let expires_at = rally_point_proto::token::ExpiresAt(
         now_unix.saturating_add(state.player_token_lifetime.as_secs()),
     );
-    let created = match session::create_or_provision_session(&state.setup, request, expires_at) {
+    // The session's lifecycle is registered inside the create's commit, before its
+    // response becomes replayable: a concurrent identical create can then never
+    // replay tokens for a session persistence does not yet capture. Its serving
+    // relays (the distinct home relays of its slots) and player/observer slots drive
+    // `sessionClosed` and the reap policies, including the fixed never-started grace
+    // (see `lifecycle::NEVER_STARTED_REAP_GRACE` for why that window is
+    // deliberately shorter than the tokens' lifetime). A replay never reaches the
+    // hook — re-registering would reset the live session's never-started clock and
+    // overwrite its serving-relay accounting on nothing more than a duplicate retry.
+    let register = |session, serving: &[RelayId]| {
+        state.lifecycle.register_session(
+            tenant.clone(),
+            session,
+            serving.to_vec(),
+            player_slots,
+            observer_slots,
+        );
+    };
+    let created = match session::create_or_provision_session_with_commit(
+        &state.setup,
+        request,
+        expires_at,
+        register,
+    ) {
         Ok(session::CreateOutcome::Created(created)) => created,
         Ok(session::CreateOutcome::Provisioning { regions }) => {
             // No session minted: a requested region has no relay yet. The
@@ -141,26 +164,15 @@ pub(super) async fn create_session(
     let resp: SessionResponse = created.response;
     let replayed = created.replayed;
 
-    // Arm the session's lifecycle only on a fresh mint: its serving relay set
-    // (the distinct home relays of its slots) and its player/observer slots
-    // drive `sessionClosed` and the reap policies, including the fixed
-    // never-started grace (see `lifecycle::NEVER_STARTED_REAP_GRACE` for why
-    // that window is deliberately shorter than the tokens' lifetime).
-    //
-    // A replayed create must skip this: the original create already registered
-    // this session, and re-registering would reset its never-started clock and
-    // overwrite its serving-relay accounting with a freshly-read set, corrupting
-    // the live session's lifecycle on nothing more than a duplicate retry.
     if !replayed {
-        state.lifecycle.register_session(
-            tenant.clone(),
-            resp.session,
-            state.setup.serving_relays(&tenant, resp.session),
-            player_slots,
-            observer_slots,
-        );
         crate::metrics::session_created(&tenant);
     }
+    // Durable before the tokens leave, on the replay path too: a client must never
+    // hold a token for a session a coordinator restart right after this would
+    // forget. A failed write refuses with a retryable 503, and the retry replays
+    // this same response through the idempotency cache (for a create that carries
+    // an `external_id`) and flushes again.
+    persist_before_answering(&state)?;
 
     tracing::info!(
         session = %resp.session,
@@ -328,6 +340,9 @@ pub(super) async fn rehome_session(
     // session records nothing here (its rehomes are cleared at close), so this can
     // never revive a dead session.
     if let Some(endpoint) = session::recorded_rehome(&state.setup, &tenant, session, dead_relay) {
+        // The recorded move may be the one an earlier ask committed but failed to
+        // persist; it must be durable before this ask points a client at it.
+        persist_before_answering(&state)?;
         return Ok(Json(RehomeResponse::from_outcome(
             &state.setup,
             &tenant,
@@ -371,6 +386,13 @@ pub(super) async fn rehome_session(
                 .on_rehome(&tenant, session, dead_relay, replacement);
         },
     );
+    // Durable before the client is pointed at the replacement, for the same reason
+    // a create flushes before answering. The move is already committed in memory, so
+    // a refused ask's retry takes the recorded fast path above and flushes again.
+    // `stay` and `unavailable` change nothing a restart could lose.
+    if matches!(outcome, RehomeOutcome::NewTarget(_)) {
+        persist_before_answering(&state)?;
+    }
     // Let the descriptor push reach R_new's control task before responding, so the
     // relay is likelier to hold the resumed descriptor before a client dials it
     // (the client's reconnect backoff absorbs whatever race remains).
@@ -448,4 +470,21 @@ pub(super) async fn sessions_alive(
         })
         .collect();
     Ok(Json(SessionsAliveResponse { alive }))
+}
+
+/// Makes the coordinator's session state durable before a create or re-home
+/// answers, refusing with a retryable `503` when the write fails. A no-op on a
+/// coordinator with no session store (the in-memory posture).
+///
+/// Refusing rather than answering anyway is the point: an answer hands a client a
+/// token or a replacement relay, and a restart that forgot the session behind it
+/// would end that game the moment its relays reconnected.
+fn persist_before_answering(state: &CoordinatorState) -> Result<(), StatusCode> {
+    let Some(store) = &state.session_store else {
+        return Ok(());
+    };
+    store.flush().map_err(|error| {
+        tracing::warn!(%error, "persisting session state failed; refusing with a retryable 503");
+        StatusCode::SERVICE_UNAVAILABLE
+    })
 }

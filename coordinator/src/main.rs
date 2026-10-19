@@ -13,6 +13,7 @@ use clap::Parser;
 use color_eyre::eyre::{Context, Result, eyre};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::ledger::RelayLedger;
+use rally_point_coordinator::persist::SessionStore;
 use rally_point_coordinator::provision::{
     EcsConfig, EcsProvisioner, ProcessConfig, ProcessProvisioner, ProvisionConfig, ProvisionLoop,
     Provisioner, WarmTargets,
@@ -20,7 +21,8 @@ use rally_point_coordinator::provision::{
 use rally_point_coordinator::session::SessionSetup;
 use rally_point_coordinator::tenant::NotifyConfig;
 use rally_point_coordinator::{
-    acme, flight_store, metrics, pair_rtts, regions, registry, session, tenant, tenant_config,
+    acme, flight_store, metrics, pair_rtts, regions, registry, session, shutdown, tenant,
+    tenant_config,
 };
 use rally_point_proto::control::{RegionId, TenantId};
 use rally_point_proto::token::KeyId;
@@ -218,7 +220,7 @@ async fn main() -> Result<()> {
     // configured: the region list, the resolved token lifetime, and the ledger,
     // pair table, and flight store opened above (the pair table already seeded
     // from the ledger).
-    let state = CoordinatorState {
+    let mut state = CoordinatorState {
         regions,
         player_token_lifetime: Duration::from_secs(player_token_lifetime_secs),
         ledger,
@@ -226,6 +228,43 @@ async fn main() -> Result<()> {
         flight_store,
         ..CoordinatorState::new(setup, control_auth)
     };
+
+    // Restore the sessions a previous lifetime left running before anything is
+    // served or provisioned, so every relay that reconnects is re-synced to the
+    // descriptor set it already holds and its games keep running. A restore
+    // failure refuses startup rather than serving with no memory: an amnesiac
+    // coordinator would end every running game on reconnect, while one that is
+    // down leaves them untouched.
+    if let Some(ledger) = &state.ledger {
+        let (store, summary) =
+            SessionStore::restore(ledger.clone(), state.setup.clone(), state.lifecycle.clone())
+                .context("restoring persisted sessions from the relay ledger")?;
+        tracing::info!(restored = summary.restored, "restored persisted sessions");
+        let store = Arc::new(store);
+        tokio::spawn(store.clone().run());
+        state.session_store = Some(store);
+    } else {
+        tracing::warn!(
+            "no --relay-ledger configured; sessions are not persisted, so a restart \
+             ends every running game"
+        );
+    }
+
+    // The shutdown sequence: a signal trips the latch, which stops the HTTP
+    // servers accepting and closes every relay control connection; then queued
+    // webhooks get a bounded drain and the session state its final flush.
+    let shutdown = state.shutdown.clone();
+    tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            shutdown::os_signal().await;
+            tracing::info!("shutdown signal received; closing connections");
+            shutdown.trigger();
+        }
+    });
+    let lifecycle = state.lifecycle.clone();
+    let session_store = state.session_store.clone();
+    let shutdown_drain = Duration::from_secs(cli.shutdown_drain_secs);
 
     // Bring up the plaintext metrics listener before the primary serve, when one
     // is configured. It serves Prometheus `/metrics` over a separate, never-TLS,
@@ -292,6 +331,7 @@ async fn main() -> Result<()> {
                 warm.clone(),
                 provision_pair_rtts.clone(),
                 provisioner,
+                shutdown.clone(),
             );
         } else if let Some(ecs_config_path) = cli.provision_ecs_config {
             let ecs_config = EcsConfig::load(&ecs_config_path).with_context(|| {
@@ -313,6 +353,7 @@ async fn main() -> Result<()> {
                 warm.clone(),
                 provision_pair_rtts.clone(),
                 provisioner,
+                shutdown.clone(),
             );
         }
     } else {
@@ -352,8 +393,18 @@ async fn main() -> Result<()> {
         let acceptor = state.axum_acceptor(state.default_rustls_config());
         tokio::spawn(acme::log_certificate_events(state));
         tracing::info!("coordinator API listening on {} (HTTPS)", cli.listen);
+        let handle = axum_server::Handle::new();
+        tokio::spawn({
+            let handle = handle.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                shutdown.wait().await;
+                handle.graceful_shutdown(Some(HTTP_SHUTDOWN_GRACE));
+            }
+        });
         axum_server::bind(cli.listen)
             .acceptor(acceptor)
+            .handle(handle)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .context("coordinator API server ended with an error")?;
@@ -362,14 +413,56 @@ async fn main() -> Result<()> {
             .await
             .context("binding coordinator listen address")?;
         tracing::info!("coordinator API listening on {}", cli.listen);
-        axum::serve(
+        let serve = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
         )
-        .await
-        .context("coordinator API server ended with an error")?;
+        .with_graceful_shutdown({
+            let shutdown = shutdown.clone();
+            async move { shutdown.wait().await }
+        });
+        // Bound the in-flight-request drain the same way the TLS server's grace
+        // does, so one slow request cannot eat the final flush's time.
+        tokio::select! {
+            result = serve => result.context("coordinator API server ended with an error")?,
+            () = async {
+                shutdown.wait().await;
+                tokio::time::sleep(HTTP_SHUTDOWN_GRACE).await;
+            } => tracing::warn!("in-flight requests outlasted the shutdown grace; abandoning them"),
+        }
     }
+
+    finish_shutdown(&lifecycle, session_store.as_deref(), shutdown_drain).await;
     Ok(())
+}
+
+/// How long a shutdown lets in-flight HTTP requests finish once it stops
+/// accepting new ones.
+const HTTP_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
+/// The tail of a shutdown, run once the servers have stopped and the relay
+/// control connections are closing: give queued webhooks up to `drain` to
+/// deliver, then write the session state one last time so the next process
+/// restores exactly what this one ended with.
+async fn finish_shutdown(
+    lifecycle: &rally_point_coordinator::lifecycle::Lifecycle,
+    store: Option<&SessionStore>,
+    drain: Duration,
+) {
+    let undelivered = lifecycle.drain_webhooks(drain).await;
+    if undelivered > 0 {
+        tracing::warn!(
+            undelivered,
+            "exiting with tenant webhooks still queued; they will not be delivered"
+        );
+    }
+    if let Some(store) = store {
+        match store.flush() {
+            Ok(()) => tracing::info!("persisted final session state"),
+            Err(error) => tracing::error!(%error, "persisting final session state failed"),
+        }
+    }
+    tracing::info!("coordinator shut down");
 }
 
 /// Rejects a zero provisioning tick interval before [`ProvisionConfig`] is ever
@@ -421,9 +514,18 @@ fn spawn_provision_loop<P: Provisioner + 'static>(
     warm: WarmTargets,
     pair_rtts: pair_rtts::PairRttStore,
     provisioner: P,
+    shutdown: shutdown::Shutdown,
 ) {
     let provision_loop = ProvisionLoop::new(config, setup, ledger, warm, pair_rtts, provisioner);
-    tokio::spawn(provision_loop.run());
+    // Stops with the shutdown: once the control connections close, every warm
+    // region reads as relay-less, and a tick then would launch tasks for a fleet
+    // that is in fact still running.
+    tokio::spawn(async move {
+        tokio::select! {
+            () = provision_loop.run() => {}
+            () = shutdown.wait() => {}
+        }
+    });
 }
 
 /// Enrolls the `--dev-tenant` tenant into `tenants`, logging the public

@@ -204,6 +204,28 @@ impl RelayReaps {
         self.relays.lock().remove(&relay_id);
     }
 
+    /// Every pending directive across all relays, as the `(relay, close)` pairs
+    /// [`send`](Self::send) would re-record — what the coordinator's session
+    /// persistence captures so a restart keeps replaying them on reconnect.
+    pub fn export_pending(&self) -> Vec<(RelayId, SlotClose)> {
+        let relays = self.relays.lock();
+        relays
+            .iter()
+            .flat_map(|(&relay, state)| {
+                state.pending.iter().map(move |((tenant, session), slots)| {
+                    (
+                        relay,
+                        SlotClose {
+                            tenant: tenant.clone(),
+                            session: *session,
+                            slots: slots.clone(),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// How many relay ids the outbox currently holds state for. Exists for
     /// regression coverage of [`forget`](Self::forget) — a coordinator with a
     /// long uptime and a steady stream of scale-to-zero churn depends on this
@@ -310,6 +332,20 @@ impl RelayDescriptors {
     /// no-op.
     pub fn forget(&self, relay_id: RelayId) {
         self.channels.lock().remove(&relay_id);
+    }
+
+    /// Every relay's current descriptor set, omitting relays whose set is empty
+    /// — what the coordinator's session persistence captures, so a restarted
+    /// coordinator re-syncs each reconnecting relay to exactly the set it held.
+    pub fn export_all(&self) -> Vec<(RelayId, Vec<SessionDescriptor>)> {
+        self.channels
+            .lock()
+            .iter()
+            .filter_map(|(&relay, channel)| {
+                let set = channel.borrow();
+                (!set.is_empty()).then(|| (relay, set.clone()))
+            })
+            .collect()
     }
 
     /// How many relay ids the outbox currently holds a channel for. Exists for

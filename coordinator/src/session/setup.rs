@@ -554,4 +554,11 @@ impl SessionSetup {
     pub fn lock_assignment(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.assignment_lock.lock()
     }
+
+    /// Whether anyone holds the assignment lock right now — for a test that must
+    /// prove some read happens inside the lock's hold rather than race against it.
+    #[cfg(test)]
+    pub(crate) fn assignment_is_locked(&self) -> bool {
+        self.assignment_lock.is_locked()
+    }
 }

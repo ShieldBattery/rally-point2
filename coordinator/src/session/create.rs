@@ -6,7 +6,7 @@
 use std::sync::atomic::Ordering;
 
 use rally_point_proto::control::{LobbyPolicy, PlayerToken, SessionRequest, SessionResponse};
-use rally_point_proto::ids::SessionId;
+use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::time::unix_secs_fail_closed;
 use rally_point_proto::token::ExpiresAt;
 
@@ -121,6 +121,36 @@ pub fn create_or_provision_session(
     create_or_provision_session_at(setup, request, expires_at, unix_secs_fail_closed())
 }
 
+/// [`create_or_provision_session`] that runs `on_commit` inside a fresh create's
+/// commit — under the assignment lock, after membership, correlation ids, and
+/// descriptors are recorded and before the idempotency entry that makes the
+/// response replayable — with the new session's id and serving relays. Not run
+/// for a replay or a hold.
+///
+/// The create handler registers the session's lifecycle here. Registering after
+/// this returned instead would leave a window in which a concurrent identical
+/// create replays the cached response for a session with no lifecycle yet — one
+/// session persistence does not capture — and hands out tokens a restart would
+/// forget. Inside the commit, every replay serializes behind the registration on
+/// the same lock.
+pub fn create_or_provision_session_with_commit(
+    setup: &SessionSetup,
+    request: SessionRequest,
+    expires_at: ExpiresAt,
+    on_commit: impl FnOnce(SessionId, &[RelayId]),
+) -> Result<CreateOutcome, SessionSetupError> {
+    create_body(
+        setup,
+        request,
+        expires_at,
+        CreatePolicy::HoldUntilReady {
+            now: unix_secs_fail_closed(),
+        },
+        || {},
+        on_commit,
+    )
+}
+
 /// [`create_or_provision_session`] with the hold-cap clock supplied, so a test can
 /// drive the cap deterministically. `now` is Unix seconds; `u64::MAX` marks an
 /// unusable clock, on which a create never holds (it falls back immediately) so a
@@ -137,6 +167,7 @@ pub fn create_or_provision_session_at(
         expires_at,
         CreatePolicy::HoldUntilReady { now },
         || {},
+        |_, _| {},
     )
 }
 
@@ -157,6 +188,7 @@ pub(super) fn create_session_inner(
         expires_at,
         CreatePolicy::Immediate,
         before_commit,
+        |_, _| {},
     )? {
         CreateOutcome::Created(created) => Ok(created),
         // Immediate placement never consults the warm gate, so it cannot warm or
@@ -170,13 +202,16 @@ pub(super) fn create_session_inner(
 /// The shared body of every create path. `policy` selects immediate placement
 /// (the behavior of [`create_session`]) or hold-until-ready (the behavior of
 /// [`create_or_provision_session`], which may return [`CreateOutcome::Provisioning`]).
-/// `before_commit` is the drain-race test seam (see [`create_session_inner`]).
+/// `before_commit` is the drain-race test seam (see [`create_session_inner`]);
+/// `on_commit` is the in-commit hook (see
+/// [`create_or_provision_session_with_commit`]).
 fn create_body(
     setup: &SessionSetup,
     request: SessionRequest,
     expires_at: ExpiresAt,
     policy: CreatePolicy,
     before_commit: impl FnOnce(),
+    on_commit: impl FnOnce(SessionId, &[RelayId]),
 ) -> Result<CreateOutcome, SessionSetupError> {
     // Hold the outermost assignment lock across this entire (await-free) body, so
     // the registry read below and the commit that follows cannot interleave with a
@@ -396,6 +431,9 @@ fn create_body(
         bounds,
         relay_regions: response_relay_regions,
     };
+    // Runs before the idempotency entry below exists, so nothing can replay this
+    // response until whatever the caller attaches to the commit is in place.
+    on_commit(session, &relay_ids);
     // Record the exact response a duplicate create for this `external_id`
     // will replay, alongside the fingerprint a replay must match, still under
     // the assignment lock this whole body holds — see the idempotency check

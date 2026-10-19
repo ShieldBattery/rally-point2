@@ -97,6 +97,24 @@ CREATE TABLE IF NOT EXISTS region_direction_rtts (
 DROP TABLE IF EXISTS region_pair_rtts;
 PRAGMA user_version = 3;";
 
+/// The v4 migration: the restart-surviving session state. `session_records` holds
+/// one opaque JSON record per live session, keyed by `(tenant, session)`;
+/// `relay_boot_ids` holds the process identity each relay id last enrolled with
+/// (`NULL` for a relay that enrolled without one). Neither is interpreted here —
+/// `crate::persist` owns what a record means. Stamps `user_version = 4`.
+const SCHEMA_V4: &str = "\
+CREATE TABLE IF NOT EXISTS session_records (
+  tenant  TEXT NOT NULL,
+  session INTEGER NOT NULL,
+  record  TEXT NOT NULL,
+  PRIMARY KEY (tenant, session)
+);
+CREATE TABLE IF NOT EXISTS relay_boot_ids (
+  relay_id INTEGER PRIMARY KEY,
+  boot_id  INTEGER
+);
+PRAGMA user_version = 4;";
+
 impl RelayLedger {
     /// Opens (creating if absent) the ledger database at `path`, migrating it forward
     /// to the current schema and leaving an already-current one untouched. Each schema
@@ -111,7 +129,7 @@ impl RelayLedger {
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
         // Apply each schema step whose version this file has not reached yet, in
         // order. Every step stamps its own `user_version`, so a fresh file (version 0)
-        // runs all three and ends at 3, while an existing file runs only the steps past
+        // runs all four and ends at 4, while an existing file runs only the steps past
         // its recorded version — preserving its provisioned-relay rows across the
         // upgrade.
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -123,6 +141,9 @@ impl RelayLedger {
         }
         if version < 3 {
             conn.execute_batch(SCHEMA_V3)?;
+        }
+        if version < 4 {
+            conn.execute_batch(SCHEMA_V4)?;
         }
         Ok(Self {
             conn: Mutex::new(conn),

@@ -65,6 +65,12 @@
 //!   enrolled or tasks the ledger lost track of. A local
 //!   [`provision::ProcessProvisioner`] spawns real relay binaries, so the whole
 //!   lifecycle runs without a cloud substrate.
+//! - **persist** ([`persist`]) — restart survival: every live session's setup
+//!   state and accumulated facts are flushed to the ledger and restored at
+//!   startup, so a restarted coordinator adopts the relays it was managing and
+//!   their games run to completion instead of being torn down.
+//! - **shutdown** ([`shutdown`]) — the process-wide shutdown signal the HTTP
+//!   servers and relay control connections stop on.
 //! - **policy** — set latency-buffer consensus *bounds* at setup; the relay
 //!   executes per-turn. The bounds type itself lives in
 //!   [`rally_point_proto::control::BufferBounds`] (it crosses the
@@ -90,12 +96,14 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod notify;
 pub mod pair_rtts;
+pub mod persist;
 pub mod presence;
 pub mod provision;
 pub mod rate_limit;
 pub mod regions;
 pub mod registry;
 pub mod session;
+pub mod shutdown;
 pub mod tenant;
 pub mod tenant_config;
 #[cfg(test)]

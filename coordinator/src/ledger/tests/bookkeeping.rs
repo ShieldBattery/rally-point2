@@ -210,7 +210,7 @@ fn a_fresh_ledger_stamps_the_current_schema_version() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(
-        version, 3,
+        version, 4,
         "a fresh file is created at the latest schema version"
     );
     // The current backbone-RTT table exists and is usable on a fresh file.
@@ -221,10 +221,10 @@ fn a_fresh_ledger_stamps_the_current_schema_version() {
 }
 
 #[test]
-fn a_v1_file_upgrades_to_v3_and_keeps_its_provisioned_relays() {
+fn a_v1_file_upgrades_to_the_latest_and_keeps_its_provisioned_relays() {
     // A database created at schema v1 (before any backbone-RTT table existed) is
-    // opened by this build: the version chain runs straight through to v3, adding
-    // the per-direction table while every v1 provisioned-relay row survives.
+    // opened by this build: the version chain runs straight through to the latest,
+    // adding every later table while every v1 provisioned-relay row survives.
     let path = temp_db_path();
 
     // Stand up a v1-only file: the v1 schema plus one provisioned-relay row.
@@ -243,14 +243,14 @@ fn a_v1_file_upgrades_to_v3_and_keeps_its_provisioned_relays() {
         assert_eq!(version, 1, "the hand-built file is at v1");
     }
 
-    // Open through the ledger: it migrates the file straight through to v3.
+    // Open through the ledger: it migrates the file straight through to the latest.
     let ledger = RelayLedger::open(&path).unwrap();
     let version: i64 = ledger
         .conn
         .lock()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3, "a v1 file migrates straight through to v3");
+    assert_eq!(version, 4, "a v1 file migrates straight through to v4");
 
     // The v1 provisioned-relay row survived the upgrade.
     let relays: i64 = ledger
@@ -278,7 +278,7 @@ fn a_v1_file_upgrades_to_v3_and_keeps_its_provisioned_relays() {
 }
 
 #[test]
-fn a_v2_file_upgrades_to_v3_dropping_the_pair_table_and_keeping_provisioned_relays() {
+fn a_v2_file_upgrades_dropping_the_pair_table_and_keeping_provisioned_relays() {
     // A database created at schema v2 (the single-value-per-pair table) is opened by
     // this build: the v3 migration drops `region_pair_rtts` and adds the
     // per-direction table, while every provisioned-relay row survives.
@@ -308,14 +308,14 @@ fn a_v2_file_upgrades_to_v3_dropping_the_pair_table_and_keeping_provisioned_rela
         assert_eq!(version, 2, "the hand-built file is at v2");
     }
 
-    // Open through the ledger: it migrates the file forward to v3.
+    // Open through the ledger: it migrates the file forward to the latest.
     let ledger = RelayLedger::open(&path).unwrap();
     let version: i64 = ledger
         .conn
         .lock()
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3, "the file is migrated to v3");
+    assert_eq!(version, 4, "the file is migrated to the latest version");
 
     // The v2 single-value pair table is gone.
     let old_tables: i64 = ledger

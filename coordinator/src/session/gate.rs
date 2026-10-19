@@ -54,7 +54,10 @@ use super::DEFAULT_WARM_TTL;
 /// Equality is plain struct equality ([`PartialEq`]), never a hash: a hash
 /// collision must not be able to bind two genuinely different rosters to one
 /// cached response.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Persisted alongside the cached response (see `crate::persist`), so a create
+/// retried across a coordinator restart is still recognized as a replay.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct CreateFingerprint {
     /// The request's players, sorted by slot so request order does not matter.
     /// A request cannot name a slot twice (`validate_request` rejects a
@@ -70,7 +73,7 @@ pub(super) struct CreateFingerprint {
 /// [`PlayerHandoff`](rally_point_proto::control::PlayerHandoff) that shape the
 /// session (its slot, the pubkey its token binds, whether it is an observer,
 /// its tenant correlation ref, and its requested region).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct FingerprintPlayer {
     slot: SlotId,
     client_pubkey: ClientPublicKey,

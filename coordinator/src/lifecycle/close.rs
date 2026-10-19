@@ -238,7 +238,12 @@ impl Lifecycle {
             );
             return;
         }
-        let _ = state.queue.try_send(job);
+        // Counted before the send so the drain task's release can never run first.
+        let pending = &self.inner.pending_webhooks;
+        pending.fetch_add(1, Ordering::AcqRel);
+        if state.queue.try_send(job).is_err() {
+            pending.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// Pushes the session's terminal `sessionClosed` job onto `queue`. Must
@@ -262,6 +267,9 @@ impl Lifecycle {
         queue: mpsc::Sender<WebhookJob>,
         job: WebhookJob,
     ) {
+        // Counted before the send so the drain task's release can never run first.
+        let pending = self.inner.pending_webhooks.clone();
+        pending.fetch_add(1, Ordering::AcqRel);
         match queue.try_send(job) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(job)) => {
@@ -272,14 +280,18 @@ impl Lifecycle {
                      awaiting capacity instead of dropping it",
                 );
                 tokio::spawn(async move {
-                    let _ = queue.send(job).await;
+                    if queue.send(job).await.is_err() {
+                        pending.fetch_sub(1, Ordering::AcqRel);
+                    }
                 });
             }
             // The drain task already exited (its receiver dropped) — nothing
             // left to deliver to. Only reachable if this queue's sender
             // somehow outlived its own drain task, which the drain loop's own
             // "exit when every sender is dropped" contract should prevent.
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                pending.fetch_sub(1, Ordering::AcqRel);
+            }
         }
     }
 
@@ -301,7 +313,11 @@ impl Lifecycle {
     pub(super) fn new_state(&self, serving_relays: Vec<RelayId>) -> SessionState {
         let (tx, rx) = mpsc::channel::<WebhookJob>(self.inner.tunables.queue_capacity);
         let tenants = self.inner.setup.tenants().clone();
-        tokio::spawn(drain_queue(rx, tenants));
+        tokio::spawn(drain_queue(
+            rx,
+            tenants,
+            self.inner.pending_webhooks.clone(),
+        ));
         SessionState {
             serving_relays,
             created_here: false,

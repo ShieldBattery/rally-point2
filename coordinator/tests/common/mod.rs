@@ -24,6 +24,7 @@ use futures_util::{SinkExt, StreamExt};
 use rally_point_coordinator::api::{self, ControlAuth, CoordinatorState};
 use rally_point_coordinator::ledger::RelayLedger;
 use rally_point_coordinator::lifecycle::Lifecycle;
+use rally_point_coordinator::persist::SessionStore;
 use rally_point_coordinator::regions::RegionsConfig;
 use rally_point_coordinator::registry::{self, RelayRegistry};
 use rally_point_coordinator::session::SessionSetup;
@@ -245,6 +246,9 @@ pub struct ServedCoordinator {
     pub setup: SessionSetup,
     /// The served router's per-session lifecycle.
     pub lifecycle: Lifecycle,
+    /// The served router's session store, when built [`with_session_store`]
+    /// (`CoordinatorBuilder::with_session_store`).
+    pub session_store: Option<Arc<SessionStore>>,
 }
 
 impl ServedCoordinator {
@@ -282,6 +286,7 @@ pub struct CoordinatorBuilder {
     tenant: bool,
     connect_info: bool,
     pending_hellos: Option<usize>,
+    session_store: bool,
 }
 
 impl Default for CoordinatorBuilder {
@@ -302,6 +307,7 @@ impl CoordinatorBuilder {
             tenant: false,
             connect_info: false,
             pending_hellos: None,
+            session_store: false,
         }
     }
 
@@ -383,6 +389,16 @@ impl CoordinatorBuilder {
         self
     }
 
+    /// Persists sessions through the ledger the way the binary does: before
+    /// serving, the coordinator restores whatever sessions the ledger holds, and
+    /// create/rehome flush through the returned store. Requires [`with_ledger`]
+    /// (`Self::with_ledger`); sharing one ledger between two served coordinators
+    /// stands in for a restart.
+    pub fn with_session_store(mut self) -> Self {
+        self.session_store = true;
+        self
+    }
+
     /// Binds an ephemeral loopback port and spawns the server on it.
     pub async fn serve(self) -> ServedCoordinator {
         let reg = registry::RelayRegistry::new();
@@ -412,6 +428,16 @@ impl CoordinatorBuilder {
             state.pending_hellos = Arc::new(tokio::sync::Semaphore::new(permits));
         }
         let lifecycle = state.lifecycle.clone();
+        if self.session_store {
+            let ledger = state
+                .ledger
+                .clone()
+                .expect("a session store needs a ledger");
+            let (store, _) = SessionStore::restore(ledger, handle.clone(), lifecycle.clone())
+                .expect("restoring persisted sessions");
+            state.session_store = Some(Arc::new(store));
+        }
+        let session_store = state.session_store.clone();
 
         let app = api::router(state);
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -436,6 +462,7 @@ impl CoordinatorBuilder {
             base_url: format!("http://{addr}"),
             setup: handle,
             lifecycle,
+            session_store,
         }
     }
 }
