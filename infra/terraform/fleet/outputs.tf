@@ -7,14 +7,19 @@
 # tasks actually run.
 output "ecs_json" {
   description = "Coordinator ECS provisioner config (config/ecs.json). Emit with: terraform output -raw ecs_json"
-  value = jsonencode({
-    started_by = local.started_by
-    container  = var.container_name
-    relay_port = var.relay_port
-    regions = {
-      for id, m in module.region : id => m.ecs_region_config
-    }
-  })
+  value = jsonencode(merge(
+    {
+      started_by = local.started_by
+      container  = var.container_name
+      relay_port = var.relay_port
+      regions = {
+        for id, m in module.region : id => m.ecs_region_config
+      }
+    },
+    # Only emitted when set: the coordinator rejects unknown fields, so leaving
+    # it out keeps this output loadable by a coordinator that predates it.
+    length(var.extra_relay_ports) > 0 ? { extra_relay_ports = var.extra_relay_ports } : {},
+  ))
 }
 
 # The coordinator's region registry, ready to write to config/regions.json:

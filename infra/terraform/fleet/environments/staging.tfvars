@@ -17,3 +17,8 @@ task_memory = 1024
 # The publish workflow ships the relay image multi-arch, and Graviton runs
 # ~20% cheaper per vCPU-hour than x86 at Fargate's on-demand rates.
 cpu_architecture = "ARM64"
+
+# UDP/443 beside the primary relay port, for clients whose networks filter UDP
+# to it. Staging proves the low-port bind (via the task's unprivileged-port
+# sysctl) before prod adopts it.
+extra_relay_ports = [443]

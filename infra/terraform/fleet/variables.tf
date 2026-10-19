@@ -51,8 +51,14 @@ variable "coordinator_bootstrap_secret" {
 
 variable "relay_port" {
   type        = number
-  description = "UDP port the relay listens on for QUIC (game clients and peer relays). Must match the relay binary's default listen port; it feeds the security groups, the task definitions, and the coordinator config output alike."
+  description = "Primary UDP port the relay listens on for QUIC (game clients and peer relays), and the first in clients' dial preference. It feeds the security groups, the task definitions, and the coordinator config output alike; the coordinator passes it to each relay at launch."
   default     = 14900
+}
+
+variable "extra_relay_ports" {
+  type        = list(number)
+  description = "Further UDP ports every relay serves beside relay_port, for clients whose networks filter UDP to it (e.g. 443). They feed the security groups, the task definitions' port mappings, and the coordinator config output, which also passes them to each relay at launch; their order is the clients' dial preference after relay_port."
+  default     = []
 }
 
 variable "container_name" {

@@ -19,13 +19,14 @@ module "region" {
   ssm_parameter_name = local.ssm_parameter_name
   log_group_name     = local.log_group_name
 
-  repo_name        = var.repo_name
-  relay_image_tag  = var.relay_image_tag
-  cpu_architecture = var.cpu_architecture
-  task_cpu         = var.task_cpu
-  task_memory      = var.task_memory
-  relay_port       = var.relay_port
-  container_name   = var.container_name
+  repo_name         = var.repo_name
+  relay_image_tag   = var.relay_image_tag
+  cpu_architecture  = var.cpu_architecture
+  task_cpu          = var.task_cpu
+  task_memory       = var.task_memory
+  relay_port        = var.relay_port
+  extra_relay_ports = var.extra_relay_ports
+  container_name    = var.container_name
 
   coordinator_url              = var.coordinator_url
   coordinator_bootstrap_secret = var.coordinator_bootstrap_secret

@@ -142,24 +142,55 @@ pub fn bind_endpoint(
     )
 }
 
-/// Binds a QUIC server endpoint on `listen` and serves the client edge on it.
+/// Binds the relay's endpoints: `listen` itself, then the same IP on each of
+/// `extra_ports`.
 ///
-/// Runs until the endpoint stops yielding connections. `registry` is the snapshot
-/// handle onto the tenant signing keys clients authorize against — fixed for a
-/// dev/static relay, or fed by the coordinator's `TenantKeys` pushes, which this
-/// server reads afresh per connection so a mid-connection replacement never tears
-/// a verification in flight.
+/// The extra ports exist for clients whose networks filter UDP to the primary
+/// port; each is a full endpoint on the same server config, so it accepts the
+/// client edge and the mesh alike. Only the primary bind is fatal. An extra port
+/// that fails to bind is logged and skipped, because a relay still serving the
+/// primary port is worth far more than one that refuses to start. A client
+/// handed the dead port loses only that one candidate in its dial race.
+pub fn bind_endpoints(
+    server_config: noq::ServerConfig,
+    listen: SocketAddr,
+    extra_ports: &[u16],
+) -> std::io::Result<Vec<noq::Endpoint>> {
+    let mut endpoints = vec![bind_endpoint(server_config.clone(), listen)?];
+    for &port in extra_ports {
+        let addr = SocketAddr::new(listen.ip(), port);
+        match bind_endpoint(server_config.clone(), addr) {
+            Ok(endpoint) => endpoints.push(endpoint),
+            Err(error) => tracing::error!(
+                %addr,
+                %error,
+                "binding an extra client-edge port failed; serving without it",
+            ),
+        }
+    }
+    Ok(endpoints)
+}
+
+/// Binds the relay's endpoints (see [`bind_endpoints`]) and serves the client
+/// edge on all of them.
+///
+/// Runs until every endpoint stops yielding connections. `registry` is the
+/// snapshot handle onto the tenant signing keys clients authorize against —
+/// fixed for a dev/static relay, or fed by the coordinator's `TenantKeys`
+/// pushes, which this server reads afresh per connection so a mid-connection
+/// replacement never tears a verification in flight.
 pub async fn run(
     listen: SocketAddr,
+    extra_ports: Vec<u16>,
     server_config: noq::ServerConfig,
     registry: RegistryReader,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
     mesh_accept: Option<tokio::sync::mpsc::Sender<noq::Connection>>,
 ) -> Result<(), ServerError> {
-    let endpoint = bind_endpoint(server_config, listen)?;
+    let endpoints = bind_endpoints(server_config, listen, &extra_ports)?;
     serve_reader(
-        endpoint,
+        endpoints,
         registry,
         sessions,
         mesh,
@@ -195,6 +226,27 @@ pub async fn serve(
     .await;
 }
 
+/// [`serve`] across several already-bound endpoints at once, as a relay with
+/// extra client-edge ports runs: one roster, one handshake-admission cap, so a
+/// client's port changes nothing past the socket it arrived on.
+pub async fn serve_all(
+    endpoints: Vec<noq::Endpoint>,
+    registry: Arc<Registry>,
+    sessions: Sessions,
+    mesh: crate::mesh::MeshState,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<noq::Connection>>,
+) {
+    serve_reader(
+        endpoints,
+        RegistryReader::fixed(registry),
+        sessions,
+        mesh,
+        mesh_accept,
+        MAX_PENDING_HANDSHAKES,
+    )
+    .await;
+}
+
 /// Serves the client edge with an explicit cap on concurrent in-flight
 /// authorization handshakes, plus ALPN-based dispatch for mesh connections.
 ///
@@ -218,7 +270,7 @@ pub async fn serve_with_max_pending(
     max_pending_handshakes: usize,
 ) {
     serve_reader(
-        endpoint,
+        vec![endpoint],
         RegistryReader::fixed(registry),
         sessions,
         mesh,
@@ -228,28 +280,54 @@ pub async fn serve_with_max_pending(
     .await;
 }
 
-/// Serves the client edge reading the tenant-key registry through a
-/// [`RegistryReader`], so a coordinator-fed relay picks up a `TenantKeys`
-/// replacement without a restart. Each accepted connection snapshots the current
-/// set once, before its handshake, and verifies against that stable snapshot for
-/// the connection's lifetime — a replacement landing mid-handshake never tears an
-/// in-flight verification.
+/// Serves the client edge on every endpoint, reading the tenant-key registry
+/// through a [`RegistryReader`], so a coordinator-fed relay picks up a
+/// `TenantKeys` replacement without a restart. Each accepted connection
+/// snapshots the current set once, before its handshake, and verifies against
+/// that stable snapshot for the connection's lifetime — a replacement landing
+/// mid-handshake never tears an in-flight verification.
+///
+/// The endpoints share one admission semaphore, so extra ports never raise the
+/// relay-wide bound on in-flight handshakes.
 async fn serve_reader(
-    endpoint: noq::Endpoint,
+    endpoints: Vec<noq::Endpoint>,
     registry: RegistryReader,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
     mesh_accept: Option<tokio::sync::mpsc::Sender<noq::Connection>>,
     max_pending_handshakes: usize,
 ) {
-    if let Ok(addr) = endpoint.local_addr() {
-        tracing::info!(%addr, "relay client edge listening");
-    }
     if registry.is_empty() {
         tracing::warn!("no tenant signing keys registered; all clients will be rejected");
     }
-
     let admission = Arc::new(Semaphore::new(max_pending_handshakes));
+    futures_util::future::join_all(endpoints.into_iter().map(|endpoint| {
+        accept_loop(
+            endpoint,
+            registry.clone(),
+            Arc::clone(&sessions),
+            mesh.clone(),
+            mesh_accept.clone(),
+            Arc::clone(&admission),
+        )
+    }))
+    .await;
+}
+
+/// Accepts connections on one endpoint until it stops yielding them, handing
+/// each to its own task: the TLS handshake, then the ALPN dispatch to the mesh
+/// or the client-edge admission pipeline.
+async fn accept_loop(
+    endpoint: noq::Endpoint,
+    registry: RegistryReader,
+    sessions: Sessions,
+    mesh: crate::mesh::MeshState,
+    mesh_accept: Option<tokio::sync::mpsc::Sender<noq::Connection>>,
+    admission: Arc<Semaphore>,
+) {
+    if let Ok(addr) = endpoint.local_addr() {
+        tracing::info!(%addr, "relay client edge listening");
+    }
     while let Some(incoming) = endpoint.accept().await {
         // Acquire the admission slot BEFORE the handshake, so the cap bounds
         // in-flight handshakes (including TLS), not just app-level auth.

@@ -122,6 +122,30 @@ resource "aws_vpc_security_group_ingress_rule" "relay_udp_ipv6" {
   cidr_ipv6         = "::/0"
 }
 
+# The same ingress on each extra relay port, for clients whose networks filter
+# UDP to the primary one.
+resource "aws_vpc_security_group_ingress_rule" "relay_udp_extra_ipv4" {
+  for_each          = toset([for port in var.extra_relay_ports : tostring(port)])
+  region            = var.aws_region
+  security_group_id = aws_security_group.relay.id
+  description       = "QUIC relay traffic from IPv4 clients on an extra port"
+  ip_protocol       = "udp"
+  from_port         = tonumber(each.value)
+  to_port           = tonumber(each.value)
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "relay_udp_extra_ipv6" {
+  for_each          = toset([for port in var.extra_relay_ports : tostring(port)])
+  region            = var.aws_region
+  security_group_id = aws_security_group.relay.id
+  description       = "QUIC relay traffic from IPv6 clients on an extra port"
+  ip_protocol       = "udp"
+  from_port         = tonumber(each.value)
+  to_port           = tonumber(each.value)
+  cidr_ipv6         = "::/0"
+}
+
 resource "aws_vpc_security_group_egress_rule" "all_ipv4" {
   region            = var.aws_region
   security_group_id = aws_security_group.relay.id
@@ -176,6 +200,13 @@ resource "aws_ecs_task_definition" "relay" {
   memory                   = var.task_memory
   execution_role_arn       = var.execution_role_arn
 
+  # A change registers a new revision; register it before deregistering the old
+  # one, so the family always has an active revision for the coordinator's
+  # launches. Running tasks are untouched by either step.
+  lifecycle {
+    create_before_destroy = true
+  }
+
   runtime_platform {
     operating_system_family = "LINUX"
     cpu_architecture        = var.cpu_architecture
@@ -188,12 +219,24 @@ resource "aws_ecs_task_definition" "relay" {
       essential = true
 
       portMappings = [
-        {
-          containerPort = var.relay_port
-          hostPort      = var.relay_port
+        for port in concat([var.relay_port], var.extra_relay_ports) : {
+          containerPort = port
+          hostPort      = port
           protocol      = "udp"
         }
       ]
+
+      # The image runs as a non-root user, which the kernel bars from binding
+      # ports under 1024 (443 among the extra ports). Lowering the unprivileged
+      # floor to the lowest relay port lets it bind them without granting any
+      # capability; the task has its own network namespace, so this reaches
+      # nothing beyond the relay.
+      systemControls = min(concat([var.relay_port], var.extra_relay_ports)...) < 1024 ? [
+        {
+          namespace = "net.ipv4.ip_unprivileged_port_start"
+          value     = tostring(min(concat([var.relay_port], var.extra_relay_ports)...))
+        }
+      ] : []
 
       # On scale-down ECS sends SIGTERM and the relay drains live game traffic
       # for up to 90s (RELAY_DRAIN_TIMEOUT_SECS). Fargate's default stopTimeout is

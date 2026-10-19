@@ -5,9 +5,11 @@ authorize each client, and hand an admitted one to `routing::run_slot_link`.
 
 ## File map
 
-- `mod.rs` — the endpoint bind, the accept loop and its admission semaphore
-  (acquired **before** the TLS handshake, so the cap bounds in-flight
-  handshakes including TLS), the ALPN dispatch, `ConnError`, and
+- `mod.rs` — the endpoint binds (the primary port, plus any extra ports such
+  as 443; only the primary's bind is fatal), one accept loop per endpoint
+  sharing a single admission semaphore (acquired **before** the TLS
+  handshake, so the cap bounds in-flight handshakes including TLS, relay-wide
+  however many ports there are), the ALPN dispatch, `ConnError`, and
   `serve_connection`: the ordered gate list, written top to bottom.
 - `admission.rs` — the refusal pipeline: the `Refusal` table (each row pairs a
   close code, a reason phrase, a `ConnError` kind and the rollback it owes),

@@ -548,6 +548,7 @@ async fn main() -> Result<()> {
     let sessions_for_idle = Arc::clone(&sessions);
     let mut server = tokio::spawn(server::run(
         cli.listen,
+        cli.extra_listen_port,
         server_config,
         registry_reader,
         sessions,

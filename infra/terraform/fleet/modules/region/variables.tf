@@ -90,6 +90,12 @@ variable "relay_port" {
   default     = 14900
 }
 
+variable "extra_relay_ports" {
+  type        = list(number)
+  description = "Further UDP ports the relay serves beside relay_port. The coordinator tells each relay to listen on them at launch; this module opens them."
+  default     = []
+}
+
 variable "container_name" {
   type        = string
   description = "Relay container name in the task definition. The coordinator targets this name when injecting per-launch environment overrides."

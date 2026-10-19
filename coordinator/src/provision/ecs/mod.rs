@@ -53,6 +53,10 @@ const ENV_RELAY_ID: &str = "RELAY_ID";
 const ENV_RELAY_ENROLL_TOKEN: &str = "RELAY_ENROLL_TOKEN";
 /// Environment variable a launched relay reads the region it serves from.
 const ENV_RELAY_REGION: &str = "RELAY_REGION";
+/// Environment variable a launched relay reads its listen address from.
+const ENV_RELAY_LISTEN: &str = "RELAY_LISTEN";
+/// Environment variable a launched relay reads its extra listen ports from.
+const ENV_RELAY_EXTRA_LISTEN_PORTS: &str = "RELAY_EXTRA_LISTEN_PORTS";
 
 /// The reason string attached to a coordinator-initiated task stop.
 const STOP_REASON: &str = "coordinator scale-down";
@@ -84,10 +88,17 @@ pub struct EcsConfig {
     /// container in the task definition.
     #[serde(default = "default_container")]
     pub container: String,
-    /// The port every resolved advertise address is paired with, matching the
-    /// port the relay listens on.
+    /// The relay's primary port: each launch tells the relay to listen on it, and
+    /// it leads the advertise set.
     #[serde(default = "default_relay_port")]
     pub relay_port: u16,
+    /// Further ports every relay serves and advertises beside `relay_port`, for
+    /// clients whose networks filter UDP to it (e.g. 443). Each launch passes them
+    /// to the relay to listen on, so what a relay serves and what it is advertised
+    /// at come from this one list. The advertise set is port-major in config
+    /// order (`relay_port` first), so the order here is the dial preference.
+    #[serde(default)]
+    pub extra_relay_ports: Vec<u16>,
     /// Placement regions keyed by their coordinator region id (the id a
     /// [`LaunchSpec`] carries), each mapped to its AWS region and networking.
     pub regions: HashMap<String, EcsRegionConfig>,
@@ -156,8 +167,9 @@ impl EcsConfig {
     }
 
     /// Rejects a config that could never launch a task: an empty launcher tag, no
-    /// regions, or a region missing its AWS region, cluster, task definition, or a
-    /// subnet (a Fargate `awsvpc` task cannot attach without one).
+    /// regions, a zero or repeated relay port, or a region missing its AWS region,
+    /// cluster, task definition, or a subnet (a Fargate `awsvpc` task cannot attach
+    /// without one).
     fn validate(&self) -> Result<(), EcsConfigError> {
         if self.started_by.trim().is_empty() {
             return Err(EcsConfigError::Invalid(
@@ -173,6 +185,14 @@ impl EcsConfig {
             return Err(EcsConfigError::Invalid(
                 "at least one region must be configured".into(),
             ));
+        }
+        let ports = self.relay_ports();
+        for (i, port) in ports.iter().enumerate() {
+            if *port == 0 || ports[..i].contains(port) {
+                return Err(EcsConfigError::Invalid(format!(
+                    "relay port {port} is zero or listed twice"
+                )));
+            }
         }
         for (id, region) in &self.regions {
             let require = |value: &str, field: &str| {
@@ -194,6 +214,13 @@ impl EcsConfig {
             }
         }
         Ok(())
+    }
+
+    /// Every port a relay serves, in advertise preference order.
+    fn relay_ports(&self) -> Vec<u16> {
+        std::iter::once(self.relay_port)
+            .chain(self.extra_relay_ports.iter().copied())
+            .collect()
     }
 }
 
@@ -272,7 +299,8 @@ struct EcsCore<Api> {
 
 impl<Api: EcsApi> EcsCore<Api> {
     /// Launches a Fargate task for `spec`'s region, passing the minted id, enroll
-    /// token, and region as container environment overrides. A region-blind spec,
+    /// token, region, and listen ports as container environment overrides. A
+    /// region-blind spec,
     /// or one naming a region this config does not cover, fails — the loop only
     /// launches for warmed configured regions, so either is a config mismatch.
     async fn launch(&self, spec: &LaunchSpec) -> Result<TaskId, ProvisionError> {
@@ -282,6 +310,26 @@ impl<Api: EcsApi> EcsCore<Api> {
         let region = self.config.regions.get(region_id.as_ref()).ok_or_else(|| {
             ProvisionError::Backend(format!("no ECS config for region {}", region_id.as_ref()))
         })?;
+        let mut env = vec![
+            (ENV_RELAY_ID.to_owned(), spec.relay_id.0.to_string()),
+            (ENV_RELAY_ENROLL_TOKEN.to_owned(), spec.enroll_token.clone()),
+            (ENV_RELAY_REGION.to_owned(), region_id.as_ref().to_owned()),
+            // The dual-stack wildcard on `relay_port`, so the port this config advertises first
+            // is the one the relay binds first, whatever the binary's default.
+            (
+                ENV_RELAY_LISTEN.to_owned(),
+                SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), self.config.relay_port).to_string(),
+            ),
+        ];
+        if !self.config.extra_relay_ports.is_empty() {
+            let ports: Vec<String> = self
+                .config
+                .extra_relay_ports
+                .iter()
+                .map(u16::to_string)
+                .collect();
+            env.push((ENV_RELAY_EXTRA_LISTEN_PORTS.to_owned(), ports.join(",")));
+        }
         let request = RunTaskRequest {
             aws_region: region.aws_region.clone(),
             cluster: region.cluster.clone(),
@@ -291,11 +339,7 @@ impl<Api: EcsApi> EcsCore<Api> {
             subnets: region.subnets.clone(),
             security_groups: region.security_groups.clone(),
             assign_public_ip: region.assign_public_ip,
-            env: vec![
-                (ENV_RELAY_ID.to_owned(), spec.relay_id.0.to_string()),
-                (ENV_RELAY_ENROLL_TOKEN.to_owned(), spec.enroll_token.clone()),
-                (ENV_RELAY_REGION.to_owned(), region_id.as_ref().to_owned()),
-            ],
+            env,
         };
         let arn = self.api.run_task(request).await?;
         Ok(TaskId(arn))
@@ -325,7 +369,7 @@ impl<Api: EcsApi> EcsCore<Api> {
         let Some(eni) = self.api.describe_eni(&parsed.region, &eni_id).await? else {
             return Ok(TaskState::Starting);
         };
-        let resolved = resolve_addresses(&eni, self.config.relay_port);
+        let resolved = resolve_addresses(&eni, &self.config.relay_ports());
         if resolved.expected_ips.is_empty() {
             return Ok(TaskState::Starting);
         }
@@ -435,18 +479,21 @@ fn is_stopped_status(status: Option<&str>) -> bool {
 }
 
 /// The address set resolved from an ENI: the advertise addresses (each public IP
-/// paired with the relay port) and the expected peer IPs (the same IPs). Both are
-/// IPv6-first — a dual-stack advertise prefers the IPv6 path — then IPv4.
+/// paired with each relay port) and the expected peer IPs (the same IPs). IPs
+/// are IPv6-first — a dual-stack advertise prefers the IPv6 path — then IPv4.
 struct ResolvedAddresses {
     expected_ips: Vec<IpAddr>,
     addrs: Vec<SocketAddr>,
 }
 
 /// Assembles an ENI's public addresses into the advertise and expected-peer sets,
-/// IPv6 addresses first (in report order) then the public IPv4. An address string
-/// that does not parse is skipped; the substrate only ever reports canonical
-/// addresses, so a skip means an interface that is not yet fully addressed.
-fn resolve_addresses(eni: &EniAddresses, port: u16) -> ResolvedAddresses {
+/// IPv6 addresses first (in report order) then the public IPv4. The advertise set
+/// is port-major: every IP on the first port, then every IP on the next, so a
+/// dialer walking it tries both families on the preferred port before falling
+/// back to another port. An address string that does not parse is skipped; the
+/// substrate only ever reports canonical addresses, so a skip means an interface
+/// that is not yet fully addressed.
+fn resolve_addresses(eni: &EniAddresses, ports: &[u16]) -> ResolvedAddresses {
     let mut ips: Vec<IpAddr> = eni
         .ipv6
         .iter()
@@ -459,7 +506,10 @@ fn resolve_addresses(eni: &EniAddresses, port: u16) -> ResolvedAddresses {
     {
         ips.push(IpAddr::from(ipv4));
     }
-    let addrs = ips.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
+    let addrs = ports
+        .iter()
+        .flat_map(|&port| ips.iter().map(move |&ip| SocketAddr::new(ip, port)))
+        .collect();
     ResolvedAddresses {
         expected_ips: ips,
         addrs,

@@ -236,7 +236,7 @@ async fn launch_builds_overrides_with_exact_env_and_network_config() {
         assert_eq!(request.security_groups, case.expected_security_groups);
         assert_eq!(request.assign_public_ip, case.expected_assign_public_ip);
 
-        // The three environment overrides, by exact name and value.
+        // The four environment overrides, by exact name and value.
         assert_eq!(
             request.env,
             vec![
@@ -246,6 +246,35 @@ async fn launch_builds_overrides_with_exact_env_and_network_config() {
                     "the-one-time-token".to_owned()
                 ),
                 ("RELAY_REGION".to_owned(), "us-east".to_owned()),
+                ("RELAY_LISTEN".to_owned(), "[::]:14900".to_owned()),
+            ],
+        );
+    }
+}
+
+#[tokio::test]
+async fn launch_tells_the_relay_every_port_to_listen_on() {
+    // The default primary with extras, and a flipped preference where the extra port leads: the
+    // relay must bind exactly what the config advertises either way, never its own default.
+    for (relay_port, extra, listen, extra_env) in [
+        (14900, vec![443, 8443], "[::]:14900", "443,8443"),
+        (443, vec![14900], "[::]:443", "14900"),
+    ] {
+        let mut config = one_region_config();
+        config.relay_port = relay_port;
+        config.extra_relay_ports = extra;
+        let core = EcsCore {
+            config,
+            api: FakeEcsApi::new(),
+        };
+        core.launch(&launch_spec(Some("us-east"))).await.unwrap();
+
+        let env = &core.api.run_requests()[0].env;
+        assert_eq!(
+            &env[env.len() - 2..],
+            &[
+                ("RELAY_LISTEN".to_owned(), listen.to_owned()),
+                ("RELAY_EXTRA_LISTEN_PORTS".to_owned(), extra_env.to_owned()),
             ],
         );
     }
@@ -410,6 +439,48 @@ async fn state_assembles_dual_stack_addresses_ipv6_first() {
                 "[2001:db8::1]:14900".parse().unwrap(),
                 "[2001:db8::2]:14900".parse().unwrap(),
                 "203.0.113.7:14900".parse().unwrap(),
+            ],
+        },
+    );
+}
+
+#[tokio::test]
+async fn state_advertises_every_relay_port_port_major() {
+    let api = FakeEcsApi::new();
+    let arn = "arn:aws:ecs:us-east-1:123456789012:task/rp2-relays/t1";
+    api.set_task(
+        arn,
+        TaskDescription {
+            last_status: Some("RUNNING".to_owned()),
+            eni_id: Some("eni-1".to_owned()),
+        },
+    );
+    api.set_eni(
+        "eni-1",
+        EniAddresses {
+            public_ipv4: Some("203.0.113.7".to_owned()),
+            ipv6: vec!["2001:db8::1".to_owned()],
+        },
+    );
+    let mut config = one_region_config();
+    config.extra_relay_ports = vec![443];
+    let core = EcsCore { config, api };
+
+    let state = core.state(&TaskId(arn.to_owned())).await.unwrap();
+    // Both families on the primary port before either on the extra one; the
+    // expected-peer set is per IP, so ports never multiply it.
+    assert_eq!(
+        state,
+        TaskState::Running {
+            expected_ips: vec![
+                "2001:db8::1".parse().unwrap(),
+                "203.0.113.7".parse().unwrap(),
+            ],
+            addrs: vec![
+                "[2001:db8::1]:14900".parse().unwrap(),
+                "203.0.113.7:14900".parse().unwrap(),
+                "[2001:db8::1]:443".parse().unwrap(),
+                "203.0.113.7:443".parse().unwrap(),
             ],
         },
     );
@@ -586,6 +657,28 @@ fn config_rejects_an_empty_required_field_or_no_regions() {
             "an empty {field} must be rejected",
         );
     }
+}
+
+#[test]
+fn config_rejects_a_zero_or_repeated_relay_port() {
+    let region = r#""regions":{"r":{"aws_region":"us-east-1","cluster":"c","task_definition":"td","subnets":["s"]}}"#;
+    for ports in [
+        r#""extra_relay_ports":[14900]"#,
+        r#""extra_relay_ports":[443,443]"#,
+        r#""extra_relay_ports":[0]"#,
+        r#""relay_port":0"#,
+    ] {
+        let json = format!(r#"{{"started_by":"x",{ports},{region}}}"#);
+        assert!(
+            matches!(EcsConfig::from_json(&json), Err(EcsConfigError::Invalid(_))),
+            "{ports} must be rejected",
+        );
+    }
+    let json = format!(r#"{{"started_by":"x","extra_relay_ports":[443],{region}}}"#);
+    assert_eq!(
+        EcsConfig::from_json(&json).unwrap().extra_relay_ports,
+        vec![443]
+    );
 }
 
 #[test]

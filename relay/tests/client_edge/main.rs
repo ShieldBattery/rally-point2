@@ -15,6 +15,7 @@ mod auth;
 mod connectivity;
 mod desync_eviction;
 mod drop_holds;
+mod extra_ports;
 mod lead_reports;
 mod leaves;
 mod lobby_policy;

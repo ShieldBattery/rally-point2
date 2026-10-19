@@ -17,6 +17,15 @@ pub(crate) struct Cli {
     #[arg(long, env = "RELAY_LISTEN", default_value_t = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), DEFAULT_PORT))]
     pub(crate) listen: SocketAddr,
 
+    /// Additional UDP ports to serve on, on `--listen`'s IP (comma-separated in
+    /// the env var). Each accepts exactly what the primary does; they exist for
+    /// clients whose networks filter UDP to the primary port, e.g. 443 beside
+    /// the default. A port that fails to bind is logged and skipped rather than
+    /// failing startup. Advertising them to clients is the coordinator's job,
+    /// not this flag's.
+    #[arg(long, env = "RELAY_EXTRA_LISTEN_PORTS", value_delimiter = ',')]
+    pub(crate) extra_listen_port: Vec<u16>,
+
     /// TLS certificate chain for the relay's identity — either a PEM file path
     /// (local dev, Docker volume mount) or inline PEM content (Fargate secret
     /// injection). If absent, a self-signed cert is generated (dev/loopback

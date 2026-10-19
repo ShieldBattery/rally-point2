@@ -1195,8 +1195,13 @@ mesh dialer does exactly that, walking a peer's candidates each attempt until on
 work lands). The relay **asserts** its addresses via repeatable explicit `--advertise-addr` flags (one
 per family, first is primary; defaulting to the listen address as a single-address advertise) — they
 are deliberately *never* observed from the control connection's source IP, since a relay reaches the
-coordinator over one family but must advertise both; deriving them from the cloud substrate (ECS
-metadata) is still future work.
+coordinator over one family but must advertise both. For a provisioned relay the coordinator's own
+resolution wins: it reads the task's public IPs off its ENI and overrides the hello's set with them.
+**Extra relay ports** (e.g. UDP/443 beside 14900, for clients whose networks filter UDP to the primary
+port) multiply that set port-major: both families on the primary port, then both on each extra port,
+in config order, so a dialer walking it tries both families on the preferred port before another
+port. One coordinator config list decides both what each relay listens on (passed at launch) and
+what it is advertised at. A relay that cannot bind an extra port logs it and serves without it.
 
 **Version negotiation at the Hello.** The relay and coordinator deploy independently, so the `Hello`
 also carries the relay's protocol **window** — `protocol` (the newest version it implements) plus an
