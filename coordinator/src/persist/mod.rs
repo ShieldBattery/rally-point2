@@ -14,10 +14,10 @@
 //!
 //! # What is kept
 //!
-//! One record per live session ([`PersistedSession`]): the setup half
-//! ([`SetupRecord`] — membership, correlation ids, the create-idempotency entry,
+//! One record per live session (`PersistedSession`): the setup half
+//! (`SetupRecord` — membership, correlation ids, the create-idempotency entry,
 //! each relay's staged descriptor and pending slot-closes, recorded re-homes) and
-//! the lifecycle half ([`LifecycleFacts`] — accounting, departures, load-state
+//! the lifecycle half (`LifecycleFacts` — accounting, departures, load-state
 //! sets, started). Plus each relay's last boot id, so a relay that restarted while
 //! the coordinator was down is still told apart from one that merely redialed.
 //! Timers and heartbeat evidence are not kept; restore re-arms them from the
