@@ -151,6 +151,50 @@ async fn rejects_a_peer_with_a_mismatched_alpn() {
     }
 }
 
+/// Neither dialer puts its server name on the wire: the acceptor sees no SNI
+/// from a client-edge or a mesh dial, while the dialer still verifies the
+/// pinned certificate against that name locally (the handshake completing
+/// proves the name check still passes).
+#[tokio::test]
+async fn dialers_send_no_server_name() {
+    let (server_chain, server_key, server_ca) = self_signed();
+    let server_cfg = server_config(server_chain, server_key).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let server = noq::Endpoint::server(server_cfg, bind).unwrap();
+    let server_addr = server.local_addr().unwrap();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(server_ca).unwrap();
+    let (dial_chain, dial_key, _dial_ca) = self_signed();
+    let dialers = [
+        ("client edge", client_config(roots.clone()).unwrap()),
+        (
+            "mesh",
+            mesh_client_config(roots, dial_chain, dial_key).unwrap(),
+        ),
+    ];
+    for (kind, dial_cfg) in dialers {
+        let accept = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept().await.unwrap().await.unwrap() })
+        };
+        let client = noq::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(dial_cfg);
+        let _dialed = client
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+        let accepted = accept.await.unwrap();
+        let handshake = accepted
+            .handshake_data()
+            .unwrap()
+            .downcast::<noq::crypto::rustls::HandshakeData>()
+            .unwrap();
+        assert_eq!(handshake.server_name, None, "{kind} dial sent an SNI");
+    }
+}
+
 /// Both ends of both connection kinds run the floored congestion controller:
 /// each endpoint's controller governs only what it sends, so a dialer-only
 /// setting would leave the relay's sends (every turn a client receives) on

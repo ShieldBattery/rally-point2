@@ -341,6 +341,12 @@ pub fn client_config(roots: rustls::RootCertStore) -> Result<noq::ClientConfig, 
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls.alpn_protocols = vec![ALPN.to_vec()];
+    // The relay's identity is the pinned leaf certificate, so the server name is
+    // only a local label the verifier checks that cert against; it carries no
+    // security weight. Leaving it off the wire matters because a QUIC Initial is
+    // decryptable by any observer: a fixed SNI is a plaintext marker
+    // that censors' SNI filters can match on.
+    tls.enable_sni = false;
 
     let client = QuicClientConfig::try_from(tls)?;
     let mut config = noq::ClientConfig::new(Arc::new(client));
@@ -376,6 +382,9 @@ pub fn mesh_client_config(
         .with_root_certificates(roots)
         .with_client_auth_cert(cert_chain, key)?;
     tls.alpn_protocols = vec![MESH_ALPN.to_vec()];
+    // Peers are fingerprint-pinned too; see `client_config` for why the server
+    // name stays off the wire.
+    tls.enable_sni = false;
 
     let client = QuicClientConfig::try_from(tls)?;
     let mut config = noq::ClientConfig::new(Arc::new(client));
