@@ -15,3 +15,8 @@ relay_image_tag = "stable"
 task_cpu         = 1024
 task_memory      = 2048
 cpu_architecture = "ARM64"
+
+# UDP/443 beside the primary relay port, for clients whose networks filter UDP
+# to it. Proven on staging: the low-port bind works and filtered clients win on
+# 443 after the dial race's stagger.
+extra_relay_ports = [443]
