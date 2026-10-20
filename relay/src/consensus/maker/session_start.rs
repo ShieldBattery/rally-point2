@@ -95,7 +95,7 @@ impl DecisionMaker {
     /// is the client's to choose, and a slot that delays saying so must not
     /// thereby look like it stopped later than the players already waiting on
     /// it. `now` is kept only as the start of the silence grace a freshly
-    /// started loop is owed (see [`note_start_learned`](Self::note_start_learned)).
+    /// started loop is owed (see [`silent_slot`](Self::silent_slot)).
     pub fn note_slot_started(&mut self, slot: SlotId, now: Instant) {
         self.started_slots.insert(slot);
         self.note_start_learned(slot, now);
@@ -111,7 +111,7 @@ impl DecisionMaker {
     ///
     /// `now` — when the report reached this relay, not when the slot's home heard
     /// it — starts the slot's silence grace here, exactly as a first-hand report
-    /// does (see [`note_start_learned`](Self::note_start_learned)).
+    /// does (see [`silent_slot`](Self::silent_slot)).
     pub fn note_peer_slot_started(&mut self, slot: SlotId, now: Instant) {
         self.peer_started_slots.insert(slot);
         self.note_start_learned(slot, now);
