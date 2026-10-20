@@ -177,3 +177,66 @@ async fn an_older_clients_unsequenced_commands_are_all_forwarded() {
     assert_eq!(next_sequenced_lobby(&mut peer_rx).await, (0, None, 0x07));
     assert_eq!(next_sequenced_lobby(&mut peer_rx).await, (0, None, 0x07));
 }
+
+#[tokio::test]
+async fn a_rate_dropped_command_is_recovered_on_the_next_re_send_without_blocking_later_ones() {
+    // Written all at once, a history one past the burst loses its last command
+    // to the rate cap. The command after it, sent once the cap refills, is
+    // delivered at once; the next re-send delivers the dropped one, once.
+    let tenant = make_default_tenant();
+    let session = SessionId(423);
+    let key = SessionKey {
+        tenant: rally_point_proto::control::TenantId(TENANT.to_owned()),
+        session,
+    };
+    let TestRelay {
+        addr, ca, sessions, ..
+    } = start_relay(registry_for_one(&tenant));
+    let endpoint = client_endpoint(&ca);
+
+    let peer = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
+    let mut peer_rx = spawn_control_reader(peer.connection().clone());
+    let host = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let (mut host_send, _) = host.connection().open_bi().await.unwrap();
+    wait_for_slots(&sessions, &key, 2).await;
+
+    let burst = u64::from(LOBBY.rate_burst);
+    send_all(
+        &mut host_send,
+        (0..=burst).map(|seq| command(Some(seq), seq as u8)),
+    )
+    .await;
+    for seq in 0..burst {
+        assert_eq!(
+            next_sequenced_lobby(&mut peer_rx).await,
+            (0, Some(seq), seq as u8)
+        );
+    }
+    assert_no_lobby(&mut peer_rx, "the command past the burst was rate-dropped").await;
+
+    // Waiting out the refill is the point here: the cap admits the next
+    // command, and nothing holds it behind the dropped one.
+    tokio::time::sleep(LOBBY.rate_refill * 2).await;
+    let after = burst + 1;
+    send_all(&mut host_send, [command(Some(after), after as u8)]).await;
+    assert_eq!(
+        next_sequenced_lobby(&mut peer_rx).await,
+        (0, Some(after), after as u8)
+    );
+
+    drop_link(&host, &sessions, &key).await;
+    tokio::time::sleep(LOBBY.rate_refill * 2).await;
+    let host_again = connect_slot(&endpoint, addr, &tenant, session, SlotId(0)).await;
+    let (mut again_send, _) = host_again.connection().open_bi().await.unwrap();
+    send_all(
+        &mut again_send,
+        (0..=after).map(|seq| command(Some(seq), seq as u8)),
+    )
+    .await;
+    assert_eq!(
+        next_sequenced_lobby(&mut peer_rx).await,
+        (0, Some(burst), burst as u8),
+        "the re-send delivers the dropped command",
+    );
+    assert_no_lobby(&mut peer_rx, "a re-sent command was delivered twice").await;
+}

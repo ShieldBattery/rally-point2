@@ -766,9 +766,17 @@ message GameResult {
 // A control-stream write carries no acknowledgment, so a command written onto
 // a connection whose path has silently died is lost with it. The authoring
 // client therefore keeps every command it authored and writes them all again,
-// in order, on each new control stream, and `seq` is what makes that repeat
-// safe: every relay that already accepted an author's command drops a copy
-// whose `seq` it has seen, so the re-send fills only the gap.
+// oldest first, on each new control stream (paced inside the relay's rate cap),
+// and `seq` is what makes that repeat safe: every relay that already accepted
+// an author's command drops a copy whose `seq` it has seen, so the re-send
+// fills only the gap. A relay also re-shares its log with a peer relay whose
+// mesh link (re)joins the session, so a command lost between relays is
+// recovered the same way. The guarantee this buys is that every authored
+// command reaches every member at most once, eventually; NOT that re-sent
+// commands keep the author's order. A command recovered by a re-send lands
+// after whatever the author wrote behind it. The channel's one consumer needs
+// no more: a ShieldBattery game applies only the host's single game-init
+// record and drops every other lobby command.
 message LobbyCommand {
   // The session slot that authored the command bytes. Client → relay this is
   // ignored and the relay overwrites it with the authenticated connection's
@@ -787,10 +795,12 @@ message LobbyCommand {
   // first lobby command of the session, one higher for each after, and the same
   // value on every re-send of the same command. Assigned once by the author and
   // carried verbatim by every hop, mesh copies included, so `(slot, seq)` names
-  // one command fleet-wide. A relay accepts a command only if its `seq` is above
-  // the highest it already accepted from that author (a lower one is a re-send
-  // and is neither logged nor forwarded), and a receiving client likewise drops
-  // one at or below the highest it already handed its game.
+  // one command fleet-wide. A relay keeps the set of seqs it accepted from each
+  // author: one already in it is a re-send, neither logged nor forwarded; any
+  // other is accepted whenever it arrives, so a command the rate cap or a
+  // policy refused before is judged afresh on its next re-send, and nothing
+  // behind it ever waits on it. A receiving client likewise drops one whose seq
+  // it already handed its game.
   //
   // Absent from a client that predates it: such a command has no identity to
   // dedupe on and is forwarded and logged exactly as it always was. A relay
@@ -1229,7 +1239,9 @@ message MeshControlFrame {
     // it on replay — and fans it out to its local members, but does not
     // re-broadcast it across the mesh: the origin already sent a copy to every
     // link serving the session, so re-flooding would only echo (mirroring the
-    // oversize-turn divert). See `LobbyCommand`.
+    // oversize-turn divert). When a mesh link (re)joins a session, each side
+    // re-shares its whole sequenced lobby log down it in these frames, so a copy
+    // lost with a dead link still arrives. See `LobbyCommand`.
     LobbyCommand lobby_command = 5;
 
     // A game-chat message one member authored, propagated to the other relays

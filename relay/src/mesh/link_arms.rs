@@ -24,8 +24,9 @@ use super::fan_out::{apply_ack_cursors, fold_oversize_into_link, reconcile_ack_c
 use super::forward::{resume_replay_for_frame, send_resume_replay};
 use super::join::{
     SentPresence, local_presence, presence_catch_up, presence_statement, presence_updates,
-    push_presence_updates, reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
-    reconcile_session_clock_on_join, reconcile_started_slots_on_join,
+    push_presence_updates, reconcile_lobby_on_join, reconcile_local_slots_on_join,
+    reconcile_resume_cursors_on_join, reconcile_session_clock_on_join,
+    reconcile_started_slots_on_join,
 };
 use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};
 use super::links::{
@@ -477,6 +478,11 @@ impl LinkDriver {
                         reconcile_local_slots_on_join(conditions, control_forward_tx, &key);
                         reconcile_started_slots_on_join(decision_makers, control_forward_tx, &key);
                         reconcile_session_clock_on_join(decision_makers, control_forward_tx, &key);
+                        reconcile_lobby_on_join(
+                            &mesh_for_dispatch.session.side_channels.lobby,
+                            control_forward_tx,
+                            &key,
+                        );
                         // The resume ask this relay's Join sent is dropped
                         // unanswered by a peer that had not joined yet, which
                         // is the usual order on the accept side of a redial:

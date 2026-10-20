@@ -1,6 +1,6 @@
 //! What a freshly registered link replays to converge: the leave, slot,
-//! started-report and resume-cursor re-sends a Join enqueues, and the presence
-//! push that carries a session's live-player count.
+//! started-report, lobby-log and resume-cursor re-sends a Join enqueues, and the
+//! presence push that carries a session's live-player count.
 
 use std::collections::HashMap;
 
@@ -106,6 +106,27 @@ pub(super) fn reconcile_started_slots_on_join(
     for slot in decision_makers.started_home_slots(key) {
         let _ = control_tx.send(slot_started_frame(key.session, slot));
     }
+}
+
+/// Re-shares this relay's lobby log for `key` down a freshly registered link's
+/// control channel: every command that carries its author's origin seq. A
+/// lobby command crosses the mesh once, when its origin relay accepts it, so
+/// one lost with a dying link would never reach the peer's members on its own,
+/// and the author re-sending it reaches only its home relay, which refuses it
+/// as a repeat. The peer refuses what it already has and accepts the rest, the
+/// same rule it applies to a live copy. Called both at this relay's own Join
+/// and on the peer's first presence report, since a frame sent before the peer
+/// joined the session is dropped there. The whole log, not just home-authored
+/// commands: a peer may have missed a third relay's command too, and every
+/// copy carries the author's own seq, so nothing loops.
+pub(super) fn reconcile_lobby_on_join(
+    lobby: &crate::session::side_channel::LobbyChannel,
+    control_tx: &MeshControlTx,
+    key: &SessionKey,
+) {
+    lobby.reshare_identified(key, |command| {
+        let _ = control_tx.send(lobby_command_frame(key.session, command.clone()));
+    });
 }
 
 /// Sends this relay's copy of `key`'s session clock down a freshly registered

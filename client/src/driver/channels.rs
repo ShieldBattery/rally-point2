@@ -89,7 +89,8 @@ pub struct TurnChannels {
     /// the caller leaves that to the relay and just hands over the bytes. Each
     /// command is kept for the session and written again on every new control
     /// stream, so one lost with a dead link still reaches the other members;
-    /// the relay drops the repeats. Used only during pre-game setup; once the
+    /// the relay drops the repeats. Writes are paced inside the relay's rate
+    /// cap, so past a burst of 16 they go out one per 400 ms. Used only during pre-game setup; once the
     /// game starts, commands move to `outbound` (the datagram turn path).
     pub lobby_out: mpsc::Sender<Vec<u8>>,
     /// Lobby commands other members authored, as the relay fanned them down the
@@ -97,9 +98,10 @@ pub struct TurnChannels {
     /// applies each to that member's lobby turn. The relay never echoes this
     /// client's own commands back (the game echoes those locally), and a member
     /// whose stream comes up after commands already flowed receives the relay's
-    /// replay of the earlier ones here, in order, before the live ones. Each
-    /// command arrives here once, across this client's reconnects too, unless
-    /// its author predates lobby-command seqs.
+    /// replay of the earlier ones here before the live ones. Each command
+    /// arrives here at most once, across this client's reconnects too, unless
+    /// its author predates lobby-command seqs; one an author had to re-send can
+    /// arrive after commands that author wrote later.
     pub lobby_in: mpsc::Receiver<(SlotId, Vec<u8>)>,
     /// In-game chat messages this game authored, to send up to the relay for
     /// the other members. The driver wraps each in a `GameChat` and writes it

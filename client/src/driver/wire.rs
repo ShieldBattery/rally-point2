@@ -85,6 +85,10 @@ pub(super) struct Wire {
     /// authoring lobby commands (the game started, or it left) — after which
     /// `recv()` is an always-ready `None` that would spin the loop.
     pub(super) lobby_out_alive: bool,
+    /// How many of [`LoopState::lobby_outbox`]'s commands THIS stream has
+    /// carried. Starts at 0 on every stream, which is what re-sends the whole
+    /// history on a new one.
+    pub(super) lobby_sent: usize,
     /// Whether the game's chat sender is still live. Unlike lobby, chat streams
     /// for the whole game, not just pre-game setup, but the disarm rule is the
     /// same: only on the sender dropping (a `None`), after which `recv()` is an
@@ -167,6 +171,7 @@ impl Wire {
             game_started_alive: true,
             result_alive: true,
             lobby_out_alive: true,
+            lobby_sent: 0,
             chat_out_alive: true,
             skin_out_alive: true,
             request_drop_alive: true,

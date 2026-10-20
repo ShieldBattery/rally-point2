@@ -10,7 +10,7 @@ use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{GameChat, Payload, PlayerSkin};
 use rally_point_transport::Link;
 use rally_point_transport::control::{
-    send_control_chat, send_control_game_result, send_control_game_started, send_control_lobby,
+    send_control_chat, send_control_game_result, send_control_game_started,
     send_control_request_drop, send_control_rollback_stats, send_control_skin,
 };
 use tokio::sync::watch;
@@ -224,23 +224,19 @@ pub(super) async fn on_game_started(signal: Option<()>, wire: &mut Wire, state: 
 }
 
 /// A lobby command the game authored during setup. Stamp it with
-/// its origin seq, retain it, and send it up the reliable control
-/// stream at once — setup runs before any turn barrier exists, so
-/// there is nothing to drain behind. The relay stamps this client's
-/// authenticated slot (the `0` here is ignored) and fans it to the
-/// other members. Disarmed when the game drops its sender (setup
-/// finished). A send failure means the stream (and almost certainly
-/// the connection) is gone; a dropped setup command would leave a
-/// member's pre-game state incomplete, so it is the same reconnect
-/// trigger as an undeliverable oversize turn — except once our leave
-/// intent is out, the relay closing the stream under this write is
-/// the expected confirmation.
+/// its origin seq, queue it behind every earlier one, and write
+/// whatever the pacer allows up the reliable control stream at once
+/// (normally this command itself) — setup runs before any turn
+/// barrier exists, so there is nothing to drain behind. The relay
+/// stamps this client's authenticated slot (the `0` here is ignored)
+/// and fans it to the other members. Disarmed when the game drops
+/// its sender (setup finished).
 ///
 /// A write that succeeds locally proves nothing: a connection whose
 /// path silently died accepts it and only times out later. Retention
-/// is what recovers that command — every new control stream re-sends
-/// all retained commands before anything else lobby-side, and the
-/// relay drops each one it already accepted by `(slot, seq)`.
+/// is what recovers that command — every new control stream writes
+/// the whole history again, and the relay drops each one it already
+/// accepted by `(slot, seq)`.
 pub(super) async fn on_lobby_out(
     bytes: Option<Vec<u8>>,
     wire: &mut Wire,
@@ -248,16 +244,35 @@ pub(super) async fn on_lobby_out(
 ) -> ArmFlow {
     match bytes {
         Some(bytes) => {
-            let command = state.lobby_retention.author(bytes);
-            if let Err(error) = send_control_lobby(&mut wire.control_send, command).await {
-                return ArmFlow::End(
-                    state
-                        .announcer
-                        .absorb_link_close(Err(DriverError::from(error))),
-                );
+            if state.lobby_outbox.author(bytes) {
+                return send_due_lobby(wire, state).await;
             }
         }
         None => wire.lobby_out_alive = false,
+    }
+    ArmFlow::Serve
+}
+
+/// Writes the lobby commands this stream has not carried yet, oldest
+/// first, as far as the pacer allows — the re-send of the history on a
+/// new stream, a command just authored, and whatever the pacer held
+/// back, all on one path through the one pacer. A failed write means the stream (and
+/// almost certainly the connection) is gone; a dropped setup command
+/// would leave a member's pre-game state incomplete, so it is the same
+/// reconnect trigger as an undeliverable oversize turn — except once our
+/// leave intent is out, the relay closing the stream under this write is
+/// the expected confirmation.
+pub(super) async fn send_due_lobby(wire: &mut Wire, state: &mut LoopState) -> ArmFlow {
+    if let Err(error) = state
+        .lobby_outbox
+        .send_due(&mut wire.control_send, &mut wire.lobby_sent)
+        .await
+    {
+        return ArmFlow::End(
+            state
+                .announcer
+                .absorb_link_close(Err(DriverError::from(error))),
+        );
     }
     ArmFlow::Serve
 }

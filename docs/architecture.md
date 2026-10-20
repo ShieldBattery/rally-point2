@@ -417,19 +417,33 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
 control stream, and a control-stream write carries no acknowledgment: one written onto a connection whose
 path silently died succeeds locally and is lost when the connection idles out, and the members waiting on
 it (a host's game-init) wait forever. So each client stamps its lobby commands with an origin `seq` (0, 1,
-… per session, never rewound), keeps every one it authored for the whole session (capped at 256 commands /
-256 KiB, oldest dropped first), and writes them all again, in order, on every new control stream —
-same-relay resume and re-home alike — ahead of any command it authors on that stream. Retention never ends
-early because nothing the client sees proves delivery: its own loop can start before a game-init it wrote
-reached anyone, and `SessionStart` only says everyone connected. Every relay keeps, beside its lobby log and
-for exactly as long, the highest `seq` it accepted per author, and refuses a command at or below it —
-before the rate cap, so a re-send spends no budget on what was delivered, and inside the log's own
-`deliver`, so a refused repeat is neither logged nor fanned locally nor forwarded across the mesh. Mesh
-copies keep the `seq`, so a relay that first received a command over the mesh refuses the author's re-send
-of it after a re-home, and the original never crosses the mesh twice. Receiving clients keep the same
-high-water mark per author and drop repeats, which also absorbs the relay re-playing its whole log each
-time a member's stream registers. A command with no `seq` (a client that predates it) is forwarded exactly
-as before. A relay that predates the field skips it, so a new client's re-send through an old relay is
+... per session, never rewound), keeps its whole history for the session (it stops authoring at the
+relay's session log ceiling, 1024 commands / 256 KiB, past which no relay accepts one), and writes all of
+it again, oldest first, on every new control stream, same-relay resume and re-home alike. Retention never
+ends early because nothing the client sees proves delivery: its own loop can start before a game-init it
+wrote reached anyone, and `SessionStart` only says everyone connected. Every relay keeps, beside its lobby
+log and for as long, the set of seqs it accepted from each author (bounded by the log's own ceiling): a
+seq already in the set is a repeat, dropped (checked before the rate cap, so a re-send spends no budget on
+it) and, being refused inside the log's own `deliver`, neither logged nor fanned locally nor forwarded
+across the mesh; any other seq is accepted whenever it arrives, subject to the rate cap and lobby policy
+as before. A command the rate cap or a policy refused is simply absent from the set, so its next re-send
+is judged afresh and nothing authored after it ever waits on it. Mesh copies keep the `seq` and are judged
+the same way. Because a command crosses the mesh only once, when its origin accepts it, a copy lost with a
+dying mesh link is recovered by the relays instead: when a link (re)joins a session, each side re-shares
+its whole sequenced log down it (alongside the other Join-time reconciles, and again on the peer's first
+presence), and the peer keeps what it lacks. Receiving clients keep the same per-author set and drop
+repeats, which also absorbs the relay re-playing its whole log each time a member's stream registers. The
+guarantee is **at most once per member, eventually, not in the author's order**: a command recovered by a
+re-send lands after whatever its author wrote behind it. That is all the channel's one consumer needs, a
+ShieldBattery game applying only the host's single game-init record and dropping every other lobby
+command. Every client write, first send and re-send alike, still goes through one session-long pacer at
+half the relay's per-slot burst and rate (32 burst, one per 200 ms), so a relay that has seen none of a
+history admits all of it without a rate drop through up to 6.4 s of path jitter; a drop past that margin
+costs only a wait for the next re-send. The limits live in `rally_point_proto::lobby`, shared by both
+ends. On a new stream the client writes its game-started re-assertion before the lobby re-send, so a relay
+meeting a started slot for the first time drops, rather than evicts over, a command its policy never
+admitted. A command with no `seq` (a client that predates it) is forwarded exactly as before and never
+re-shared. A relay that predates the field skips it, so a new client's re-send through an old relay is
 delivered again: **deploy relays before clients.**
 
 **Coordinator `POST /session/rehome`.** Tenant-authenticated and app-server-mediated — clients never talk to
@@ -1768,11 +1782,16 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   scored result.
 - **Presence fail-open (35s TTL):** locking players out of queueing on infra flap is strictly worse
   than the status quo (see the presence section above for the full argument).
-- **Lobby-command delivery is re-send plus origin-seq dedupe, not acknowledgment:** a client re-sends
-  every lobby command it authored on each new control stream for the whole session, and relays (and
-  receiving clients) drop what they already accepted by `(slot, seq)` high-water mark. An ack would
-  only move the same "was it processed?" question onto another unacknowledged write; a re-send that
-  every hop dedupes needs no answer to it. Unsequenced commands stay forwarded as-is for old clients.
+- **Lobby-command delivery is paced re-send plus origin-seq set dedupe, at most once and unordered,
+  not acknowledgment:** a client re-sends every lobby command it authored on each new control stream
+  for the whole session, paced inside the relay's rate cap; relays (and receiving clients) drop a
+  `(slot, seq)` they already accepted and accept any other whenever it arrives, re-sharing their
+  logs on every mesh rejoin. An ack would only move the same "was it processed?" question onto
+  another unacknowledged write. Per-author ordering was tried and dropped: any rule that holds a
+  later command for an earlier one turns one refused command (rate cap, lobby policy) into a stall
+  of everything behind it, and ShieldBattery's lobby channel carries one meaningful command per game
+  (the host's game-init), so order buys nothing. Unsequenced commands stay forwarded as-is for old
+  clients.
 - **The relay-side coordinator-notice buffer is unbounded by deliberate choice** (delivery over
   memory); the coordinator's own per-session webhook queues are bounded (128) with a drop counter
   on `/metrics`. Relay-reported webhook events take precedence over coordinator-derived ones by

@@ -1,6 +1,7 @@
 //! The ordered-log policy's own guarantees: the replay is the whole log, in
-//! arrival order, exactly once per member, it stops at the ceilings, and an
-//! author's re-send of a command it already accepted is refused.
+//! arrival order, exactly once per member, it stops at the ceilings, an
+//! author's re-send of a command it already accepted is refused, and any other
+//! command is accepted whenever it arrives.
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::LobbyCommand;
@@ -218,4 +219,44 @@ fn the_dedupe_state_ends_with_the_sessions_log() {
     channel.end_session(&k);
     assert!(!channel.is_repeat(&k, &sequenced(0, 0, 0x01)));
     assert!(channel.deliver(&k, sequenced(0, 0, 0x01)));
+}
+
+#[test]
+fn a_command_is_accepted_whenever_it_arrives_and_only_once() {
+    // A command the rate cap refused the first time arrives on a later
+    // re-send, after commands authored behind it. Nothing waits on it, and it
+    // is still accepted once when it lands.
+    let channel = Lobby::channel();
+    let k = session_key(1);
+    let mut peer = channel.register_member(&k, SlotId(1));
+    assert!(channel.deliver(&k, sequenced(0, 0, 0x01)));
+    assert!(
+        channel.deliver(&k, sequenced(0, 2, 0x03)),
+        "seq 1 is not waited on"
+    );
+    assert!(
+        channel.deliver(&k, sequenced(0, 1, 0x02)),
+        "seq 1 is accepted late"
+    );
+    for seq in 0..3 {
+        assert!(channel.is_repeat(&k, &sequenced(0, seq, 0)));
+        assert!(!channel.deliver(&k, sequenced(0, seq, 0)));
+    }
+    assert_eq!(bytes(&mut peer), vec![(0, 0x01), (0, 0x03), (0, 0x02)]);
+}
+
+#[test]
+fn the_re_share_hands_over_every_sequenced_command_in_log_order() {
+    // What a relay re-shares with a peer on a mesh rejoin: the log's sequenced
+    // commands, each author's seqs climbing. Unsequenced ones have no identity
+    // a peer could refuse a repeat by, so they stay out.
+    let channel = Lobby::channel();
+    let k = session_key(1);
+    assert!(channel.deliver(&k, sequenced(0, 0, 0x01)));
+    assert!(channel.deliver(&k, command(2, 0x0F)));
+    assert!(channel.deliver(&k, sequenced(1, 0, 0x11)));
+    assert!(channel.deliver(&k, sequenced(0, 1, 0x02)));
+    let mut shared = Vec::new();
+    channel.reshare_identified(&k, |message| shared.push((message.slot, message.seq)));
+    assert_eq!(shared, vec![(0, Some(0)), (1, Some(0)), (0, Some(1))]);
 }

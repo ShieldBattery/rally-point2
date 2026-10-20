@@ -36,6 +36,9 @@
   accept side of a redial usually reads the dialer's ask before its own Join
   lands, so a resuming Join asks again on the peer's first presence report.
   Anything replayed on a peer's Join-time arrival must also be re-sent there.
+  The lobby log is one of these re-sends (`reconcile_lobby_on_join`): a lobby
+  command crosses the mesh once, so the re-share is its only recovery from a
+  dead link.
 - Every inline reliable-stream write is deadline-bounded; a peer that stops
   reading would otherwise suspend the loop for every session on the pair. The
   unacked-window cap and a full forward queue both reset the link on purpose:

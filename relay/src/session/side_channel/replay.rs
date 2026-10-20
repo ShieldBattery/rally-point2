@@ -1,7 +1,7 @@
 //! What a side channel keeps for a member that was not there when a message
 //! was delivered — the one axis the three channels differ on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
 use rally_point_proto::ids::SlotId;
@@ -113,15 +113,21 @@ pub struct LogLimits {
 /// are refused, so a late joiner replays a truncated but *consistent prefix*
 /// rather than the relay growing the log without bound.
 ///
-/// **Re-sends are refused.** An author's client writes every command it
-/// authored again on each new control stream, because a write onto a
-/// connection that silently died is lost with nothing to report it. A message
-/// carrying an origin seq at or below the highest this log already accepted
-/// from the same author is that repeat: refused, so it is neither logged again
-/// nor fanned out, nor (through `deliver`'s verdict) forwarded across the mesh.
-/// The high-water mark rather than a set of seen seqs is enough because an
-/// author re-sends in seq order, so its accepted seqs only ever climb. A
-/// message without a seq (a client that predates it) is never a repeat.
+/// **A re-send is refused by identity.** An author's client writes every
+/// command it authored again on each new control stream, because a write onto
+/// a connection that silently died is lost with nothing to report it, and a
+/// peer relay re-shares its log whenever a mesh link (re)joins the session. A
+/// message whose origin seq this log already accepted from the same author is
+/// such a repeat: refused, so it is neither logged again nor fanned out, nor
+/// (through `deliver`'s verdict) forwarded across the mesh. Any other seq is
+/// accepted whenever it arrives, in whatever order: a command the rate cap or
+/// a session rule refused earlier is simply not here, so a later re-send of it
+/// is judged afresh and nothing after it ever waits on it. Delivery is
+/// therefore at most once per command but not in the author's order across
+/// re-sends, which the channel's one consumer does not need: a ShieldBattery
+/// game applies only the host's single game-init record and drops the rest.
+///
+/// A message without a seq (a client that predates it) is never a repeat.
 pub struct OrderedLog<M> {
     /// Every message delivered for this session, in arrival order — the replay
     /// source for a member whose stream comes up after messages flowed.
@@ -131,10 +137,12 @@ pub struct OrderedLog<M> {
     /// Whether the log has hit a ceiling. Once set, further messages are
     /// dropped (the session is misbehaving).
     overflowed: bool,
-    /// Per author, the highest origin seq accepted into `log`. Lives exactly as
-    /// long as the log it guards, so a re-send is recognized for as long as
-    /// the command it repeats could still be replayed.
-    accepted_through: HashMap<u32, u64>,
+    /// Per author, every origin seq accepted into `log`. Lives exactly as long
+    /// as the log it guards, so a re-send is recognized for as long as the
+    /// command it repeats could still be replayed, and bounded by it: each
+    /// entry is one logged message, so all authors together hold at most the
+    /// log's message ceiling.
+    accepted: HashMap<u32, HashSet<u64>>,
 }
 
 impl<M> Default for OrderedLog<M> {
@@ -143,7 +151,7 @@ impl<M> Default for OrderedLog<M> {
             log: Vec::new(),
             log_bytes: 0,
             overflowed: false,
-            accepted_through: HashMap::new(),
+            accepted: HashMap::new(),
         }
     }
 }
@@ -179,7 +187,10 @@ impl<M: SideChannelMessage> ReplayPolicy for OrderedLog<M> {
         self.log.push(message.clone());
         self.log_bytes += new_bytes;
         if let Some(seq) = message.origin_seq() {
-            self.accepted_through.insert(message.author(), seq);
+            self.accepted
+                .entry(message.author())
+                .or_default()
+                .insert(seq);
         }
         true
     }
@@ -190,9 +201,9 @@ impl<M: SideChannelMessage> ReplayPolicy for OrderedLog<M> {
 
     fn is_repeat(&self, message: &M) -> bool {
         message.origin_seq().is_some_and(|seq| {
-            self.accepted_through
+            self.accepted
                 .get(&message.author())
-                .is_some_and(|&through| seq <= through)
+                .is_some_and(|seqs| seqs.contains(&seq))
         })
     }
 }

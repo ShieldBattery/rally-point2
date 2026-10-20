@@ -1,6 +1,7 @@
 //! Lobby commands across reconnects: each authored command's origin seq, the
-//! re-send of every retained command on a fresh control stream, and the
-//! receiving side dropping a command the game already has.
+//! retention ceiling and the write pacing, the re-send of every retained command
+//! on a fresh control stream, and the receiving side dropping a command the game
+//! already has.
 
 use rally_point_proto::messages::LobbyCommand;
 use rally_point_transport::control::send_control_lobby;
@@ -18,21 +19,41 @@ fn authored(frame: ControlInbound) -> (Option<u64>, Vec<u8>) {
 }
 
 #[test]
-fn authored_commands_take_climbing_seqs_and_the_oldest_leaves_past_the_cap() {
-    let mut retention = LobbyRetention::default();
-    let first = retention.author(vec![0xA0]);
-    let second = retention.author(vec![0xA1]);
-    assert_eq!((first.seq, second.seq), (Some(0), Some(1)));
-
-    for _ in 0..LOBBY_RETENTION_CAP {
-        retention.author(vec![0xB0]);
+fn authored_commands_keep_the_whole_history_up_to_the_relays_log_ceiling() {
+    // A relay that has seen none of an author's commands accepts only a
+    // history starting at seq 0, so nothing is ever dropped from the front;
+    // past the ceiling no relay could accept another, so the newest is refused.
+    let mut outbox = LobbyOutbox::new(tokio::time::Instant::now());
+    for _ in 0..rally_point_proto::lobby::LOG_MAX_COMMANDS {
+        assert!(outbox.author(vec![0xB0]));
     }
-    let seqs: Vec<_> = retention.retained().map(|command| command.seq).collect();
-    assert_eq!(seqs.len(), LOBBY_RETENTION_CAP);
-    // The two oldest left; the rest keep their seqs, so a relay still dedupes
-    // whatever it already accepted among them.
-    assert_eq!(seqs.first(), Some(&Some(2)));
-    assert_eq!(seqs.last(), Some(&Some(LOBBY_RETENTION_CAP as u64 + 1)));
+    assert!(!outbox.author(vec![0xB1]), "past the log ceiling");
+    let seqs: Vec<_> = outbox.retained().map(|command| command.seq).collect();
+    assert_eq!(seqs.len(), rally_point_proto::lobby::LOG_MAX_COMMANDS);
+    assert!(
+        seqs.iter()
+            .enumerate()
+            .all(|(index, seq)| *seq == Some(index as u64)),
+        "seqs climb from 0 with no gap",
+    );
+
+    let mut outbox = LobbyOutbox::new(tokio::time::Instant::now());
+    assert!(outbox.author(vec![0; rally_point_proto::lobby::LOG_MAX_BYTES]));
+    assert!(!outbox.author(vec![0]), "past the log's byte ceiling");
+}
+
+#[test]
+fn the_pacer_bursts_half_the_relays_cap_then_refills_at_half_its_rate() {
+    let start = tokio::time::Instant::now();
+    let mut pacer = LobbyPacer::new(start);
+    for _ in 0..PACE_BURST {
+        assert!(pacer.try_take(start));
+    }
+    assert!(!pacer.try_take(start), "the burst is spent");
+    assert_eq!(pacer.next_token_at(), start + PACE_REFILL);
+    assert!(!pacer.try_take(start + PACE_REFILL - Duration::from_millis(1)));
+    assert!(pacer.try_take(start + PACE_REFILL));
+    assert!(!pacer.try_take(start + PACE_REFILL));
 }
 
 #[test]
@@ -52,6 +73,12 @@ fn receipts_drop_an_authors_repeat_but_never_an_unsequenced_command() {
         receipts.admit(SlotId(2), Some(0)),
         "each author has its own seq space",
     );
+    assert!(receipts.admit(SlotId(1), Some(3)));
+    assert!(
+        receipts.admit(SlotId(1), Some(2)),
+        "a command an author had to re-send can arrive after a later one",
+    );
+    assert!(!receipts.admit(SlotId(1), Some(2)));
     assert!(receipts.admit(SlotId(1), None));
     assert!(
         receipts.admit(SlotId(1), None),

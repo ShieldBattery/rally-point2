@@ -73,19 +73,6 @@ impl LinkDriver {
                 .announcer
                 .absorb_link_close(Err(DriverError::from(error)));
         }
-        // Re-send every lobby command this client authored, oldest first, ahead
-        // of any it authors from here on: one written onto the last connection
-        // may never have reached the relay (a write onto a path that silently
-        // died succeeds locally and is lost with it). The relay drops each one
-        // it already accepted by its origin seq, so only what was lost is
-        // delivered. Its failure is the same reconnect trigger as a live lobby
-        // send's, and retention is untouched by it, so the next stream carries
-        // the whole set again.
-        if let Err(error) = state.lobby_retention.resend(&mut wire.control_send).await {
-            return state
-                .announcer
-                .absorb_link_close(Err(DriverError::from(error)));
-        }
         // Re-assert the game's own "my loop is running" announcement on this
         // connection's fresh control stream. The fact is session state, not link
         // state, so every stream carries it: an announcement whose write raced a
@@ -109,6 +96,21 @@ impl LinkDriver {
                     "re-asserting the game-started announcement failed; retrying on the next stream"
                 ),
             }
+        }
+        // Re-send every lobby command this client authored, oldest first, ahead
+        // of any it authors from here on: one written onto the last connection
+        // may never have reached the relay (a write onto a path that silently
+        // died succeeds locally and is lost with it). The relay drops each one
+        // it already accepted by its origin seq, so only what was lost is
+        // delivered (possibly after newer commands that went through first;
+        // the channel promises at most once, not order). The pacer may hold
+        // part of a long history back; the lobby-due arm below writes the rest.
+        // After the game-started re-assertion above: a relay meeting this
+        // client for the first time (a re-home) then already knows the slot
+        // started, and a lobby policy merely drops, rather than evicts over, a
+        // command it never admitted.
+        if let ArmFlow::End(result) = outbound::send_due_lobby(&mut wire, state).await {
+            return result;
         }
         // Rollback statistics are session state too: the newest snapshot rides
         // every fresh stream, so the relay serving this connection records it
@@ -183,6 +185,12 @@ impl LinkDriver {
                 .held
                 .front()
                 .map(|&(due, _)| due)
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
+            // Armed only while the pacer holds back a lobby command this stream
+            // has not carried; the day-out fallback keeps it dormant otherwise.
+            let lobby_due = state
+                .lobby_outbox
+                .next_due(wire.lobby_sent)
                 .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400));
 
             tokio::select! {
@@ -270,6 +278,15 @@ impl LinkDriver {
                 // going out, not the relay's start directive arriving.
                 signal = seam.game_started.recv(), if wire.game_started_alive => {
                     outbound::on_game_started(signal, &mut wire, state).await;
+                }
+                () = sleep_until(lobby_due),
+                    if state.lobby_outbox.next_due(wire.lobby_sent).is_some() =>
+                {
+                    match outbound::send_due_lobby(&mut wire, state).await {
+                        ArmFlow::Serve => {}
+                        ArmFlow::Teardown => break 'serve,
+                        ArmFlow::End(result) => return result,
+                    }
                 }
                 bytes = seam.lobby_out.recv(), if wire.lobby_out_alive => {
                     match outbound::on_lobby_out(bytes, &mut wire, state).await {

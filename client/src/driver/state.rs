@@ -16,7 +16,7 @@ use crate::leave_announcer::LeaveAnnouncer;
 use crate::phase::{PhaseSlew, PhaseStatus};
 
 use super::connectivity::ConnectivityFence;
-use super::lobby::{LobbyReceipts, LobbyRetention};
+use super::lobby::{LobbyOutbox, LobbyReceipts};
 use super::reorder::SlotReorder;
 use super::retention::RetentionRing;
 
@@ -290,10 +290,11 @@ pub(super) struct LoopState {
     /// stream it opens on the new connection — the same divert path an
     /// oversize turn takes when first sent — and it empties on each drain.
     pub(super) pending_control_redivert: Vec<Payload>,
-    /// Every lobby command this client authored, seq-stamped, re-sent on each
-    /// new control stream: a write onto a connection that silently died is
-    /// otherwise lost with nothing to report it.
-    pub(super) lobby_retention: LobbyRetention,
+    /// Every lobby command this client authored, seq-stamped, written again on
+    /// each new control stream (a write onto a connection that silently died is
+    /// otherwise lost with nothing to report it), and the pacing all those
+    /// writes share.
+    pub(super) lobby_outbox: LobbyOutbox,
     /// The newest origin seq of each member's lobby commands already handed to
     /// the game, so a relay's replay of its log after this client reconnects
     /// does not deliver them twice.
@@ -333,7 +334,7 @@ impl LoopState {
             game_started: false,
             retention: RetentionRing::default(),
             pending_control_redivert: Vec::new(),
-            lobby_retention: LobbyRetention::default(),
+            lobby_outbox: LobbyOutbox::new(Instant::now()),
             lobby_receipts: LobbyReceipts::default(),
             connectivity: ConnectivityFence::default(),
             phase_slew: PhaseSlew::new(Instant::now()),

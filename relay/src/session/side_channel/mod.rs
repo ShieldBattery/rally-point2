@@ -292,6 +292,23 @@ impl<R: ReplayPolicy> SideChannel<R> {
             .is_some_and(|session| session.replay.is_repeat(message))
     }
 
+    /// Hands every retained message that carries an origin seq to `send`, in
+    /// log order. A relay re-shares these with a peer relay whose link just
+    /// (re)joined the session, and the peer refuses what it already has.
+    /// Unsequenced messages have no identity a peer could refuse a repeat by,
+    /// so they are never re-shared.
+    pub fn reshare_identified(&self, key: &SessionKey, mut send: impl FnMut(&R::Message)) {
+        let sessions = self.sessions.lock();
+        let Some(session) = sessions.get(key) else {
+            return;
+        };
+        for message in session.replay.replay() {
+            if message.origin_seq().is_some() {
+                send(message);
+            }
+        }
+    }
+
     /// Checks whether one client-authored message from `slot` in `key`'s
     /// session may proceed to [`deliver`](Self::deliver): `len` fits the
     /// configured size cap (if this channel has one), and `slot`'s token bucket

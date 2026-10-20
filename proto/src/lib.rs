@@ -16,6 +16,8 @@
 //! - **SC:R command parsing** — `command_lengths` + var-length rules ([`commands`]).
 //! - **protocol versioning + negotiation** ([`version`]).
 //! - **typed turn coordinates / ids** shared across the logic layers ([`ids`]).
+//! - **lobby-command admission limits** a client paces its re-sends against
+//!   ([`lobby`]).
 //! - **QUIC application close codes** for the client↔relay link, the diagnosis
 //!   that outlives a dead connection ([`close_codes`]).
 //!
@@ -31,6 +33,7 @@ pub mod commands;
 pub mod control;
 pub mod handshake;
 pub mod ids;
+pub mod lobby;
 pub mod mesh;
 pub mod request_auth;
 pub mod rollback;

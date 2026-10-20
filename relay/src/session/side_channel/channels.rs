@@ -2,6 +2,7 @@
 //! the per-session tasks carry them in.
 
 use rally_point_proto::ids::SlotId;
+use rally_point_proto::lobby;
 use rally_point_proto::messages::{GameChat, LobbyCommand, PlayerSkin};
 use tokio::sync::mpsc;
 
@@ -47,14 +48,14 @@ impl SideChannelMessage for PlayerSkin {
     }
 }
 
-/// Pre-game lobby-command fan-out with its ordered replay log.
+/// Pre-game lobby-command fan-out with its replay log.
 ///
-/// Before a game starts, the host's game authors the lobby's setup commands —
-/// slot and color assignments, the game-init that seeds the synced RNG — and
-/// every other session member must apply that byte stream, in the order the
-/// host emitted it, before the first turn. Members also author their own small
-/// requests (a join, a ready toggle, a race change) that must reach the host
-/// and the other members.
+/// Before a game starts, the host's game authors the game-init command that
+/// seeds the synced RNG, and every other session member must apply it before
+/// the first turn. Each command reaches every member at most once, deduplicated
+/// by its author's seq, but commands an author re-sends after a reconnect can
+/// land after newer ones: the channel promises no order between them, which the
+/// game's single setup command never needs.
 pub type LobbyChannel = SideChannel<OrderedLog<LobbyCommand>>;
 
 /// Mid-game game-chat fan-out — the reliable, ephemeral in-game chat channel.
@@ -90,8 +91,9 @@ pub const LOBBY: SideChannelConfig<LogLimits> = SideChannelConfig {
     // back-to-back the moment the host's UI populates, with nothing pacing them
     // (unlike chat, no human types that fast). 32 covers that whole burst from a
     // single slot with a little room to spare, while still bounding a flooding
-    // client to a small, cheap admission check per command.
-    rate_burst: 32,
+    // client to a small, cheap admission check per command. Shared with the
+    // client, which paces its re-sends to stay inside it.
+    rate_burst: lobby::RATE_BURST,
     // Ordinary post-setup lobby traffic is a member's own occasional request (a
     // ready toggle, a race or team change) — nothing close to chat's typing
     // cadence, let alone a flood. 200ms (5/sec sustained) is generous enough
@@ -99,15 +101,15 @@ pub const LOBBY: SideChannelConfig<LogLimits> = SideChannelConfig {
     // still keeping a misbehaving or hostile client's sustained rate an order of
     // magnitude below what could meaningfully grow the mesh control channel or
     // the local push queues.
-    rate_refill: Duration::from_millis(200),
+    rate_refill: lobby::RATE_REFILL,
     replay: LogLimits {
         // A real lobby is a burst of setup commands and a handful of per-member
         // requests — tens, not thousands — so this is far above any legitimate
-        // session.
-        max_messages: 1024,
+        // session. Shared with the client, which retains no more than this.
+        max_messages: lobby::LOG_MAX_COMMANDS,
         // Like the count cap, far above any real lobby; it is what stops a few
         // large payloads pinning memory under the count ceiling.
-        max_bytes: 256 * 1024,
+        max_bytes: lobby::LOG_MAX_BYTES,
     },
 };
 
