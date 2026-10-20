@@ -294,6 +294,15 @@ pub struct DecisionMaker {
     /// owed. Only ever buys the slot time before the silence watch may name it,
     /// never a newer stop time (see [`silent_slot`](Self::silent_slot)).
     pub(in crate::consensus) start_learned_at: HashMap<SlotId, Instant>,
+    /// Every slot at least one of whose turns this relay forwarded **from its own
+    /// home client** — any turn on the datagram or oversize path, before its game
+    /// loop ran or after. Grows monotonically and is restated on every heartbeat.
+    /// Unlike `started_slots` this is the relay's own observation rather than a
+    /// client's report: the turn arrived, passed validation and the forward-once
+    /// gate, and went out. Lobby commands ride the control stream and never land
+    /// here. Home-only for the same reason as `started_slots`: what this relay
+    /// reports upward is what it saw first-hand.
+    pub(in crate::consensus) forwarded_slots: HashSet<SlotId>,
     /// Slots this relay closed for good, and why: for producing no turns while
     /// the session advanced past them (see [`silent_slot`](Self::silent_slot)),
     /// or because a rollback verdict named them (see
@@ -525,6 +534,7 @@ impl DecisionMaker {
             started_slots: HashSet::new(),
             peer_started_slots: HashSet::new(),
             start_learned_at: HashMap::new(),
+            forwarded_slots: HashSet::new(),
             evictions: HashMap::new(),
             pending_desync_evictions: Vec::new(),
             decided_leave_at: HashMap::new(),

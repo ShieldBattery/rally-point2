@@ -323,6 +323,7 @@ fn presence_entry(key: SessionKey, slots: Vec<SlotId>, load: RetainedLoadState) 
         slots,
         ever_connected: load.ever_connected,
         started: load.started,
+        forwarded: load.forwarded,
         lobby_violations: load.lobby_violations,
         started_at_ms: load.started_at_ms,
     }

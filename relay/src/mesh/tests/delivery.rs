@@ -427,3 +427,47 @@ fn checksum_sequence_gaps_never_hold_gameplay_delivery() {
         assert_eq!(forwarded.commands, payload.commands);
     }
 }
+
+/// The relay's own load evidence comes off the shared delivery path: a home
+/// client's turn counts as forwarded whether it is a frameless pipe seed or a
+/// framed loop turn, and a peer-homed turn records nothing — the peer's home
+/// records its own clients first-hand.
+#[test]
+fn delivered_home_turns_record_the_slot_as_forwarded() {
+    use crate::consensus::delivery::DeliveryHome;
+    use crate::consensus::{self, Authority};
+    use rally_point_proto::control::BufferBounds;
+
+    let sessions = routing::Sessions::default();
+    let mesh = MeshState::default();
+    let decision_makers = mesh.session.decision_makers.clone();
+    let key = control_key();
+    let _ = decision_makers.sync_maker(
+        &key,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1), SlotId(2)].into(),
+            ..consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay)
+        },
+    );
+    let turn = |seq: u64, slot: u8, frame: Option<u32>| Payload {
+        seq,
+        slot: u32::from(slot),
+        game_frame_count: frame,
+        ..Default::default()
+    };
+    let deliver = |slot: u8, payload: Payload, home: DeliveryHome| {
+        deliver_turn_to_locals(&sessions, &mesh, &key, SlotId(slot), payload, home);
+    };
+
+    // Slot 0 seeds its pipe and its loop never steps.
+    deliver(0, turn(0, 0, None), DeliveryHome::Local);
+    deliver(0, turn(1, 0, None), DeliveryHome::Local);
+    // Slot 1's first turn to get through is one its running loop framed.
+    deliver(1, turn(4, 1, Some(0)), DeliveryHome::Local);
+    // Slot 2 is homed on a peer: its turns reach this relay over the mesh.
+    deliver(2, turn(0, 2, None), DeliveryHome::Peer(RelayId(9)));
+    deliver(2, turn(1, 2, Some(0)), DeliveryHome::Peer(RelayId(9)));
+
+    let load = decision_makers.retained_load_state(&key);
+    assert_eq!(load.forwarded, vec![SlotId(0), SlotId(1)]);
+}

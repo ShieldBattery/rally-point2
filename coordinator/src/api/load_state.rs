@@ -35,11 +35,13 @@ struct SessionLoadStateRequest {
 /// the session's load progress. camelCase, the tenant's own convention (like the
 /// webhook bodies).
 ///
-/// `connectedSlots` / `startedSlots` / `startedAtMs` are always whatever the
-/// coordinator has accumulated, `known` or not: they are positive evidence, and the
-/// tenant merges them with its own regardless. Both slot sets are always present,
-/// empty when nothing is known. `known` gates only the *negative* inference —
-/// reading a slot's **absence** from the sets as proof that player never got there.
+/// Every slot set and `startedAtMs` are always whatever the coordinator has
+/// accumulated, `known` or not: they are positive evidence, and the tenant merges
+/// them with its own regardless. Every slot set is always present, empty when
+/// nothing is known. `known` gates only the *negative* inference for
+/// `connectedSlots` and `startedSlots` — reading a slot's **absence** from them as
+/// proof that player never got there — and `turnsKnown` does the same for
+/// `forwardedSlots` (below).
 ///
 /// `known: true` means every relay serving the session produced a snapshot **after
 /// this request reached it**, that each of those relays had **fenced** the session
@@ -58,20 +60,49 @@ struct SessionLoadStateRequest {
 /// nothing later can reconstruct) all read that way. The answer is cheap to repeat,
 /// so a caller with time left may simply read again; one whose deadline has passed
 /// decides on the positive facts alone.
+///
+/// `startedSlots` is a relay-recorded *client claim*: the client says its game loop
+/// is running, and nothing the relay sees backs that up. `forwardedSlots` is the
+/// relays' own observation, each slot taken only from the relay that homes it (a
+/// serving relay naming a slot it does not home is dropped on ingest): the slot's
+/// home relay forwarded at least one of its turns — it arrived from the slot's
+/// client, passed validation and the forward-once gate, and went out. That counts
+/// the pipe seed a client flushes the moment its loading ends, before its loop
+/// runs, so this is the relay-authored "this player's game got far enough to send
+/// something", which a client whose uplink never delivered cannot claim its way
+/// into. It is also the most a waiting player can show: a running loop sends
+/// nothing after its seed until every player's seed has arrived, so an honest
+/// player whose opponents never finished loading has forwarded its seed and
+/// nothing more.
+///
+/// `turnsKnown: true` licenses reading a slot's absence from `forwardedSlots` as
+/// "its home relay had forwarded no turn of it before this read was sent". It
+/// rests on everything `known` does except the fence — every serving relay answered
+/// after this request reached it, the coordinator created the session, and relay
+/// memory covering it is unbroken — plus every serving relay's answer declaring
+/// that it records the set at all. No fence is needed because the set holds only
+/// what each relay itself forwarded, so no client can be holding back a fact they
+/// owe it: a turn that has not arrived was not forwarded, which is exactly what its
+/// absence says. The declaration is needed because a relay build that predates the
+/// set answers without it, whatever it forwarded: a session served by one is never
+/// `turnsKnown`, and its empty set carries no information.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionLoadStateResponse {
     known: bool,
+    turns_known: bool,
     setup_final: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at_ms: Option<u64>,
     connected_slots: Vec<u8>,
     started_slots: Vec<u8>,
+    forwarded_slots: Vec<u8>,
     lobby_violation_slots: Vec<u8>,
 }
 
 /// Session load-progress read: which slots ever connected, which ever reported
-/// their game loop running, and when the session started.
+/// their game loop running, which had turns forwarded by their home relay, and
+/// when the session started.
 ///
 /// The tenant consults this when its **own** load deadline expires and it must
 /// decide whom to blame for a game that never got going. The `slotConnected` /
@@ -81,7 +112,7 @@ struct SessionLoadStateResponse {
 /// coordinator's accumulated state directly rather than trusting that every
 /// notification arrived.
 ///
-/// Both slot lists are **ever**-sets, ascending: a slot that connected and then
+/// Every slot list is an **ever**-set, ascending: a slot that connected and then
 /// dropped still appears, because the question is who got here at all, not who is
 /// here now (`POST /presence/query` answers the latter).
 ///
@@ -146,6 +177,8 @@ pub(super) async fn session_load_state(
             started_at_ms: None,
             connected_slots: Vec::new(),
             started_slots: Vec::new(),
+            forwarded_slots: Vec::new(),
+            turns_known: false,
             lobby_violation_slots: Vec::new(),
         })
         .into_response());
@@ -170,6 +203,8 @@ pub(super) async fn session_load_state(
             started_at_ms: before.started_at_ms,
             connected_slots: before.connected_slots.iter().map(|s| s.0).collect(),
             started_slots: before.started_slots.iter().map(|s| s.0).collect(),
+            forwarded_slots: before.forwarded_slots.iter().map(|s| s.0).collect(),
+            turns_known: false,
             lobby_violation_slots: before.lobby_violation_slots.iter().map(|s| s.0).collect(),
         })
         .into_response());
@@ -184,6 +219,17 @@ pub(super) async fn session_load_state(
             .serving_relays
             .iter()
             .all(|relay| round.fenced.contains(relay));
+    // Turn evidence needs no fence: it holds only what each relay itself forwarded,
+    // so no client can be holding a turn the set owes it. It needs everything else
+    // `known` does, plus a relay build that records the set at all — an older one
+    // answers without it whatever it forwarded.
+    let turns_known = after.created_here
+        && after.attestable
+        && !before.serving_relays.is_empty()
+        && before
+            .serving_relays
+            .iter()
+            .all(|relay| round.reports_turns.contains(relay));
     let setup_final = request.settle_lobby
         && after.created_here
         && after.attestable
@@ -210,6 +256,8 @@ pub(super) async fn session_load_state(
         started_at_ms: after.started_at_ms,
         connected_slots: after.connected_slots.iter().map(|s| s.0).collect(),
         started_slots: after.started_slots.iter().map(|s| s.0).collect(),
+        forwarded_slots: after.forwarded_slots.iter().map(|s| s.0).collect(),
+        turns_known,
         lobby_violation_slots: after.lobby_violation_slots.iter().map(|s| s.0).collect(),
     })
     .into_response())
@@ -268,6 +316,7 @@ async fn attest_serving_relays(
     let mut attested = std::collections::HashSet::new();
     let mut fenced = std::collections::HashSet::new();
     let mut setup_settled = std::collections::HashSet::new();
+    let mut reports_turns = std::collections::HashSet::new();
     for (relay, waiter) in &mut pending {
         if let Ok(Some(snapshot)) = tokio::time::timeout_at(deadline, waiter.recv()).await {
             attested.insert(*relay);
@@ -277,6 +326,9 @@ async fn attest_serving_relays(
             if snapshot.setup_settled {
                 setup_settled.insert(*relay);
             }
+            if snapshot.reports_turns {
+                reports_turns.insert(*relay);
+            }
         }
     }
     crate::attest::AttestRound {
@@ -284,5 +336,6 @@ async fn attest_serving_relays(
         attested: std::sync::Arc::new(attested),
         fenced: std::sync::Arc::new(fenced),
         setup_settled: std::sync::Arc::new(setup_settled),
+        reports_turns: std::sync::Arc::new(reports_turns),
     }
 }

@@ -70,6 +70,56 @@ fn a_session_without_a_maker_retains_no_load_state() {
 }
 
 #[test]
+fn turn_evidence_is_home_first_hand_and_outlives_the_link() {
+    // The relay's own record that a home client's turns got here. Kept apart from the client's start report so a slot can be forwarded
+    // without having claimed anything, and claim without being forwarded.
+    let registry = new_decision_makers();
+    let k = key();
+    let _ = registry.sync_maker(&k, MakerSync::new(bounds(1, 6), Authority::Peer));
+    registry.note_slot_connected(&k, SlotId(1), false);
+    registry.note_slot_connected(&k, SlotId(2), false);
+    // Slot 1 claims its loop is running but no turn of its ever arrived.
+    registry.note_slot_started(&k, SlotId(1));
+    // Slot 2 never claimed anything, yet its seed and its loop's turns flow.
+    registry.note_unframed_home_turn(&k, SlotId(2));
+    registry.observe_turn_frame(
+        &k,
+        SlotId(2),
+        3,
+        GameFrameCount(0),
+        crate::consensus::delivery::DeliveryHome::Local,
+    );
+    // Slot 3 is a peer's home client; this relay only carries its turns.
+    registry.observe_turn_frame(
+        &k,
+        SlotId(3),
+        3,
+        GameFrameCount(0),
+        crate::consensus::delivery::DeliveryHome::Peer(rally_point_proto::ids::RelayId(9)),
+    );
+    assert!(registry.remove_slot_for_epoch(&k, SlotId(2), None));
+
+    let load = load_state_of(&registry, &k);
+    assert_eq!(load.started, vec![SlotId(1)]);
+    assert_eq!(
+        load.forwarded,
+        vec![SlotId(2)],
+        "a start claim is not a forwarded turn, and a departed link keeps its record",
+    );
+
+    // Without a maker there is nowhere to retain the evidence.
+    let other = SessionKey {
+        session: SessionId(99),
+        ..key()
+    };
+    registry.note_unframed_home_turn(&other, SlotId(1));
+    assert_eq!(
+        load_state_of(&registry, &other),
+        RetainedLoadState::default()
+    );
+}
+
+#[test]
 fn a_peer_adopting_the_start_directive_stands_in_its_own_start_instant() {
     // The authority's notice can be lost and the authority can die before its
     // next beat, leaving no relay to restate the start it decided. A peer that

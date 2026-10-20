@@ -363,6 +363,7 @@ impl DecisionMaker {
         RetainedLoadState {
             ever_connected: sorted_slots(&self.connected_slots),
             started: sorted_slots(&self.started_slots),
+            forwarded: sorted_slots(&self.forwarded_slots),
             lobby_violations: self.lobby_violations(),
             started_at_ms: self.started_at_ms,
         }

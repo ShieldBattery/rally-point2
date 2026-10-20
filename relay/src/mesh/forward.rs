@@ -232,14 +232,24 @@ pub(super) fn deliver_turn_to_locals(
     // carry no frame and don't move the consensus coordinate. Every turn here
     // was validated at its ingress client edge (the mesh never re-validates),
     // so only validated turns feed the coordinate.
-    if let Some(frame) = payload.game_frame_count {
-        decision_makers.observe_turn_frame(
+    //
+    // The same point records the relay's own load evidence for a home client:
+    // that one of its turns got here at all — its frameless pipe seed included,
+    // which it flushes the moment its loading ends. A framed turn is recorded
+    // under the frame observation's lock, a frameless one on its own. A
+    // peer-homed turn records nothing: its home already did, first-hand.
+    match payload.game_frame_count {
+        Some(frame) => decision_makers.observe_turn_frame(
             key,
             slot,
             payload.seq,
             rally_point_proto::ids::GameFrameCount(frame),
             home,
-        );
+        ),
+        None if home == crate::consensus::delivery::DeliveryHome::Local => {
+            decision_makers.note_unframed_home_turn(key, slot);
+        }
+        None => {}
     }
     // The region-label release gate, evaluated here so it is checked only while
     // turns are actually flowing — no timer task, and a session that goes quiet

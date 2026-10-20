@@ -12,6 +12,7 @@ fn roster_for(tenant: TenantId, session: u64, slots: &[u8]) -> Vec<SessionPresen
         slots: slots.iter().map(|&s| SlotId(s)).collect(),
         ever_connected: vec![],
         started: vec![],
+        forwarded: vec![],
         started_at_ms: None,
         lobby_violations: vec![],
     }]

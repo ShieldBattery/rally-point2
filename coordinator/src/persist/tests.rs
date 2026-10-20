@@ -122,6 +122,18 @@ async fn a_restart_keeps_accounting_departures_and_load_state() {
     first.lifecycle.on_slot_connected(tid(), session, SlotId(1));
     first.lifecycle.on_slot_started(tid(), session, SlotId(0));
     first.lifecycle.on_session_started(tid(), session, 1_234);
+    first
+        .lifecycle
+        .merge_load_state(&[rally_point_proto::control::SessionPresence {
+            tenant: tid(),
+            session,
+            slots: vec![],
+            ever_connected: vec![],
+            started: vec![],
+            forwarded: vec![SlotId(0), SlotId(1)],
+            started_at_ms: None,
+            lobby_violations: vec![],
+        }]);
     first.lifecycle.on_departure(
         tid(),
         session,
@@ -133,8 +145,13 @@ async fn a_restart_keeps_accounting_departures_and_load_state() {
     first.store.flush().unwrap();
 
     let (restarted, _) = Lifetime::restarted(&ledger);
+    let restored = restarted
+        .lifecycle
+        .load_state(&tid(), session)
+        .expect("the session survives the restart");
+    assert_eq!(restored.forwarded_slots, vec![SlotId(0), SlotId(1)]);
     assert_eq!(
-        restarted.lifecycle.load_state(&tid(), session),
+        Some(restored),
         first.lifecycle.load_state(&tid(), session),
         "the load record a tenant pulls reads the same across the restart",
     );

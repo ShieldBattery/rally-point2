@@ -247,6 +247,7 @@ async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_ten
             lobby_violation_slots: vec![],
             connected_slots: vec![],
             started_slots: vec![],
+            forwarded_slots: vec![],
         }),
         "a stale connection's beat records nothing at all",
     );
@@ -422,6 +423,70 @@ async fn heartbeat_keeps_lobby_violations_only_from_the_reporting_slots_home() {
         "a serving relay cannot retain a punitive violation for another relay's slot",
     );
 }
+
+#[tokio::test]
+async fn heartbeat_keeps_turn_evidence_only_from_the_reporting_slots_home() {
+    // A tenant blames a player by its absence from these sets, so a relay that
+    // never carried a slot's client must not be able to vouch for it.
+    let (setup, response) = SessionFixture {
+        relays: vec![
+            RelaySpec {
+                id: 1,
+                region: Some("region-a"),
+            },
+            RelaySpec {
+                id: 2,
+                region: Some("region-b"),
+            },
+        ],
+        players: vec![
+            PlayerSpec {
+                slot: 0,
+                external_ref: None,
+                region: Some("region-a"),
+            },
+            PlayerSpec {
+                slot: 1,
+                external_ref: None,
+                region: Some("region-b"),
+            },
+        ],
+        ..Default::default()
+    }
+    .build_response();
+    let session = response.session;
+    let relay_2_generation = registry::enrolled_relays(setup.registry())
+        .into_iter()
+        .find(|relay| relay.relay_id == RelayId(2))
+        .expect("relay 2 is enrolled")
+        .generation;
+
+    let lifecycle = Lifecycle::new(setup.clone());
+    lifecycle.register_session(
+        tid(),
+        session,
+        setup.serving_relays(&tid(), session),
+        HashSet::from([SlotId(0), SlotId(1)]),
+        HashSet::new(),
+    );
+    let regions = RegionsConfig::default();
+    let store = PairRttStore::new();
+    lifecycle.ingest_heartbeat(
+        RelayId(2),
+        relay_2_generation,
+        beat_with_sessions(vec![SessionPresence {
+            forwarded: slots(&[0, 1]),
+            ..presence_entry(&tid(), session, &[1])
+        }]),
+        &idle_rtt_ingest(&regions, &store),
+    );
+
+    let load = lifecycle
+        .load_state(&tid(), session)
+        .expect("the session was registered");
+    assert_eq!(load.forwarded_slots, vec![SlotId(1)]);
+}
+
 #[tokio::test]
 async fn heartbeat_session_roster_beyond_the_cap_is_truncated_and_stops_being_authoritative() {
     // Truncation drops a suffix the relay actually reported, so the beat stops

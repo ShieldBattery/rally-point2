@@ -79,6 +79,7 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
                     rally_point_proto::ids::SlotId(3),
                 ],
                 started: vec![rally_point_proto::ids::SlotId(3)],
+                forwarded: vec![],
                 // The session never started on this relay — neither its own
                 // coverage latch nor an adopted directive — so it has no
                 // instant to restate.
@@ -128,6 +129,7 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
             slots: vec![],
             ever_connected: vec![SlotId(0)],
             started: vec![SlotId(0)],
+            forwarded: vec![],
             started_at_ms: None,
             lobby_violations: vec![],
         }],
@@ -182,8 +184,8 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
         }
     });
 
-    // What this relay holds for the session: slot 2 arrived and dropped, slot 3
-    // is here and running.
+    // What this relay holds for the session: slot 2 arrived, sent its pipe seed,
+    // and dropped; slot 3 is here and running, its loop's turns flowing.
     let (sessions, decision_makers) = fence_fixture();
     let (mut guard, _inbox) =
         crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3), 1)
@@ -193,6 +195,14 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
         decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(slot), false);
     }
     decision_makers.note_slot_started(&key(7), rally_point_proto::ids::SlotId(3));
+    decision_makers.note_unframed_home_turn(&key(7), rally_point_proto::ids::SlotId(2));
+    decision_makers.observe_turn_frame(
+        &key(7),
+        rally_point_proto::ids::SlotId(3),
+        4,
+        rally_point_proto::ids::GameFrameCount(0),
+        crate::consensus::delivery::DeliveryHome::Local,
+    );
 
     SubscriberFixture {
         heartbeat: HeartbeatConfig {
@@ -228,6 +238,10 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
                     rally_point_proto::ids::SlotId(3),
                 ],
                 started: vec![rally_point_proto::ids::SlotId(3)],
+                forwarded: vec![
+                    rally_point_proto::ids::SlotId(2),
+                    rally_point_proto::ids::SlotId(3),
+                ],
                 started_at_ms: None,
                 lobby_violations: vec![],
             },
@@ -236,6 +250,8 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
             // this answer's absences carry no proof.
             fenced: false,
             setup_settled: false,
+            // The turn set needs no fence, and this build always carries it.
+            reports_turns: true,
         },
     );
 }
@@ -293,6 +309,7 @@ fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
             slots: vec![],
             ever_connected: vec![],
             started: vec![],
+            forwarded: vec![],
             started_at_ms: None,
             lobby_violations: vec![],
         },

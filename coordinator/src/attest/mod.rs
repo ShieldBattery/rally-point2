@@ -176,6 +176,10 @@ pub struct AttestedSnapshot {
     pub fenced: bool,
     /// Whether this request made a final setup-lobby ingress cut on the relay.
     pub setup_settled: bool,
+    /// Whether the relay records its home slots' forwarded turns, so that their
+    /// absence from `state` means it forwarded none. False for a relay that
+    /// predates the turn set.
+    pub reports_turns: bool,
 }
 
 /// One attestation round's outcome, shared by every read that joined it.
@@ -196,6 +200,8 @@ pub struct AttestRound {
     pub fenced: Arc<HashSet<RelayId>>,
     /// The relays that made a final setup-lobby ingress cut — a subset of `attested`.
     pub setup_settled: Arc<HashSet<RelayId>>,
+    /// The relays whose answer reported turn evidence — a subset of `attested`.
+    pub reports_turns: Arc<HashSet<RelayId>>,
 }
 
 /// A request in flight, held by the caller waiting on its answer.

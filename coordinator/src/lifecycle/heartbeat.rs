@@ -155,7 +155,7 @@ impl RegionRttIngest<'_> {
     }
 }
 
-/// Truncates each of a session entry's three slot lists to
+/// Truncates each of a session entry's slot lists to
 /// [`MAX_HEARTBEAT_SESSION_SLOTS`], logging what was cut.
 ///
 /// A session cannot have more slots than that ceiling, so a longer list is forged
@@ -170,6 +170,7 @@ pub(crate) fn bound_session_slot_lists(relay_id: RelayId, session: &mut SessionP
         ("connected", &mut session.slots),
         ("ever-connected", &mut session.ever_connected),
         ("started", &mut session.started),
+        ("forwarded", &mut session.forwarded),
         ("lobby-violations", &mut session.lobby_violations),
     ] {
         if slots.len() > MAX_HEARTBEAT_SESSION_SLOTS {
@@ -185,6 +186,38 @@ pub(crate) fn bound_session_slot_lists(relay_id: RelayId, session: &mut SessionP
             slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
         }
     }
+}
+
+/// Drops every slot from a session entry's forwarded turn evidence that `relay`
+/// does not home, logging each one. `source` names the frame kind for the log.
+///
+/// A relay records turn evidence only for the clients that dial it, so a slot
+/// homed elsewhere in the list is forged or a relay bug. Applied to a heartbeat's
+/// roster and an attested load-state snapshot alike, because the tenant reads a
+/// slot's *absence* from the set against that player: another serving relay must
+/// not be able to vouch for a slot it never carried.
+pub(crate) fn retain_home_turn_evidence(
+    setup: &session::SessionSetup,
+    relay: RelayId,
+    session: &mut SessionPresence,
+    source: &'static str,
+) {
+    let tenant = &session.tenant;
+    let id = session.session;
+    session.forwarded.retain(|&slot| {
+        let allowed = setup.relay_homes_slot(relay, tenant, id, slot);
+        if !allowed {
+            tracing::warn!(
+                relay_id = relay.0,
+                tenant = tenant.as_ref(),
+                session = id.0,
+                slot = slot.0,
+                source,
+                "turn evidence from a relay not homing the slot; rejecting",
+            );
+        }
+        allowed
+    });
 }
 
 impl Lifecycle {
@@ -303,6 +336,7 @@ impl Lifecycle {
                 }
                 allowed
             });
+            retain_home_turn_evidence(setup, relay, session, "heartbeat");
         }
         presence::apply_heartbeat(
             setup.presence(),

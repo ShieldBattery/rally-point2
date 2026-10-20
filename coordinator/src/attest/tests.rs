@@ -11,11 +11,13 @@ fn snapshot(session: SessionId, ever_connected: &[u8]) -> AttestedSnapshot {
             slots: vec![],
             ever_connected: ever_connected.iter().map(|&s| SlotId(s)).collect(),
             started: vec![],
+            forwarded: vec![],
             started_at_ms: None,
             lobby_violations: vec![],
         },
         fenced: true,
         setup_settled: false,
+        reports_turns: true,
     }
 }
 
@@ -175,6 +177,7 @@ async fn concurrent_reads_of_one_session_share_a_single_round() {
         attested: Arc::new(HashSet::from([RelayId(1)])),
         fenced: Arc::new(HashSet::from([RelayId(1)])),
         setup_settled: Arc::new(HashSet::new()),
+        reports_turns: Arc::new(HashSet::new()),
     });
     let joined = joined_round(watch).await.expect("the round published");
     assert_eq!(
@@ -220,6 +223,7 @@ fn round_started_at(started: Instant, relay: RelayId) -> AttestRound {
         attested: Arc::new(HashSet::from([relay])),
         fenced: Arc::new(HashSet::from([relay])),
         setup_settled: Arc::new(HashSet::new()),
+        reports_turns: Arc::new(HashSet::new()),
     }
 }
 

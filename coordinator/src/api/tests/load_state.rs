@@ -13,6 +13,9 @@ struct AttestOptions {
     fenced: bool,
     /// Whether its snapshot confirms that the relay closed lobby ingress.
     setup_settled: bool,
+    /// Whether its snapshot declares turn evidence, as every current relay's
+    /// does; false stands in for a relay that predates the turn set.
+    reports_turns: bool,
     /// When set, each answer is held until the test sends a release, so a test
     /// can keep a round open while other reads arrive.
     release: Option<tokio::sync::mpsc::Receiver<()>>,
@@ -26,6 +29,7 @@ impl Default for AttestOptions {
         Self {
             fenced: true,
             setup_settled: false,
+            reports_turns: true,
             release: None,
             seen: None,
         }
@@ -48,6 +52,7 @@ fn spawn_attesting_relay(
     let AttestOptions {
         fenced,
         setup_settled,
+        reports_turns,
         mut release,
         seen,
     } = opts;
@@ -68,6 +73,7 @@ fn spawn_attesting_relay(
                     state: snapshot.clone(),
                     fenced,
                     setup_settled,
+                    reports_turns,
                 })
                 .expect("a snapshot serializes")
                 .into(),
@@ -147,9 +153,11 @@ async fn settling_read_returns_finality_and_retained_lobby_violation() {
         serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
         serde_json::json!({
             "known": true,
+            "turnsKnown": true,
             "setupFinal": true,
             "connectedSlots": [],
             "startedSlots": [],
+            "forwardedSlots": [],
             "lobbyViolationSlots": [0],
         }),
     );
@@ -299,7 +307,7 @@ async fn every_serving_relay_attesting_makes_the_answer_complete() {
     // completeness is the exchange, not a clock.
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":true,"setupFinal":false,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1],"lobbyViolationSlots":[]}"#,
+        r#"{"known":true,"turnsKnown":true,"setupFinal":false,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
     );
 }
 
@@ -339,7 +347,7 @@ async fn one_unfenced_relay_costs_the_claim_but_not_the_others_facts() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"setupFinal":false,"connectedSlots":[0,1],"startedSlots":[1],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":true,"setupFinal":false,"connectedSlots":[0,1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
         "both relays' positives stand; only the negative inference is withheld",
     );
 }
@@ -404,7 +412,7 @@ async fn concurrent_reads_of_one_session_cost_fewer_rounds_than_reads() {
         let body = read.await.expect("the read completes");
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            r#"{"known":true,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"lobbyViolationSlots":[]}"#,
+            r#"{"known":true,"turnsKnown":true,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
         );
     }
     assert!(
@@ -480,7 +488,7 @@ async fn one_silent_relay_costs_the_claim_but_not_the_others_facts() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[1],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
     );
 }
 
@@ -506,7 +514,7 @@ async fn a_relay_with_no_control_connection_never_attests() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
     );
 }
 
@@ -533,7 +541,7 @@ async fn a_broken_lineage_withholds_the_claim_even_when_every_relay_attests() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
         "the facts the snapshot carried still stand",
     );
 }
@@ -547,7 +555,7 @@ async fn a_session_the_coordinator_holds_nothing_for_answers_no_information() {
     let body = read_load_state(app, 6).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"setupFinal":false,"connectedSlots":[],"startedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
     );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("startedAtMs").is_none(), "absent, never null");
@@ -571,7 +579,7 @@ async fn a_session_this_coordinator_never_created_answers_its_facts_only() {
     let body = read_load_state(app, 7).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
         "the facts stand; only the read-absence-as-proof claim is withheld",
     );
 }
@@ -604,6 +612,7 @@ async fn a_snapshot_correlated_to_another_relays_request_is_discarded() {
             },
             fenced: true,
             setup_settled: false,
+            reports_turns: true,
         })
         .unwrap()
         .into(),
@@ -626,4 +635,122 @@ async fn a_snapshot_correlated_to_another_relays_request_is_discarded() {
         "relay 1 is still waiting to be answered",
     );
     drop(one);
+}
+
+/// A session homed across two relays — slot 0 on relay 1, slot 1 on relay 2 —
+/// created and registered the way production does, so each relay homes exactly
+/// one slot.
+fn state_with_split_homes() -> (CoordinatorState, SessionId) {
+    let (setup, session) = SessionFixture {
+        relays: vec![
+            RelaySpec {
+                id: 1,
+                region: Some("region-a"),
+            },
+            RelaySpec {
+                id: 2,
+                region: Some("region-b"),
+            },
+        ],
+        players: vec![
+            PlayerSpec {
+                slot: 0,
+                external_ref: None,
+                region: Some("region-a"),
+            },
+            PlayerSpec {
+                slot: 1,
+                external_ref: None,
+                region: Some("region-b"),
+            },
+        ],
+        ..Default::default()
+    }
+    .build();
+    let state = state_over(setup);
+    let serving = state.setup.serving_relays(&tenant_id(), session);
+    state.lifecycle.register_session(
+        tenant_id(),
+        session,
+        serving,
+        std::collections::HashSet::from([SlotId(0), SlotId(1)]),
+        std::collections::HashSet::new(),
+    );
+    (state, session)
+}
+
+#[tokio::test]
+async fn turn_evidence_is_merged_from_each_slots_home_and_needs_no_fence() {
+    // The motivating game: slot 1 claims its loop started but its home never
+    // forwarded a single turn of its, while slot 0's seed went out. The
+    // relay-authored set tells the two apart where `startedSlots`
+    // cannot, and a relay that could not fence still vouches for what it itself
+    // forwarded.
+    let (state, session) = state_with_split_homes();
+    let tenant = tenant_id();
+    let _one = spawn_attesting_relay(
+        &state,
+        RelayId(1),
+        SessionPresence {
+            ever_connected: slots(&[0]),
+            started: slots(&[0]),
+            forwarded: slots(&[0]),
+            ..presence_entry(&tenant, session, &[0])
+        },
+        AttestOptions::default(),
+    );
+    let _two = spawn_attesting_relay(
+        &state,
+        RelayId(2),
+        SessionPresence {
+            ever_connected: slots(&[1]),
+            started: slots(&[1]),
+            // Slot 0 is relay 1's to vouch for; this claim is dropped.
+            forwarded: slots(&[0]),
+            ..presence_entry(&tenant, session, &[1])
+        },
+        AttestOptions {
+            fenced: false,
+            ..Default::default()
+        },
+    );
+
+    let body = read_load_state(router(state), session.0).await;
+    assert_eq!(
+        std::str::from_utf8(&body).unwrap(),
+        r#"{"known":false,"turnsKnown":true,"setupFinal":false,"connectedSlots":[0,1],"startedSlots":[0,1],"forwardedSlots":[0],"lobbyViolationSlots":[]}"#,
+    );
+}
+
+#[tokio::test]
+async fn a_relay_predating_turn_evidence_withholds_turns_known() {
+    // An older relay's snapshot carries no turn set whatever it forwarded, so an
+    // empty set from it says nothing: the turn claim waits on every serving
+    // relay declaring that it reports turns, while `known` is unaffected.
+    let (state, session) = state_with_split_homes();
+    let tenant = tenant_id();
+    let _one = spawn_attesting_relay(
+        &state,
+        RelayId(1),
+        SessionPresence {
+            forwarded: slots(&[0]),
+            ..presence_entry(&tenant, session, &[0])
+        },
+        AttestOptions::default(),
+    );
+    let _two = spawn_attesting_relay(
+        &state,
+        RelayId(2),
+        presence_entry(&tenant, session, &[1]),
+        AttestOptions {
+            reports_turns: false,
+            ..Default::default()
+        },
+    );
+
+    let body = read_load_state(router(state), session.0).await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["known"], true);
+    assert_eq!(response["turnsKnown"], false);
+    assert_eq!(response["forwardedSlots"], serde_json::json!([0]));
 }

@@ -555,6 +555,21 @@ pub enum RelayToCoordinator {
         /// never attest final setup state.
         #[serde(default, skip_serializing_if = "is_false")]
         setup_settled: bool,
+        /// Whether this relay records its home slots' forwarded turns
+        /// ([`SessionPresence::forwarded`]), so that an empty set in `state`
+        /// means "forwarded nothing from them" rather than "does not report
+        /// this". Every relay that has the set sets it.
+        ///
+        /// Needs no fence: the set holds only what this relay itself forwarded,
+        /// so nothing still queued in a client can be owed to it — a turn that
+        /// has not arrived simply has not been forwarded, which is exactly what
+        /// its absence says.
+        ///
+        /// Additive: a relay that predates the set omits it and reads as `false`,
+        /// so its silence about turns can never be taken for a statement that it
+        /// forwarded none.
+        #[serde(default, skip_serializing_if = "is_false")]
+        reports_turns: bool,
     },
     /// A message kind this coordinator does not recognize (a newer relay). Decodes
     /// here so the coordinator skips it rather than dropping the connection.
@@ -577,12 +592,12 @@ pub enum RelayToCoordinator {
 ///
 /// Beside the live roster it carries the relay's **retained load state** for the
 /// session: which slots ever connected, which ever reported their game loop
-/// running, and when the relay learned the session started. Those are cumulative
-/// facts, not a live view, and every beat restates them in full — which is what
+/// running, which of its home slots' turns it ever forwarded, and when the relay
+/// learned the session started. Those are cumulative facts, not a live view, and every beat restates them in full — which is what
 /// makes them durable where the matching notices are not: a notice is dropped
 /// once its send succeeds, so a coordinator that dies between receiving one and
 /// committing it — or simply restarts — recovers the whole truth from the next
-/// beat. All three are optional on the wire: a relay that predates them omits
+/// beat. Every one is optional on the wire: a relay that predates them omits
 /// them, a coordinator that predates them ignores them, and a session running
 /// without a decision-maker has nothing to report.
 ///
@@ -611,6 +626,16 @@ pub struct SessionPresence {
     /// relay, ascending. Monotonic for the same reason as `ever_connected`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub started: Vec<SlotId>,
+    /// Every slot **homed on the reporting relay** at least one of whose turns
+    /// that relay forwarded, ascending. The relay's own observation, not a
+    /// client report: a turn arrived from the slot's client, passed validation
+    /// and the forward-once gate, and went out. Counts the pre-loop pipe seed a
+    /// client flushes as its loading ends, so this is the relay-authored answer
+    /// to "did this player's game get far enough to send anything", which a
+    /// client whose uplink never delivered cannot claim its way into. Monotonic.
+    /// Lobby commands ride the control stream and are not turns here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forwarded: Vec<SlotId>,
     /// Every home slot this relay evicted for a pre-game lobby policy violation,
     /// ascending. A relay restates this positive evidence on every heartbeat so
     /// the coordinator can recover it after losing a notice or restarting.

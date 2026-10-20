@@ -80,11 +80,13 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
             slots: vec![],
             ever_connected: vec![],
             started: vec![],
+            forwarded: vec![],
             started_at_ms: None,
             lobby_violations: vec![],
         },
         fenced: false,
         setup_settled: false,
+        reports_turns: false,
     };
     let json = serde_json::to_string(&message).unwrap();
     assert!(!json.contains("ever_connected"));
@@ -92,6 +94,8 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
     assert!(!json.contains("fenced"));
     assert!(!json.contains("setup_settled"));
     assert!(!json.contains("lobby_violations"));
+    assert!(!json.contains("forwarded"));
+    assert!(!json.contains("reports_turns"));
     let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
     assert_eq!(back, message);
 
@@ -105,11 +109,13 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
             slots: vec![SlotId(1)],
             ever_connected: vec![SlotId(0), SlotId(1)],
             started: vec![SlotId(1)],
+            forwarded: vec![SlotId(0), SlotId(1)],
             started_at_ms: Some(1_700_000_000_000),
             lobby_violations: vec![SlotId(1)],
         },
         fenced: true,
         setup_settled: true,
+        reports_turns: true,
     };
     let json = serde_json::to_string(&populated).unwrap();
     assert!(json.contains("\"type\":\"load_state_snapshot\""));
@@ -117,6 +123,8 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
     assert!(json.contains("\"fenced\":true"));
     assert!(json.contains("\"setup_settled\":true"));
     assert!(json.contains("\"lobby_violations\":[1]"));
+    assert!(json.contains("\"forwarded\":[0,1]"));
+    assert!(json.contains("\"reports_turns\":true"));
     assert_eq!(
         serde_json::from_str::<RelayToCoordinator>(&json).unwrap(),
         populated
@@ -157,4 +165,22 @@ fn settlement_fields_default_false_for_pre_settlement_peers() {
     };
     assert!(!setup_settled);
     assert!(state.lobby_violations.is_empty());
+}
+
+#[test]
+fn a_snapshot_from_a_relay_predating_turn_evidence_reports_no_turns() {
+    // An older relay omits the turn set and the flag. The empty set alone would
+    // read as "forwarded nothing from anyone"; the flag defaulting false is what
+    // keeps the coordinator from taking that silence for a statement.
+    let json = r#"{"type":"load_state_snapshot","request_id":3,"state":{"tenant":"sb-staging","session":7,"slots":[1],"started":[1]}}"#;
+    let RelayToCoordinator::LoadStateSnapshot {
+        state,
+        reports_turns,
+        ..
+    } = serde_json::from_str::<RelayToCoordinator>(json).unwrap()
+    else {
+        panic!("decodes as a load-state snapshot");
+    };
+    assert!(!reports_turns);
+    assert!(state.forwarded.is_empty());
 }

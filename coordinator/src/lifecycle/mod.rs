@@ -176,6 +176,8 @@ pub struct SessionLoadState {
     pub connected_slots: Vec<SlotId>,
     /// Slots that ever reported their game loop running, ascending.
     pub started_slots: Vec<SlotId>,
+    /// Slots whose home relay ever forwarded one of their turns, ascending.
+    pub forwarded_slots: Vec<SlotId>,
     /// Slots whose home relay observed a pre-game lobby policy violation, ascending.
     pub lobby_violation_slots: Vec<SlotId>,
 }
@@ -270,6 +272,10 @@ struct SessionState {
     /// Slots that have ever reported their game loop running. Grows
     /// monotonically for the same reason as `connected_slots`.
     started_slots: HashSet<SlotId>,
+    /// Slots whose home relay reported forwarding at least one of their turns —
+    /// the relay's own observation, unlike `started_slots`. Grows monotonically;
+    /// only ever restated by heartbeats and load-state snapshots, never notified.
+    forwarded_slots: HashSet<SlotId>,
     /// Slots whose home relay observed a pre-game lobby policy violation.
     /// Positive evidence only; retained heartbeats repair a lost notice.
     lobby_violation_slots: HashSet<SlotId>,
@@ -560,7 +566,9 @@ mod sessions;
 pub use heartbeat::{
     MAX_HEARTBEAT_REGION_RTTS, MAX_HEARTBEAT_SESSION_SLOTS, MAX_HEARTBEAT_SESSIONS,
 };
-pub(crate) use heartbeat::{RegionRttIngest, RelayHeartbeat, bound_session_slot_lists};
+pub(crate) use heartbeat::{
+    RegionRttIngest, RelayHeartbeat, bound_session_slot_lists, retain_home_turn_evidence,
+};
 pub(crate) use notices::NoticeKey;
 pub use notices::SessionNotice;
 pub(crate) use persist::LifecycleFacts;

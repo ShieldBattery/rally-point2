@@ -311,6 +311,12 @@ impl DecisionMakers {
     /// the leave path calls this**, never the seq-less `observe_frame` (which is
     /// test-only), so the clamp always has history to work from. A no-op when no
     /// maker exists.
+    ///
+    /// A framed turn from a `Local` home client is also a turn this relay forwarded
+    /// from its own client, so the same lock records the slot in the maker's
+    /// ever-forwarded set (see [`DecisionMaker::note_home_turn_forwarded`]); a
+    /// frameless home turn takes
+    /// [`note_unframed_home_turn`](Self::note_unframed_home_turn) instead.
     pub fn observe_turn_frame(
         &self,
         key: &SessionKey,
@@ -324,6 +330,9 @@ impl DecisionMakers {
             let Some(maker) = makers.get_mut(key) else {
                 return;
             };
+            if home == crate::consensus::delivery::DeliveryHome::Local {
+                maker.note_home_turn_forwarded(slot);
+            }
             let regression = maker.observe_turn_frame(slot, seq, frame);
             // The same validated turn is the origin-side half of end-to-end
             // delivery tracking: the newest seq this relay has seen from `slot`,

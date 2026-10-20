@@ -33,6 +33,8 @@ pub(crate) struct LifecycleFacts {
     connected_slots: Vec<SlotId>,
     /// Slots that ever reported their game loop running, ascending.
     started_slots: Vec<SlotId>,
+    /// Slots whose home relay ever forwarded one of their turns, ascending.
+    forwarded_slots: Vec<SlotId>,
     /// Slots whose home relay observed a lobby policy violation, ascending.
     lobby_violation_slots: Vec<SlotId>,
     /// Each departed slot's rehome seed, ascending by slot.
@@ -77,6 +79,7 @@ impl Lifecycle {
                     accounted: sorted_slots(&state.accounted),
                     connected_slots: sorted_slots(&state.connected_slots),
                     started_slots: sorted_slots(&state.started_slots),
+                    forwarded_slots: sorted_slots(&state.forwarded_slots),
                     lobby_violation_slots: sorted_slots(&state.lobby_violation_slots),
                     departures,
                 };
@@ -114,6 +117,7 @@ impl Lifecycle {
         state.accounted.extend(facts.accounted);
         state.connected_slots.extend(facts.connected_slots);
         state.started_slots.extend(facts.started_slots);
+        state.forwarded_slots.extend(facts.forwarded_slots);
         state
             .lobby_violation_slots
             .extend(facts.lobby_violation_slots);

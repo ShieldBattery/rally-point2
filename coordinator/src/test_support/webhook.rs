@@ -307,6 +307,7 @@ pub(crate) fn presence_entry(
         slots: slots(connected),
         ever_connected: vec![],
         started: vec![],
+        forwarded: vec![],
         started_at_ms: None,
         lobby_violations: vec![],
     }

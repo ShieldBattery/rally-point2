@@ -65,6 +65,19 @@ impl DecisionMakers {
         }
     }
 
+    /// Records that this relay forwarded a frameless turn from its **home** client
+    /// `slot` — a turn produced before that client's game loop took its first
+    /// network step, its pipe seed — into the session's ever-forwarded set. A
+    /// framed home turn is recorded by [`observe_turn_frame`](Self::observe_turn_frame)
+    /// under the lock it already takes, so the steady in-game path pays no
+    /// second lock for it. Fires no notice: the heartbeat and the
+    /// load-state snapshot restate the set, and the tenant reads it from the pull.
+    pub fn note_unframed_home_turn(&self, key: &SessionKey, slot: SlotId) {
+        if let Some(maker) = self.lock().get_mut(key) {
+            maker.note_home_turn_forwarded(slot);
+        }
+    }
+
     /// Whether `key`'s session rolls back. `false` for a session with no maker here, which knows
     /// nothing of its mode.
     pub fn rollback_enabled(&self, key: &SessionKey) -> bool {

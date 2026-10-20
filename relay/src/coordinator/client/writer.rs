@@ -410,6 +410,9 @@ pub(super) async fn write_control_frames(
                     state: answer.state,
                     fenced: answer.fenced,
                     setup_settled: answer.setup_settled,
+                    // Every snapshot this build answers with carries its home
+                    // slots' forwarded set, empty or not.
+                    reports_turns: true,
                 })
                 .expect("a load-state snapshot always serializes");
                 sink.send(Message::Text(frame.into())).await?;

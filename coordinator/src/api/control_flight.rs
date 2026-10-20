@@ -310,6 +310,7 @@ pub(super) fn handle_load_state_snapshot(
     mut snapshot: rally_point_proto::control::SessionPresence,
     fenced: bool,
     setup_settled: bool,
+    reports_turns: bool,
 ) {
     let relay_id = inbound.relay_id;
     bound_session_slot_lists(relay_id, &mut snapshot);
@@ -341,6 +342,12 @@ pub(super) fn handle_load_state_snapshot(
         }
         allowed
     });
+    crate::lifecycle::retain_home_turn_evidence(
+        inbound.setup,
+        relay_id,
+        &mut snapshot,
+        "load-state snapshot",
+    );
     inbound
         .lifecycle
         .merge_load_state(std::slice::from_ref(&snapshot));
@@ -354,6 +361,7 @@ pub(super) fn handle_load_state_snapshot(
                 state: snapshot,
                 fenced,
                 setup_settled,
+                reports_turns,
             },
         )
         .is_err()

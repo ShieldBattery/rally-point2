@@ -510,9 +510,10 @@ pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> 
 
 /// One session's load state as this relay has retained it: the slots whose links
 /// ever activated here, the slots that ever reported their game loop running,
-/// and the instant this relay learned the session started. Both slot lists are
-/// ascending, so a heartbeat's wire output is deterministic rather than following
-/// a hash set's iteration order.
+/// the home slots whose turns this relay forwarded, and the instant this relay
+/// learned the session started. Every slot list is ascending, so a heartbeat's
+/// wire output is deterministic rather than following a hash set's iteration
+/// order.
 ///
 /// This is the durable half of the load-progress reporting: the matching notices
 /// are dropped the moment their send succeeds, while every heartbeat restates
@@ -524,6 +525,8 @@ pub struct RetainedLoadState {
     pub ever_connected: Vec<SlotId>,
     /// Slots that ever reported their game loop running here, ascending.
     pub started: Vec<SlotId>,
+    /// Home slots at least one of whose turns this relay forwarded, ascending.
+    pub forwarded: Vec<SlotId>,
     /// Home slots this relay evicted for a pre-game lobby policy violation.
     pub lobby_violations: Vec<SlotId>,
     /// Relay wall-clock (unix epoch milliseconds) for the session's start, as

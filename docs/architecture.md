@@ -1418,7 +1418,8 @@ The webhooks are the **fast path**, not the record. A notice is dropped from the
 WebSocket send succeeds, so a coordinator that dies between receiving one and committing it — or that simply
 restarts — has lost it. What makes the facts durable is that every relay **heartbeat carries the session's
 whole retained load state**: the slots that ever connected there, the slots that ever reported their game
-loop, and the instant that relay learned the session started. The relay retains all three on the session's
+loop, the home slots whose turns it ever forwarded (see the load-state pull below), and the instant that
+relay learned the session started. The relay retains all of it on the session's
 decision-maker and restates them on every beat, declaratively, exactly as it does the live roster — so a lost
 notice costs at most one beat, and the coordinator merges each beat into the same accumulated sets the pull
 below reads. It merges the entry's *currently connected* slots as ever-connected too: a slot connected now
@@ -1485,16 +1486,40 @@ forgotten session still delivers (a webhook-only queue is created lazily) but it
 reaps do not re-arm, and the liveness probe force-reconciles it.
 
 Beside it sits the **load-state pull** (`POST /session/load-state`), which answers one session's accumulated
-load progress: when it started, which slots ever connected, and which ever reported their game loop running.
+load progress: when it started, which slots ever connected, which ever reported their game loop running, and
+which had turns forwarded by their home relay (`forwardedSlots`, below).
 The tenant consults it when its own load deadline expires and it must decide whom to blame for a game that
 never got going — which makes the three load-progress webhooks an optimization feed and *this* the
 correctness signal, since it reads the coordinator's state directly rather than trusting that every
-notification arrived. Both slot lists are *ever*-sets (a slot that arrived and then dropped still appears —
+notification arrived. Every slot list is an *ever*-set (a slot that arrived and then dropped still appears —
 "who got here at all", not "who is here now", which `POST /presence/query` answers).
 
 The sets are **positive evidence and always safe to merge**, so the pull answers with everything the
 coordinator holds whatever their provenance. What takes qualifying is reading a slot's *absence* as proof it
 never arrived, and `known` gates exactly that.
+
+**Turn evidence.** `startedSlots` is a client's *claim*: a relay records the `GameStarted` frame, but nothing
+it observes backs the frame up, and a client whose link was black-holed can run its loop locally, re-assert
+started on reconnect, and never deliver a turn — so blaming its opponents by their absence from that set lets
+client-sent data hurt other players. `forwardedSlots` is the relay's own observation instead, recorded on the
+decision-maker at the shared delivery choke point, after the forward-once gate, and only for turns from the
+relay's **own home clients** (a peer-homed turn is its home's to record; the coordinator drops any slot a
+reporting relay does not home). It names every slot at least one of whose turns its home relay forwarded.
+That deliberately includes the **pipe seed**, the frameless turns a client flushes the moment its loading
+screen ends and before its loop runs: the seed is the earliest thing a loaded player sends, and a current
+client's lobby traffic never reaches this path (it rides the control stream as `LobbyCommand`s), so a
+forwarded turn is the relay-authored "this player loaded and its uplink delivered". It is also the most an
+honest waiting player can show: a lockstep loop sends nothing after its seed until it can run its first step,
+which needs every player's seed, and a rollback loop may not predict until every peer's first in-loop turn is
+in — so a player whose opponents never finished loading has forwarded its seed and nothing more.
+
+Its absences are gated by `turnsKnown` rather than `known`. It needs every condition `known` does — every
+serving relay answered after the request reached it, the coordinator created the session, relay memory is
+unbroken — except the fence, because the set holds only what each relay itself forwarded: nothing queued in a
+client can be owed to it, and a turn that has not arrived was not forwarded, which is what its absence says.
+It additionally needs every serving relay's snapshot to carry `reports_turns`, the flag a relay build with the
+set always sets: an older relay answers without the set whatever it forwarded, so a session served by one is
+never `turnsKnown`. The set fires no webhook; the heartbeat restates it and the pull is how a tenant reads it.
 
 The read is an **exchange, not a lookup**. On each request the coordinator asks every relay serving the
 session, down the control connection each already holds, what it holds for that session; the relay snapshots

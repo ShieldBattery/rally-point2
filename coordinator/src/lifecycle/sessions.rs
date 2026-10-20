@@ -304,10 +304,10 @@ impl Lifecycle {
 
     /// The session's load progress as the coordinator currently knows it: when it
     /// started, which slots ever connected, which ever reported their game loop
-    /// running, plus the two facts a completeness claim rests on — whether this
-    /// coordinator created the session and whether relay memory covering it is
-    /// unbroken — and the relays that would have to attest for such a claim. Both
-    /// slot lists are sorted ascending.
+    /// running, which had turns forwarded by their home relay, plus the two facts a
+    /// completeness claim rests on — whether this coordinator created the session
+    /// and whether relay memory covering it is unbroken — and the relays that would
+    /// have to attest for such a claim. Every slot list is sorted ascending.
     ///
     /// `Some` for every session the coordinator holds any state for, whatever built
     /// that state: the facts it has accumulated are positive evidence and worth
@@ -330,6 +330,7 @@ impl Lifecycle {
                 started_at_ms: state.started_at_ms,
                 connected_slots: sorted_slots(&state.connected_slots),
                 started_slots: sorted_slots(&state.started_slots),
+                forwarded_slots: sorted_slots(&state.forwarded_slots),
                 lobby_violation_slots: sorted_slots(&state.lobby_violation_slots),
             })
     }
@@ -369,10 +370,28 @@ impl Lifecycle {
             for &slot in &session.lobby_violations {
                 self.on_lobby_violation(session.tenant.clone(), session.session, slot);
             }
+            self.merge_turn_evidence(session);
             if let Some(started_at_ms) = session.started_at_ms {
                 self.on_session_started(session.tenant.clone(), session.session, started_at_ms);
             }
         }
+    }
+
+    /// Folds one entry's forwarded turn evidence into its session's record.
+    /// Lazily creates a webhook-only state, as every other fact this merge carries
+    /// does, so the tenant's pull still finds the evidence after a coordinator
+    /// restart forgot the session. An entry with an empty set touches nothing,
+    /// which is what every heartbeat from a relay predating the set is.
+    fn merge_turn_evidence(&self, session: &SessionPresence) {
+        if session.forwarded.is_empty() {
+            return;
+        }
+        let mut sessions = self.inner.sessions.lock();
+        let state = sessions
+            .entry((session.tenant.clone(), session.session))
+            .or_insert_with(|| self.new_state(Vec::new()));
+        state.forwarded_slots.extend(&session.forwarded);
+        self.arm_webhook_reap_if_orphan(&session.tenant, session.session, state);
     }
 
     /// Records that `relay`'s process memory is discontinuous with whatever it held

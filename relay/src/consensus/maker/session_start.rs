@@ -142,6 +142,17 @@ impl DecisionMaker {
         sorted_slots(&self.started_slots)
     }
 
+    /// Records that this relay forwarded one of its **home** client `slot`'s
+    /// turns, into the ever-forwarded set the heartbeat restates. Called once per
+    /// distinct turn, after the forward-once gate, so a redundant copy never
+    /// reaches here; idempotent regardless, and nothing ever removes a slot.
+    ///
+    /// On the turn path, so it must not allocate once a slot is recorded: an
+    /// insert of a slot already present only probes.
+    pub fn note_home_turn_forwarded(&mut self, slot: SlotId) {
+        self.forwarded_slots.insert(slot);
+    }
+
     /// Records that `slot` is present — registered on some relay serving the
     /// session (this relay's own roster, or a peer's `SlotPresent`) — and returns
     /// whether the session-start directive should now be emitted session-wide.
