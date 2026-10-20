@@ -287,6 +287,13 @@ pub struct DecisionMaker {
     /// union wherever the question is simply whether a slot has left loading
     /// behind (see [`has_started`](Self::has_started)).
     pub(in crate::consensus) peer_started_slots: HashSet<SlotId>,
+    /// The instant this relay first learned each slot's game loop is running,
+    /// first-hand or over the mesh — whichever arrived first. Never overwritten:
+    /// a mesh peer re-sharing its started set on a (re)join restates old news,
+    /// and a later instant would hand the slot a fresh silence grace it is not
+    /// owed. Only ever buys the slot time before the silence watch may name it,
+    /// never a newer stop time (see [`silent_slot`](Self::silent_slot)).
+    pub(in crate::consensus) start_learned_at: HashMap<SlotId, Instant>,
     /// Slots this relay closed for good, and why: for producing no turns while
     /// the session advanced past them (see [`silent_slot`](Self::silent_slot)),
     /// or because a rollback verdict named them (see
@@ -517,6 +524,7 @@ impl DecisionMaker {
             connected_slots: HashSet::new(),
             started_slots: HashSet::new(),
             peer_started_slots: HashSet::new(),
+            start_learned_at: HashMap::new(),
             evictions: HashMap::new(),
             pending_desync_evictions: Vec::new(),
             decided_leave_at: HashMap::new(),

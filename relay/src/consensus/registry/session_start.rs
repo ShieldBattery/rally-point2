@@ -43,7 +43,7 @@ impl DecisionMakers {
     /// the maker and stops there.
     pub fn note_slot_started(&self, key: &SessionKey, slot: SlotId) {
         if let Some(maker) = self.lock().get_mut(key) {
-            maker.note_slot_started(slot);
+            maker.note_slot_started(slot, Instant::now());
         }
         self.emit_notice(RelayNotice::SlotStarted(
             self.slot_started_notice(key, slot),
@@ -61,7 +61,7 @@ impl DecisionMakers {
     /// second relay reporting it would attribute one client's load twice.
     pub fn note_peer_slot_started(&self, key: &SessionKey, slot: SlotId) {
         if let Some(maker) = self.lock().get_mut(key) {
-            maker.note_peer_slot_started(slot);
+            maker.note_peer_slot_started(slot, Instant::now());
         }
     }
 

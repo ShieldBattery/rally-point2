@@ -980,15 +980,22 @@ middle of leaving. Among the participants, the slot closed is then the one that 
 nobody: a session that stopped all at once has no victim, and a slot with no other participant left to be
 earlier than is holding nobody up. Being nameable at all additionally requires that this relay strictly homes
 the slot (only the home owns its link), that its connection is up with no departure or decided leave, that its
-link has been up at least a window, and that it has reported its game loop running.
+link has been up at least a window, and that it has reported its game loop running at least a window
+ago.
 
 A slot that has forwarded nothing since the session started **stopped when the session started** — the
-earliest stop time there is, so it is the slot named as soon as it has reported its game loop running.
+earliest stop time there is, so it is the slot named once a window has passed since this relay learned
+its game loop is running.
 That fallback is the relay's own start latch and never anything the slot says about itself: a client can
 withhold its seed payloads entirely and delay reporting its loop, and if its own report dated its silence it
 would carry a stop time *later* than the opponents who seeded and then stalled waiting for it — handing
 them the blame. The started report supplies no timestamp of its own, and an honest client seeds within
-milliseconds of reporting, which moves its clock the only way a clock moves here.
+milliseconds of reporting, which moves its clock the only way a clock moves here. The relay does note
+when it first learned of the start — first-hand from its home client or from a peer's mesh
+`SlotStarted`, whichever came first, never restarted by a restated report — but only to owe the slot
+the same time-only grace as a reconnected link (below). A slow loader is exactly this case: everyone
+who finished loading has sat stalled for its first simulated turn, so the moment its report completes
+the evidence it is the unique earliest stopper by a wide margin, with no chance yet to have stepped.
 
 A slot's stop time **never moves except by forwarding**. A reconnected link is owed a full window before
 it can be evicted — it has had no chance to forward anything yet — but its stop time stays where its

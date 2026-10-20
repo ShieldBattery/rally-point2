@@ -705,7 +705,7 @@ fn silence_maker_with(
         connect_slot(&mut maker, slot, start);
     }
     for &slot in started {
-        maker.note_slot_started(SlotId(slot));
+        maker.note_slot_started(SlotId(slot), start);
     }
     (maker, start)
 }

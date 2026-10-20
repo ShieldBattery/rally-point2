@@ -102,15 +102,19 @@ fn a_slot_that_has_forwarded_nothing_stopped_when_the_session_started() {
         "a slot that has not reported its game loop running is still loading",
     );
 
-    maker.note_slot_started(SlotId(1));
+    maker.note_slot_started(SlotId(1), now);
+    assert!(
+        maker.silent_slot(now, SILENCE_WINDOW).is_none(),
+        "a loop that just started is owed a window to forward its first turn",
+    );
     assert_eq!(
-        maker.silent_slot(now, SILENCE_WINDOW),
+        maker.silent_slot(now + SILENCE_WINDOW, SILENCE_WINDOW),
         Some(SilentSlot {
             slot: SlotId(1),
-            silent_for: Duration::from_secs(31),
+            silent_for: Duration::from_secs(41),
             lead: Duration::from_secs(5),
         }),
-        "the late report names the slot, and never re-dates its silence",
+        "the late report buys time, and never re-dates its silence",
     );
 }
 
@@ -151,7 +155,7 @@ fn an_expected_slot_this_relay_holds_no_state_for_blocks_every_verdict() {
     // now has a stop time, so the earliest of them can be named.
     let arrival = start + Duration::from_secs(31);
     connect_slot(&mut maker, 2, arrival);
-    maker.note_slot_started(SlotId(2));
+    maker.note_slot_started(SlotId(2), arrival);
     maker.note_forward_advance(SlotId(2), arrival + Duration::from_secs(1));
 
     assert_eq!(
@@ -376,7 +380,7 @@ fn a_loader_that_keeps_forwarding_blocks_instead_of_shifting_the_blame() {
 
     // Once slot 1 is known to be simulating, both clocks mean the same thing
     // and the earlier stopper is the one holding lockstep up.
-    maker.note_slot_started(SlotId(1));
+    maker.note_slot_started(SlotId(1), start + Duration::from_secs(31));
     assert_eq!(
         maker.silent_slot(start + Duration::from_secs(31), SILENCE_WINDOW),
         Some(SilentSlot {
@@ -402,7 +406,7 @@ fn a_peer_homed_slot_blocks_the_watch_until_its_home_shares_the_start_report() {
         "this relay cannot weigh a peer's slot before its home says it is simulating",
     );
 
-    maker.note_peer_slot_started(SlotId(0));
+    maker.note_peer_slot_started(SlotId(0), start + Duration::from_secs(12));
     assert_eq!(
         maker.silent_slot(start + Duration::from_secs(12), SILENCE_WINDOW),
         Some(SilentSlot {
@@ -411,6 +415,112 @@ fn a_peer_homed_slot_blocks_the_watch_until_its_home_shares_the_start_report() {
             lead: Duration::from_millis(200),
         }),
         "the shared report completes the roster, and the earliest stopper is named",
+    );
+}
+
+/// The slow loader everyone finished waiting on. Its only clock is the seed
+/// traffic it flushed before its loop ran, while the players who loaded first
+/// seeded later and have sat stalled for its first simulated turn ever since —
+/// so the instant its start report completes the evidence, it is the unique
+/// earliest stopper by a wide margin, through no fault of its own.
+#[test]
+fn a_late_loader_is_owed_a_window_after_its_start_but_no_newer_stop_time() {
+    let (mut maker, start) = silence_maker(&[0, 1], &[0]);
+    maker.note_forward_advance(SlotId(1), start + Duration::from_millis(500));
+    maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
+
+    let started = start + Duration::from_secs(12);
+    maker.note_slot_started(SlotId(1), started);
+    for after in [
+        Duration::ZERO,
+        Duration::from_millis(500),
+        Duration::from_millis(9_900),
+    ] {
+        assert!(
+            maker.silent_slot(started + after, SILENCE_WINDOW).is_none(),
+            "a loop {after:?} old has had no chance to forward a simulated turn",
+        );
+    }
+
+    // It never steps. The grace ran out, and its stop time is where its
+    // forwarding stopped, not where its start report landed.
+    assert_eq!(
+        maker.silent_slot(started + SILENCE_WINDOW, SILENCE_WINDOW),
+        Some(SilentSlot {
+            slot: SlotId(1),
+            silent_for: Duration::from_millis(21_500),
+            lead: Duration::from_millis(500),
+        }),
+        "a started loop that stays silent past its grace is named",
+    );
+}
+
+#[test]
+fn a_late_loader_that_starts_stepping_is_never_named() {
+    let (mut maker, start) = silence_maker(&[0, 1], &[0]);
+    maker.note_forward_advance(SlotId(1), start + Duration::from_millis(500));
+    maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
+
+    let started = start + Duration::from_secs(12);
+    maker.note_slot_started(SlotId(1), started);
+    maker.note_forward_advance(SlotId(1), started + Duration::from_millis(600));
+    maker.note_forward_advance(SlotId(0), started + Duration::from_millis(700));
+    assert!(
+        maker
+            .silent_slot(started + SILENCE_WINDOW, SILENCE_WINDOW)
+            .is_none(),
+        "the session moving again is what ends the stall, and nobody is to blame",
+    );
+}
+
+/// The grace starts when this relay first learned the slot started, by
+/// whichever path came first, and a restated report never restarts it: a mesh
+/// peer re-shares its whole started set every time a link (re)joins.
+#[test]
+fn a_restated_start_report_does_not_restart_the_grace() {
+    let (mut maker, start) = silence_maker(&[0, 1], &[0]);
+    maker.note_forward_advance(SlotId(1), start + Duration::from_millis(500));
+    maker.note_forward_advance(SlotId(0), start + Duration::from_secs(1));
+
+    // Learned second-hand first — a mesh `SlotStarted` reaching a relay that
+    // later homes the slot — then restated by a reconcile and first-hand.
+    let learned = start + Duration::from_secs(12);
+    maker.note_peer_slot_started(SlotId(1), learned);
+    maker.note_peer_slot_started(SlotId(1), learned + Duration::from_secs(5));
+    maker.note_slot_started(SlotId(1), learned + Duration::from_secs(8));
+
+    assert_eq!(
+        maker
+            .silent_slot(learned + SILENCE_WINDOW, SILENCE_WINDOW)
+            .map(|found| found.slot),
+        Some(SlotId(1)),
+        "the grace runs from the first instant the start was learned",
+    );
+}
+
+/// The start grace is spent long before a mid-game hang: a slot whose loop
+/// has been running for minutes and then stops is named as soon as the
+/// session has sat still for a window behind it.
+#[test]
+fn a_slot_that_hangs_long_after_starting_is_named_after_one_window() {
+    let (mut maker, start) = silence_maker(&[0, 1], &[0, 1]);
+    let hang = start + Duration::from_secs(300);
+    maker.note_forward_advance(SlotId(1), hang);
+    maker.note_forward_advance(SlotId(0), hang + Duration::from_millis(200));
+
+    assert!(
+        maker
+            .silent_slot(hang + Duration::from_secs(10), SILENCE_WINDOW)
+            .is_none(),
+        "the survivor's last step is still inside the window",
+    );
+    assert_eq!(
+        maker.silent_slot(hang + Duration::from_millis(10_300), SILENCE_WINDOW),
+        Some(SilentSlot {
+            slot: SlotId(1),
+            silent_for: Duration::from_millis(10_300),
+            lead: Duration::from_millis(200),
+        }),
     );
 }
 

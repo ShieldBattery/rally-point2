@@ -91,12 +91,14 @@ impl DecisionMaker {
     /// [`note_peer_slot_started`](Self::note_peer_slot_started) instead, keeping
     /// this set first-hand.
     ///
-    /// The report deliberately supplies no timestamp to the watch: the moment a
-    /// client says it began is the client's to choose, and a slot that delays
-    /// saying so must not thereby look like it stopped later than the players
-    /// already waiting on it.
-    pub fn note_slot_started(&mut self, slot: SlotId) {
+    /// The report never becomes a stop time: the moment a client says it began
+    /// is the client's to choose, and a slot that delays saying so must not
+    /// thereby look like it stopped later than the players already waiting on
+    /// it. `now` is kept only as the start of the silence grace a freshly
+    /// started loop is owed (see [`note_start_learned`](Self::note_start_learned)).
+    pub fn note_slot_started(&mut self, slot: SlotId, now: Instant) {
         self.started_slots.insert(slot);
+        self.note_start_learned(slot, now);
     }
 
     /// Records a peer relay's report that one of ITS home slots' game loops is
@@ -106,8 +108,22 @@ impl DecisionMaker {
     /// which is what this relay restates to the coordinator — the home already
     /// reported this slot, and a second relay reporting it would attribute the
     /// same load twice.
-    pub fn note_peer_slot_started(&mut self, slot: SlotId) {
+    ///
+    /// `now` — when the report reached this relay, not when the slot's home heard
+    /// it — starts the slot's silence grace here, exactly as a first-hand report
+    /// does (see [`note_start_learned`](Self::note_start_learned)).
+    pub fn note_peer_slot_started(&mut self, slot: SlotId, now: Instant) {
         self.peer_started_slots.insert(slot);
+        self.note_start_learned(slot, now);
+    }
+
+    /// Records `now` as the instant this relay learned `slot`'s game loop is
+    /// running, unless it already knew. The first instant stands: a peer
+    /// re-sharing its started set when a mesh link (re)joins, or the home and a
+    /// peer both reporting the same slot, restates a start this relay already
+    /// timed, and must not restart the slot's silence grace.
+    fn note_start_learned(&mut self, slot: SlotId, now: Instant) {
+        self.start_learned_at.entry(slot).or_insert(now);
     }
 
     /// Whether `slot`'s game loop is known to be running, from this relay's own

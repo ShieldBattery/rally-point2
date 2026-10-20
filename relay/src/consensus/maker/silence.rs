@@ -176,6 +176,13 @@ impl DecisionMaker {
     ///   an advance is named once the session has sat still for a window again.
     ///   This also means the candidate itself stopped at least `window` ago;
     /// — its link has been up at least `window`;
+    /// — this relay has known its game loop to be running for at least
+    ///   `window`. A slot's start can be the last thing the session waits on: a
+    ///   slow loader's stop time is its pre-loop seed traffic or the session
+    ///   start, while everyone who finished loading sits stalled waiting for its
+    ///   first simulated turn, so the moment its start report completes the
+    ///   evidence it is already the unique earliest stopper by a wide margin,
+    ///   having had no chance to forward a single simulated turn;
     /// — and it stopped *strictly* before every other participant. Ties evict
     ///   nobody: a session that stopped all at once has no victim to name, and a
     ///   slot with no other participant left to be earlier than is holding nobody
@@ -298,6 +305,19 @@ impl DecisionMaker {
                 .get(&slot)
                 .and_then(|state| state.connection_up_at);
             if connection_up_at.is_some_and(|up| now.saturating_duration_since(up) < window) {
+                continue;
+            }
+            // A loop that just started is owed the same window for the same
+            // reason, and on the same terms: the grace is time only. Its stop
+            // time stays at its pre-loop traffic or the session start, because
+            // re-dating it to the start report would let a client that delays
+            // that report sit later in the stop order than the players already
+            // waiting on it. A loader that does start stepping moves its own
+            // clock with its first forwarded turn.
+            let start_learned_at = self.start_learned_at.get(&slot);
+            if start_learned_at
+                .is_some_and(|&learned| now.saturating_duration_since(learned) < window)
+            {
                 continue;
             }
             // The margin over the next-earliest stopper. It stays absent when
