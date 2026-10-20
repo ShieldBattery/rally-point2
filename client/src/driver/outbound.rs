@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{GameChat, LobbyCommand, Payload, PlayerSkin};
+use rally_point_proto::messages::{GameChat, Payload, PlayerSkin};
 use rally_point_transport::Link;
 use rally_point_transport::control::{
     send_control_chat, send_control_game_result, send_control_game_started, send_control_lobby,
@@ -223,41 +223,32 @@ pub(super) async fn on_game_started(signal: Option<()>, wire: &mut Wire, state: 
     }
 }
 
-/// A lobby command the game authored during setup. Send it up the
-/// reliable control stream at once — setup runs before any turn
-/// barrier exists, so there is nothing to drain behind. The relay
-/// stamps this client's authenticated slot (the `0` here is
-/// ignored) and fans it to the other members. Disarmed when the
-/// game drops its sender (setup finished). A send failure means the
-/// stream (and almost certainly the connection) is gone; a dropped
-/// setup command would leave a member's pre-game state incomplete,
-/// so it is the same reconnect trigger as an undeliverable oversize
-/// turn — except once our leave intent is out, the relay closing
-/// the stream under this write is the expected confirmation.
+/// A lobby command the game authored during setup. Stamp it with
+/// its origin seq, retain it, and send it up the reliable control
+/// stream at once — setup runs before any turn barrier exists, so
+/// there is nothing to drain behind. The relay stamps this client's
+/// authenticated slot (the `0` here is ignored) and fans it to the
+/// other members. Disarmed when the game drops its sender (setup
+/// finished). A send failure means the stream (and almost certainly
+/// the connection) is gone; a dropped setup command would leave a
+/// member's pre-game state incomplete, so it is the same reconnect
+/// trigger as an undeliverable oversize turn — except once our leave
+/// intent is out, the relay closing the stream under this write is
+/// the expected confirmation.
 ///
-/// Unlike an oversize turn, a lobby command is never retained for
-/// redelivery on a resume: `LobbyCommand` carries no seq or other
-/// origin identity, and the relay's lobby log neither dedups nor
-/// rejects a byte-identical repeat — it is simply appended and
-/// fanned out again as a second, indistinguishable command. Ever
-/// resending one (even only the "recent tail") risks silently
-/// corrupting setup state (a double-applied slot/color/ready
-/// toggle), which is worse than the narrow gap this leaves: a
-/// drop between this write succeeding locally and the relay
-/// actually processing it, on a same-relay resume, can still lose
-/// a lobby command with no retry. Known and intentionally out of
-/// scope until lobby commands carry real delivery confirmation.
+/// A write that succeeds locally proves nothing: a connection whose
+/// path silently died accepts it and only times out later. Retention
+/// is what recovers that command — every new control stream re-sends
+/// all retained commands before anything else lobby-side, and the
+/// relay drops each one it already accepted by `(slot, seq)`.
 pub(super) async fn on_lobby_out(
     bytes: Option<Vec<u8>>,
     wire: &mut Wire,
-    state: &LoopState,
+    state: &mut LoopState,
 ) -> ArmFlow {
     match bytes {
         Some(bytes) => {
-            let command = LobbyCommand {
-                slot: 0,
-                payload: bytes.into(),
-            };
+            let command = state.lobby_retention.author(bytes);
             if let Err(error) = send_control_lobby(&mut wire.control_send, command).await {
                 return ArmFlow::End(
                     state

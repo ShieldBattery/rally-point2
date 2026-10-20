@@ -69,6 +69,7 @@ async fn allowed_lobby_command_forwards_and_replays_from_the_authenticated_slot(
         LobbyCommand {
             slot: 99,
             payload: b"allow".to_vec().into(),
+            seq: None,
         },
     )
     .await
@@ -109,6 +110,7 @@ async fn pre_start_lobby_mismatch_is_not_delivered_reports_and_refuses_redial() 
         LobbyCommand {
             slot: 0,
             payload: b"wrong-slot".to_vec().into(),
+            seq: None,
         },
     )
     .await
@@ -164,6 +166,7 @@ async fn post_start_mismatch_is_dropped_and_no_policy_still_forwards() {
         LobbyCommand {
             slot: 0,
             payload: b"wrong".to_vec().into(),
+            seq: None,
         },
     )
     .await
@@ -188,6 +191,7 @@ async fn post_start_mismatch_is_dropped_and_no_policy_still_forwards() {
         LobbyCommand {
             slot: 99,
             payload: b"legacy".to_vec().into(),
+            seq: None,
         },
     )
     .await
@@ -216,6 +220,7 @@ async fn wrong_lobby_bytes_are_blocked_before_delivery_or_replay() {
         LobbyCommand {
             slot: 0,
             payload: b"wrong-bytes".to_vec().into(),
+            seq: None,
         },
     )
     .await

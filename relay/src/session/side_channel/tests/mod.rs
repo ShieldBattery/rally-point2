@@ -47,6 +47,7 @@ impl Probe for Lobby {
         LobbyCommand {
             slot,
             payload: body.as_bytes().to_vec().into(),
+            seq: None,
         }
     }
 

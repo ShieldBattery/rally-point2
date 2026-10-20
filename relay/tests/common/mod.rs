@@ -441,6 +441,31 @@ pub async fn recv_meaningful(reader: &mut mpsc::Receiver<ControlInbound>) -> Con
     }
 }
 
+/// `(author, seq, first payload byte)` of the next lobby command on `reader`,
+/// skipping connectivity frames like [`recv_meaningful`]; panics on any other
+/// frame.
+pub async fn next_sequenced_lobby(
+    reader: &mut mpsc::Receiver<ControlInbound>,
+) -> (u32, Option<u64>, u8) {
+    match recv_meaningful(reader).await {
+        ControlInbound::Lobby(command) => (command.slot, command.seq, command.payload[0]),
+        other => panic!("expected a lobby command, got {other:?}"),
+    }
+}
+
+/// Fails if a lobby command reaches `reader` within a short window. A negative
+/// claim no poll can make: on loopback a forwarded command, mesh hop included,
+/// lands in well under a millisecond, so 100ms is ample for a duplicate to have
+/// shown up.
+pub async fn assert_no_lobby(reader: &mut mpsc::Receiver<ControlInbound>, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    while let Ok(Some(frame)) = tokio::time::timeout_at(deadline, reader.recv()).await {
+        if let ControlInbound::Lobby(command) = frame {
+            panic!("{what}: got {command:?}");
+        }
+    }
+}
+
 /// Polls `condition` until it holds, panicking with `what` if it has not within
 /// five seconds. How a test observes server-side state that no control frame
 /// reports — a teardown finishing, a mesh link registering, a timer standing

@@ -54,6 +54,7 @@ async fn lobby_commands_reach_same_relay_and_cross_relay_peers_in_order() -> Res
             LobbyCommand {
                 slot: 99,
                 payload: vec![byte].into(),
+                seq: None,
             },
         )
         .await?;
@@ -78,6 +79,7 @@ async fn lobby_commands_reach_same_relay_and_cross_relay_peers_in_order() -> Res
         LobbyCommand {
             slot: 42,
             payload: vec![0xAA].into(),
+            seq: None,
         },
     )
     .await?;
@@ -123,6 +125,7 @@ async fn a_late_dialing_peer_replays_the_full_lobby_sequence() -> Result<(), Any
             LobbyCommand {
                 slot: 0,
                 payload: vec![byte].into(),
+                seq: None,
             },
         )
         .await?;
@@ -191,6 +194,7 @@ async fn lobby_spam_past_the_rate_cap_never_reaches_the_mesh_and_a_departure_sti
             LobbyCommand {
                 slot: 99,
                 payload: vec![i as u8].into(),
+                seq: None,
             },
         )
         .await?;
@@ -416,6 +420,7 @@ async fn rejected_home_lobby_command_never_crosses_the_mesh() -> Result<(), AnyE
         LobbyCommand {
             slot: 0,
             payload: b"wrong".to_vec().into(),
+            seq: None,
         },
     )
     .await?;

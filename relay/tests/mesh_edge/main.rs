@@ -15,5 +15,6 @@ mod helpers;
 mod delivery;
 mod link_lifecycle;
 mod lobby;
+mod lobby_resend;
 mod presence;
 mod sessions;

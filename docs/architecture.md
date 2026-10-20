@@ -413,6 +413,25 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
   session rather than losing it. An undecided drop-hold at relay death is deliberately lost — survivors
   re-wait the fresh 30s floor on the new relay.
 
+**Lobby commands across any reconnect are re-sent and deduped by origin seq.** A lobby command rides the
+control stream, and a control-stream write carries no acknowledgment: one written onto a connection whose
+path silently died succeeds locally and is lost when the connection idles out, and the members waiting on
+it (a host's game-init) wait forever. So each client stamps its lobby commands with an origin `seq` (0, 1,
+… per session, never rewound), keeps every one it authored for the whole session (capped at 256 commands /
+256 KiB, oldest dropped first), and writes them all again, in order, on every new control stream —
+same-relay resume and re-home alike — ahead of any command it authors on that stream. Retention never ends
+early because nothing the client sees proves delivery: its own loop can start before a game-init it wrote
+reached anyone, and `SessionStart` only says everyone connected. Every relay keeps, beside its lobby log and
+for exactly as long, the highest `seq` it accepted per author, and refuses a command at or below it —
+before the rate cap, so a re-send spends no budget on what was delivered, and inside the log's own
+`deliver`, so a refused repeat is neither logged nor fanned locally nor forwarded across the mesh. Mesh
+copies keep the `seq`, so a relay that first received a command over the mesh refuses the author's re-send
+of it after a re-home, and the original never crosses the mesh twice. Receiving clients keep the same
+high-water mark per author and drop repeats, which also absorbs the relay re-playing its whole log each
+time a member's stream registers. A command with no `seq` (a client that predates it) is forwarded exactly
+as before. A relay that predates the field skips it, so a new client's re-send through an old relay is
+delivered again: **deploy relays before clients.**
+
 **Coordinator `POST /session/rehome`.** Tenant-authenticated and app-server-mediated — clients never talk to
 the coordinator directly. The re-home is authenticated exactly like `POST /session/create`: the tenant's app
 server signs the request with its client key, and the coordinator verifies that request signature (the
@@ -1749,9 +1768,11 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   scored result.
 - **Presence fail-open (35s TTL):** locking players out of queueing on infra flap is strictly worse
   than the status quo (see the presence section above for the full argument).
-- **Lobby commands are not replayed on a same-relay resume (SB-side scope-out):** they have no
-  dedup identity, so a resume replay would double-apply them; the oversize-turn half of that
-  resume problem is handled.
+- **Lobby-command delivery is re-send plus origin-seq dedupe, not acknowledgment:** a client re-sends
+  every lobby command it authored on each new control stream for the whole session, and relays (and
+  receiving clients) drop what they already accepted by `(slot, seq)` high-water mark. An ack would
+  only move the same "was it processed?" question onto another unacknowledged write; a re-send that
+  every hop dedupes needs no answer to it. Unsequenced commands stay forwarded as-is for old clients.
 - **The relay-side coordinator-notice buffer is unbounded by deliberate choice** (delivery over
   memory); the coordinator's own per-session webhook queues are bounded (128) with a drop counter
   on `/metrics`. Relay-reported webhook events take precedence over coordinator-derived ones by

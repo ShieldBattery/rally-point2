@@ -73,6 +73,19 @@ impl LinkDriver {
                 .announcer
                 .absorb_link_close(Err(DriverError::from(error)));
         }
+        // Re-send every lobby command this client authored, oldest first, ahead
+        // of any it authors from here on: one written onto the last connection
+        // may never have reached the relay (a write onto a path that silently
+        // died succeeds locally and is lost with it). The relay drops each one
+        // it already accepted by its origin seq, so only what was lost is
+        // delivered. Its failure is the same reconnect trigger as a live lobby
+        // send's, and retention is untouched by it, so the next stream carries
+        // the whole set again.
+        if let Err(error) = state.lobby_retention.resend(&mut wire.control_send).await {
+            return state
+                .announcer
+                .absorb_link_close(Err(DriverError::from(error)));
+        }
         // Re-assert the game's own "my loop is running" announcement on this
         // connection's fresh control stream. The fact is session state, not link
         // state, so every stream carries it: an announcement whose write raced a

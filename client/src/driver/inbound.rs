@@ -205,6 +205,17 @@ pub(super) async fn on_control_frame(
                 );
                 return ArmFlow::Serve;
             };
+            // Already handed to the game: the relay replays its whole log
+            // each time this client's stream registers, and a relay that
+            // never saw an author's earlier commands accepts its re-send.
+            if !state.lobby_receipts.admit(SlotId(slot_id), command.seq) {
+                tracing::debug!(
+                    slot = slot_id,
+                    seq = command.seq,
+                    "dropping a lobby command already delivered to the game",
+                );
+                return ArmFlow::Serve;
+            }
             match push_to_game(&seam.lobby_in, (SlotId(slot_id), command.payload.to_vec())) {
                 GamePush::Sent => {}
                 GamePush::Full => {

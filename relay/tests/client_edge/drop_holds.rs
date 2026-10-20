@@ -137,6 +137,7 @@ async fn a_held_last_slot_disconnect_defers_the_session_close_and_keeps_its_stat
         rally_point_proto::messages::LobbyCommand {
             slot: 1,
             payload: vec![0xAB, 0xCD].into(),
+            seq: None,
         },
     );
     // The blip must come after the relay has validated that turn.

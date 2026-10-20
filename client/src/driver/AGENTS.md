@@ -21,6 +21,8 @@
   `LoopState`: everything a re-dialed session must carry across.
 - `reconnect.rs` / `retention.rs` — re-dial + escalation; `RetentionRing` and what a
   resume re-sends off it, and how it anchors.
+- `lobby.rs` — `LobbyRetention` (every authored lobby command, seq-stamped, re-sent on each new
+  control stream) and `LobbyReceipts` (drops a member's lobby command the game already has).
 - `backoff.rs` — non-blocking game pushes, the waits that keep servicing the seam, jittered backoff.
 - `teardown.rs` — the post-loop drain and the two delivery fences.
 
@@ -49,6 +51,9 @@
   `REHOME_PROVIDER_DEADLINE` or `RECONNECT_DIAL_TIMEOUT` can push a re-home past it. A re-home
   dial walks every address the replacement advertises, so its worst case is one
   `RECONNECT_DIAL_TIMEOUT` per address.
+- Retained lobby commands are re-sent in `session_body` before the `select!` loop starts, so they
+  precede any command authored on the new stream; the relay's per-author seq high-water mark
+  depends on an author's seqs arriving in climbing order.
 - Every driver → game push is non-blocking: awaiting one parks acks and outbound turns behind a
   stalled consumer.
 

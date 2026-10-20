@@ -217,8 +217,11 @@ pub(super) fn handle_control_frame(
                 }
             }
         }
-        // The client's lobby command. Admit it against the relay's
-        // per-slot rate cap first — a failure drops the command
+        // The client's lobby command. A re-send of one the session's
+        // log already accepted from this slot (same origin seq) is
+        // dropped first: the client writes every command it authored
+        // again on each new control stream. Otherwise admit it against
+        // the relay's per-slot rate cap — a failure drops the command
         // without closing the link, mirroring chat. An admitted
         // command is bound to the authenticated slot — never the
         // client-asserted `slot` on the wire, exactly as
@@ -236,6 +239,7 @@ pub(super) fn handle_control_frame(
 
             enum LobbyIngress {
                 Held,
+                Repeat,
                 RateLimited,
                 Overflow,
                 Verdict(crate::consensus::LobbyCommandVerdict),
@@ -252,10 +256,16 @@ pub(super) fn handle_control_frame(
                 .gates
                 .with_ingress(&ctx.key, || {
                     let lobby = &ctx.side_channels.lobby;
+                    command.slot = u32::from(ctx.slot.0);
+                    // A command the client re-sent on this fresh stream that
+                    // the log already holds: dropped before it can spend rate
+                    // budget that a genuinely lost command behind it needs.
+                    if lobby.is_repeat(&ctx.key, &command) {
+                        return LobbyIngress::Repeat;
+                    }
                     if !lobby.admit(&ctx.key, ctx.slot, command.payload.len()) {
                         return LobbyIngress::RateLimited;
                     }
-                    command.slot = u32::from(ctx.slot.0);
                     let pen = &ctx.mesh_for_teardown.session.provisional_turns;
                     if pen.armed() {
                         match pen.hold(&ctx.key, PennedIngress::Lobby(ctx.slot, command.clone())) {
@@ -285,7 +295,7 @@ pub(super) fn handle_control_frame(
                     );
                     return ControlFlow::Break(());
                 }
-                Some(LobbyIngress::Held | LobbyIngress::RateLimited) => {}
+                Some(LobbyIngress::Held | LobbyIngress::Repeat | LobbyIngress::RateLimited) => {}
                 Some(LobbyIngress::Overflow) => {
                     link.connection().close(
                         VarInt::from_u32(close_codes::PROVISIONAL_CAPACITY),

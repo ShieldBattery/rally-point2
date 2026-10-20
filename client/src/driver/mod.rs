@@ -91,6 +91,7 @@ mod backoff;
 mod channels;
 mod connectivity;
 mod inbound;
+mod lobby;
 mod outbound;
 mod reconnect;
 mod reorder;

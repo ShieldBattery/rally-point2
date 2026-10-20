@@ -259,6 +259,7 @@ fn every_control_frame_kind_round_trips_through_the_shared_framing() {
             control_frame::Kind::LobbyCommand(LobbyCommand {
                 slot: 3,
                 payload: vec![0x0C, 1, 2, 3].into(),
+                seq: None,
             }),
         ),
         (
@@ -356,6 +357,7 @@ fn every_mesh_control_frame_kind_round_trips_through_the_shared_framing() {
             mesh_control_frame::Kind::LobbyCommand(LobbyCommand {
                 slot: 3,
                 payload: vec![0x0C, 1, 2, 3].into(),
+                seq: None,
             }),
         ),
         (

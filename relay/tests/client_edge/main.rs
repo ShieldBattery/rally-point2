@@ -20,6 +20,7 @@ mod lead_reports;
 mod leaves;
 mod lobby_policy;
 mod lobby_policy_descriptor;
+mod lobby_resend;
 mod provisional;
 mod reconnect;
 mod region_labels;

@@ -90,6 +90,14 @@ pub trait SideChannelMessage: Clone {
     /// opaque game payload varies materially in size; the rest of a message is
     /// a handful of fixed scalar fields.
     fn retained_bytes(&self) -> usize;
+
+    /// The author's origin sequence number, when the message carries one: with
+    /// [`author`](Self::author) it names the message fleet-wide, so a re-send
+    /// of one already delivered can be recognized. `None` for a message kind
+    /// with no such identity, and for one from a client that predates it.
+    fn origin_seq(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// The knobs one side channel is configured with — the four every channel
@@ -268,6 +276,22 @@ impl<R: ReplayPolicy> SideChannel<R> {
         self.sessions.lock().remove(key);
     }
 
+    /// Whether `message`, already stamped with its author, repeats one `key`'s
+    /// replay policy already accepted (see [`ReplayPolicy::is_repeat`]). The
+    /// client edge asks this before [`admit`](Self::admit), so a client
+    /// re-sending its commands on a fresh control stream spends none of its
+    /// rate budget on the ones already delivered — that budget is what the
+    /// command the re-send exists to recover still needs. Advisory: the
+    /// authoritative refusal is [`deliver`](Self::deliver)'s, under the same
+    /// lock as the append, so a race between the two only means a repeat
+    /// reaches `deliver` and is refused there.
+    pub fn is_repeat(&self, key: &SessionKey, message: &R::Message) -> bool {
+        self.sessions
+            .lock()
+            .get(key)
+            .is_some_and(|session| session.replay.is_repeat(message))
+    }
+
     /// Checks whether one client-authored message from `slot` in `key`'s
     /// session may proceed to [`deliver`](Self::deliver): `len` fits the
     /// configured size cap (if this channel has one), and `slot`'s token bucket
@@ -332,8 +356,9 @@ impl<R: ReplayPolicy> SideChannel<R> {
     ///
     /// Only ever called after [`admit`](Self::admit) has cleared a
     /// client-authored message (or, for a mesh-received one, unconditionally —
-    /// see `admit`'s docs); this function's own admission concern is the
-    /// policy's session-wide ceiling, independent of any one slot's rate.
+    /// see `admit`'s docs); this function's own admission concerns are the
+    /// policy's: its session-wide ceiling, independent of any one slot's rate,
+    /// and whether the message repeats one it already accepted.
     /// Returns whether the message was retained and delivered — the caller's
     /// cue for whether to also forward a copy across the mesh: a message this
     /// relay refused was never retained or fanned to its own locals, so a peer

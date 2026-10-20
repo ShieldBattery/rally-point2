@@ -1,5 +1,6 @@
 //! The ordered-log policy's own guarantees: the replay is the whole log, in
-//! arrival order, exactly once per member, and it stops at the ceilings.
+//! arrival order, exactly once per member, it stops at the ceilings, and an
+//! author's re-send of a command it already accepted is refused.
 
 use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::LobbyCommand;
@@ -14,6 +15,7 @@ fn command(slot: u32, byte: u8) -> LobbyCommand {
     LobbyCommand {
         slot,
         payload: vec![byte].into(),
+        seq: None,
     }
 }
 
@@ -140,6 +142,7 @@ fn the_log_stops_growing_past_the_byte_cap() {
     let big = LobbyCommand {
         slot: 0,
         payload: vec![0u8; LOBBY.replay.max_bytes * 2 / 3].into(),
+        seq: None,
     };
     assert!(
         channel.deliver(&k, big.clone()),
@@ -149,4 +152,70 @@ fn the_log_stops_growing_past_the_byte_cap() {
         !channel.deliver(&k, big),
         "the second would cross it, and is refused far under the message cap",
     );
+}
+
+/// [`command`] carrying the author's origin seq, as a current client sends it.
+fn sequenced(slot: u32, seq: u64, byte: u8) -> LobbyCommand {
+    LobbyCommand {
+        seq: Some(seq),
+        ..command(slot, byte)
+    }
+}
+
+#[test]
+fn a_re_sent_command_is_neither_logged_nor_fanned_out_again() {
+    // A client writes every command it authored again on each fresh control
+    // stream, so the log sees the ones it already accepted a second time.
+    // Refusing them is also what keeps them off the mesh: `deliver`'s verdict
+    // is the forward cue.
+    let channel = Lobby::channel();
+    let k = session_key(1);
+    let mut peer = channel.register_member(&k, SlotId(1));
+    assert!(channel.deliver(&k, sequenced(0, 0, 0x01)));
+    assert!(channel.deliver(&k, sequenced(0, 1, 0x02)));
+
+    // The re-send after a reconnect: both repeats refused, the lost tail kept.
+    assert!(channel.is_repeat(&k, &sequenced(0, 0, 0x01)));
+    assert!(!channel.deliver(&k, sequenced(0, 0, 0x01)));
+    assert!(!channel.deliver(&k, sequenced(0, 1, 0x02)));
+    assert!(!channel.is_repeat(&k, &sequenced(0, 2, 0x03)));
+    assert!(channel.deliver(&k, sequenced(0, 2, 0x03)));
+    assert_eq!(bytes(&mut peer), vec![(0, 0x01), (0, 0x02), (0, 0x03)]);
+
+    // A member joining afterwards replays each command once.
+    let mut late = channel.register_member(&k, SlotId(2));
+    assert_eq!(bytes(&mut late), vec![(0, 0x01), (0, 0x02), (0, 0x03)]);
+}
+
+#[test]
+fn seqs_are_per_author_and_an_unsequenced_command_is_never_a_repeat() {
+    let channel = Lobby::channel();
+    let k = session_key(1);
+    let mut peer = channel.register_member(&k, SlotId(3));
+    assert!(channel.deliver(&k, sequenced(0, 0, 0x01)));
+    assert!(
+        channel.deliver(&k, sequenced(1, 0, 0x02)),
+        "another author's seq 0 is its own command",
+    );
+    // A client that predates the seq: no identity, so byte-identical
+    // commands are each delivered, exactly as before the seq existed.
+    assert!(channel.deliver(&k, command(2, 0x03)));
+    assert!(!channel.is_repeat(&k, &command(2, 0x03)));
+    assert!(channel.deliver(&k, command(2, 0x03)));
+    assert_eq!(
+        bytes(&mut peer),
+        vec![(0, 0x01), (1, 0x02), (2, 0x03), (2, 0x03)],
+    );
+}
+
+#[test]
+fn the_dedupe_state_ends_with_the_sessions_log() {
+    // The seen seqs guard the log they were accepted into; a session whose log
+    // was torn down starts both over together.
+    let channel = Lobby::channel();
+    let k = session_key(1);
+    assert!(channel.deliver(&k, sequenced(0, 0, 0x01)));
+    channel.end_session(&k);
+    assert!(!channel.is_repeat(&k, &sequenced(0, 0, 0x01)));
+    assert!(channel.deliver(&k, sequenced(0, 0, 0x01)));
 }

@@ -515,6 +515,7 @@ fn lobby(slot: u8, payload: &[u8]) -> PennedIngress {
         LobbyCommand {
             slot: u32::from(slot),
             payload: payload.to_vec().into(),
+            seq: None,
         },
     )
 }
@@ -614,6 +615,7 @@ fn lobby_quota_survives_disconnect_and_uses_authenticated_slot() {
         LobbyCommand {
             slot: 0,
             payload: vec![0; limit].into(),
+            seq: None,
         },
     );
     assert_eq!(pen.hold(&key(), forged), HoldOutcome::Held);

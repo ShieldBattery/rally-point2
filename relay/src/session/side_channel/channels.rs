@@ -21,6 +21,10 @@ impl SideChannelMessage for LobbyCommand {
     fn retained_bytes(&self) -> usize {
         self.payload.len()
     }
+
+    fn origin_seq(&self) -> Option<u64> {
+        self.seq
+    }
 }
 
 impl SideChannelMessage for GameChat {

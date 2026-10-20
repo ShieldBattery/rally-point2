@@ -9,7 +9,9 @@
 //! Split by topic: `helpers` holds the shared tenant/relay/client fixtures;
 //! `connect_and_turns` covers dialing (success, failure, timeout) and the basic
 //! turn/session-start path; `directives` covers the lobby/chat/skin
-//! control-stream broadcasts; `reconnect_and_leaves` covers a dropped link's
+//! control-stream broadcasts; `lobby_retention` covers a lobby command written
+//! into a path that silently died reaching its peer after the reconnect;
+//! `reconnect_and_leaves` covers a dropped link's
 //! reconnect-and-replay and a survivor's manual drop of a disconnected peer;
 //! `rehome` covers failover to a replacement relay; `address_fallback` covers
 //! re-dialing past a relay address whose path died to its next one; `stale_mapping`
@@ -20,6 +22,7 @@ mod helpers;
 mod address_fallback;
 mod connect_and_turns;
 mod directives;
+mod lobby_retention;
 mod reconnect_and_leaves;
 mod rehome;
 mod stale_mapping;

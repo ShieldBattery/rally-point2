@@ -65,6 +65,7 @@ fn a_peer_relays_local_fan_out_frames_deliver_locally_and_never_echo() {
     dispatch(mesh_control_frame::Kind::LobbyCommand(LobbyCommand {
         slot: 0,
         payload: vec![0xAB].into(),
+        seq: None,
     }));
     let delivered = lobby_member
         .try_recv()
@@ -164,6 +165,7 @@ fn peer_lobby_mismatch_is_dropped_without_eviction_or_replay() {
                 kind: Some(mesh_control_frame::Kind::LobbyCommand(LobbyCommand {
                     slot: 0,
                     payload: payload.into(),
+                    seq: None,
                 })),
             },
             RelayId(9),

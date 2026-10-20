@@ -28,6 +28,7 @@ mod connectivity;
 mod control_frames;
 mod delivery;
 mod leave_result;
+mod lobby;
 mod reconnect;
 mod recovery;
 mod reorder;

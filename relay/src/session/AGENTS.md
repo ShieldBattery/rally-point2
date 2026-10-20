@@ -37,7 +37,11 @@ module's teardown).
     to a late joiner, because setup can predate a member's dial and a missed
     setup command leaves its pre-game state permanently incomplete. Bounded by
     message count *and* payload bytes; past either, the overflow latch refuses
-    so a late joiner replays a truncated but consistent prefix.
+    so a late joiner replays a truncated but consistent prefix. Also refuses an
+    author's re-send of a command it already accepted (origin `seq` at or below
+    that author's high-water mark), which is what makes the client's re-send
+    of every lobby command on a fresh stream safe; the client edge checks
+    `is_repeat` before the rate cap so a re-send spends no budget.
   - `NoReplay` (**chat**) — nothing is retained; a member whose stream comes
     up late simply missed what was said. Also the one policy that never
     creates per-session state on delivery alone.

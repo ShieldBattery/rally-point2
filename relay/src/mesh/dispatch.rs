@@ -43,7 +43,10 @@ use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 ///   slot-stamped by the origin. Delivered to this relay's local members and
 ///   appended to this relay's replay log — so a late-dialing local member still
 ///   gets it — but, like the oversize turn, not re-broadcast across the mesh:
-///   the origin already sent a copy to every link serving the session.
+///   the origin already sent a copy to every link serving the session. A copy
+///   whose `(slot, seq)` this relay's log already accepted is dropped: its
+///   author re-sent it from a fresh stream on another relay, and the original
+///   already reached this one.
 /// - **`GameChat`**: a chat message a peer relay's member authored, already
 ///   slot-stamped by the origin. Delivered to this relay's local members — no
 ///   log to append to, chat is ephemeral — and, like the lobby command, not
@@ -343,7 +346,8 @@ fn dispatch_mesh_control_frame(
                 return;
             }
             // Store and fan out locally, without a mesh echo: the origin
-            // already sent a copy to every serving relay.
+            // already sent a copy to every serving relay. `deliver` refuses a
+            // copy whose origin seq the log already accepted from this author.
             mesh.session.side_channels.lobby.deliver(&key, command);
         }
         Some(mesh_control_frame::Kind::GameChat(chat_msg)) => {

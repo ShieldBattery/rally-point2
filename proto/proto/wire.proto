@@ -759,7 +759,16 @@ message GameResult {
 // up with the identical ordered sequence regardless of when it joined. A member
 // never receives its own authored command back (the relay never echoes to the
 // author; the game applies its own locally), and the replay/live handoff is
-// exact: each command reaches a member exactly once, in order.
+// exact: each command reaches a member's control stream exactly once, in order.
+// A member that reconnects registers again and replays the whole log again, so
+// the receiving client drops what it already handed its game (see `seq`).
+//
+// A control-stream write carries no acknowledgment, so a command written onto
+// a connection whose path has silently died is lost with it. The authoring
+// client therefore keeps every command it authored and writes them all again,
+// in order, on each new control stream, and `seq` is what makes that repeat
+// safe: every relay that already accepted an author's command drops a copy
+// whose `seq` it has seen, so the re-send fills only the gap.
 message LobbyCommand {
   // The session slot that authored the command bytes. Client → relay this is
   // ignored and the relay overwrites it with the authenticated connection's
@@ -773,6 +782,21 @@ message LobbyCommand {
   // not something the relay parses. Bounded by the control frame's size cap;
   // lobby commands are tens of bytes in practice.
   bytes payload = 2;
+
+  // The authoring client's origin sequence number for this command: 0 for its
+  // first lobby command of the session, one higher for each after, and the same
+  // value on every re-send of the same command. Assigned once by the author and
+  // carried verbatim by every hop, mesh copies included, so `(slot, seq)` names
+  // one command fleet-wide. A relay accepts a command only if its `seq` is above
+  // the highest it already accepted from that author (a lower one is a re-send
+  // and is neither logged nor forwarded), and a receiving client likewise drops
+  // one at or below the highest it already handed its game.
+  //
+  // Absent from a client that predates it: such a command has no identity to
+  // dedupe on and is forwarded and logged exactly as it always was. A relay
+  // that predates the field skips it as unknown, so a re-send through one is
+  // delivered again, and the copies it forwards no longer carry it.
+  optional uint64 seq = 3;
 }
 
 // One in-game chat message a session member authored, carried on the reliable
@@ -1197,12 +1221,15 @@ message MeshControlFrame {
     // A lobby command one member authored, propagated to the other relays so
     // each fans it out to its own local members. The origin relay stamps the
     // authoring `slot` onto the `LobbyCommand` before it ever leaves that relay's
-    // client edge, so a mesh copy already carries the authoritative slot. A relay
-    // that receives this appends it to its own per-session lobby log — so its
-    // late-dialing local members still get it on replay — and fans it out to its
-    // local members, but does not re-broadcast it across the mesh: the origin
-    // already sent a copy to every link serving the session, so re-flooding would
-    // only echo (mirroring the oversize-turn divert). See `LobbyCommand`.
+    // client edge, so a mesh copy already carries the authoritative slot, and it
+    // keeps the author's `seq`. A relay that receives this drops it if it already
+    // accepted that `(slot, seq)` — an author that moved relays re-sends what
+    // its old relay already forwarded here — and otherwise appends it to its
+    // own per-session lobby log — so its late-dialing local members still get
+    // it on replay — and fans it out to its local members, but does not
+    // re-broadcast it across the mesh: the origin already sent a copy to every
+    // link serving the session, so re-flooding would only echo (mirroring the
+    // oversize-turn divert). See `LobbyCommand`.
     LobbyCommand lobby_command = 5;
 
     // A game-chat message one member authored, propagated to the other relays

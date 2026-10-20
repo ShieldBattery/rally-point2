@@ -42,6 +42,7 @@ async fn send_lobby(send: &mut rally_point_transport::noq::SendStream, payload: 
         LobbyCommand {
             slot: 99,
             payload: payload.to_vec().into(),
+            seq: None,
         },
     )
     .await

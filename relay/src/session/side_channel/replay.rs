@@ -39,6 +39,13 @@ pub trait ReplayPolicy: Default {
     /// The retained messages a newly registered member replays, in the order it
     /// must apply them.
     fn replay(&self) -> impl Iterator<Item = &Self::Message>;
+
+    /// Whether `message` is a re-send of one this policy already accepted, so
+    /// [`retain`](Self::retain) would refuse it. A policy that does not track
+    /// message identity never reports one.
+    fn is_repeat(&self, _message: &Self::Message) -> bool {
+        false
+    }
 }
 
 /// Retain nothing: a member whose control stream comes up after a message
@@ -105,6 +112,16 @@ pub struct LogLimits {
 /// Once either ceiling is hit the overflow latch stays set and further messages
 /// are refused, so a late joiner replays a truncated but *consistent prefix*
 /// rather than the relay growing the log without bound.
+///
+/// **Re-sends are refused.** An author's client writes every command it
+/// authored again on each new control stream, because a write onto a
+/// connection that silently died is lost with nothing to report it. A message
+/// carrying an origin seq at or below the highest this log already accepted
+/// from the same author is that repeat: refused, so it is neither logged again
+/// nor fanned out, nor (through `deliver`'s verdict) forwarded across the mesh.
+/// The high-water mark rather than a set of seen seqs is enough because an
+/// author re-sends in seq order, so its accepted seqs only ever climb. A
+/// message without a seq (a client that predates it) is never a repeat.
 pub struct OrderedLog<M> {
     /// Every message delivered for this session, in arrival order — the replay
     /// source for a member whose stream comes up after messages flowed.
@@ -114,6 +131,10 @@ pub struct OrderedLog<M> {
     /// Whether the log has hit a ceiling. Once set, further messages are
     /// dropped (the session is misbehaving).
     overflowed: bool,
+    /// Per author, the highest origin seq accepted into `log`. Lives exactly as
+    /// long as the log it guards, so a re-send is recognized for as long as
+    /// the command it repeats could still be replayed.
+    accepted_through: HashMap<u32, u64>,
 }
 
 impl<M> Default for OrderedLog<M> {
@@ -122,6 +143,7 @@ impl<M> Default for OrderedLog<M> {
             log: Vec::new(),
             log_bytes: 0,
             overflowed: false,
+            accepted_through: HashMap::new(),
         }
     }
 }
@@ -133,6 +155,9 @@ impl<M: SideChannelMessage> ReplayPolicy for OrderedLog<M> {
     const RETAINS: bool = true;
 
     fn retain(&mut self, message: &M, limits: &LogLimits, warn: Warn<'_>) -> bool {
+        if self.is_repeat(message) {
+            return false;
+        }
         if self.overflowed {
             return false;
         }
@@ -153,11 +178,22 @@ impl<M: SideChannelMessage> ReplayPolicy for OrderedLog<M> {
         }
         self.log.push(message.clone());
         self.log_bytes += new_bytes;
+        if let Some(seq) = message.origin_seq() {
+            self.accepted_through.insert(message.author(), seq);
+        }
         true
     }
 
     fn replay(&self) -> impl Iterator<Item = &M> {
         self.log.iter()
+    }
+
+    fn is_repeat(&self, message: &M) -> bool {
+        message.origin_seq().is_some_and(|seq| {
+            self.accepted_through
+                .get(&message.author())
+                .is_some_and(|&through| seq <= through)
+        })
     }
 }
 
