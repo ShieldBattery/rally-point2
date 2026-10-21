@@ -43,9 +43,16 @@ struct FakeState {
     panic_next: Option<&'static str>,
     /// How many `list` calls have been made, including one that panicked.
     list_calls: usize,
+    /// Runs once, inside the next `stop` call, with the task being stopped: the
+    /// point at which a tick is suspended awaiting the provisioner, so whatever
+    /// this does lands mid-tick, as a racing event would.
+    during_next_stop: Option<StopHook>,
     /// What [`Provisioner::expects_public_ipv4`] reports for every region.
     expects_public_ipv4: bool,
 }
+
+/// A one-shot hook `FakeProvisioner::stop` runs with the task it is stopping.
+type StopHook = Box<dyn FnOnce(&str) + Send>;
 
 /// A running-task state at a fixed loopback address — the usual scripted
 /// "the launch came up" outcome.
@@ -71,6 +78,7 @@ impl FakeProvisioner {
                 fail_list: false,
                 panic_next: None,
                 list_calls: 0,
+                during_next_stop: None,
                 expects_public_ipv4: false,
             }),
         })
@@ -106,6 +114,11 @@ impl FakeProvisioner {
     /// way a bug deep in a substrate call would unwind out of the middle of a tick.
     fn panic_next(&self, method: &'static str) {
         self.state.lock().panic_next = Some(method);
+    }
+
+    /// Runs `hook` inside the next `stop` call (see `FakeState::during_next_stop`).
+    fn during_next_stop(&self, hook: impl FnOnce(&str) + Send + 'static) {
+        self.state.lock().during_next_stop = Some(Box::new(hook));
     }
 
     fn list_calls(&self) -> usize {
@@ -152,6 +165,10 @@ impl Provisioner for FakeProvisioner {
     }
 
     async fn stop(&self, task: &TaskId) -> Result<(), ProvisionError> {
+        let hook = self.state.lock().during_next_stop.take();
+        if let Some(hook) = hook {
+            hook(&task.0);
+        }
         let mut state = panic_if_scripted(self.state.lock(), "stop");
         if state.fail_stop {
             return Err(ProvisionError::Backend("stop failed".into()));

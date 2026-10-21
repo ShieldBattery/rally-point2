@@ -135,6 +135,13 @@ impl<P: Provisioner> ProvisionLoop<P> {
     /// would ever stop it. Re-deriving the work from the registry each tick makes
     /// any interrupted drain finish on the next one. A relay that began its own
     /// drain and has emptied is finished the same way, ahead of its own exit.
+    ///
+    /// The candidates come from a snapshot, and each stop awaits, so by the time a
+    /// later candidate comes up it may have reconnected: the new enrollment starts
+    /// undrained and can take sessions. Each one is therefore re-checked under the
+    /// assignment lock, as draining under the snapshot's generation with no
+    /// sessions, immediately before its stop. A superseded enrollment is skipped;
+    /// if it still needs draining, the next tick decides that afresh.
     pub(super) async fn finish_drains(&mut self) {
         let unretired: HashSet<RelayId> = match self.ledger.bound_unretired() {
             Ok(bound) => bound.into_iter().map(|relay| relay.relay_id).collect(),
@@ -147,8 +154,16 @@ impl<P: Provisioner> ProvisionLoop<P> {
             if !relay.draining || !unretired.contains(&relay.relay_id) {
                 continue;
             }
-            // A draining relay can gain no session, so a zero read here stays zero.
-            if self.setup.session_count_for_relay(relay.relay_id) != 0 {
+            let idle = {
+                // Placement and enrollment both hold this lock, so neither can land
+                // between the check and the release. A relay confirmed draining here
+                // can gain no session before the stop below, which follows with no
+                // await in between.
+                let _assignment = self.setup.lock_assignment();
+                registry::is_draining_at(self.setup.registry(), relay.relay_id, relay.generation)
+                    && self.setup.session_count_for_relay(relay.relay_id) == 0
+            };
+            if !idle {
                 continue;
             }
             tracing::info!(

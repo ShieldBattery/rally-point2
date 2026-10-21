@@ -353,6 +353,19 @@ pub fn clear_draining(registry: &RelayRegistry, id: RelayId, generation: u64) ->
     }
 }
 
+/// Whether `id` is still draining under the enrollment `generation` names. False
+/// once a reconnect has installed a newer enrollment (which starts undrained and
+/// may already be taking sessions), or once the relay has left. A caller acting on
+/// a snapshot's draining flag checks this, under the assignment lock, right before
+/// it acts.
+pub fn is_draining_at(registry: &RelayRegistry, id: RelayId, generation: u64) -> bool {
+    registry
+        .relays
+        .lock()
+        .get(&id)
+        .is_some_and(|r| r.generation == generation && r.draining)
+}
+
 /// Whether `id` is enrolled and available for a *new* session assignment — present
 /// in the registry and not draining. A draining relay reads as unavailable here
 /// even though it stays enrolled and keeps serving its existing sessions.

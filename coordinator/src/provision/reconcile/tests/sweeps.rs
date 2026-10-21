@@ -301,6 +301,67 @@ async fn a_draining_relay_still_serving_a_session_is_left_running() {
 }
 
 #[tokio::test]
+async fn a_drain_candidate_that_reconnects_mid_sweep_is_not_stopped() {
+    let (mut h, east) = Harness::default_region();
+    let (first, first_generation) = h.seed_live_relay(&east, 1_000);
+    let (second, second_generation) = h.seed_live_relay(&east, 1_000);
+    assert!(registry::mark_draining(
+        h.setup.registry(),
+        first,
+        first_generation
+    ));
+    assert!(registry::mark_draining(
+        h.setup.registry(),
+        second,
+        second_generation
+    ));
+
+    // Both are draining and idle when the sweep snapshots them. While it is
+    // suspended stopping whichever comes first, the other one reconnects: its new
+    // enrollment starts undrained, so it is placeable again, though it has no game
+    // yet when the sweep reaches it.
+    let reg = h.reg.clone();
+    let region = east.clone();
+    let reconnected = Arc::new(Mutex::new(None));
+    let reconnected_in_hook = reconnected.clone();
+    h.fake.during_next_stop(move |stopping| {
+        let other = if stopping == format!("task-live-{}", first.0) {
+            second
+        } else {
+            first
+        };
+        registry::enroll(
+            &reg,
+            hello(other.0, 14_900 + other.0 as u16).with_region(region),
+        );
+        *reconnected_in_hook.lock() = Some(other);
+    });
+
+    h.provision.tick(1_000).await;
+
+    let reconnected = reconnected
+        .lock()
+        .expect("the hook ran during the first stop");
+    assert_eq!(
+        h.fake.stops().len(),
+        1,
+        "only the relay still draining under its snapshot enrollment was stopped",
+    );
+    assert_ne!(h.fake.stops()[0], format!("task-live-{}", reconnected.0));
+    assert!(
+        h.ledger
+            .bound_unretired()
+            .unwrap()
+            .iter()
+            .any(|relay| relay.relay_id == reconnected),
+        "the reconnected relay's id was not retired",
+    );
+    // It goes on serving: the next game lands on it.
+    let session = create_session(&h.setup, request(two_players()), ExpiresAt(u64::MAX)).unwrap();
+    assert_eq!(session.response.home_relay.relay_id, reconnected);
+}
+
+#[tokio::test]
 async fn a_stop_error_during_drain_still_retires_the_id() {
     let (mut h, east) = Harness::with_grace(5);
     let (id, _gen) = h.seed_live_relay(&east, 1_000);

@@ -42,8 +42,10 @@ Scaling awaits provisioner calls between decisions, so the tick's `enrolled`
 snapshot can be wrong by the time a relay is drained: another relay in the
 region may have disconnected or begun its own drain. Every decision that removes
 a placeable relay re-checks the live registry under the assignment lock first.
-`retire_aged` requires a still-available replacement, and `try_drain_one`
-requires the region to still be over target. A new drain path must do the same.
+`retire_aged` requires a still-available replacement, `try_drain_one`
+requires the region to still be over target, and `finish_drains` requires the
+relay to still be draining under the snapshot's generation (a reconnect installs
+an undrained enrollment) with no sessions. A new drain path must do the same.
 
 ## Coverage backoff
 A region demands one relay per uncovered pair for `COVERAGE_HOLD_SECS`; still
