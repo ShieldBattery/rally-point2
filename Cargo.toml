@@ -30,7 +30,7 @@ tokio = { version = "1.52", features = [
 # QUIC via the maintained noq implementation.
 # Pin the rustls + ring backend rather than aws-lc-rs to avoid the C/NASM toolchain
 # requirement on Windows MSVC; `client` also builds for `i686-pc-windows-msvc`.
-noq = { version = "1.2.0", default-features = false, features = [
+noq = { version = "1.4.0", default-features = false, features = [
   "runtime-tokio",
   "rustls-ring",
   "tracing-log",
@@ -38,7 +38,7 @@ noq = { version = "1.2.0", default-features = false, features = [
 # The QUIC protocol core behind noq, already in the tree as its dependency.
 # Named directly only because the congestion `Controller` trait takes its
 # `RttEstimator`, which noq doesn't re-export; pinned to noq's own version.
-noq-proto = { version = "1.3.0", default-features = false }
+noq-proto = { version = "1.4.0", default-features = false }
 bytes = "1.12"
 byteorder = "1.5"
 # Dual-stack UDP socket construction for the client endpoint: std's UdpSocket
@@ -47,14 +47,12 @@ byteorder = "1.5"
 socket2 = "0.6"
 # TLS for QUIC. Pinned to the ring provider (no aws-lc-rs) to match the noq
 # backend and keep the 32-bit client build free of a C/NASM toolchain.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-# PEM cert/key file reading for the relay binary (loads --cert/--key files).
-rustls-pemfile = "2"
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 # X.509 signature verification, ring-backed, already resolved transitively via
 # rustls: the coordinator uses `webpki::EndEntityCert` to verify a relay's
 # enroll proof-of-possession signature against its presented certificate,
 # without pulling in a second X.509 stack.
-rustls-webpki = { version = "0.103", default-features = false, features = [
+rustls-webpki = { version = "0.103.16", default-features = false, features = [
   "ring",
   "std",
 ] }
@@ -95,7 +93,7 @@ prost = "0.14"
 # the build script avoids the `unsafe { env::set_var("PROTOC", ...) }` that the
 # vendored-protoc approach forces under edition 2024 + our deny-unsafe lint.
 prost-build = "0.14"
-protox = "0.9"
+protox = "0.10"
 
 # --- Errors ---
 thiserror = "2.0"
@@ -246,7 +244,7 @@ aws-sdk-ec2 = { version = "1.208", default-features = false, features = [
 # reuses the workspace's single crypto backend and the tree grows no aws-lc-rs path.
 # Pinned exactly so adding it leaves the shared `aws-smithy-*` versions the other SDK
 # clients resolved untouched. Coordinator-only.
-aws-sdk-s3 = { version = "=1.146.1", default-features = false, features = [
+aws-sdk-s3 = { version = "=1.153.0", default-features = false, features = [
   "rt-tokio",
   "behavior-version-latest",
 ] }

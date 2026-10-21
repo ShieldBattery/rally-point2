@@ -26,8 +26,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-# PEM cert/key file parsing for --cert/--key.
-rustls-pemfile = { workspace = true }
 # Self-signed cert generation for dev/loopback (when --cert/--key aren't
 # supplied). Uses ring, not the default aws-lc-rs, to match the pinned QUIC
 # crypto provider — no NASM toolchain needed.

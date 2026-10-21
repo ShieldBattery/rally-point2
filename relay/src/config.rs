@@ -18,7 +18,8 @@ use rally_point_proto::token::KeyId;
 use rally_point_transport::noq;
 use rally_point_transport::quic;
 use rally_point_transport::rustls::RootCertStore;
-use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rally_point_transport::rustls::pki_types::pem::PemObject;
+use rally_point_transport::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use ring::signature::KeyPair;
 
@@ -64,17 +65,16 @@ pub fn load_cert(
     let cert_pem = read_pem_input(cert_input, "cert")?;
     let key_pem = read_pem_input(key_input, "key")?;
 
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_pem[..])
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
         .collect::<Result<_, _>>()
         .map_err(|e| color_eyre::eyre::eyre!("parsing PEM certificates: {e}"))?;
     if certs.is_empty() {
         color_eyre::eyre::bail!("no certificates found in cert input");
     }
 
-    let keys: Vec<rally_point_transport::rustls::pki_types::PrivatePkcs8KeyDer> =
-        rustls_pemfile::pkcs8_private_keys(&mut &key_pem[..])
-            .collect::<Result<_, _>>()
-            .map_err(|e| color_eyre::eyre::eyre!("parsing PEM private keys: {e}"))?;
+    let keys: Vec<PrivatePkcs8KeyDer<'static>> = PrivatePkcs8KeyDer::pem_slice_iter(&key_pem)
+        .collect::<Result<_, _>>()
+        .map_err(|e| color_eyre::eyre::eyre!("parsing PEM private keys: {e}"))?;
     let key = PrivateKeyDer::from(
         keys.into_iter()
             .next()
@@ -266,7 +266,7 @@ pub fn load_mesh_roots(
     match mesh_roots {
         Some(input) => {
             let pem = read_pem_input(input, "mesh-roots")?;
-            for cert in rustls_pemfile::certs(&mut &pem[..]) {
+            for cert in CertificateDer::pem_slice_iter(&pem) {
                 roots
                     .add(cert.context("parsing mesh-roots PEM")?)
                     .map_err(|e| color_eyre::eyre::eyre!("adding mesh-roots cert: {e}"))?;
