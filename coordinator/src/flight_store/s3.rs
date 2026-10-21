@@ -14,11 +14,20 @@ use super::{
 /// indefinitely.
 const CONNECT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long [`S3FlightStore::get`] may spend reading an object's body, start to
+/// finish. The SDK's operation timeouts end once the response headers arrive and
+/// do not cover the streamed body, so a body trickling in just fast enough to dodge
+/// the per-read timeout would otherwise hold the read open indefinitely. Room for
+/// a [`MAX_FLIGHT_BLOB_BYTES`] object at well under 100 KB/s.
+const BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The time budgets every bucket call runs under. The SDK's defaults bound only
 /// connection setup, so without these a request whose response never arrives
 /// waits forever, holding whatever awaits it. A recording is at most
 /// [`MAX_FLIGHT_BLOB_BYTES`], so these leave room for a slow transfer of the
 /// largest one while still cutting off a call that has stopped making progress.
+/// They stop at the response headers; a streamed body is bounded separately by
+/// [`BODY_READ_TIMEOUT`].
 fn sdk_timeouts() -> aws_config::timeout::TimeoutConfig {
     use std::time::Duration;
     aws_config::timeout::TimeoutConfig::builder()
@@ -178,9 +187,18 @@ impl FlightStore for S3FlightStore {
                 // module — can't be read into an unbounded in-memory buffer.
                 let mut body = output.body;
                 let mut bytes = Vec::new();
-                while let Some(chunk) = body.try_next().await.map_err(|error| {
-                    FlightStoreError(format!("reading flight blob body: {error}"))
-                })? {
+                let deadline = tokio::time::Instant::now() + BODY_READ_TIMEOUT;
+                while let Some(chunk) = tokio::time::timeout_at(deadline, body.try_next())
+                    .await
+                    .map_err(|_| {
+                        FlightStoreError(format!(
+                            "reading flight blob at {key:?} took longer than {BODY_READ_TIMEOUT:?}"
+                        ))
+                    })?
+                    .map_err(|error| {
+                        FlightStoreError(format!("reading flight blob body: {error}"))
+                    })?
+                {
                     bytes.extend_from_slice(&chunk);
                     if bytes.len() > MAX_FLIGHT_BLOB_BYTES {
                         return Err(FlightStoreError(format!(

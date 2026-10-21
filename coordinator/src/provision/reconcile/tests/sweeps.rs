@@ -174,8 +174,8 @@ async fn provisioner_state_and_list_errors_do_not_kill_the_loop() {
     let minted_id = h.fake.launches()[0].relay_id;
     h.provision.tick(1_001).await;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
-        Some("task-0".to_owned()),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
+        Some(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 15_000))]),
         "the recovered poll records the task",
     );
 }
@@ -186,7 +186,7 @@ async fn a_panicking_tick_does_not_stop_the_running_loop() {
     let fake = h.fake.clone();
     // The first tick's orphan sweep panics inside the provisioner. Nothing else
     // in the coordinator would notice the loop dying, so it must keep ticking.
-    fake.panic_next_list();
+    fake.panic_next("list");
     let running = tokio::spawn(h.provision.run());
 
     // Paused time auto-advances through the 5 s interval: ticks at 0, 5 and 10.
@@ -198,6 +198,106 @@ async fn a_panicking_tick_does_not_stop_the_running_loop() {
     );
     assert!(!running.is_finished(), "the loop is still running");
     running.abort();
+}
+
+#[tokio::test]
+async fn a_launch_outlives_a_tick_that_panics_while_polling_it() {
+    let (mut h, east) = Harness::default_region();
+    h.warm
+        .warm_at(east.clone(), Duration::from_secs(600), 1_000);
+    h.fake.set_launch_state(TaskState::Starting);
+    h.provision.tick(1_000).await;
+    assert_eq!(h.fake.launches().len(), 1);
+    let launched = h.fake.launches()[0].relay_id;
+
+    // The poll of the still-starting task unwinds out of the tick.
+    h.fake.panic_next("state");
+    h.tick_panicking(1_001).await;
+
+    // The task comes up. The next tick must still know about it: poll it, record
+    // its addresses, and neither stop it as an orphan nor launch a second relay.
+    h.fake.set_task_state("task-0", running());
+    h.provision.tick(1_002).await;
+    assert!(
+        h.fake.stops().is_empty(),
+        "the launched task was not stopped"
+    );
+    assert_eq!(h.fake.launches().len(), 1, "no replacement was launched");
+    assert_eq!(
+        h.ledger
+            .advertised_addrs(launched)
+            .unwrap()
+            .map(|a| a.len()),
+        Some(1),
+        "the task's addresses were recorded",
+    );
+    assert_eq!(h.provision.pending_launches(), 0);
+}
+
+#[tokio::test]
+async fn a_restarted_loop_keeps_polling_a_launch_it_did_not_start() {
+    let (mut h, east) = Harness::default_region();
+    h.warm
+        .warm_at(east.clone(), Duration::from_secs(600), 1_000);
+    h.fake.set_launch_state(TaskState::Starting);
+    h.provision.tick(1_000).await;
+    let launched = h.fake.launches()[0].relay_id;
+
+    h.restart_loop();
+    h.fake.set_task_state("task-0", running());
+    h.provision.tick(1_001).await;
+    assert!(
+        h.fake.stops().is_empty(),
+        "the launched task was not stopped"
+    );
+    assert_eq!(h.fake.launches().len(), 1, "no replacement was launched");
+    assert!(
+        h.ledger.advertised_addrs(launched).unwrap().is_some(),
+        "the restarted loop recorded the task's addresses",
+    );
+}
+
+#[tokio::test]
+async fn a_drain_whose_stop_panicked_is_finished_on_the_next_tick() {
+    let (mut h, east) = Harness::with_grace(5);
+    let (id, _generation) = h.seed_live_relay(&east, 1_000);
+
+    // No warm demand, so the idle relay is over target. The first tick starts its
+    // idle timer; the second, past the grace, marks it draining and then its stop
+    // unwinds out of the tick before the id is retired.
+    h.provision.tick(1_000).await;
+    h.fake.panic_next("stop");
+    h.tick_panicking(1_010).await;
+    assert!(h.fake.stops().is_empty());
+    let unretired = |h: &Harness| {
+        h.ledger
+            .bound_unretired()
+            .unwrap()
+            .iter()
+            .any(|relay| relay.relay_id == id)
+    };
+    assert!(unretired(&h), "the interrupted drain left the id unretired");
+
+    // The relay is still enrolled and marked draining, so scale-down skips it. The
+    // next tick must finish the drain anyway.
+    h.provision.tick(1_011).await;
+    assert_eq!(h.fake.stops(), vec![format!("task-live-{}", id.0)]);
+    assert!(!unretired(&h), "the finished drain retired the id");
+}
+
+#[tokio::test]
+async fn a_draining_relay_still_serving_a_session_is_left_running() {
+    let (mut h, east) = Harness::with_grace(5);
+    let (id, generation) = h.seed_live_relay(&east, 1_000);
+    let running = create_session(&h.setup, request(two_players()), ExpiresAt(u64::MAX)).unwrap();
+    assert_eq!(running.response.home_relay.relay_id, id);
+    assert!(registry::mark_draining(h.setup.registry(), id, generation));
+
+    h.provision.tick(1_000).await;
+    assert!(
+        h.fake.stops().is_empty(),
+        "a draining relay keeps running until its last session ends",
+    );
 }
 
 #[tokio::test]

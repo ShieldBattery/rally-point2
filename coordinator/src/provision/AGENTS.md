@@ -21,10 +21,11 @@
 ## Tick order (why)
 `refresh_idle` → `aged_relays` → per-region `scale_up` → `retire_aged` →
 `scale_down` (target = `max(warm, coverage)`, never their sum) → `resolve_pending` →
-`launch_deadline_sweep` → `vanished_task_sweep` → `orphan_sweep`. Scaling runs
-first so a launch made this tick is never swept as an orphan (`pending`
-entries are exempt). The sweeps' relative order doesn't matter — each is an
-independent full re-derivation from the ledger/registry.
+`finish_drains` → `launch_deadline_sweep` → `vanished_task_sweep` →
+`orphan_sweep`. A launch is written to the ledger (`record_launch`) the moment
+it returns, so the orphan sweep never mistakes it for a stray, whatever the
+order. The sweeps' relative order doesn't matter — each is an independent full
+re-derivation from the ledger/registry.
 
 ## Max-age retirement
 Two relay counts per region, and mixing them up breaks make-before-break.
@@ -61,6 +62,14 @@ panicking tick is caught and logged in `run` rather than ending the task, and a
 tick past `SLOW_TICK_WARN` is logged while still stuck. Completed ticks stamp
 `rp2_provision_last_tick_seconds`; a value falling behind the clock is the
 stall signal.
+
+Continuing after a panic is only sound because a tick can stop at any await
+without stranding anything: every piece of work is re-derived from the ledger
+and registry on the next tick (launches still coming up from
+`unrecorded_launches`, interrupted drains from `finish_drains`). Loop-local
+state (`idle_since`, `coverage`) may only hold what is safe to lose. A new step
+that half-applies a change across an await must leave behind something the next
+tick finds and finishes; test it by panicking the provisioner mid-step.
 
 ## `Provisioner` contract
 Every method must be safe to retry, with no memory of a prior failure — the

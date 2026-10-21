@@ -425,6 +425,44 @@ impl RelayLedger {
         Ok(())
     }
 
+    /// Records the provisioner task `relay_id` was just launched as, before its
+    /// addresses are known. From here on the ledger, not loop memory, is what says
+    /// the task exists: the orphan sweep sees it referenced, the launch-deadline
+    /// sweep can stop it, and [`unrecorded_launches`](Self::unrecorded_launches)
+    /// hands it back to be polled until [`record_task`](Self::record_task) fills in
+    /// its addresses — across a coordinator restart or an interrupted tick alike.
+    /// Leaves the expected-address gate unset, as it is for every id until
+    /// `record_task`.
+    pub(crate) fn record_launch(
+        &self,
+        relay_id: RelayId,
+        task_arn: &str,
+    ) -> Result<(), LedgerError> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE provisioned_relays SET task_arn = ?1 WHERE relay_id = ?2",
+            params![task_arn, as_i64(relay_id.0)],
+        )?;
+        Ok(())
+    }
+
+    /// Every unretired id with a launched task whose addresses are not recorded
+    /// yet, with when it launched (Unix seconds): the launches the reconcile loop
+    /// polls until their task reports running.
+    pub(crate) fn unrecorded_launches(&self) -> Result<Vec<(ProvisionedTask, u64)>, LedgerError> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT relay_id, task_arn, region, launched_at FROM provisioned_relays
+              WHERE retired_at IS NULL AND task_arn IS NOT NULL AND addrs IS NULL",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row_to_provisioned_task(row)?, as_u64(row.get::<_, i64>(3)?)))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// The coordinator-resolved advertise-address set recorded for `relay_id`, in
     /// stored order (first is the primary), or `None` when none was recorded — a
     /// relay whose addresses were never set through

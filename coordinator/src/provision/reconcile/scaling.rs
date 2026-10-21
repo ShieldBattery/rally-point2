@@ -182,12 +182,31 @@ impl<P: Provisioner> ProvisionLoop<P> {
                         task = %task,
                         "launched a relay task",
                     );
-                    self.pending.push(PendingLaunch {
-                        relay_id: minted.relay_id,
-                        expects_public_ipv4: self.provisioner.expects_public_ipv4(Some(region)),
-                        task,
-                        launched_at: now,
-                    });
+                    if let Err(error) = self.ledger.record_launch(minted.relay_id, &task.0) {
+                        // Unrecorded, the task would be stopped as an orphan on the next
+                        // sweep while its id still counted as launching, holding off a
+                        // replacement until the launch deadline. Undo it now instead.
+                        tracing::warn!(
+                            relay_id = minted.relay_id.0,
+                            %error,
+                            "recording a launched task failed; stopping it and retiring the id",
+                        );
+                        if let Err(error) = self.provisioner.stop(&task).await {
+                            tracing::warn!(
+                                relay_id = minted.relay_id.0,
+                                %error,
+                                "stopping an unrecorded launch failed",
+                            );
+                        }
+                        if let Err(error) = self.retire_relay(minted.relay_id) {
+                            tracing::warn!(
+                                relay_id = minted.relay_id.0,
+                                %error,
+                                "retiring an unrecorded launch's id failed",
+                            );
+                        }
+                        return;
+                    }
                     launching += 1;
                 }
                 Err(error) => {

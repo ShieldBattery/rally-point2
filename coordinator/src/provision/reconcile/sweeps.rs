@@ -1,71 +1,78 @@
-//! The fleet-wide sweeps a tick runs after scaling: launches whose enroll
+//! The fleet-wide sweeps a tick runs after scaling: launches still waiting for
+//! their addresses, draining relays with no sessions left, launches whose enroll
 //! token expired, bound ids whose relay vanished from the registry, and
 //! provisioner tasks the ledger no longer references. Each sweep is
-//! independent — one relay's cleanup failing does not block the others.
+//! independent — one relay's cleanup failing does not block the others — and
+//! each re-derives its work from the ledger and registry, so a tick cut short
+//! leaves nothing the next one won't find.
 
 use super::*;
 
 impl<P: Provisioner> ProvisionLoop<P> {
-    /// Polls each pending launch at `now` (Unix seconds). A task that reports
-    /// running has its addresses recorded and leaves the pending set — unless the
-    /// launch expects a public IPv4 address that the reported set does not carry
-    /// yet, in which case the launch stays pending until the address appears or
+    /// Polls each launch whose addresses are not recorded yet at `now` (Unix
+    /// seconds). The set is read from the ledger every tick rather than held in
+    /// loop memory, so a restart or an interrupted tick loses no launch. A task that
+    /// reports running has its addresses recorded, which takes it out of the set —
+    /// unless its region expects a public IPv4 address that the reported set does
+    /// not carry yet, in which case it is polled again until the address appears or
     /// [`PUBLIC_IPV4_WAIT_SECS`] has elapsed since launch, whichever comes first
     /// (past that point the set is recorded as-is, so a deployment with no public
-    /// IPv4 at all is never blocked forever). A task still starting stays
-    /// pending; one that stopped before enrolling is a failed launch — its id is
-    /// retired so it can never enroll, and the next tick re-mints. A record or
-    /// poll error keeps the task pending for a later tick.
+    /// IPv4 at all is never blocked forever). A task still starting is polled again
+    /// next tick; one that stopped before enrolling is a failed launch — its id is
+    /// retired so it can never enroll, and the next tick re-mints. A record or poll
+    /// error leaves the launch for a later tick.
     pub(super) async fn resolve_pending(&mut self, now: u64) {
-        let pending = std::mem::take(&mut self.pending);
-        let mut still = Vec::with_capacity(pending.len());
-        for launch in pending {
-            match self.provisioner.state(&launch.task).await {
+        let launches = match self.ledger.unrecorded_launches() {
+            Ok(launches) => launches,
+            Err(error) => {
+                tracing::warn!(%error, "listing unrecorded launches failed; skipping the launch poll");
+                return;
+            }
+        };
+        for (launch, launched_at) in launches {
+            let Some(task) = launch.task_arn.map(TaskId) else {
+                continue;
+            };
+            match self.provisioner.state(&task).await {
                 Ok(TaskState::Running {
                     expected_ips,
                     addrs,
                 }) => {
-                    let missing_ipv4 =
-                        launch.expects_public_ipv4 && !expected_ips.iter().any(|ip| ip.is_ipv4());
-                    if missing_ipv4
-                        && now < launch.launched_at.saturating_add(PUBLIC_IPV4_WAIT_SECS)
-                    {
+                    let missing_ipv4 = self.provisioner.expects_public_ipv4(launch.region.as_ref())
+                        && !expected_ips.iter().any(|ip| ip.is_ipv4());
+                    if missing_ipv4 && now < launched_at.saturating_add(PUBLIC_IPV4_WAIT_SECS) {
                         tracing::debug!(
                             relay_id = launch.relay_id.0,
-                            task = %launch.task,
+                            task = %task,
                             "task's public IPv4 association has not appeared yet; waiting \
                              before recording its addresses",
                         );
-                        still.push(launch);
                         continue;
                     }
                     if missing_ipv4 {
                         tracing::warn!(
                             relay_id = launch.relay_id.0,
-                            task = %launch.task,
+                            task = %task,
                             "recording a relay's addresses without the expected public IPv4; \
                              the association never appeared",
                         );
                     }
-                    if let Err(error) = self.ledger.record_task(
-                        launch.relay_id,
-                        &launch.task.0,
-                        &expected_ips,
-                        &addrs,
-                    ) {
+                    if let Err(error) =
+                        self.ledger
+                            .record_task(launch.relay_id, &task.0, &expected_ips, &addrs)
+                    {
                         tracing::warn!(
                             relay_id = launch.relay_id.0,
                             %error,
                             "recording a launched task failed; retrying next tick",
                         );
-                        still.push(launch);
                     }
                 }
-                Ok(TaskState::Starting) => still.push(launch),
+                Ok(TaskState::Starting) => {}
                 Ok(TaskState::Stopped) => {
                     tracing::warn!(
                         relay_id = launch.relay_id.0,
-                        task = %launch.task,
+                        task = %task,
                         "a launched task stopped before enrolling; retiring the id",
                     );
                     if let Err(error) = self.retire_relay(launch.relay_id) {
@@ -82,11 +89,9 @@ impl<P: Provisioner> ProvisionLoop<P> {
                         %error,
                         "polling a launched task failed; retrying next tick",
                     );
-                    still.push(launch);
                 }
             }
         }
-        self.pending = still;
     }
 
     /// Stops and retires every launch whose token expired before it enrolled — the
@@ -118,8 +123,39 @@ impl<P: Provisioner> ProvisionLoop<P> {
                 );
             }
             crate::metrics::relay_reaped(relay.region.as_ref(), "launch_deadline");
-            self.pending.retain(|p| p.relay_id != relay.relay_id);
             self.idle_since.remove(&relay.relay_id);
+        }
+    }
+
+    /// Stops and retires every enrolled relay that is draining with no sessions
+    /// left while its id is still live in the ledger. The step that marks a relay
+    /// draining normally stops it in the same breath, but if that step is cut short
+    /// (its stop panicked, or the tick never got past it) the relay would stay
+    /// marked: placement and scale-down both skip draining relays, so nothing else
+    /// would ever stop it. Re-deriving the work from the registry each tick makes
+    /// any interrupted drain finish on the next one. A relay that began its own
+    /// drain and has emptied is finished the same way, ahead of its own exit.
+    pub(super) async fn finish_drains(&mut self) {
+        let unretired: HashSet<RelayId> = match self.ledger.bound_unretired() {
+            Ok(bound) => bound.into_iter().map(|relay| relay.relay_id).collect(),
+            Err(error) => {
+                tracing::warn!(%error, "listing bound relays failed; skipping the drain sweep");
+                return;
+            }
+        };
+        for relay in registry::enrolled_relays(self.setup.registry()) {
+            if !relay.draining || !unretired.contains(&relay.relay_id) {
+                continue;
+            }
+            // A draining relay can gain no session, so a zero read here stays zero.
+            if self.setup.session_count_for_relay(relay.relay_id) != 0 {
+                continue;
+            }
+            tracing::info!(
+                relay_id = relay.relay_id.0,
+                "stopping a draining relay with no sessions left",
+            );
+            self.stop_and_retire(relay.relay_id).await;
         }
     }
 
@@ -171,11 +207,10 @@ impl<P: Provisioner> ProvisionLoop<P> {
     }
 
     /// Stops every task the provisioner still runs that no unretired ledger row
-    /// references and that this loop is not itself tracking as a pending launch — a
-    /// task the ledger lost track of (e.g. one that outlived a coordinator restart
-    /// that cleared the pending set) must not keep running unaccounted. A task the
-    /// loop just launched but has not recorded yet is spared: it is accounted for
-    /// even though the ledger does not reference it yet.
+    /// references — a task whose id was retired, or one launched without its task
+    /// ever reaching the ledger, must not keep running unaccounted. A launch is
+    /// referenced from the moment it returns (see `RelayLedger::record_launch`), so
+    /// one still coming up is never mistaken for an orphan.
     pub(super) async fn orphan_sweep(&mut self) {
         let tasks = match self.provisioner.list().await {
             Ok(tasks) => tasks,
@@ -184,16 +219,13 @@ impl<P: Provisioner> ProvisionLoop<P> {
                 return;
             }
         };
-        let mut accounted: HashSet<String> = match self.ledger.referenced_task_arns() {
+        let accounted: HashSet<String> = match self.ledger.referenced_task_arns() {
             Ok(arns) => arns.into_iter().collect(),
             Err(error) => {
                 tracing::warn!(%error, "listing referenced tasks failed; skipping the orphan sweep");
                 return;
             }
         };
-        for launch in &self.pending {
-            accounted.insert(launch.task.0.clone());
-        }
         for task in tasks {
             if !accounted.contains(&task.0) {
                 // An orphaned task has no ledger row, so no region is known for it.

@@ -35,8 +35,10 @@
 //! arrive backs off exponentially rather than relaunching forever); see
 //! [`ProvisionLoop::coverage_demand`].
 //!
-//! Then, fleet-wide, it sweeps: launches whose token expired before enrolling,
-//! bound ids whose relay vanished, and tasks the ledger no longer references.
+//! Then, fleet-wide, it sweeps: launches still coming up (polled until their
+//! addresses can be recorded), draining relays with no sessions left, launches
+//! whose token expired before enrolling, bound ids whose relay vanished, and tasks
+//! the ledger no longer references.
 //!
 //! # File map
 //!
@@ -45,8 +47,8 @@
 //!   idle tracking, coverage demand, and scale up/down.
 //! - `retirement` — max-age retirement: which relays have aged out, and the
 //!   make-before-break drain that replaces them.
-//! - `sweeps` — the fleet-wide sweeps `tick` runs after scaling: expired
-//!   launches, vanished tasks, and ledger orphans.
+//! - `sweeps` — the fleet-wide sweeps `tick` runs after scaling: launch polling,
+//!   unfinished drains, expired launches, vanished tasks, and ledger orphans.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
@@ -84,26 +86,6 @@ pub struct ProvisionConfig {
     /// new sessions and is replaced (see `ProvisionLoop::retire_aged`). `None`
     /// lets a busy relay run indefinitely.
     pub max_relay_age: Option<Duration>,
-}
-
-/// A launched task whose addresses have not been recorded yet — the loop polls it
-/// each tick until it reports running. `expects_public_ipv4` and `launched_at`
-/// gate that recording against a substrate whose task can report running with an
-/// address set that is still missing an address family it will carry once fully
-/// up (see [`PUBLIC_IPV4_WAIT_SECS`]).
-struct PendingLaunch {
-    /// The id the task runs as.
-    relay_id: RelayId,
-    /// The provisioner handle for the task.
-    task: TaskId,
-    /// Whether this launch's substrate is expected to eventually attach a public
-    /// IPv4 address to the task. When true, an address set reporting running
-    /// without one is treated as still incomplete rather than final.
-    expects_public_ipv4: bool,
-    /// When the task was launched (Unix seconds) — what
-    /// [`PUBLIC_IPV4_WAIT_SECS`] is measured from when deciding whether a
-    /// still-v4-less address set has waited long enough to record as-is.
-    launched_at: u64,
 }
 
 /// How long an address set missing an expected public IPv4 is treated as still
@@ -210,7 +192,10 @@ enum CoveragePhase {
 /// The reconcile loop. Owns the coordinator handles it reconciles over — the
 /// registry, session membership, the ledger, warm demand, and a provisioner —
 /// plus the loop-local memory a level-triggered pass needs across ticks: per-relay
-/// idle timers and the set of launched-but-not-yet-recorded tasks.
+/// idle timers and coverage backoff. Neither is load-bearing: losing it to a
+/// restart or an interrupted tick only delays a scale-down or re-probes a region.
+/// Anything whose loss would strand a task or a relay lives in the ledger or the
+/// registry instead.
 ///
 /// Generic over the [`Provisioner`] so it dispatches statically to whichever
 /// substrate it was built with; it never names a concrete one.
@@ -229,10 +214,6 @@ pub struct ProvisionLoop<P> {
     /// loop-local: a restart resets it, which only delays a scale-down by one grace
     /// period.
     idle_since: HashMap<RelayId, u64>,
-    /// Tasks launched this loop's lifetime whose addresses are not yet recorded.
-    /// Polled every tick until running. Also spares them from the orphan sweep —
-    /// they are accounted for even though the ledger does not reference them yet.
-    pending: Vec<PendingLaunch>,
     /// Per-region bootstrap tracking for coverage demand — attempt counts and
     /// backoff windows. Purely loop-local: a restart resets it, at worst re-probing
     /// a region one extra time.
@@ -256,18 +237,19 @@ impl<P: Provisioner> ProvisionLoop<P> {
             pair_rtts,
             provisioner,
             idle_since: HashMap::new(),
-            pending: Vec::new(),
             coverage: HashMap::new(),
         }
     }
 
     /// How many launches are still waiting for their address to be recorded —
     /// the observable a test drives to confirm a launch is in flight (credited
-    /// against target, spared from the orphan sweep) without reaching into the
-    /// private `pending` field.
+    /// against target, spared from the orphan sweep).
     #[cfg(test)]
     pub(crate) fn pending_launches(&self) -> usize {
-        self.pending.len()
+        self.ledger
+            .unrecorded_launches()
+            .expect("the in-memory ledger reads")
+            .len()
     }
 
     /// Runs the loop forever, ticking on the configured interval. A tick is skipped
@@ -371,6 +353,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
         }
 
         self.resolve_pending(now).await;
+        self.finish_drains().await;
         self.launch_deadline_sweep(now).await;
         self.vanished_task_sweep().await;
         self.orphan_sweep().await;

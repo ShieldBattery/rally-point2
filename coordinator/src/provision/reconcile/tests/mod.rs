@@ -38,8 +38,9 @@ struct FakeState {
     fail_state: bool,
     fail_stop: bool,
     fail_list: bool,
-    /// Makes the next `list` call panic instead of answering, then clears.
-    panic_next_list: bool,
+    /// Makes the next call of this method (`"state"`, `"stop"` or `"list"`)
+    /// panic instead of answering, then clears.
+    panic_next: Option<&'static str>,
     /// How many `list` calls have been made, including one that panicked.
     list_calls: usize,
     /// What [`Provisioner::expects_public_ipv4`] reports for every region.
@@ -68,7 +69,7 @@ impl FakeProvisioner {
                 fail_state: false,
                 fail_stop: false,
                 fail_list: false,
-                panic_next_list: false,
+                panic_next: None,
                 list_calls: 0,
                 expects_public_ipv4: false,
             }),
@@ -101,8 +102,10 @@ impl FakeProvisioner {
         self.state.lock().fail_list = fail;
     }
 
-    fn panic_next_list(&self) {
-        self.state.lock().panic_next_list = true;
+    /// Makes the next call of `method` (`"state"`, `"stop"` or `"list"`) panic, the
+    /// way a bug deep in a substrate call would unwind out of the middle of a tick.
+    fn panic_next(&self, method: &'static str) {
+        self.state.lock().panic_next = Some(method);
     }
 
     fn list_calls(&self) -> usize {
@@ -137,7 +140,7 @@ impl Provisioner for FakeProvisioner {
     }
 
     async fn state(&self, task: &TaskId) -> Result<TaskState, ProvisionError> {
-        let state = self.state.lock();
+        let state = panic_if_scripted(self.state.lock(), "state");
         if state.fail_state {
             return Err(ProvisionError::Backend("state failed".into()));
         }
@@ -149,7 +152,7 @@ impl Provisioner for FakeProvisioner {
     }
 
     async fn stop(&self, task: &TaskId) -> Result<(), ProvisionError> {
-        let mut state = self.state.lock();
+        let mut state = panic_if_scripted(self.state.lock(), "stop");
         if state.fail_stop {
             return Err(ProvisionError::Backend("stop failed".into()));
         }
@@ -161,10 +164,7 @@ impl Provisioner for FakeProvisioner {
     async fn list(&self) -> Result<Vec<TaskId>, ProvisionError> {
         let mut state = self.state.lock();
         state.list_calls += 1;
-        if std::mem::take(&mut state.panic_next_list) {
-            drop(state);
-            panic!("scripted list panic");
-        }
+        let state = panic_if_scripted(state, "list");
         if state.fail_list {
             return Err(ProvisionError::Backend("list failed".into()));
         }
@@ -179,6 +179,20 @@ impl Provisioner for FakeProvisioner {
     fn expects_public_ipv4(&self, _region: Option<&RegionId>) -> bool {
         self.state.lock().expects_public_ipv4
     }
+}
+
+/// Panics, releasing the lock first, when `method` is the one scripted to panic
+/// next; otherwise hands the guard back.
+fn panic_if_scripted<'a>(
+    mut state: parking_lot::MutexGuard<'a, FakeState>,
+    method: &'static str,
+) -> parking_lot::MutexGuard<'a, FakeState> {
+    if state.panic_next == Some(method) {
+        state.panic_next = None;
+        drop(state);
+        panic!("scripted {method} panic");
+    }
+    state
 }
 
 /// How many launches the fake provisioner has recorded for `region` so far —
@@ -266,6 +280,30 @@ impl Harness {
             hello(minted.relay_id.0, 14_900 + minted.relay_id.0 as u16).with_region(region.clone()),
         );
         (minted.relay_id, generation)
+    }
+
+    /// Runs a tick at `now` that is expected to unwind out of the middle (the fake
+    /// was scripted to panic), the way `ProvisionLoop::run` catches it, and asserts
+    /// that it did.
+    async fn tick_panicking(&mut self, now: u64) {
+        use futures_util::FutureExt;
+        let outcome = std::panic::AssertUnwindSafe(self.provision.tick(now))
+            .catch_unwind()
+            .await;
+        assert!(outcome.is_err(), "the scripted panic fired mid-tick");
+    }
+
+    /// Replaces the loop with a fresh one over the same handles, as a coordinator
+    /// restart would: everything loop-local is gone, the ledger and registry are not.
+    fn restart_loop(&mut self) {
+        self.provision = ProvisionLoop::new(
+            self.provision.config.clone(),
+            self.setup.clone(),
+            self.ledger.clone(),
+            self.warm.clone(),
+            self.pair_rtts.clone(),
+            self.fake.clone(),
+        );
     }
 
     /// The common single-region rig every scaling/sweep test that doesn't care

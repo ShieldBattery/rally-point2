@@ -20,8 +20,8 @@ async fn scale_up_mints_launches_and_records_once_running() {
     // The running task's address was recorded against the minted id.
     let minted_id = launches[0].relay_id;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
-        Some("task-0".to_owned()),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
+        Some(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 15_000))]),
         "the launched task is recorded once it reports running",
     );
     // Still launching (unbound) — one in-flight launch credited against target.
@@ -62,7 +62,7 @@ async fn a_starting_task_is_recorded_once_it_reports_running() {
     h.provision.tick(1_000).await;
     let minted_id = h.fake.launches()[0].relay_id;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
         None,
         "a still-starting task is not yet recorded",
     );
@@ -71,8 +71,8 @@ async fn a_starting_task_is_recorded_once_it_reports_running() {
     h.fake.set_task_state("task-0", running());
     h.provision.tick(1_005).await;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
-        Some("task-0".to_owned()),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
+        Some(vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 15_000))]),
     );
     assert_eq!(
         h.provision.pending_launches(),
@@ -97,7 +97,7 @@ async fn a_v6_only_running_state_stays_pending_until_the_public_ipv4_appears() {
     h.provision.tick(1_000).await;
     let minted_id = h.fake.launches()[0].relay_id;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
         None,
         "a v6-only address set is not recorded while the public IPv4 may still appear",
     );
@@ -116,8 +116,8 @@ async fn a_v6_only_running_state_stays_pending_until_the_public_ipv4_appears() {
     );
     h.provision.tick(1_010).await;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
-        Some("task-0".to_owned()),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
+        Some(vec![v6_addr, v4_addr]),
         "once the v4 association appears the dual-stack set is recorded",
     );
     assert_eq!(
@@ -148,7 +148,7 @@ async fn a_v6_only_running_state_is_recorded_once_the_wait_lapses() {
     h.provision.tick(1_000).await;
     let minted_id = h.fake.launches()[0].relay_id;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
         None,
         "still within the wait, the v6-only set is not yet recorded",
     );
@@ -158,8 +158,8 @@ async fn a_v6_only_running_state_is_recorded_once_the_wait_lapses() {
     // forever.
     h.provision.tick(1_000 + PUBLIC_IPV4_WAIT_SECS + 1).await;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
-        Some("task-0".to_owned()),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
+        Some(vec![v6_addr]),
         "past the wait the v6-only set is recorded rather than blocked forever",
     );
 }
@@ -181,8 +181,8 @@ async fn a_v6_only_running_state_is_recorded_immediately_when_ipv4_is_not_expect
     h.provision.tick(1_000).await;
     let minted_id = h.fake.launches()[0].relay_id;
     assert_eq!(
-        h.ledger.task_arn(minted_id).unwrap(),
-        Some("task-0".to_owned()),
+        h.ledger.advertised_addrs(minted_id).unwrap(),
+        Some(vec![v6_addr]),
         "a v6-only deployment records immediately when no public IPv4 is expected",
     );
 }
