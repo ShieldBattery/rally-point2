@@ -16,7 +16,7 @@
 //!   whole turn is refused. This is also where save/load lands: they're real
 //!   multiplayer commands, but ShieldBattery deliberately doesn't support saving
 //!   or loading games (see below), so the table doesn't model them.
-//! - **strips commands a live client turn shouldn't carry** — two kinds.
+//! - **strips commands a live client turn shouldn't carry** — three kinds.
 //!   *Relay-owned pacing* (added-latency, set/dynamic turn-rate) must change on
 //!   the same turn for every player, so the relay — the one vantage point that
 //!   sees all the links — decides it and originates it on its outbound fan-out; an
@@ -24,7 +24,9 @@
 //!   *Replay-playback* commands (set-speed, seek, the leave marker) only mean
 //!   something while a replay plays. This is an *ingress* rule: the relay-
 //!   originated pacing copies going back out aren't stripped, and a replay session
-//!   (below) keeps the playback commands.
+//!   (below) keeps the playback commands. *Out-of-range hotkeys* name a
+//!   selection group past the last one SC:R keeps, which its handler writes
+//!   into the next player's groups instead of rejecting.
 //!
 //! Three things are deliberately out of scope here:
 //!
@@ -76,11 +78,26 @@ const RELAY_OWNED_PACING: [u8; 3] = [0x55, 0x5f, 0x66];
 /// turns keep stripping them.
 const REPLAY_ONLY: [u8; 3] = [0x56, 0x5d, 0x57];
 
-/// Whether `opcode` must be stripped from a live-game client turn: a relay-owned
-/// pacing control or a replay-playback command. Neither belongs in a live turn,
-/// though for different reasons (see each set).
-fn is_stripped_from_live_turn(opcode: u8) -> bool {
-    RELAY_OWNED_PACING.contains(&opcode) || REPLAY_ONLY.contains(&opcode)
+/// The selection hotkey command (`0x13`): an action byte (assign, recall, add)
+/// and the group it acts on.
+const HOTKEY: u8 = 0x13;
+
+/// Selection groups SC:R keeps per player: 0-9 for the number keys and 10-17
+/// for its history of recent selections, which an Alt+click recalls. Its hotkey
+/// handler accepts group 18 too, and the write lands in the next player's
+/// group 0. No honest client sends a group past 17.
+const SELECTION_GROUPS: u8 = 18;
+
+/// Whether `command` must be stripped from a live-game client turn: a relay-owned
+/// pacing control, a replay-playback command, or a hotkey naming a group SC:R
+/// doesn't keep. None of them belongs in a live turn, though for different
+/// reasons (see each).
+fn is_stripped_from_live_turn(command: &[u8]) -> bool {
+    match command {
+        [HOTKEY, _, group, ..] => *group >= SELECTION_GROUPS,
+        [opcode, ..] => RELAY_OWNED_PACING.contains(opcode) || REPLAY_ONLY.contains(opcode),
+        [] => false,
+    }
 }
 
 /// A client turn that passed validation: the sanitized payload to forward, plus
@@ -89,16 +106,17 @@ fn is_stripped_from_live_turn(opcode: u8) -> bool {
 pub struct ValidatedTurn {
     /// The payload to fan out. Its `slot` is bound to the authorized slot (never
     /// the client-sent value), its `commands` are the client's bytes with the
-    /// commands a live turn shouldn't carry (relay-owned pacing and
-    /// replay-playback) removed, and its `seq` is the client's origin identity —
-    /// preserved verbatim. The seq is the turn's identity across the whole mesh:
-    /// assigned by the sending client and honored by every hop, so the relay
-    /// forwards it untouched rather than restamping.
+    /// commands a live turn shouldn't carry (relay-owned pacing,
+    /// replay-playback, out-of-range hotkeys) removed, and its `seq` is the
+    /// client's origin identity — preserved verbatim. The seq is the turn's
+    /// identity across the whole mesh: assigned by the sending client and
+    /// honored by every hop, so the relay forwards it untouched rather than
+    /// restamping.
     pub payload: Payload,
-    /// How many commands were stripped — relay-owned pacing or replay-playback.
-    /// Non-zero means the client emitted something a live turn has no business
-    /// carrying, a signal worth recording for abuse attribution even though the
-    /// turn itself is salvaged.
+    /// How many commands were stripped — relay-owned pacing, replay-playback, or
+    /// out-of-range hotkeys. Non-zero means the client emitted something a live
+    /// turn has no business carrying, a signal worth recording for abuse
+    /// attribution even though the turn itself is salvaged.
     pub stripped_control: u32,
 }
 
@@ -127,10 +145,11 @@ pub enum ValidationError {
 /// — assigned by the sending client and preserved end-to-end. On success the
 /// returned [`ValidatedTurn`] holds a payload safe to forward: bound to `slot`,
 /// the client's `seq` preserved verbatim, every command length-checked, and the
-/// commands a live turn shouldn't carry (relay-owned pacing, replay-playback)
-/// stripped. An empty command stream (a bare turn signal, or a turn that stripped
-/// down to nothing) is valid and yields an empty payload. When nothing needs
-/// stripping, validation reuses the decoded command buffer without copying it.
+/// commands a live turn shouldn't carry (relay-owned pacing, replay-playback,
+/// out-of-range hotkeys) stripped. An empty command stream (a bare turn signal,
+/// or a turn that stripped down to nothing) is valid and yields an empty
+/// payload. When nothing needs stripping, validation reuses the decoded command
+/// buffer without copying it.
 ///
 /// `payload.game_frame_count` is the consensus coordinate — which simulated
 /// step the turn belongs to. Like `payload.seq`, it is preserved verbatim across
@@ -171,7 +190,7 @@ pub fn validate_turn(slot: SlotId, mut payload: Payload) -> Result<ValidatedTurn
             .get(..length)
             .ok_or(ValidationError::Truncated { offset, opcode })?;
 
-        if is_stripped_from_live_turn(opcode) {
+        if is_stripped_from_live_turn(command) {
             stripped_control += 1;
             if forwarded.is_none() {
                 let mut sanitized = Vec::with_capacity(commands.len());
@@ -428,6 +447,31 @@ mod tests {
             assert!(turn.payload.commands.is_empty(), "{control:?} not stripped");
             assert_eq!(turn.stripped_control, 1);
         }
+    }
+
+    #[test]
+    fn strips_hotkeys_past_the_last_selection_group() {
+        // Hotkey (0x13, 3): action, group. Groups 0-17 exist; SC:R's handler
+        // also takes 18, writing it into the next player's group 0.
+        for group in [18u8, 19, 0xff] {
+            for action in [0u8, 1, 2] {
+                let turn = validated(&[0x13, action, group]);
+                assert!(
+                    turn.payload.commands.is_empty(),
+                    "group {group} not stripped"
+                );
+                assert_eq!(turn.stripped_control, 1);
+            }
+        }
+        // The number-key groups and the selection history pass through.
+        let kept = [0x13, 0x01, 0x00, 0x13, 0x01, 0x0e, 0x13, 0x00, 0x11];
+        let turn = validated(&kept);
+        assert_eq!(&turn.payload.commands[..], &kept[..]);
+        assert_eq!(turn.stripped_control, 0);
+        // Only the bad command goes; its neighbors are forwarded in order.
+        let turn = validated(&[0x13, 0x01, 0x02, 0x13, 0x00, 0x12, 0x05]);
+        assert_eq!(&turn.payload.commands[..], &[0x13, 0x01, 0x02, 0x05]);
+        assert_eq!(turn.stripped_control, 1);
     }
 
     #[test]
