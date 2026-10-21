@@ -115,6 +115,10 @@ pub(super) struct EnrollContext<'a> {
     regions: &'a RegionsConfig,
     ledger: Option<&'a RelayLedger>,
     peer_ip: Option<IpAddr>,
+    /// Test seam: runs after the ledger authorizes an enroll and before the
+    /// registry insert, so a test can land a retirement exactly there.
+    #[cfg(test)]
+    after_authorize: Option<Box<dyn Fn() + Send + Sync + 'a>>,
 }
 
 impl<'a> EnrollContext<'a> {
@@ -134,7 +138,16 @@ impl<'a> EnrollContext<'a> {
             regions,
             ledger,
             peer_ip,
+            #[cfg(test)]
+            after_authorize: None,
         }
+    }
+
+    /// Installs the `after_authorize` test seam.
+    #[cfg(test)]
+    pub(super) fn with_after_authorize(mut self, seam: impl Fn() + Send + Sync + 'a) -> Self {
+        self.after_authorize = Some(Box::new(seam));
+        self
     }
 }
 
@@ -401,6 +414,11 @@ impl<'a> EnrollHandshake<'a> {
             }
         }
 
+        #[cfg(test)]
+        if let Some(seam) = &self.ctx.after_authorize {
+            seam();
+        }
+
         match self.enroll(hello, relay_id, &relay_region, negotiated, cold_start_secs) {
             Ok(generation) => EnrollStep::Enrolled(Enrolled {
                 relay_id,
@@ -458,6 +476,26 @@ impl<'a> EnrollHandshake<'a> {
         // it internally.
         let (enroll_result, evict) = {
             let _assign = setup.lock_assignment();
+            // The reconcile loop tombstones an id under this same lock before it
+            // stops the relay's task, as the terminal step of a drain. The ledger
+            // authorization above ran outside the lock, so a reconnect it admitted
+            // can reach here after the tombstone; installing it would hand the drain
+            // a placeable relay it is about to stop. Re-read it here, where the
+            // insert lands.
+            if let Some(ledger) = self.ctx.ledger {
+                let retired = ledger.is_retired(relay_id);
+                if !matches!(retired, Ok(false)) {
+                    tracing::warn!(
+                        relay_id = relay_id.0,
+                        ?retired,
+                        "refusing relay control connection: the id was retired during enrollment",
+                    );
+                    return Err(ControlClose {
+                        code: CONTROL_CLOSE_ENROLL_UNAUTHORIZED,
+                        reason: "enrollment not authorized for this relay id".to_owned(),
+                    });
+                }
+            }
             let result =
                 lifecycle.enroll_relay_epoch(relay_id, || registry::try_enroll(registry, hello));
             // Whether this is the process that was here before, or a new one whose

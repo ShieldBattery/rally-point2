@@ -310,6 +310,25 @@ impl Harness {
         assert!(outcome.is_err(), "the scripted panic fired mid-tick");
     }
 
+    /// Arms the next `stop` to record which seeded relay (`task-live-<id>`) it is
+    /// stopping and whether that id was already retired in the ledger at that
+    /// moment. A drain must commit the tombstone under the assignment lock before
+    /// it stops anything, so this must read `true` for every drain path.
+    fn observe_tombstone_at_next_stop(&self) -> Arc<Mutex<Option<(RelayId, bool)>>> {
+        let observed = Arc::new(Mutex::new(None));
+        let observed_in_hook = observed.clone();
+        let ledger = self.ledger.clone();
+        self.fake.during_next_stop(move |task| {
+            let id = RelayId(
+                task.strip_prefix("task-live-")
+                    .and_then(|id| id.parse().ok())
+                    .expect("a seeded relay's task"),
+            );
+            *observed_in_hook.lock() = Some((id, ledger.is_retired(id).unwrap()));
+        });
+        observed
+    }
+
     /// Replaces the loop with a fresh one over the same handles, as a coordinator
     /// restart would: everything loop-local is gone, the ledger and registry are not.
     fn restart_loop(&mut self) {

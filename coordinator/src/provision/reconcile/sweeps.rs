@@ -140,8 +140,10 @@ impl<P: Provisioner> ProvisionLoop<P> {
     /// later candidate comes up it may have reconnected: the new enrollment starts
     /// undrained and can take sessions. Each one is therefore re-checked under the
     /// assignment lock, as draining under the snapshot's generation with no
-    /// sessions, immediately before its stop. A superseded enrollment is skipped;
-    /// if it still needs draining, the next tick decides that afresh.
+    /// sessions, and tombstoned in the same hold (see `tombstone_locked`), so no
+    /// reconnect can make it placeable between the check and its stop. A
+    /// superseded enrollment is skipped; if it still needs draining, the next tick
+    /// decides that afresh.
     pub(super) async fn finish_drains(&mut self) {
         let unretired: HashSet<RelayId> = match self.ledger.bound_unretired() {
             Ok(bound) => bound.into_iter().map(|relay| relay.relay_id).collect(),
@@ -155,13 +157,10 @@ impl<P: Provisioner> ProvisionLoop<P> {
                 continue;
             }
             let idle = {
-                // Placement and enrollment both hold this lock, so neither can land
-                // between the check and the release. A relay confirmed draining here
-                // can gain no session before the stop below, which follows with no
-                // await in between.
                 let _assignment = self.setup.lock_assignment();
                 registry::is_draining_at(self.setup.registry(), relay.relay_id, relay.generation)
                     && self.setup.session_count_for_relay(relay.relay_id) == 0
+                    && self.tombstone_locked(relay.relay_id)
             };
             if !idle {
                 continue;
@@ -170,7 +169,7 @@ impl<P: Provisioner> ProvisionLoop<P> {
                 relay_id = relay.relay_id.0,
                 "stopping a draining relay with no sessions left",
             );
-            self.stop_and_retire(relay.relay_id).await;
+            self.stop_retired(relay.relay_id).await;
         }
     }
 

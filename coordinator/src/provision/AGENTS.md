@@ -47,6 +47,14 @@ requires the region to still be over target, and `finish_drains` requires the
 relay to still be draining under the snapshot's generation (a reconnect installs
 an undrained enrollment) with no sessions. A new drain path must do the same.
 
+Releasing the lock is the race boundary, not an await: other runtime workers can
+enroll or place the instant it drops. So every drain commits in the same hold as
+its check, through `tombstone_locked` (ledger retirement + forgetting the relay),
+and only then stops the task outside the lock. Enrollment re-reads the tombstone
+under the lock at the registry insert (`control_enroll`), so even a reconnect the
+ledger authorized just before the commit can't get back in. Never stop a relay
+whose id isn't already retired.
+
 ## Coverage backoff
 A region demands one relay per uncovered pair for `COVERAGE_HOLD_SECS`; still
 uncovered when that lapses is a failed attempt, doubling the backoff
@@ -68,7 +76,9 @@ stall signal.
 Continuing after a panic is only sound because a tick can stop at any await
 without stranding anything: every piece of work is re-derived from the ledger
 and registry on the next tick (launches still coming up from
-`unrecorded_launches`, interrupted drains from `finish_drains`). Loop-local
+`unrecorded_launches`; a drain committed but never stopped from the orphan sweep,
+since its retired id no longer references the task; a relay left draining but
+uncommitted from `finish_drains`). Loop-local
 state (`idle_since`, `coverage`) may only hold what is safe to lose. A new step
 that half-applies a change across an await must leave behind something the next
 tick finds and finishes; test it by panicking the provisioner mid-step.

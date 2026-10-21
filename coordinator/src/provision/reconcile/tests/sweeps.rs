@@ -261,28 +261,47 @@ async fn a_restarted_loop_keeps_polling_a_launch_it_did_not_start() {
 async fn a_drain_whose_stop_panicked_is_finished_on_the_next_tick() {
     let (mut h, east) = Harness::with_grace(5);
     let (id, _generation) = h.seed_live_relay(&east, 1_000);
+    let task = format!("task-live-{}", id.0);
+    h.fake.set_task_state(&task, running());
 
     // No warm demand, so the idle relay is over target. The first tick starts its
-    // idle timer; the second, past the grace, marks it draining and then its stop
-    // unwinds out of the tick before the id is retired.
+    // idle timer; the second, past the grace, commits the drain (the id is retired
+    // under the assignment lock) and then its stop unwinds out of the tick.
     h.provision.tick(1_000).await;
     h.fake.panic_next("stop");
     h.tick_panicking(1_010).await;
     assert!(h.fake.stops().is_empty());
-    let unretired = |h: &Harness| {
-        h.ledger
-            .bound_unretired()
-            .unwrap()
-            .iter()
-            .any(|relay| relay.relay_id == id)
-    };
-    assert!(unretired(&h), "the interrupted drain left the id unretired");
+    assert!(
+        h.ledger.is_retired(id).unwrap(),
+        "the drain was committed before its stop"
+    );
 
-    // The relay is still enrolled and marked draining, so scale-down skips it. The
-    // next tick must finish the drain anyway.
+    // The retired id no longer references the still-running task, so the next
+    // tick's orphan sweep stops it.
     h.provision.tick(1_011).await;
-    assert_eq!(h.fake.stops(), vec![format!("task-live-{}", id.0)]);
-    assert!(!unretired(&h), "the finished drain retired the id");
+    assert_eq!(h.fake.stops(), vec![task]);
+}
+
+#[tokio::test]
+async fn a_scale_down_tombstones_the_relay_before_stopping_it() {
+    let (mut h, east) = Harness::with_grace(5);
+    let (id, _generation) = h.seed_live_relay(&east, 1_000);
+    h.provision.tick(1_000).await;
+
+    let observed = h.observe_tombstone_at_next_stop();
+    h.provision.tick(1_010).await;
+    assert_eq!(*observed.lock(), Some((id, true)));
+}
+
+#[tokio::test]
+async fn an_unfinished_drain_tombstones_the_relay_before_stopping_it() {
+    let (mut h, east) = Harness::default_region();
+    let (id, generation) = h.seed_live_relay(&east, 1_000);
+    assert!(registry::mark_draining(h.setup.registry(), id, generation));
+
+    let observed = h.observe_tombstone_at_next_stop();
+    h.provision.tick(1_000).await;
+    assert_eq!(*observed.lock(), Some((id, true)));
 }
 
 #[tokio::test]

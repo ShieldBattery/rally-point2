@@ -390,6 +390,22 @@ impl RelayLedger {
         )?;
         Ok(())
     }
+
+    /// Whether `relay_id` carries a retirement tombstone. Enrollment re-reads this
+    /// under the assignment lock at the moment it inserts into the registry: a
+    /// reconnect authorized just before a drain tombstoned the id must still not
+    /// get back in.
+    pub fn is_retired(&self, relay_id: RelayId) -> Result<bool, LedgerError> {
+        let conn = self.conn.lock();
+        let retired: Option<bool> = conn
+            .query_row(
+                "SELECT retired_at IS NOT NULL FROM provisioned_relays WHERE relay_id = ?1",
+                params![as_i64(relay_id.0)],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(retired.unwrap_or(false))
+    }
 }
 
 impl RelayLedger {

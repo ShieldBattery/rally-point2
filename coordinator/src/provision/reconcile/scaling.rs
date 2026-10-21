@@ -274,15 +274,14 @@ impl<P: Provisioner> ProvisionLoop<P> {
         }
     }
 
-    /// Drains one relay, closing the placement race. Marks it draining and
-    /// re-checks its session count under the assignment lock, so the mark and the
-    /// check are mutually exclusive with any session-create commit: a session that
-    /// raced the mark is either seen here (the relay is spared and un-marked) or was
-    /// blocked until the mark was visible (so it never placed on the relay). Only
-    /// then, with the relay already ineligible for new placement and confirmed
-    /// session-free, does it stop the task and retire the id — outside the lock,
-    /// since stopping awaits the task's death. Returns whether the relay was
-    /// drained.
+    /// Drains one relay, closing the placement race. Under the assignment lock it
+    /// marks the relay draining, re-checks its session count, and tombstones its
+    /// id (see [`tombstone_locked`](Self::tombstone_locked)). Placement and
+    /// enrollment take the same lock, so a session that raced the mark is either
+    /// seen here (the relay is spared and un-marked) or was blocked until the mark
+    /// was visible, and once the tombstone is written no reconnect can make the
+    /// relay placeable again. Only then does it stop the task, outside the lock,
+    /// since stopping awaits the provisioner. Returns whether the relay was drained.
     ///
     /// Under the same lock it first re-counts `region`'s placeable relays from the
     /// live registry and refuses to go below `target`. The caller's count comes
@@ -305,8 +304,11 @@ impl<P: Provisioner> ProvisionLoop<P> {
             } else if !registry::mark_draining(self.setup.registry(), relay_id, generation) {
                 // The relay reconnected or left between selection and the mark.
                 false
-            } else if self.setup.session_count_for_relay(relay_id) != 0 {
-                // A session landed in the placement race: spare the relay.
+            } else if self.setup.session_count_for_relay(relay_id) != 0
+                || !self.tombstone_locked(relay_id)
+            {
+                // A session landed in the placement race, or the id could not be
+                // tombstoned: spare the relay.
                 registry::clear_draining(self.setup.registry(), relay_id, generation);
                 false
             } else {
@@ -316,42 +318,63 @@ impl<P: Provisioner> ProvisionLoop<P> {
         if !proceed {
             return false;
         }
-        self.stop_and_retire(relay_id).await;
+        self.stop_retired(relay_id).await;
         true
     }
 
-    /// Stops a drained relay's task and retires its id, forgetting its idle timer.
-    /// The caller has already marked the relay draining and confirmed it
-    /// session-free under the assignment lock. Each step is logged and skipped on
-    /// failure rather than aborting: a task that failed to stop is caught by the
-    /// orphan sweep once its id is retired.
-    pub(super) async fn stop_and_retire(&mut self, relay_id: RelayId) {
+    /// Retires `relay_id`: the commit point of every drain, after which the relay
+    /// can never take another session. Call it only while holding the assignment
+    /// lock, having just confirmed under that hold that the relay is draining and
+    /// session-free. Placement and enrollment take the same lock, and enrollment
+    /// refuses a tombstoned id, so once this returns `true` no reconnect (even one
+    /// the ledger authorized a moment earlier) can install a placeable entry, and
+    /// the stop that follows outside the lock cannot catch a game. Forgetting the
+    /// relay here too closes its control connection as retired, so all that is
+    /// left for after the lock is stopping the task, which the orphan sweep redoes
+    /// if it never happens. On `false` (the ledger write failed) the relay must be
+    /// left running.
+    pub(super) fn tombstone_locked(&self, relay_id: RelayId) -> bool {
+        match self.retire_relay(relay_id) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    relay_id = relay_id.0,
+                    %error,
+                    "tombstoning a drained relay failed; leaving it running for now",
+                );
+                false
+            }
+        }
+    }
+
+    /// The half of a drain that runs after the lock: stops a retired relay's task
+    /// and drops its idle timer. A task that failed to stop, or that a panic kept
+    /// this from reaching, is caught by the orphan sweep, since a retired id no
+    /// longer references its task.
+    pub(super) async fn stop_retired(&mut self, relay_id: RelayId) {
         match self.ledger.task_arn(relay_id) {
             Ok(Some(arn)) => {
                 if let Err(error) = self.provisioner.stop(&TaskId(arn)).await {
                     tracing::warn!(
                         relay_id = relay_id.0,
                         %error,
-                        "stopping a drained relay's task failed; retiring the id anyway",
+                        "stopping a drained relay's task failed; the orphan sweep will retry",
                     );
                 }
             }
             Ok(None) => {
                 tracing::warn!(
                     relay_id = relay_id.0,
-                    "draining a relay with no recorded task; retiring the id only",
+                    "a drained relay has no recorded task"
                 );
             }
             Err(error) => {
                 tracing::warn!(
                     relay_id = relay_id.0,
                     %error,
-                    "reading a drained relay's task failed; retiring the id anyway",
+                    "reading a drained relay's task failed; the orphan sweep will stop it",
                 );
             }
-        }
-        if let Err(error) = self.retire_relay(relay_id) {
-            tracing::warn!(relay_id = relay_id.0, %error, "retiring a drained relay failed");
         }
         self.idle_since.remove(&relay_id);
     }

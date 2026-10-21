@@ -297,6 +297,35 @@ fn a_ledger_refusal_lands_after_the_permit_drops_and_before_the_registry() {
 }
 
 #[test]
+fn an_id_retired_after_authorization_is_refused_at_the_registry_insert() {
+    let setup = relayless_setup();
+    let lifecycle = Lifecycle::new(setup.clone());
+    let regions = RegionsConfig::default();
+    let ledger = RelayLedger::open(Path::new(":memory:")).expect("an in-memory ledger opens");
+    let minted = ledger.mint(None, Duration::from_secs(300)).unwrap();
+    let relay_id = minted.relay_id;
+    // The ledger authorizes this enroll, then a drain tombstones the id before the
+    // registry insert, the way the reconcile loop can between its own steps.
+    let context = EnrollContext::new(&setup, &lifecycle, &regions, Some(&ledger), None)
+        .with_after_authorize(|| ledger.retire(relay_id).unwrap());
+    let gate = Arc::new(Semaphore::new(1));
+    let mut handshake = EnrollHandshake::start(&context, &gate).unwrap();
+
+    let relay = RelayIdentity::generate();
+    let mut hello = relay.hello(relay_id.0);
+    hello.enroll_token = Some(minted.token);
+    let nonce = challenge_nonce(handshake.offer(Some(RelayToCoordinator::Hello(hello))));
+    let close = refusal(handshake.offer(Some(relay.proof(&nonce))));
+
+    assert_eq!(close.code, CONTROL_CLOSE_ENROLL_UNAUTHORIZED);
+    assert_eq!(
+        enrolled_count(&setup),
+        0,
+        "a retired id never gets back into the registry",
+    );
+}
+
+#[test]
 fn a_second_certificate_claiming_a_live_relay_id_is_refused_as_a_duplicate() {
     let setup = relayless_setup();
     let lifecycle = Lifecycle::new(setup.clone());

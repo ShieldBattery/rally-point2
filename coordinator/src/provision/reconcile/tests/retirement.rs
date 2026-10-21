@@ -133,6 +133,21 @@ async fn an_aged_relay_keeps_serving_until_its_replacement_enrolls() {
 }
 
 #[tokio::test]
+async fn an_idle_aged_relay_is_tombstoned_before_its_task_is_stopped() {
+    let (mut h, east) = with_max_age(600);
+    let (old, _) = h.seed_live_relay(&east, 1_000);
+    h.warm
+        .warm_at(east.clone(), Duration::from_secs(200_000), 1_000);
+    let t = aged_at(old, 1_000);
+    h.provision.tick(t).await;
+    enroll_launched(&h, 0, &east, t + 1);
+
+    let observed = h.observe_tombstone_at_next_stop();
+    h.provision.tick(t + 5).await;
+    assert_eq!(*observed.lock(), Some((old, true)));
+}
+
+#[tokio::test]
 async fn a_busy_aged_relay_takes_no_new_sessions_and_stops_once_they_end() {
     let (mut h, east) = with_max_age(600);
     let (old, _) = h.seed_live_relay(&east, 1_000);
