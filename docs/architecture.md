@@ -456,9 +456,12 @@ sessions. A missing/invalid signature, a stale timestamp, or an unenrolled tenan
 per-`(tenant, session)` rate limit `429`s a caller that re-asks too fast. Because the session lookup is
 tenant-keyed, a `session` owned by another tenant simply finds no serving set and returns `unavailable`,
 leaking nothing. The decision: a relay **still enrolled *and* still in this session's serving set** → `stay`
-(the coordinator overrules a genuine false alarm); **dead** → move the whole group to a replacement — a live
-relay already serving the session (earliest in the authority order) if one exists, else the lowest-id live
-relay, else `unavailable` — updating the serving set (which is also the descriptors' authority order) in place,
+(the coordinator overrules a genuine false alarm); **dead** → move the whole group to a replacement — the live
+relay nearest the dead relay's region by backbone round-trip (one in that region first), with a relay already
+serving the session winning when it is within a small margin of the nearest; when nothing can be ranked (an
+untagged dead relay, no pair data), a live relay already serving the session (earliest in the authority order),
+else the lowest-id live relay; else `unavailable` — updating the serving set (which is also the descriptors'
+authority order) in place,
 rebuilding every serving relay's descriptor as **resumed**, and pushing R_new's first so it is staged before
 the response returns (the client's backoff absorbs the residual descriptor/dial race). The response is
 snake_case `{ "decision", "relay"? }`, where `relay` (present only when `decision` is `newTarget`) is

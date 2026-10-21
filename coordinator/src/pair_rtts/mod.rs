@@ -319,6 +319,32 @@ impl PairRttStore {
         rows
     }
 
+    /// The served round-trip from `region` to every other region it has a stored pair
+    /// with, keyed by the other region, taken in one locked pass. Each value is the
+    /// same one [`snapshot`](Self::snapshot) serves for the pair: the average of its
+    /// present directions, so a pair only the far end has measured still answers.
+    /// Values carry no age cutoff: backbone round-trips are set by geography and
+    /// routing and stay stable for days, and relays deliberately re-measure only once
+    /// per lifetime, so an old value is the expected state, not a suspect one.
+    pub fn rtts_from(&self, region: &RegionId) -> HashMap<RegionId, u32> {
+        let pairs = self.pairs.lock();
+        pairs
+            .iter()
+            .filter_map(|((a, b), directions)| {
+                let other = if a == region {
+                    b
+                } else if b == region {
+                    a
+                } else {
+                    return None;
+                };
+                directions
+                    .served()
+                    .map(|served| (other.clone(), served.rtt_ms))
+            })
+            .collect()
+    }
+
     /// The set of region pairs that currently hold a value in at least one direction,
     /// as canonical keys (`a <= b`). The reconcile loop's coverage bootstrap diffs
     /// this against the configured region pairs to find backbone links still lacking

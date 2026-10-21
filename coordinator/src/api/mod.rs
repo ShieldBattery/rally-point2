@@ -84,7 +84,7 @@ use crate::attest::LOAD_STATE_ATTEST_TIMEOUT;
 use crate::flight_store::S3FlightStore;
 use crate::ledger::RelayLedger;
 use crate::lifecycle::Lifecycle;
-use crate::pair_rtts::{self, PairRttStore};
+use crate::pair_rtts::PairRttStore;
 use crate::persist::SessionStore;
 use crate::regions::RegionsConfig;
 use crate::session::SessionSetup;
@@ -318,6 +318,9 @@ impl CoordinatorState {
     /// state literal in the crate.
     pub fn new(setup: SessionSetup, control_auth: ControlAuth) -> Self {
         let lifecycle = Lifecycle::new(setup.clone());
+        // The setup's table, so what the heartbeat ingest records is what
+        // placement ranks fallback regions by.
+        let pair_rtts = setup.pair_rtts().clone();
         Self {
             setup,
             lifecycle,
@@ -328,7 +331,7 @@ impl CoordinatorState {
             regions: RegionsConfig::default(),
             player_token_lifetime: DEFAULT_PLAYER_TOKEN_LIFETIME,
             ledger: None,
-            pair_rtts: pair_rtts::PairRttStore::new(),
+            pair_rtts,
             flight_store: None,
             pending_hellos: Arc::new(tokio::sync::Semaphore::new(
                 control_enroll::MAX_PENDING_CONTROL_HELLOS,

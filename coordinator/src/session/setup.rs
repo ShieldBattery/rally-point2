@@ -15,6 +15,7 @@ use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use crate::attest::LoadStateAttest;
 use crate::descriptors::{RelayDescriptors, RelayReaps};
 use crate::endpoint_limits::{LoadStateLimiter, RehomeLimiter};
+use crate::pair_rtts::PairRttStore;
 use crate::presence::PresenceStore;
 use crate::registry::RelayRegistry;
 use crate::tenant::TenantStore;
@@ -141,6 +142,12 @@ pub struct SessionSetup {
     /// handshake. Cohort placement is unconditional; only the feature bit is
     /// gated. See [`with_finalized_drops`](Self::with_finalized_drops).
     pub(super) finalize_feature: bool,
+    /// The backbone-RTT pair table relays fill from their heartbeats. Placement
+    /// and re-home read it to send a slot whose region has no available relay to
+    /// the nearest region that has one. Empty (every such slot takes the
+    /// lowest-id pick) until relays report or the ledger seeds it; see
+    /// [`with_pair_rtts`](Self::with_pair_rtts).
+    pub(super) pair_rtts: PairRttStore,
 }
 
 /// The key of a recorded rehome decision: which dead relay, for which session.
@@ -169,7 +176,23 @@ impl SessionSetup {
             pending_creates: Arc::new(Mutex::new(HashMap::new())),
             session_ceiling: None,
             finalize_feature: true,
+            pair_rtts: PairRttStore::new(),
         }
+    }
+
+    /// Shares `store` as the backbone-RTT table placement and re-home rank
+    /// fallback regions by. Production passes the same table the heartbeat
+    /// ingest fills and `GET /regions` serves.
+    #[must_use]
+    pub fn with_pair_rtts(mut self, store: PairRttStore) -> Self {
+        self.pair_rtts = store;
+        self
+    }
+
+    /// The backbone-RTT table placement reads (see
+    /// [`with_pair_rtts`](Self::with_pair_rtts)).
+    pub fn pair_rtts(&self) -> &PairRttStore {
+        &self.pair_rtts
     }
 
     /// Sets whether new sessions on capable cohorts run the finalized-drop

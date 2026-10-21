@@ -274,3 +274,28 @@ fn seed_loads_directional_rows_and_canonicalizes() {
         "the served age is the newer of the two seeded directions",
     );
 }
+
+#[test]
+fn rtts_from_answers_every_pair_touching_the_region_from_either_end() {
+    // `rtts_from` reads a pair whichever end measured it and whichever canonical
+    // slot the region sits in, serves the two-direction average, and leaves out
+    // pairs the region is not part of.
+    let store = PairRttStore::new();
+    store.record(&region("us-west"), &region("mx"), 40, 1);
+    store.record(&region("mx"), &region("us-west"), 50, 2);
+    store.record(&region("mx"), &region("eu-north"), 160, 3);
+    store.record(&region("us-east"), &region("eu-north"), 90, 4);
+
+    let from_mx = store.rtts_from(&region("mx"));
+    assert_eq!(from_mx.len(), 2, "only the pairs that include mx");
+    assert_eq!(from_mx[&region("us-west")], 45, "(40 + 50) / 2 = 45");
+    assert_eq!(from_mx[&region("eu-north")], 160);
+
+    let from_east = store.rtts_from(&region("us-east"));
+    assert_eq!(
+        from_east.get(&region("eu-north")),
+        Some(&90),
+        "a region in the pair's `a` slot reads it too",
+    );
+    assert!(store.rtts_from(&region("sg")).is_empty());
+}

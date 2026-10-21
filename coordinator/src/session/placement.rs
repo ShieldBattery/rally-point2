@@ -3,7 +3,7 @@
 //! is warmed. Grouped together because the hold decision and the placement it
 //! defers to must read the same available-relay snapshot and region-match rule.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -12,6 +12,7 @@ use rally_point_proto::control::{
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 
+use crate::pair_rtts::PairRttStore;
 use crate::registry::{self, RelayRegistry, SessionSetupError, cert_fingerprint};
 
 use super::PENDING_PRUNE_MIN_SLACK;
@@ -49,12 +50,78 @@ pub(super) struct Placement {
     pub(super) relay_regions: std::collections::BTreeMap<RelayId, Option<RegionId>>,
 }
 
+/// How much farther (backbone round-trip, in milliseconds) a relay already serving
+/// the session may sit from a slot's region than the nearest available relay and
+/// still be chosen over it. Reusing a serving relay keeps the session's relay set
+/// from growing: one fewer mesh link for turns to cross and one fewer relay whose
+/// death disturbs the game. A gap this small is about what two independent
+/// medians of the same long backbone path disagree by (the pair table's own
+/// dead-band is 5% of the value, 15 ms on a 300 ms trans-oceanic link), and well
+/// under one 42 ms game frame, so treating it as a tie costs the slot nothing it
+/// would feel. A larger gap is a real geographic difference and the nearer relay
+/// wins.
+const SERVING_RELAY_MARGIN_MS: u32 = 15;
+
+/// The relay in `entries` nearest to `requested`, for a slot or homed group whose
+/// own region may have no available relay. `entries` is the already-filtered
+/// candidate cohort; `serving` lists the relays already serving the session, in
+/// preference order.
+///
+/// A relay in `requested` itself scores 0; any other relay scores the backbone
+/// round-trip between its region and `requested` from `pair_rtts`. A relay with
+/// no region, or whose region has no stored pair with `requested`, is not ranked
+/// at all. A serving relay scoring within [`SERVING_RELAY_MARGIN_MS`] of the best
+/// score wins (nearest first, then `serving` order); otherwise the best score
+/// wins, ties broken by the lowest relay id, so the choice is deterministic for a
+/// given registry and table.
+///
+/// `None` when no relay can be ranked — no relay in `requested` and no pair data
+/// for any candidate's region — so the caller applies its own region-blind rule
+/// rather than this guessing.
+pub(super) fn nearest_relay<'a>(
+    entries: &'a [RelayEntry],
+    requested: &RegionId,
+    serving: &[RelayId],
+    pair_rtts: &PairRttStore,
+) -> Option<&'a RelayEntry> {
+    let rtts = pair_rtts.rtts_from(requested);
+    let score = |entry: &RelayEntry| -> Option<u32> {
+        let region = entry.region.as_ref()?;
+        if region == requested {
+            Some(0)
+        } else {
+            rtts.get(region).copied()
+        }
+    };
+    let (best, best_entry) = entries
+        .iter()
+        .filter_map(|entry| score(entry).map(|rtt| (rtt, entry)))
+        .min_by_key(|&(rtt, entry)| (rtt, entry.relay_id))?;
+    let serving_pick = serving
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, &id)| {
+            let entry = entries.iter().find(|e| e.relay_id == id)?;
+            let rtt = score(entry)?;
+            (rtt <= best.saturating_add(SERVING_RELAY_MARGIN_MS)).then_some((rtt, rank, entry))
+        })
+        .min_by_key(|&(rtt, rank, _)| (rtt, rank))
+        .map(|(_, _, entry)| entry);
+    Some(serving_pick.unwrap_or(best_entry))
+}
+
 /// The requested slot regions with no available relay to home them — the regions
-/// [`place_by_region`] would fall back to the region-blind pick for. Reads the same
-/// available-relay snapshot placement does and applies the same region-match rule,
-/// so the hold decision and the eventual placement agree on which regions are lit.
+/// [`place_by_region`] would send to a relay in another region. Reads the same
+/// available-relay snapshot placement does and applies the same region-match rule.
 /// Order-preserving and de-duplicated: each unlit region appears once, in
 /// first-requested order. A request naming no regions yields an empty set.
+///
+/// Deliberately blind to the capability cohort placement narrows the snapshot to.
+/// A region lit only by relays outside the cohort reads as lit here, so its create
+/// places at once on the nearest in-cohort relay instead of holding: the warm
+/// demand a hold raises is met by any relay in the region, whatever its build, so
+/// such a region is already at its warm target, nothing launches, and a hold could
+/// only wait out its whole cap before falling back to the same relay.
 pub(super) fn unlit_requested_regions(
     registry: &RelayRegistry,
     request: &SessionRequest,
@@ -117,11 +184,13 @@ pub(super) fn hold_pending_create(
 }
 
 /// Region-aware placement: home each slot on a live relay in the region it
-/// requested, falling back to the region-blind pick (the lowest-id available
-/// relay overall) for a slot that named no region, or whose region has no live
-/// relay. Slots sharing a region share that region's relay, so a same-region
-/// game stays single-relay while a cross-region game produces the meshed
-/// `slot_homes` shape.
+/// requested. A slot whose region has no live relay homes in the nearest region
+/// that has one by backbone round-trip ([`nearest_relay`]), reusing a relay
+/// another slot already homes on when it is nearly as close. A slot that named no
+/// region, or whose region has no pair data to rank by, takes the region-blind
+/// pick (the lowest-id available relay overall). Slots sharing a region share one
+/// relay, so a same-region game stays single-relay while a cross-region game
+/// produces the meshed `slot_homes` shape.
 ///
 /// The response's `home_relay` is the relay assigned the most slots. When several
 /// relays tie for that maximum, the would-be session id rotates the primary among
@@ -130,6 +199,7 @@ pub(super) fn hold_pending_create(
 /// distinct assigned homes and every serving relay homes at least one slot.
 pub(super) fn place_by_region(
     registry: &RelayRegistry,
+    pair_rtts: &PairRttStore,
     request: &SessionRequest,
     session: SessionId,
     finalize_feature: bool,
@@ -148,7 +218,7 @@ pub(super) fn place_by_region(
     // the capable cohort (the fleet's future); fall back to the incapable one
     // only when no capable relay is available at all. Within the chosen
     // cohort the region logic below runs unchanged — a slot whose region only
-    // exists in the other cohort takes the in-cohort region-blind fallback
+    // exists in the other cohort takes the in-cohort cross-region fallback
     // rather than mixing. Cohorting applies whether or not the FEATURE is
     // enabled — build classes must never mix in one session regardless — but
     // the handshake itself only turns on for a capable cohort when the
@@ -179,10 +249,40 @@ pub(super) fn place_by_region(
     // Ascending id, so "first in a region" and "first overall" are both the
     // deterministic lowest-id pick.
     entries.sort_by_key(|e| e.relay_id);
-    let fallback = &entries[0];
+    let region_blind = &entries[0];
 
-    // Assign each slot: the lowest-id available relay in its requested region if
-    // one exists, else the region-blind fallback.
+    // Each requested region's relay. Lit regions resolve first — the lowest-id
+    // available relay in the region — along with the region-blind pick for slots
+    // naming no region, so every relay those settle on is known before any unlit
+    // region is ranked and can be reused by it, whatever order the roster lists
+    // its players in. Unlit regions then resolve in first-requested order, each
+    // one's pick joining the reusable set for the next.
+    let mut region_relay: HashMap<&RegionId, &RelayEntry> = HashMap::new();
+    let mut unlit: Vec<&RegionId> = Vec::new();
+    let mut chosen: BTreeSet<RelayId> = BTreeSet::new();
+    for player in &request.players {
+        let Some(region) = &player.region else {
+            chosen.insert(region_blind.relay_id);
+            continue;
+        };
+        if region_relay.contains_key(region) || unlit.contains(&region) {
+            continue;
+        }
+        match entries.iter().find(|e| e.region.as_ref() == Some(region)) {
+            Some(entry) => {
+                region_relay.insert(region, entry);
+                chosen.insert(entry.relay_id);
+            }
+            None => unlit.push(region),
+        }
+    }
+    for region in unlit {
+        let serving: Vec<RelayId> = chosen.iter().copied().collect();
+        let entry = nearest_relay(&entries, region, &serving, pair_rtts).unwrap_or(region_blind);
+        region_relay.insert(region, entry);
+        chosen.insert(entry.relay_id);
+    }
+
     let slot_relay: Vec<(SlotId, &RelayEntry)> = request
         .players
         .iter()
@@ -190,8 +290,7 @@ pub(super) fn place_by_region(
             let entry = player
                 .region
                 .as_ref()
-                .and_then(|region| entries.iter().find(|e| e.region.as_ref() == Some(region)))
-                .unwrap_or(fallback);
+                .map_or(region_blind, |region| region_relay[region]);
             (player.slot, entry)
         })
         .collect();

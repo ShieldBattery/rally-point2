@@ -31,6 +31,7 @@ mod cohorts;
 mod create;
 mod descriptors;
 mod drain;
+mod fallback;
 mod idempotency;
 mod placement;
 mod provisioning;
@@ -138,6 +139,16 @@ fn create_default_session(setup: &SessionSetup) -> SessionResponse {
     create_session(setup, request(two_players()), ExpiresAt(u64::MAX))
         .unwrap()
         .response
+}
+
+/// Records each `(from, to, rtt_ms)` backbone round-trip into `setup`'s pair
+/// table, as a relay in `from` reporting its sweep toward `to` would.
+fn record_rtts(setup: &SessionSetup, rtts: &[(&str, &str, u32)]) {
+    for &(from, to, rtt_ms) in rtts {
+        setup
+            .pair_rtts()
+            .record(&region(from), &region(to), rtt_ms, 0);
+    }
 }
 
 /// Creates a session from `players` (region-tagged), returning the response.

@@ -113,8 +113,9 @@ fn replaying_a_balanced_create_keeps_its_exact_rotated_home() {
 
 #[test]
 fn a_slot_whose_region_has_no_relay_falls_back_to_the_global_pick() {
-    // Only region-a has relays; a slot asking for region-b falls back to the
-    // lowest-id available relay overall — today's region-blind pick.
+    // Only region-a has relays and the pair table is empty; a slot asking for
+    // region-b has nothing to rank by, so it takes the region-blind pick, the
+    // lowest-id available relay overall.
     let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-a"))]);
     let resp = create_region_session(
         &setup,
@@ -298,8 +299,8 @@ fn rehome_prefers_a_replacement_in_the_dead_relays_region() {
 #[test]
 fn rehome_falls_back_to_any_relay_when_the_dead_region_has_no_live_relay() {
     // relay 2 (region-b) homes the session; the only spare is relay 1 (region-a).
-    // When relay 2 dies, region-b has no live relay, so the replacement is the
-    // region-blind fallback (relay 1).
+    // When relay 2 dies, region-b has no live relay and the pair table is empty,
+    // so the replacement is the region-blind fallback (relay 1).
     let setup = region_fleet(&[(1, 14900, Some("region-a")), (2, 14901, Some("region-b"))]);
     let resp = create_region_session(&setup, vec![player_in_region(0, Some("region-b"))]);
     assert_eq!(resp.home_relay.relay_id, RelayId(2));

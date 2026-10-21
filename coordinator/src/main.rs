@@ -157,7 +157,8 @@ async fn main() -> Result<()> {
     // them. Seeded from the ledger at startup so last-known values survive a restart or
     // a scale-to-zero; memory-only (still functional within a process lifetime) when no
     // ledger is configured. A read failure is logged and left empty rather than failing
-    // startup — the table is informational telemetry, not a serving prerequisite.
+    // startup — the table is not a serving prerequisite: placement uses it only to rank
+    // a cold region's fallback, and an empty table falls back to the lowest-id relay.
     let pair_rtts = pair_rtts::PairRttStore::new();
     if let Some(ledger) = &ledger {
         match ledger.direction_rtts() {
@@ -174,6 +175,9 @@ async fn main() -> Result<()> {
             }
         }
     }
+    // Placement ranks a cold region's fallback by this same table, and the served
+    // state below takes it from the setup.
+    setup = setup.with_pair_rtts(pair_rtts.clone());
 
     // Load and connect the flight-recorder durable sink when one is configured. Fail
     // startup on a malformed config, an unset credential variable, or an unreachable
@@ -217,14 +221,13 @@ async fn main() -> Result<()> {
 
     let player_token_lifetime_secs = clamp_player_token_lifetime(cli.player_token_lifetime_secs);
     // The dev / loopback posture, overridden with everything this binary
-    // configured: the region list, the resolved token lifetime, and the ledger,
-    // pair table, and flight store opened above (the pair table already seeded
-    // from the ledger).
+    // configured: the region list, the resolved token lifetime, and the ledger
+    // and flight store opened above. The pair table rides in on the setup,
+    // already seeded from the ledger.
     let mut state = CoordinatorState {
         regions,
         player_token_lifetime: Duration::from_secs(player_token_lifetime_secs),
         ledger,
-        pair_rtts,
         flight_store,
         ..CoordinatorState::new(setup, control_auth)
     };

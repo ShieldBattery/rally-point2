@@ -49,10 +49,18 @@
 - A session's relays must stay inside one finalized-drop capability cohort even
   when the feature switch is off — `capable_cohort` (build class) and
   `finalized_drops` (feature on) are deliberately separate flags.
+- A slot whose region has no in-cohort relay, and a re-homed group, go to the
+  nearest region by the backbone pair table (`nearest_relay`); the lowest-id
+  relay is only the answer when nothing can be ranked. Placement resolves lit
+  regions before ranking unlit ones so a serving relay within the margin is
+  reused regardless of roster order. `unlit_requested_regions` is deliberately
+  cohort-blind: warm demand counts any relay in the region, so holding for a
+  region lit only outside the cohort could launch nothing and only delay the
+  fallback by the whole cap.
 
 ## Tests
 
-`cargo test -p rally-point-coordinator --lib session::` (89). Fixtures live in
+`cargo test -p rally-point-coordinator --lib session::` (93). Fixtures live in
 `tests/mod.rs` and reach every topic child through `use super::*;` — add new ones
 there instead of duplicating an enroll helper. Hold-cap tests drive the clock
 explicitly via `create_or_provision_session_at`, so nothing here sleeps.

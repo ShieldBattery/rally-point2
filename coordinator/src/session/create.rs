@@ -274,10 +274,10 @@ fn create_body(
 
     // Hold-until-ready: on a provisioning-enabled coordinator, a request naming a
     // region with no available relay warms that region and holds — returning a
-    // provisioning signal rather than falling straight back to a region-blind
-    // relay — until the region's relay enrolls or a per-create hold cap elapses.
+    // provisioning signal rather than falling straight back to a relay in another
+    // region — until the region's relay enrolls or a per-create hold cap elapses.
     // The hold is anchored across retries by `external_id`; a request with none has
-    // nothing to key the cap on and falls straight through to region-blind
+    // nothing to key the cap on and falls straight through to cross-region
     // placement. A held create commits nothing (no placement runs), so a retry that
     // finally places does not double-place.
     if let CreatePolicy::HoldUntilReady { now } = policy
@@ -297,21 +297,23 @@ fn create_body(
                 return Ok(CreateOutcome::Provisioning { regions: unlit });
             }
             // The cap elapsed (or the clock is unusable): the anchor was dropped and
-            // the create falls through to placement below, whose region-blind
+            // the create falls through to placement below, whose cross-region
             // fallback fills the still-unlit slots — a game is never refused because
             // a region stayed cold.
         }
     }
 
     // Placement: each slot homes on a relay in the region it requested when one
-    // is live, else the region-blind fallback (the lowest-id available relay). A
-    // request with no per-slot regions at all falls back for every slot, landing
-    // everyone on that single relay. Peek rather than consume the id: balanced
+    // is live, else on the nearest region that has one (see `place_by_region`). A
+    // request with no per-slot regions at all takes the region-blind pick (the
+    // lowest-id available relay) for every slot, landing everyone on that single
+    // relay. Peek rather than consume the id: balanced
     // placements use it to rotate the primary home, but a placement failure must
     // leave the same id available to the next successful create.
     let candidate_session = candidate_session_id(setup);
     let placement = place_by_region(
         &setup.registry,
+        &setup.pair_rtts,
         &request,
         candidate_session,
         setup.finalize_feature,

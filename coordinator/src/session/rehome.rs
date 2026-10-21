@@ -11,7 +11,7 @@ use crate::registry::{self, cert_fingerprint};
 
 use super::RehomeOutcome;
 use super::descriptor::build_descriptor;
-use super::placement::{relay_finalize_capable, relay_rollback_capable};
+use super::placement::{nearest_relay, relay_finalize_capable, relay_rollback_capable};
 use super::setup::SessionSetup;
 
 /// The replacement relay a prior [`rehome`] already recorded for
@@ -67,10 +67,13 @@ pub fn recorded_rehome(
 /// is unknown or no live relay can take it over, and otherwise moves the whole
 /// homed group to a replacement relay and returns its [`RelayEndpoint`].
 ///
-/// The replacement `R_new` is chosen as a live relay **already serving** the
+/// The replacement `R_new` is the available relay nearest the **dead relay's
+/// recorded region** by backbone round-trip — a relay in that region itself
+/// first — except that a relay **already serving** the session wins when it is
+/// nearly as close (see `nearest_relay`). When the dead relay had no region, or
+/// nothing can be ranked against it, `R_new` is a live relay already serving the
 /// session if one exists (earliest in the authority order, which the serving set
-/// records home-first), else the lowest-id available relay in the **dead relay's
-/// recorded region**, else the lowest-id available relay overall. The dead relay
+/// records home-first), else the lowest-id available relay overall. The dead relay
 /// is replaced **in place** in the serving set — which is also the descriptors'
 /// authority order — so `R_new` inherits its rank, and every serving relay's
 /// descriptor is rebuilt as a `resumed` (rehome) descriptor seeding
@@ -265,9 +268,9 @@ pub(super) fn rehome_inner(
     }
 
     // The dead relay's recorded region, so the replacement can prefer a live relay
-    // in the same region — keeping a re-homed slot near where it was placed. `None`
-    // for an untagged dead relay (or a session with no recorded region), which
-    // simply skips straight to the region-blind fallback.
+    // in or near the same region — keeping a re-homed slot near where it was
+    // placed. `None` for an untagged dead relay (or a session with no recorded
+    // region), which skips straight to the region-blind fallback.
     let dead_region: Option<RegionId> = setup
         .session_refs
         .lock()
@@ -275,14 +278,17 @@ pub(super) fn rehome_inner(
         .and_then(|refs| refs.relay_regions.get(&dead_relay).cloned())
         .flatten();
 
-    // Pick the replacement: prefer a live *available* relay already serving the
-    // session (earliest in the authority order), else the lowest-id available relay
-    // in the dead relay's region, else the lowest-id available relay overall. A
-    // draining relay is never chosen — it asked to stop taking new work, and
-    // re-homing a whole group onto it would be exactly that.
+    // Pick the replacement from the *available* relays: the one nearest the dead
+    // relay's region (a relay in that region first), preferring one already serving
+    // the session when it is nearly as close, so the homed group stays near where
+    // it was placed without needlessly growing the relay set. With no region or no
+    // pair data to rank by, a relay already serving the session (earliest in the
+    // authority order), else the lowest-id available relay overall. A draining
+    // relay is never chosen — it asked to stop taking new work, and re-homing a
+    // whole group onto it would be exactly that.
     //
     // The dead relay's own id is a legal candidate here: reaching this point means
-    // it either is not enrolled at all (genuinely gone, so `is_available` below
+    // it either is not enrolled at all (genuinely gone, so `available_entries` below
     // already excludes it) or is enrolled under a cert that no longer matches the
     // pin (the stay-check above ruled out a match) — the restart-in-place case,
     // where the relay is live, enrolled, available, and its own fresh cert is
@@ -308,22 +314,20 @@ pub(super) fn rehome_inner(
     let entry_matches = |e: &RelayEntry| {
         relay_finalize_capable(e) == cohort_capable && (!rollback || relay_rollback_capable(e))
     };
-    let cohort_matches =
-        |id: RelayId| registry::entry(&setup.registry, id).is_some_and(|e| entry_matches(&e));
-    let r_new = serving
+    let mut entries = registry::available_entries(&setup.registry);
+    entries.retain(entry_matches);
+    entries.sort_by_key(|e| e.relay_id);
+    let serving_candidates: Vec<RelayId> = serving
         .iter()
         .copied()
-        .find(|&id| registry::is_available(&setup.registry, id) && cohort_matches(id))
-        .or_else(|| {
-            let mut entries = registry::available_entries(&setup.registry);
-            entries.retain(entry_matches);
-            entries.sort_by_key(|e| e.relay_id);
-            dead_region
-                .as_ref()
-                .and_then(|region| entries.iter().find(|e| e.region.as_ref() == Some(region)))
-                .or_else(|| entries.first())
-                .map(|e| e.relay_id)
-        });
+        .filter(|&id| entries.iter().any(|e| e.relay_id == id))
+        .collect();
+    let r_new = dead_region
+        .as_ref()
+        .and_then(|region| nearest_relay(&entries, region, &serving_candidates, &setup.pair_rtts))
+        .map(|e| e.relay_id)
+        .or_else(|| serving_candidates.first().copied())
+        .or_else(|| entries.first().map(|e| e.relay_id));
     let Some(r_new) = r_new else {
         return RehomeOutcome::Unavailable;
     };
