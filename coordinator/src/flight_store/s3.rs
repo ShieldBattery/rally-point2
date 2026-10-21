@@ -14,6 +14,21 @@ use super::{
 /// indefinitely.
 const CONNECT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The time budgets every bucket call runs under. The SDK's defaults bound only
+/// connection setup, so without these a request whose response never arrives
+/// waits forever, holding whatever awaits it. A recording is at most
+/// [`MAX_FLIGHT_BLOB_BYTES`], so these leave room for a slow transfer of the
+/// largest one while still cutting off a call that has stopped making progress.
+fn sdk_timeouts() -> aws_config::timeout::TimeoutConfig {
+    use std::time::Duration;
+    aws_config::timeout::TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(30))
+        .operation_attempt_timeout(Duration::from_secs(60))
+        .operation_timeout(Duration::from_secs(120))
+        .build()
+}
+
 /// The real [`FlightStore`]: a thin wrapper over an S3 SDK client pointed at the
 /// configured Spaces bucket. Built once at startup by [`connect`](Self::connect).
 pub struct S3FlightStore {
@@ -66,6 +81,7 @@ impl S3FlightStore {
             .http_client(http)
             .credentials_provider(credentials)
             .endpoint_url(resolved.endpoint)
+            .timeout_config(sdk_timeouts())
             .load()
             .await;
         // Some S3-compatible stores reject the SDK's default unsolicited

@@ -12,10 +12,10 @@ use super::census::CoordinatorCensus;
 use super::counters::{
     CONTROL_CONNECTION_ENDS, CONTROL_SEND_DURATION, DESCRIPTOR_DELTA_ENTRIES_SENT,
     DESCRIPTOR_DELTAS_SENT, DESCRIPTOR_FULL_SETS_SENT, DESYNCS, FLIGHT_RECORDINGS,
-    FLIGHT_RECORDINGS_PINNED, REAP_DIRECTIVES_SENT, REAP_NUDGES_COALESCED, RELAY_COLD_START,
-    RELAY_DRAINS, RELAY_ENROLLS, RELAY_LAUNCH_FAILURES, RELAY_LAUNCHES, RELAY_REAPED,
-    SESSION_HOLDS, SESSION_REAPS, SESSIONS_CLOSED, SESSIONS_CREATED, WEBHOOK_ATTEMPT_FAILURES,
-    WEBHOOK_DELIVERIES,
+    FLIGHT_RECORDINGS_PINNED, PROVISION_LAST_TICK, REAP_DIRECTIVES_SENT, REAP_NUDGES_COALESCED,
+    RELAY_COLD_START, RELAY_DRAINS, RELAY_ENROLLS, RELAY_LAUNCH_FAILURES, RELAY_LAUNCHES,
+    RELAY_REAPED, SESSION_HOLDS, SESSION_REAPS, SESSIONS_CLOSED, SESSIONS_CREATED,
+    WEBHOOK_ATTEMPT_FAILURES, WEBHOOK_DELIVERIES,
 };
 use super::instruments::LabeledCounter;
 use crate::lifecycle::{LifecycleMetrics, SessionCensus};
@@ -56,6 +56,20 @@ pub(super) fn exposition(census: &CoordinatorCensus) -> String {
         "rp2_flight_store_configured",
         &[],
         u64::from(census.flight_store_configured),
+    );
+
+    write_meta(
+        &mut out,
+        "rp2_provision_last_tick_seconds",
+        "Unix time at which the last provisioning tick to run to completion began; 0 \
+         before the first. A value falling behind the clock means the loop has stalled.",
+        "gauge",
+    );
+    write_series(
+        &mut out,
+        "rp2_provision_last_tick_seconds",
+        &[],
+        PROVISION_LAST_TICK.load(Ordering::Relaxed),
     );
 
     render_tenants(&mut out, &census.tenants);

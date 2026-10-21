@@ -49,8 +49,11 @@
 //!   launches, vanished tasks, and ledger orphans.
 
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
+
+use futures_util::FutureExt;
 
 use rally_point_proto::control::RegionId;
 use rally_point_proto::ids::RelayId;
@@ -114,6 +117,23 @@ struct PendingLaunch {
 /// launch-deadline sweep remains the backstop for a task that never truly comes
 /// up.
 const PUBLIC_IPV4_WAIT_SECS: u64 = 90;
+
+/// How long a tick may run before the loop logs it as stalled. A healthy tick
+/// takes about a second, and every provisioner call it makes is bounded by the
+/// substrate's own timeouts. A tick still running past this is either stacking
+/// those timeouts across many calls (a provider outage) or stuck on something
+/// they don't cover.
+const SLOW_TICK_WARN: Duration = Duration::from_secs(120);
+
+/// The message a caught panic carried, for logging: the `&str` or `String`
+/// payload `panic!` produces, or a placeholder for any other payload type.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
 
 /// How long a region may demand a bootstrap relay without any of its pairs gaining
 /// a value before the loop counts the attempt failed and starts backing off. Kept
@@ -254,6 +274,15 @@ impl<P: Provisioner> ProvisionLoop<P> {
     /// only when the system clock is unusable — a token expiry derived from it
     /// could not be trusted, so it is safer to wait for the next tick than to sweep
     /// against a broken clock.
+    ///
+    /// Nothing else in the coordinator notices when this loop stops: sessions keep
+    /// being created and held, and only scaling silently ceases. So a tick that
+    /// panics is logged and the loop carries on — every tick re-derives its work
+    /// from the ledger and registry, so whatever it left half-done is picked up by
+    /// the next one — and a tick still running past `SLOW_TICK_WARN` is logged
+    /// while it is still stuck, not only once it returns. Each completed tick
+    /// stamps the `rp2_provision_last_tick_seconds` gauge, so a stall is visible
+    /// on a scrape too.
     pub async fn run(mut self) {
         let mut interval = tokio::time::interval(self.config.tick_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -264,7 +293,31 @@ impl<P: Provisioner> ProvisionLoop<P> {
                 tracing::warn!("system clock is unusable; skipping this provisioning tick");
                 continue;
             }
-            self.tick(now).await;
+            let started = tokio::time::Instant::now();
+            let mut tick = std::pin::pin!(AssertUnwindSafe(self.tick(now)).catch_unwind());
+            let outcome = match tokio::time::timeout(SLOW_TICK_WARN, &mut tick).await {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    tracing::warn!(
+                        elapsed_secs = SLOW_TICK_WARN.as_secs(),
+                        "a provisioning tick is still running; no relay will launch or drain \
+                         until it finishes",
+                    );
+                    let outcome = tick.await;
+                    tracing::warn!(
+                        elapsed_secs = started.elapsed().as_secs(),
+                        "a slow provisioning tick finished",
+                    );
+                    outcome
+                }
+            };
+            match outcome {
+                Ok(()) => crate::metrics::provision_tick_completed(now),
+                Err(payload) => tracing::error!(
+                    panic = panic_message(payload.as_ref()),
+                    "a provisioning tick panicked; continuing with the next tick",
+                ),
+            }
         }
     }
 

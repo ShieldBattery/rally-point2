@@ -180,6 +180,26 @@ async fn provisioner_state_and_list_errors_do_not_kill_the_loop() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_panicking_tick_does_not_stop_the_running_loop() {
+    let (h, _east) = Harness::default_region();
+    let fake = h.fake.clone();
+    // The first tick's orphan sweep panics inside the provisioner. Nothing else
+    // in the coordinator would notice the loop dying, so it must keep ticking.
+    fake.panic_next_list();
+    let running = tokio::spawn(h.provision.run());
+
+    // Paused time auto-advances through the 5 s interval: ticks at 0, 5 and 10.
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert!(
+        fake.list_calls() >= 3,
+        "ticks after the panicking one still sweep (saw {} list calls)",
+        fake.list_calls(),
+    );
+    assert!(!running.is_finished(), "the loop is still running");
+    running.abort();
+}
+
 #[tokio::test]
 async fn a_stop_error_during_drain_still_retires_the_id() {
     let (mut h, east) = Harness::with_grace(5);

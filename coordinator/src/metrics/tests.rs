@@ -129,6 +129,25 @@ fn render_emits_help_type_and_sorted_series() {
     assert!(active < revoked && revoked < suspended, "sorted states");
 }
 
+#[test]
+fn a_completed_provisioning_tick_stamps_the_last_tick_gauge() {
+    // The gauge is a process-wide static that a concurrently running loop test
+    // may also stamp (with a real clock reading), so this checks only that the
+    // series renders as a gauge and has moved off 0 once a tick completed.
+    crate::metrics::provision_tick_completed(1_000);
+    let text = render(&test_state());
+    assert!(
+        text.contains("# TYPE rp2_provision_last_tick_seconds gauge"),
+        "{text}"
+    );
+    let value = series_value(&text, "rp2_provision_last_tick_seconds", "")
+        .expect("the last-tick series renders");
+    assert!(
+        value >= 1_000,
+        "a completed tick moves the gauge off 0: {value}"
+    );
+}
+
 #[tokio::test]
 async fn metrics_endpoint_serves_prometheus_text() {
     let app = router(test_state());

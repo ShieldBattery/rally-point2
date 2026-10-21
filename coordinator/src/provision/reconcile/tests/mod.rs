@@ -38,6 +38,10 @@ struct FakeState {
     fail_state: bool,
     fail_stop: bool,
     fail_list: bool,
+    /// Makes the next `list` call panic instead of answering, then clears.
+    panic_next_list: bool,
+    /// How many `list` calls have been made, including one that panicked.
+    list_calls: usize,
     /// What [`Provisioner::expects_public_ipv4`] reports for every region.
     expects_public_ipv4: bool,
 }
@@ -64,6 +68,8 @@ impl FakeProvisioner {
                 fail_state: false,
                 fail_stop: false,
                 fail_list: false,
+                panic_next_list: false,
+                list_calls: 0,
                 expects_public_ipv4: false,
             }),
         })
@@ -93,6 +99,14 @@ impl FakeProvisioner {
 
     fn set_fail_list(&self, fail: bool) {
         self.state.lock().fail_list = fail;
+    }
+
+    fn panic_next_list(&self) {
+        self.state.lock().panic_next_list = true;
+    }
+
+    fn list_calls(&self) -> usize {
+        self.state.lock().list_calls
     }
 
     fn set_expects_public_ipv4(&self, expects: bool) {
@@ -145,7 +159,12 @@ impl Provisioner for FakeProvisioner {
     }
 
     async fn list(&self) -> Result<Vec<TaskId>, ProvisionError> {
-        let state = self.state.lock();
+        let mut state = self.state.lock();
+        state.list_calls += 1;
+        if std::mem::take(&mut state.panic_next_list) {
+            drop(state);
+            panic!("scripted list panic");
+        }
         if state.fail_list {
             return Err(ProvisionError::Backend("list failed".into()));
         }

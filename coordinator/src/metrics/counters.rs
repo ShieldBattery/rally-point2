@@ -50,6 +50,7 @@ pub(super) static CONTROL_CONNECTION_ENDS: LabeledCounter<String> = LabeledCount
 pub(super) static DESCRIPTOR_DELTAS_SENT: AtomicU64 = AtomicU64::new(0);
 pub(super) static DESCRIPTOR_FULL_SETS_SENT: AtomicU64 = AtomicU64::new(0);
 pub(super) static DESCRIPTOR_DELTA_ENTRIES_SENT: AtomicU64 = AtomicU64::new(0);
+pub(super) static PROVISION_LAST_TICK: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Increment functions — one line at each event site
@@ -146,6 +147,13 @@ pub(crate) fn flight_recording_pinned() {
 /// Observes a relay's cold-start duration (launch to first enroll), in seconds.
 pub(crate) fn observe_relay_cold_start(seconds: u64) {
     RELAY_COLD_START.observe(seconds);
+}
+
+/// Records that a provisioning tick that began at `now` (Unix seconds) ran to
+/// completion. A loop that has stopped ticking leaves this value behind, which is
+/// how a stall shows up on a scrape.
+pub(crate) fn provision_tick_completed(now: u64) {
+    PROVISION_LAST_TICK.store(now, Ordering::Relaxed);
 }
 
 /// Records `count` slot-close directives written down relay control connections.

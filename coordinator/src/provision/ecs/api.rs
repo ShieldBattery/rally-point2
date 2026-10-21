@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::time::Duration;
 
 use super::{ENI_ATTACHMENT_TYPE, ENI_ID_DETAIL_KEY, ENI_NOT_FOUND_CODE, EcsConfig, EcsError};
 
@@ -108,10 +109,31 @@ struct RegionClients {
     ec2: aws_sdk_ec2::Client,
 }
 
+/// The time budgets every ECS/EC2 call runs under. The SDK's defaults bound only
+/// connection setup, so a request whose response never arrives would wait
+/// forever — and the reconcile loop makes its calls one after another, so a
+/// single such call stops every launch, drain, and sweep in every region. An
+/// attempt is cut off after `ATTEMPT`, and the SDK's retries of it after
+/// `OPERATION` in total, after which the call fails like any other error and the
+/// next tick retries it. These calls normally answer in well under a second.
+fn sdk_timeouts() -> aws_config::timeout::TimeoutConfig {
+    const CONNECT: Duration = Duration::from_secs(5);
+    const READ: Duration = Duration::from_secs(10);
+    const ATTEMPT: Duration = Duration::from_secs(15);
+    const OPERATION: Duration = Duration::from_secs(45);
+    aws_config::timeout::TimeoutConfig::builder()
+        .connect_timeout(CONNECT)
+        .read_timeout(READ)
+        .operation_attempt_timeout(ATTEMPT)
+        .operation_timeout(OPERATION)
+        .build()
+}
+
 impl EcsClients {
     /// Builds a client pair for each distinct AWS region named in `config`. The
     /// HTTPS connector is pinned to the rustls **ring** provider, matching the
-    /// workspace's single crypto backend.
+    /// workspace's single crypto backend, and every call runs under
+    /// [`sdk_timeouts`].
     pub(super) async fn from_config(config: &EcsConfig) -> Self {
         let http = aws_smithy_http_client::Builder::new()
             .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
@@ -127,6 +149,7 @@ impl EcsClients {
             let shared = aws_config::defaults(aws_config::BehaviorVersion::latest())
                 .region(aws_config::Region::new(region.aws_region.clone()))
                 .http_client(http.clone())
+                .timeout_config(sdk_timeouts())
                 .load()
                 .await;
             regions.insert(

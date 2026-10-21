@@ -53,6 +53,15 @@ a region is fully covered; the loop republishes the resulting phase into the
 gate's `CoverageStatus` every tick it derives one, so the published bit is
 level-triggered and never has to be cleared by hand.
 
+## Loop liveness
+Nothing outside the loop notices it stopping: creates keep being held and
+answered, and only scaling ceases. So every substrate call must be bounded (the
+ECS clients carry SDK operation timeouts; a new substrate needs the same), a
+panicking tick is caught and logged in `run` rather than ending the task, and a
+tick past `SLOW_TICK_WARN` is logged while still stuck. Completed ticks stamp
+`rp2_provision_last_tick_seconds`; a value falling behind the clock is the
+stall signal.
+
 ## `Provisioner` contract
 Every method must be safe to retry, with no memory of a prior failure — the
 ledger/registry, not the provisioner, is the source of truth for whether a
