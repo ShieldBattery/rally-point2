@@ -80,6 +80,18 @@ pub fn build_descriptor(
     let refs = session_refs(setup, tenant, session).unwrap_or_default();
 
     Some(SessionDescriptor {
+        evidence_keys: refs.evidence_keys.clone(),
+        required_evidence_slots: refs.required_evidence_slots.clone(),
+        evidence_assignments: refs
+            .evidence_assignments
+            .iter()
+            .map(
+                |(&slot, &revision)| rally_point_proto::control::SlotEvidenceAssignment {
+                    slot,
+                    revision,
+                },
+            )
+            .collect(),
         lobby_policy: refs.lobby_policy.clone(),
         lobby_settled: refs.lobby_settled,
         rollback: refs.rollback,

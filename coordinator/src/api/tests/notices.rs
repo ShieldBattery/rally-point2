@@ -24,6 +24,7 @@ fn notices_of_every_kind(session: SessionId) -> Vec<(&'static str, Message)> {
         (
             "slotConnected",
             frame(&RelayToCoordinator::SlotConnected(SlotConnectedNotice {
+                evidence: None,
                 tenant: tenant_id(),
                 session,
                 slot: SlotId(0),
@@ -168,6 +169,7 @@ async fn a_reconnect_does_not_re_fire_slot_connected_and_the_first_start_instant
 
     let connected = |resumed: bool, at_ms: u64| {
         frame(&RelayToCoordinator::SlotConnected(SlotConnectedNotice {
+            evidence: None,
             tenant: tenant_id(),
             session,
             slot: SlotId(0),

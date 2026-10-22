@@ -30,24 +30,30 @@ mod congestion;
 
 pub use congestion::MIN_CONGESTION_WINDOW;
 
-/// ALPN protocol id negotiated on every client ↔ relay QUIC connection. The
-/// trailing number is bumped on any change an older peer can't interoperate
-/// with — the datagram wire framing, the connection-binding handshake, or the
-/// connection's stream shape — so a peer on an incompatible protocol is
-/// rejected at the TLS handshake rather than later, as a malformed datagram or
-/// a puzzling credential failure. `1` is the first version shipped to
-/// production; there is no earlier one, so every bump from here is a real
-/// wire-compat boundary a gradual rollout crosses deliberately.
+/// Preferred client-edge protocol, including the optional evidence frame after resume cursors.
+/// Both endpoints also offer [`LEGACY_ALPN`]; only the negotiated protocol selects the framing.
+/// Mesh connections use the independent [`MESH_ALPN`] namespace.
 ///
-/// This is the client-edge ALPN. Mesh links use [`MESH_ALPN`] — a separate
-/// `rp2-mesh/N` namespace, not this `rp2/N` line — so a relay server advertises
-/// both and dispatches by which one negotiated, and the two can never collide
-/// even as each bumps independently. The two connection kinds carry distinct
-/// wire types (`Packet` vs `MeshPacket`), so the ALPN selects which one a
-/// connection may exchange. A client dialing with this ALPN can never produce a
-/// `MeshPacket` even by mistake: the type lives in a code path the client crate
-/// never touches.
-pub const ALPN: &[u8] = b"rp2/1";
+/// Bump the trailing version when the handshake, datagram framing, or stream shape
+/// becomes incompatible. Negotiation selects a complete wire contract before any
+/// application bytes are exchanged, so incompatible peers fail during TLS rather
+/// than misreading each other's messages. Offering the legacy version alongside
+/// the preferred version permits either rollout order; each negotiated version
+/// must retain its own framing. Mesh versions evolve independently because their
+/// connections carry different packets and streams.
+pub const ALPN: &[u8] = b"rp2/2";
+
+/// Client-edge protocol without the optional evidence frame.
+pub const LEGACY_ALPN: &[u8] = b"rp2/1";
+
+/// Whether the negotiated client-edge protocol includes the evidence frame.
+pub fn supports_evidence(connection: &noq::Connection) -> bool {
+    connection.handshake_data().is_some_and(|data| {
+        data.downcast_ref::<noq::crypto::rustls::HandshakeData>()
+            .and_then(|data| data.protocol.as_deref())
+            == Some(ALPN)
+    })
+}
 
 /// ALPN protocol id negotiated on every relay ↔ relay mesh QUIC connection. A
 /// relay-pair shares one connection across every game both relays jointly serve,
@@ -301,7 +307,7 @@ impl ClientCertVerifier for RequestClientCert {
 /// Builds the relay-side QUIC server config from its certificate chain and
 /// private key. The relay presents this chain; clients verify it against their
 /// trusted roots (see [`client_config`]). The server advertises both the
-/// client-edge [`ALPN`] and the mesh [`MESH_ALPN`], so a single listening
+/// client-edge [`ALPN`]/[`LEGACY_ALPN`] and the mesh [`MESH_ALPN`], so a single listening
 /// endpoint accepts both connection kinds; the negotiated ALPN tells the accept
 /// loop which wire type (`Packet` or `MeshPacket`) the connection will carry.
 ///
@@ -322,7 +328,7 @@ pub fn server_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(cert_chain, key)?;
-    tls.alpn_protocols = vec![ALPN.to_vec(), MESH_ALPN.to_vec()];
+    tls.alpn_protocols = vec![ALPN.to_vec(), LEGACY_ALPN.to_vec(), MESH_ALPN.to_vec()];
 
     let server = QuicServerConfig::try_from(tls)?;
     let mut config = noq::ServerConfig::with_crypto(Arc::new(server));
@@ -340,7 +346,7 @@ pub fn client_config(roots: rustls::RootCertStore) -> Result<noq::ClientConfig, 
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.alpn_protocols = vec![ALPN.to_vec(), LEGACY_ALPN.to_vec()];
     // The relay's identity is the pinned leaf certificate, so the server name is
     // only a local label the verifier checks that cert against; it carries no
     // security weight. Leaving it off the wire matters because a QUIC Initial is

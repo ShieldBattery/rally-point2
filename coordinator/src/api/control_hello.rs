@@ -31,6 +31,7 @@ pub(super) async fn read_hello(socket: &mut WebSocket) -> Option<RelayHello> {
                     // first.
                     Ok(
                         RelayToCoordinator::Heartbeat { .. }
+                        | RelayToCoordinator::DescriptorsApplied { .. }
                         | RelayToCoordinator::Draining
                         | RelayToCoordinator::Departure(_)
                         | RelayToCoordinator::Desync(_)

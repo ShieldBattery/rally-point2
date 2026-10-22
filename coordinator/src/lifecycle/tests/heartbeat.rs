@@ -240,6 +240,7 @@ async fn a_heartbeats_load_state_reaches_the_lifecycle_without_notifying_the_ten
     assert_eq!(
         lifecycle.load_state(&tid(), session),
         Some(crate::lifecycle::SessionLoadState {
+            evidence: Vec::new(),
             created_here: true,
             attestable: true,
             serving_relays: vec![RelayId(1)],
@@ -303,10 +304,12 @@ async fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
         session::create_session(
             &setup,
             SessionRequest {
+                evidence_keys: Vec::new(),
                 lobby_policy: None,
                 rollback: false,
                 tenant: tid(),
                 players: vec![PlayerHandoff {
+                    require_evidence: false,
                     slot: SlotId(0),
                     client_pubkey: ClientPublicKey([key; 32]),
                     external_ref: None,

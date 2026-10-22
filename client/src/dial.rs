@@ -118,6 +118,9 @@ pub enum DialError {
     /// error, unchanged.
     #[error("relay refused the re-dial: slot already departed")]
     SlotDeparted,
+    /// The relay refused the connection under its evidence policy. Terminal for a re-dial.
+    #[error("relay refused the connection")]
+    EvidenceRejected,
 }
 
 impl ClientEndpoint {
@@ -234,7 +237,13 @@ impl ClientEndpoint {
 
         // A fresh dial presents no resume cursors: the relay replays nothing.
         match timeout_at(deadline, authorize(&connection, identity, &[])).await {
-            Ok(result) => result.map(|()| Link::new(connection)),
+            Ok(result) => {
+                if refused_with(&connection, close_codes::EVIDENCE_REJECTED) {
+                    Err(DialError::EvidenceRejected)
+                } else {
+                    result.map(|()| Link::new(connection))
+                }
+            }
             Err(_elapsed) => {
                 connection.close(
                     noq::VarInt::from_u32(close_codes::CLIENT_CONNECT_TIMEOUT),
@@ -284,8 +293,10 @@ impl ClientEndpoint {
                 // the connection to refuse the re-dial. Prefer its application close
                 // code, which names *why* — a departed slot is terminal — over the
                 // transport-level error the failed I/O surfaced.
-                if refused_as_departed(&connection) {
+                if refused_with(&connection, close_codes::SLOT_DEPARTED) {
                     Err(DialError::SlotDeparted)
+                } else if refused_with(&connection, close_codes::EVIDENCE_REJECTED) {
+                    Err(DialError::EvidenceRejected)
                 } else {
                     Err(error)
                 }
@@ -313,14 +324,12 @@ fn udp_socket(local: SocketAddr) -> std::io::Result<Socket> {
     Ok(socket)
 }
 
-/// Whether the relay closed `connection` with its slot-departed application code —
-/// the terminal "the game moved on without you" refusal, as opposed to a live
-/// double-connect refusal or any transport-level failure.
-fn refused_as_departed(connection: &noq::Connection) -> bool {
+/// Whether the relay supplied the specified application close code.
+fn refused_with(connection: &noq::Connection, code: u32) -> bool {
     matches!(
         connection.close_reason(),
         Some(noq::ConnectionError::ApplicationClosed(ref close))
-            if close.error_code == noq::VarInt::from_u32(close_codes::SLOT_DEPARTED)
+            if close.error_code == noq::VarInt::from_u32(code)
     )
 }
 
@@ -360,6 +369,21 @@ async fn authorize(
     // sends it to keep the handshake byte-aligned.
     let cursor_frame = handshake::encode_resume_cursors(cursors)?;
     send.write_all(&cursor_frame).await?;
+
+    if quic::supports_evidence(connection) {
+        let evidence = identity
+            .collect_evidence(handshake::EvidenceRequest {
+                challenge,
+                channel_binding,
+                tenant: identity.token.claims.tenant.clone(),
+                session: identity.token.claims.session,
+                slot: identity.token.claims.slot,
+                client_pubkey: identity.token.claims.client_pubkey,
+            })
+            .await;
+        let frame = handshake::encode_evidence_frame(evidence.as_ref())?;
+        send.write_all(&frame).await?;
+    }
 
     // The relay acknowledges only once our slot is routable.
     let mut ack = [0u8; 1];

@@ -9,21 +9,43 @@ impl DecisionMakers {
     /// Reports that `slot`'s link just activated on this relay: retains the slot in
     /// the session's ever-connected set and fires one slot-connected notice up the
     /// coordinator connection. `resumed` marks a dial that presented resume cursors
-    /// (a reconnect or a re-home re-dial) apart from a first connect.
+    /// (a reconnect or a re-home re-dial) apart from a first connect. This lets
+    /// the tenant distinguish arrival from merely reaching a load deadline.
     ///
     /// Fired on every activation, not just the first: the coordinator keeps the
-    /// ever-connected set and dedups the tenant notification itself, and only the
-    /// relay can see a reconnect at all. The retained set is what every heartbeat
-    /// restates, so the fact survives a lost notice; the notice is only the fast
-    /// path. A session run without a decision-maker (no descriptor) retains nothing
+    /// ever-connected set and each connection's observation separately. Evidence
+    /// is recorded only if its assignment still matches the descriptor. A stale
+    /// assignment returns false without publishing a notice. Every heartbeat
+    /// restates the retained set, so the fact survives a lost notice; the notice is
+    /// only the fast path. A session run without a decision-maker retains nothing
     /// and still reports, with a notice that simply carries no correlation ids.
-    pub fn note_slot_connected(&self, key: &SessionKey, slot: SlotId, resumed: bool) {
-        if let Some(maker) = self.lock().get_mut(key) {
-            maker.note_slot_connected(slot);
+    pub fn note_slot_connected(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        resumed: bool,
+        evidence: Option<rally_point_proto::control::EvidenceObservation>,
+    ) -> bool {
+        {
+            let mut makers = self.lock();
+            if let Some(maker) = makers.get_mut(key) {
+                if let Some(observation) = &evidence
+                    && !maker.evidence_assignment_current(slot, observation.assignment_revision)
+                {
+                    return false;
+                }
+                if let Some(observation) = &evidence {
+                    maker.record_evidence(slot, observation.clone());
+                }
+                maker.note_slot_connected(slot);
+            } else if evidence.is_some() && self.descriptors_required() {
+                return false;
+            }
         }
         self.emit_notice(RelayNotice::SlotConnected(
-            self.slot_connected_notice(key, slot, resumed),
+            self.slot_connected_notice(key, slot, resumed, evidence),
         ));
+        true
     }
 
     /// Forwards a **home** client's report that its game loop has started: retains

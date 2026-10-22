@@ -35,8 +35,16 @@ authorize each client, and hand an admitted one to `routing::run_slot_link`.
   retirement's own sweep owns that state, and the gate tombstone already makes
   the rollback a no-op (`SessionGates::discard_if` refuses a retired gate
   without running its ownership check).
+- **Managed admission requires a descriptor.** Startup enables descriptor waiting
+  before accepting clients. Both client protocols share the same authorization
+  deadline and handshake permit while waiting; standalone relays keep
+  descriptor-less admission. Required evidence is checked before registration
+  or handshake acknowledgement. Cached descriptors proceed immediately; a
+  missing descriptor waits only within the remaining authorization deadline.
+  Retirement wakes that wait promptly. Production leaves provisional admission
+  disarmed; library callers can explicitly opt into it.
 - **Close codes are a wire contract.** They live in `proto::close_codes`, one
-  table for the whole 0x01–0x0D space, and a client reads them as its only
+  table for the whole 0x01–0x11 space, and a client reads them as its only
   diagnosis. Never reuse a retired number, and never collapse two causes onto
   one code.
 

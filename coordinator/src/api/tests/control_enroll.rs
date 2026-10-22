@@ -357,3 +357,122 @@ fn a_second_certificate_claiming_a_live_relay_id_is_refused_as_a_duplicate() {
     // the entry, exactly as it always has.
     assert!(matches!(enroll(&first), EnrollStep::Enrolled(_)));
 }
+
+#[tokio::test]
+async fn capability_downgrade_rehomes_required_sessions_and_preserves_optional_sessions() {
+    for restarted in [false, true] {
+        check_evidence_downgrade(true, restarted).await;
+    }
+}
+
+#[tokio::test]
+async fn capability_downgrade_retires_only_required_sessions_without_a_replacement() {
+    for restarted in [false, true] {
+        check_evidence_downgrade(false, restarted).await;
+    }
+}
+
+async fn check_evidence_downgrade(replacement: bool, restarted: bool) {
+    use rally_point_proto::control::{CAPABILITY_EVIDENCE_V1, EvidenceKey};
+    let setup = relayless_setup();
+    let lifecycle = Lifecycle::new(setup.clone());
+    let regions = RegionsConfig::default();
+    let context = EnrollContext::new(&setup, &lifecycle, &regions, None, None);
+    let relay = RelayIdentity::generate();
+    let enroll = |capable, boot| {
+        let mut hello = relay.hello(1).with_boot_id(boot);
+        if capable {
+            hello = hello.with_capabilities(vec![CAPABILITY_EVIDENCE_V1.into()]);
+        }
+        let mut handshake = EnrollHandshake::start(&context, &Arc::new(Semaphore::new(1))).unwrap();
+        let nonce = challenge_nonce(handshake.offer(Some(RelayToCoordinator::Hello(hello))));
+        handshake.offer(Some(relay.proof(&nonce)))
+    };
+    assert!(matches!(enroll(true, 7), EnrollStep::Enrolled(_)));
+    let mut request = crate::test_support::request(vec![crate::test_support::player(0)]);
+    request.players[0].require_evidence = true;
+    request.evidence_keys = vec![EvidenceKey {
+        key_id: 1,
+        public_key: ClientPublicKey([3; 32]),
+    }];
+    let required = session::create_session(&setup, request, ExpiresAt(u64::MAX))
+        .unwrap()
+        .response
+        .session;
+    let optional = session::create_session(
+        &setup,
+        crate::test_support::request(vec![crate::test_support::player(0)]),
+        ExpiresAt(u64::MAX),
+    )
+    .unwrap()
+    .response
+    .session;
+    for session in [required, optional] {
+        lifecycle.register_session(
+            tenant_id(),
+            session,
+            vec![RelayId(1)],
+            std::collections::HashSet::from([SlotId(0)]),
+            Default::default(),
+        );
+    }
+    let (url, mut webhooks) = WebhookReceiver::default().spawn().await;
+    crate::tenant::set_notify(
+        setup.tenants(),
+        &tenant_id(),
+        Some(crate::tenant::NotifyConfig { url }),
+    );
+    if replacement {
+        registry::enroll(
+            setup.registry(),
+            crate::test_support::hello(2, 14902)
+                .with_capabilities(vec![CAPABILITY_EVIDENCE_V1.into()]),
+        );
+    }
+    let EnrollStep::Enrolled(enrolled) = enroll(false, if restarted { 8 } else { 7 }) else {
+        panic!("the relay remains available for optional sessions");
+    };
+    assert!(registry::generation_is_current(
+        setup.registry(),
+        RelayId(1),
+        enrolled.generation
+    ));
+    assert!(registry::is_available(setup.registry(), RelayId(1)));
+    assert_eq!(
+        setup.serving_relays(&tenant_id(), optional),
+        vec![RelayId(1)]
+    );
+    assert!(lifecycle.load_state(&tenant_id(), optional).is_some());
+    let descriptors = setup.descriptors().current_for(RelayId(1));
+    assert_eq!(descriptors.len(), 1);
+    assert_eq!(descriptors[0].session, optional);
+    assert!(descriptors[0].required_evidence_slots.is_empty());
+    if replacement {
+        assert_eq!(
+            setup.serving_relays(&tenant_id(), required),
+            vec![RelayId(2)]
+        );
+        assert_eq!(
+            lifecycle
+                .load_state(&tenant_id(), required)
+                .unwrap()
+                .serving_relays,
+            vec![RelayId(2)]
+        );
+        let descriptors = setup.descriptors().current_for(RelayId(2));
+        assert_eq!(descriptors[0].session, required);
+        assert_eq!(descriptors[0].required_evidence_slots, vec![SlotId(0)]);
+        assert_eq!(descriptors[0].evidence_assignments[0].revision, 2);
+        assert!(webhooks.try_recv().is_err());
+    } else {
+        assert!(setup.serving_relays(&tenant_id(), required).is_empty());
+        assert!(session::session_refs(&setup, &tenant_id(), required).is_none());
+        assert!(lifecycle.load_state(&tenant_id(), required).is_none());
+        let webhook = tokio::time::timeout(Duration::from_secs(2), webhooks.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(webhook.body["event"], "sessionClosed");
+        assert_eq!(webhook.body["session"], required.0);
+    }
+}

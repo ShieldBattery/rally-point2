@@ -10,6 +10,9 @@ use super::*;
 /// fixture for the descriptor-diff unit tests.
 fn diff_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        evidence_keys: Vec::new(),
+        required_evidence_slots: Vec::new(),
+        evidence_assignments: Vec::new(),
         lobby_policy: None,
         lobby_settled: false,
         rollback: false,
@@ -205,3 +208,5 @@ async fn an_ending_without_a_retirement_sends_no_retired_close() {
         "an un-retired relay's connection ends without a close, sent {frames:?}",
     );
 }
+
+mod acknowledgements;

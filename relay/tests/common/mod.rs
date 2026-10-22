@@ -175,6 +175,10 @@ pub async fn handshake(
 
     let cursor_frame = rally_point_proto::handshake::encode_resume_cursors(resume_cursors)?;
     send.write_all(&cursor_frame).await?;
+    if rally_point_transport::quic::supports_evidence(connection) {
+        send.write_all(&rally_point_proto::handshake::encode_evidence_frame(None)?)
+            .await?;
+    }
 
     let mut ack = [0u8; 1];
     recv.read_exact(&mut ack).await?;
@@ -260,6 +264,9 @@ pub fn build_turn(slot: u8, seq: u64, frame: Option<u32>) -> Payload {
 /// field costs one line here instead of one per test.
 pub fn descriptor(tenant: &str, session: SessionId) -> SessionDescriptor {
     SessionDescriptor {
+        evidence_keys: vec![],
+        required_evidence_slots: vec![],
+        evidence_assignments: vec![],
         lobby_policy: None,
         lobby_settled: false,
         rollback: false,

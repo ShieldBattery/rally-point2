@@ -205,6 +205,9 @@ pub(super) fn place_by_region(
     finalize_feature: bool,
 ) -> Result<Placement, SessionSetupError> {
     let mut entries = registry::available_entries(registry);
+    if request.players.iter().any(|p| p.require_evidence) {
+        entries.retain(relay_evidence_capable);
+    }
     if entries.is_empty() {
         return Err(SessionSetupError::NoRelaysAvailable);
     }
@@ -379,4 +382,12 @@ pub(super) fn relay_finalize_capable(entry: &RelayEntry) -> bool {
         .capabilities
         .iter()
         .any(|c| c == rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1)
+}
+
+/// Whether a relay supports connection evidence and its required-slot policy.
+pub(super) fn relay_evidence_capable(entry: &RelayEntry) -> bool {
+    entry
+        .capabilities
+        .iter()
+        .any(|c| c == rally_point_proto::control::CAPABILITY_EVIDENCE_V1)
 }

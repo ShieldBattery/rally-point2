@@ -326,6 +326,11 @@ pub(super) fn handle_load_state_snapshot(
         );
         return;
     }
+    inbound.lifecycle.merge_connection_evidence(
+        relay_id,
+        inbound.generation,
+        std::slice::from_ref(&snapshot),
+    );
     snapshot.lobby_violations.retain(|&slot| {
         let allowed =
             inbound

@@ -17,6 +17,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

@@ -50,6 +50,8 @@ pub struct MakerSync<'a> {
     pub rollback: bool,
     /// Immutable descriptor allow-list reconciled into the per-session decision maker.
     pub lobby_policy: Option<LobbyPolicy>,
+    /// The session's evidence keys, required slots, and current assignments.
+    pub evidence: EvidenceConfig,
     /// Monotonic descriptor latch closing future home-authored lobby ingress.
     pub lobby_settled: bool,
 }
@@ -69,6 +71,7 @@ impl<'a> MakerSync<'a> {
             finalized_drops: false,
             rollback: false,
             lobby_policy: None,
+            evidence: EvidenceConfig::default(),
             lobby_settled: false,
         }
     }
@@ -95,6 +98,7 @@ impl<'a> MakerSync<'a> {
             finalized_drops: descriptor.finalized_drops,
             rollback: descriptor.rollback,
             lobby_policy: descriptor.lobby_policy.clone(),
+            evidence: EvidenceConfig::from_descriptor(descriptor),
             lobby_settled: descriptor.lobby_settled,
         }
     }
@@ -151,6 +155,7 @@ impl DecisionMakers {
             finalized_drops,
             rollback,
             lobby_policy,
+            evidence,
             lobby_settled,
         } = sync;
         let (mut leaves, fresh, seeded) = {
@@ -164,6 +169,7 @@ impl DecisionMakers {
                     maker.reconcile_finalized_drops(finalized_drops);
                     maker.reconcile_rollback(rollback);
                     maker.reconcile_lobby_policy(&lobby_policy);
+                    maker.reconcile_evidence(evidence);
                     if lobby_settled {
                         maker.settle_lobby();
                     }
@@ -192,6 +198,7 @@ impl DecisionMakers {
                     maker.latch_finalized_drops(finalized_drops);
                     maker.latch_rollback(rollback);
                     maker.latch_lobby_policy(lobby_policy);
+                    maker.evidence_config = evidence;
                     if lobby_settled {
                         maker.settle_lobby();
                     }
@@ -205,6 +212,7 @@ impl DecisionMakers {
                 }
             }
         };
+        self.descriptors_changed.notify_waiters();
         for leave in &fresh {
             self.record_leave_event(key, leave);
             self.emit_notice(RelayNotice::Departure(self.departure_notice(key, leave)));

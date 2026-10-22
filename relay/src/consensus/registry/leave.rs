@@ -219,6 +219,7 @@ impl DecisionMakers {
     pub fn deregister_maker(&self, key: &SessionKey) {
         self.lock().remove(key);
         self.forget_session_refs(key);
+        self.descriptors_changed.notify_waiters();
     }
 
     /// Decides a synced player-leave for `slot` on the session's authority relay and

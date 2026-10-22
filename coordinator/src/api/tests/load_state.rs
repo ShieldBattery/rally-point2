@@ -5,6 +5,8 @@ use rally_point_proto::control::SessionPresence;
 
 use super::*;
 
+mod evidence;
+
 /// How a stand-in relay answers the questions addressed to it.
 struct AttestOptions {
     /// Whether its snapshot claims the session was fenced against its own

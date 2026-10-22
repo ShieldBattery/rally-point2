@@ -78,6 +78,7 @@ pub struct RelayRegistry {
     /// for the coordinator's lifetime, so two connections (even for the same
     /// relay id) never share one.
     next_generation: Arc<AtomicU64>,
+    changed: Arc<tokio::sync::Notify>,
     /// Broadcast of the fleet's current mesh-peer set — every enrolled relay's id
     /// paired with the SHA-256 fingerprint of the certificate it enrolled with
     /// ([`MeshPeerIdentity`]). Rebuilt and published under the registry lock on
@@ -101,6 +102,7 @@ impl Default for RelayRegistry {
         Self {
             relays: Arc::default(),
             next_generation: Arc::default(),
+            changed: Arc::default(),
             mesh_peers: Arc::new(watch::channel(Vec::new()).0),
             boot_ids: Arc::default(),
         }
@@ -217,6 +219,11 @@ pub fn forget_boot_id(registry: &RelayRegistry, id: RelayId) {
     registry.boot_ids.lock().remove(&id);
 }
 
+/// The process identity most recently enrolled for a relay.
+pub(crate) fn boot_id(registry: &RelayRegistry, id: RelayId) -> Option<u64> {
+    registry.boot_ids.lock().get(&id).copied().flatten()
+}
+
 /// Every remembered relay process identity, sorted by relay id — what the
 /// coordinator's session persistence stores so a restart can still tell a relay
 /// that merely redialed from one that restarted while the coordinator was down.
@@ -307,6 +314,7 @@ fn insert_locked(
         },
     );
     publish_mesh_peers(relays, &registry.mesh_peers);
+    registry.changed.notify_waiters();
     generation
 }
 
@@ -492,6 +500,24 @@ pub fn entry(registry: &RelayRegistry, id: RelayId) -> Option<RelayEntry> {
     registry.relays.lock().get(&id).map(|r| r.entry.clone())
 }
 
+/// Wakes on enrollment or removal, including capability-only reenrollment that
+/// leaves the mesh-peer list unchanged. Enable before inspecting the registry.
+pub(crate) fn changed(registry: &RelayRegistry) -> tokio::sync::futures::Notified<'_> {
+    registry.changed.notified()
+}
+
+/// Looks up a relay and its current control-connection generation atomically.
+pub(crate) fn entry_with_generation(
+    registry: &RelayRegistry,
+    id: RelayId,
+) -> Option<(RelayEntry, u64)> {
+    registry
+        .relays
+        .lock()
+        .get(&id)
+        .map(|r| (r.entry.clone(), r.generation))
+}
+
 /// All registered relays' full entries, in an unspecified order — draining ones
 /// included. Callers that must reach *every* enrolled relay (e.g. a re-home
 /// last-resort fallback picking any live relay) use this; assignment of a *new*
@@ -539,6 +565,7 @@ pub fn remove(registry: &RelayRegistry, id: RelayId) {
     if relays.remove(&id).is_some() {
         // The relay left the fleet: re-publish the shrunk mesh-peer set.
         publish_mesh_peers(&relays, &registry.mesh_peers);
+        registry.changed.notify_waiters();
     }
 }
 
@@ -558,6 +585,7 @@ pub fn remove_if_current(registry: &RelayRegistry, id: RelayId, generation: u64)
             relays.remove(&id);
             // The relay left the fleet: re-publish the shrunk mesh-peer set.
             publish_mesh_peers(&relays, &registry.mesh_peers);
+            registry.changed.notify_waiters();
             true
         }
         _ => false,
@@ -600,6 +628,9 @@ pub enum SessionSetupError {
     /// still-live session are unaffected — they mint nothing.
     #[error("the coordinator's live-session ceiling is reached")]
     SessionCeilingReached,
+    /// The evidence key set is duplicated, oversized, or absent when required.
+    #[error("invalid evidence keys")]
+    InvalidEvidenceKeys,
     /// A player's slot index is out of range (max 11: 8 players + 4
     /// observers, BW's 12 network participants).
     #[error("slot {0} is out of range (max 11)")]

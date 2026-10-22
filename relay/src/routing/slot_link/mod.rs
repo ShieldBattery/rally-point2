@@ -127,6 +127,7 @@ pub async fn run_slot_link(
     slot: SlotId,
     connection_epoch: u64,
     mut resume_cursors: std::collections::HashMap<SlotId, u64>,
+    evidence: crate::auth::CheckedEvidence,
     inbox: SlotInbox,
     sessions: Sessions,
     mesh: crate::mesh::MeshState,
@@ -181,25 +182,27 @@ pub async fn run_slot_link(
             },
         ..
     } = mesh;
-    if !setup::activate_slot(
+    if let Err(refusal) = setup::activate_slot(
         &link,
         &sessions,
         &mesh_for_teardown,
         &key,
         slot,
-        connection_epoch,
-        resumed_dial,
+        setup::Activation {
+            connection_epoch,
+            resumed_dial,
+            evidence,
+        },
     ) {
         tracing::info!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
             slot = slot.0,
-            "session retired before slot-link activation; closing the link",
+            ?refusal,
+            "slot-link activation refused; closing the link",
         );
-        link.connection().close(
-            VarInt::from_u32(close_codes::SESSION_RETIRED),
-            b"session retired",
-        );
+        link.connection()
+            .close(VarInt::from_u32(refusal.code()), refusal.reason());
         end_slot_link(
             &sessions,
             &mesh_for_teardown,

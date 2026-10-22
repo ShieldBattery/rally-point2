@@ -140,6 +140,8 @@ pub(super) struct ResultWebhook {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct SlotConnectedWebhook {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) evidence: Option<EvidencePayload>,
     pub(super) event: &'static str,
     pub(super) tenant: String,
     pub(super) session: u64,
@@ -252,4 +254,45 @@ pub(crate) fn session_closed_dispatch(
         }
     };
     Some((config, body))
+}
+
+/// Tenant-facing observation, shared by notifications and load-state responses.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EvidencePayload {
+    connection_id: String,
+    sequence: u64,
+    assignment_revision: u64,
+    verdict: rally_point_proto::control::EvidenceVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_id: Option<u32>,
+    body: String,
+}
+
+impl From<rally_point_proto::control::EvidenceObservation> for EvidencePayload {
+    fn from(value: rally_point_proto::control::EvidenceObservation) -> Self {
+        Self {
+            connection_id: BASE64_STANDARD.encode(value.connection_id),
+            sequence: value.sequence,
+            assignment_revision: value.assignment_revision,
+            verdict: value.verdict,
+            key_id: value.key_id,
+            body: BASE64_STANDARD.encode(value.body),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SlotEvidencePayload {
+    slot: u8,
+    observation: EvidencePayload,
+}
+
+impl From<rally_point_proto::control::SlotEvidence> for SlotEvidencePayload {
+    fn from(value: rally_point_proto::control::SlotEvidence) -> Self {
+        Self {
+            slot: value.slot.0,
+            observation: value.observation.into(),
+        }
+    }
 }

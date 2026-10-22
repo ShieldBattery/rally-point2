@@ -63,6 +63,8 @@ pub(super) struct CreateFingerprint {
     /// A request cannot name a slot twice (`validate_request` rejects a
     /// duplicate), so the slot totally orders this list.
     players: Vec<FingerprintPlayer>,
+    #[serde(default)]
+    evidence_keys: Vec<rally_point_proto::control::EvidenceKey>,
     /// The request's worst-pairwise one-way path-latency estimate.
     latency_estimate_ms: Option<u32>,
     /// The request's lobby command allow-list.
@@ -75,6 +77,8 @@ pub(super) struct CreateFingerprint {
 /// its tenant correlation ref, and its requested region).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct FingerprintPlayer {
+    #[serde(default)]
+    require_evidence: bool,
     slot: SlotId,
     client_pubkey: ClientPublicKey,
     observer: bool,
@@ -91,6 +95,7 @@ impl CreateFingerprint {
             .players
             .iter()
             .map(|p| FingerprintPlayer {
+                require_evidence: p.require_evidence,
                 slot: p.slot,
                 client_pubkey: p.client_pubkey,
                 observer: p.observer,
@@ -99,8 +104,11 @@ impl CreateFingerprint {
             })
             .collect();
         players.sort_by_key(|p| p.slot);
+        let mut evidence_keys = request.evidence_keys.clone();
+        evidence_keys.sort_by_key(|key| key.key_id);
         Self {
             players,
+            evidence_keys,
             latency_estimate_ms: request.latency_estimate_ms,
             lobby_policy: request.lobby_policy.clone(),
         }

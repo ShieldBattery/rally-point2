@@ -29,8 +29,9 @@ use crate::routing::{self, Sessions};
 mod admission;
 
 use admission::{
-    Admission, DEPARTED_AT_ADMISSION, PRE_REGISTER_GATES, PROVISIONAL_CAPACITY, SESSION_RETIRED,
-    SLOT_TAKEN, journal_seal_still_clear,
+    ASSIGNMENT_CHANGED, Admission, DEPARTED_AT_ADMISSION, EVIDENCE_REJECTED, EVIDENCE_UNAVAILABLE,
+    PRE_REGISTER_GATES, PROVISIONAL_CAPACITY, SESSION_RETIRED, SLOT_TAKEN,
+    journal_seal_still_clear,
 };
 
 /// Maximum authorization handshakes in flight at once. A coarse admission backstop:
@@ -84,6 +85,20 @@ enum ConnError {
     /// relay in a multi-relay session).
     #[error("tenant {tenant:?} session {session:?} slot {slot:?} is not homed on this relay")]
     SlotNotHomed {
+        tenant: TenantId,
+        session: SessionId,
+        slot: SlotId,
+    },
+    /// Required evidence was unavailable for this connection attempt.
+    #[error("tenant {tenant:?} session {session:?} slot {slot:?} evidence unavailable")]
+    EvidenceUnavailable {
+        tenant: TenantId,
+        session: SessionId,
+        slot: SlotId,
+    },
+    /// The slot requires evidence and the supplied frame did not pass.
+    #[error("tenant {tenant:?} session {session:?} slot {slot:?} evidence refused")]
+    EvidenceRejected {
         tenant: TenantId,
         session: SessionId,
         slot: SlotId,
@@ -439,25 +454,65 @@ async fn serve_connection(
 
     // GATE: the authorization handshake, and the deadline on it. Nothing below
     // has a session to refuse against until this has named one.
+    let auth_deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
     let handshake = auth::authenticate(&connection, registry, time::unix_secs_fail_closed());
-    let (authorized, resume_cursors, connection_epoch, mut handshake_send) =
-        match tokio::time::timeout(AUTH_TIMEOUT, handshake).await {
-            Ok(result) => result?,
-            Err(_elapsed) => {
+    let auth::Authenticated {
+        authorized,
+        resume_cursors,
+        connection_epoch,
+        send: mut handshake_send,
+        evidence,
+        evidence_request,
+    } = match tokio::time::timeout_at(auth_deadline, handshake).await {
+        Ok(result) => result?,
+        Err(_elapsed) => {
+            connection.close(
+                VarInt::from_u32(close_codes::AUTH_TIMEOUT),
+                b"authorization timed out",
+            );
+            return Err(ConnError::AuthTimeout);
+        }
+    };
+
+    let key = SessionKey {
+        tenant: authorized.tenant.clone(),
+        session: authorized.session,
+    };
+
+    // A managed relay cannot know an absent descriptor's policy. Keep both
+    // protocol versions within the authorization deadline and admission cap until
+    // the descriptor is installed; no roster or routing state exists while waiting.
+    let config = if mesh.session.decision_makers.descriptors_required() {
+        let wait = mesh.session.wait_evidence_config(&key);
+        match tokio::time::timeout_at(auth_deadline, wait).await {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                connection.close(
+                    VarInt::from_u32(close_codes::SESSION_RETIRED),
+                    b"session retired",
+                );
+                return Err(ConnError::SessionRetired {
+                    tenant: key.tenant,
+                    session: key.session,
+                    slot: authorized.slot,
+                });
+            }
+            Err(_) => {
                 connection.close(
                     VarInt::from_u32(close_codes::AUTH_TIMEOUT),
                     b"authorization timed out",
                 );
                 return Err(ConnError::AuthTimeout);
             }
-        };
-
-    drop(handshake_permit);
-
-    let key = SessionKey {
-        tenant: authorized.tenant.clone(),
-        session: authorized.session,
+        }
+    } else {
+        mesh.session
+            .decision_makers
+            .evidence_config(&key)
+            .unwrap_or_default()
     };
+    let evidence = auth::verify_evidence(&evidence_request, evidence, &config);
+    drop(handshake_permit);
 
     // The session and slot are known, so from here on a refusal could leave
     // relay state behind. The guard takes custody: it closes the connection,
@@ -473,6 +528,17 @@ async fn serve_connection(
         if let Some(refusal) = gate(&mesh.session, &key, authorized.slot) {
             return Err(admission.refuse(refusal));
         }
+    }
+
+    if config.required_slots.contains(&authorized.slot)
+        && evidence.verdict != rally_point_proto::control::EvidenceVerdict::Valid
+    {
+        let refusal = if evidence.verdict == rally_point_proto::control::EvidenceVerdict::Missing {
+            EVIDENCE_UNAVAILABLE
+        } else {
+            EVIDENCE_REJECTED
+        };
+        return Err(admission.refuse(refusal));
     }
 
     // GATE: the roster seat. Admission is an ingress critical section on the
@@ -512,6 +578,19 @@ async fn serve_connection(
             Some(false) => return Err(admission.refuse(PROVISIONAL_CAPACITY)),
             None => return Err(admission.refuse(SESSION_RETIRED)),
         }
+    }
+
+    let current_assignment = mesh.session.gates.with_ingress(&key, || {
+        mesh.session.decision_makers.evidence_assignment_current(
+            &key,
+            authorized.slot,
+            evidence.assignment_revision,
+        )
+    });
+    match current_assignment {
+        Some(true) => {}
+        Some(false) => return Err(admission.refuse(ASSIGNMENT_CHANGED)),
+        None => return Err(admission.refuse(SESSION_RETIRED)),
     }
 
     // GATE: the handshake ack, written BEFORE touching any hold/departure
@@ -557,16 +636,11 @@ async fn serve_connection(
         let verdict = mesh
             .session
             .admit_reconnect(&key, authorized.slot, Some(connection_epoch));
-        // Bound the admit-first race this connection just rode (the home-relay
-        // gate above, admitted because no descriptor names this session yet):
-        // if the coordinator's descriptor push never arrives, the
-        // provisional-admission sweep tears this session down rather than
-        // trusting it indefinitely. A session already covered by a descriptor
-        // — even one with an empty (unenforced) homed set — is left alone; see
-        // `crate::session::provisional::ProvisionalSessions::mark_if_undescribed`.
-        // Inside the ingress section so the mark and the maker existence it
-        // keys on are read atomically against a retirement sweep.
-        if matches!(verdict, consensus::ReconnectAdmission::Admitted { .. }) {
+        // Library callers can explicitly enable provisional admission. Managed
+        // relays wait for descriptors and never arm this bookkeeping.
+        if mesh.session.provisional_turns.armed()
+            && matches!(verdict, consensus::ReconnectAdmission::Admitted { .. })
+        {
             mesh.session
                 .provisional
                 .mark_if_undescribed(&mesh.session.decision_makers, &key);
@@ -612,6 +686,7 @@ async fn serve_connection(
         authorized.slot,
         connection_epoch,
         resume_cursors,
+        evidence,
         inbox,
         sessions,
         mesh,

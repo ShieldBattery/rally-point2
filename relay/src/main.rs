@@ -40,7 +40,6 @@ use rally_point_relay::mesh::dialer;
 use rally_point_relay::mesh::edge;
 use rally_point_relay::routing::Sessions;
 use rally_point_relay::server;
-use rally_point_relay::session::provisional;
 use rally_point_transport::noq;
 
 mod cli;
@@ -352,12 +351,8 @@ async fn main() -> Result<()> {
         // crashed former authority) re-broadcasts the synced leave that
         // authority never delivered to this relay's own clients and its mesh
         // peers, skipping a slot whose drop is still held undecided exactly as
-        // the presence-driven promotion does; an applying descriptor clears the
-        // provisional mark client admission left on the session and drains the
-        // provisional-turn pen through the ordinary forward path, where the
-        // fresh maker's seeded decided leaves fence a departed slot's held
-        // turns; and retirement closes the same ingress gate the turn path,
-        // mesh dispatch, and client admission run through.
+        // the presence-driven promotion does; retirement closes the same ingress
+        // gate the turn path, mesh dispatch, and client admission run through.
         let mesh_control =
             control::MeshControl::new(RelayId(our_id), &mesh_state, Arc::clone(&sessions));
         // The flight recorder's create-on-first-touch consults the same gates,
@@ -375,13 +370,10 @@ async fn main() -> Result<()> {
         // the registry still fills as links establish and tests drive `Join` on
         // the command senders directly.
         if let Some(coordinator_url) = cli.coordinator_url.clone() {
-            // Coordinator-managed: every session's descriptor is expected, so
-            // arm the provisional-turn pen — the turn funnel holds a
-            // pre-descriptor client's turns until the descriptor proves its
-            // slot current (or seeds it departed, fencing them). A standalone
-            // dev/loopback relay has no descriptor source and leaves the pen
-            // disarmed, keeping its descriptor-less sessions flowing.
-            mesh_state.session.provisional_turns.arm();
+            // Managed clients wait for their descriptor before admission. The
+            // provisional journal stays disarmed: no client turns can arrive
+            // before this relay knows the session's policy and assignment.
+            mesh_state.session.decision_makers.require_descriptors();
             // The on-demand dialer: establish (and re-establish) mesh links to the
             // peers the coordinator's descriptors name, driven by the Join source's
             // desired-peer set. This is the production dial path — the static
@@ -429,6 +421,8 @@ async fn main() -> Result<()> {
             // sessions' state hash reports, which the coordinator likewise asks
             // only of sessions every assigned relay supports.
             .with_capabilities(vec![
+                rally_point_proto::control::CAPABILITY_EVIDENCE_V1.to_owned(),
+                rally_point_proto::control::CAPABILITY_DESCRIPTOR_ACK_V1.to_owned(),
                 rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1.to_owned(),
                 rally_point_proto::control::CAPABILITY_ROLLBACK_V1.to_owned(),
             ]);
@@ -469,17 +463,9 @@ async fn main() -> Result<()> {
                 .decision_makers
                 .set_notice_notifier(notices_tx);
 
-            // The provisional-admission sweep's arming signal: `true` only
-            // while the control connection below is actually established (see
-            // `coordinator::client::run_descriptor_subscriber`'s doc on
-            // `control_connected`). Local to this block, so dev/static mode
-            // (no coordinator URL) never constructs it and never spawns the
-            // sweep task at all — the simplest possible "never arms".
+            // The idle self-exit tracks whether the control connection is enrolled.
             let (control_connected_tx, control_connected_rx) = tokio::sync::watch::channel(false);
-            // Hand the idle self-exit a read handle onto the same signal: a relay
-            // that loses this control connection and holds no session self-reaps
-            // once both have held for the exit threshold.
-            idle_exit_connected_rx = Some(control_connected_rx.clone());
+            idle_exit_connected_rx = Some(control_connected_rx);
 
             tokio::spawn(coordinator::client::run_descriptor_subscriber(
                 coordinator::client::EnrollConfig {
@@ -510,12 +496,6 @@ async fn main() -> Result<()> {
                 },
                 drain_rx.clone(),
                 control_connected_tx,
-            ));
-            tokio::spawn(provisional::run_sweep(
-                mesh_state.session.provisional.clone(),
-                Arc::clone(&sessions),
-                Arc::clone(&mesh_state.session.decision_makers),
-                control_connected_rx,
             ));
             // Measure backbone round-trips to the coordinator's region beacons and
             // report the medians up the heartbeat. Spawned only here, inside the

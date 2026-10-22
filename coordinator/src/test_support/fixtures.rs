@@ -117,6 +117,7 @@ pub(crate) fn enroll_fleet(reg: &RelayRegistry, relays: &[FleetRelay<'_>]) -> Ve
 /// carrying no external ref. Override fields with struct-update syntax.
 pub(crate) fn player(slot: u8) -> PlayerHandoff {
     PlayerHandoff {
+        require_evidence: false,
         slot: SlotId(slot),
         client_pubkey: ClientPublicKey([slot; 32]),
         external_ref: None,
@@ -151,6 +152,7 @@ pub(crate) fn two_players() -> Vec<PlayerHandoff> {
 /// latency estimate. Override either with struct-update syntax.
 pub(crate) fn request(players: Vec<PlayerHandoff>) -> SessionRequest {
     SessionRequest {
+        evidence_keys: Vec::new(),
         lobby_policy: None,
         rollback: false,
         tenant: tid(),
@@ -165,6 +167,9 @@ pub(crate) fn request(players: Vec<PlayerHandoff>) -> SessionRequest {
 /// struct-update syntax, so its body shows only what it is about.
 pub(crate) fn descriptor(tenant: TenantId, session: u64) -> SessionDescriptor {
     SessionDescriptor {
+        evidence_keys: Vec::new(),
+        required_evidence_slots: Vec::new(),
+        evidence_assignments: Vec::new(),
         lobby_policy: None,
         lobby_settled: false,
         rollback: false,

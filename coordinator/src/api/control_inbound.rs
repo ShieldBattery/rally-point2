@@ -201,37 +201,46 @@ pub(super) fn note_inbound(
             );
             InboundAction::None
         }
+        Ok(RelayToCoordinator::DescriptorsApplied { ack_id }) => {
+            if registry::generation_is_current(setup.registry(), relay_id, generation) {
+                setup
+                    .descriptors()
+                    .delivery()
+                    .acknowledge(relay_id, generation, ack_id);
+            }
+            InboundAction::None
+        }
         Ok(RelayToCoordinator::Draining) => {
             // Presence is enough for liveness; the loop runs the set-before-ack drain
             // exchange, which needs the connection's socket and generation.
             InboundAction::DrainRequested
         }
         Ok(RelayToCoordinator::Departure(notice)) => {
-            lifecycle.ingest_notice(relay_id, SessionNotice::Departure(notice));
+            lifecycle.ingest_notice(relay_id, generation, SessionNotice::Departure(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::Desync(notice)) => {
-            lifecycle.ingest_notice(relay_id, SessionNotice::Desync(notice));
+            lifecycle.ingest_notice(relay_id, generation, SessionNotice::Desync(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::Result(notice)) => {
-            lifecycle.ingest_notice(relay_id, SessionNotice::Result(notice));
+            lifecycle.ingest_notice(relay_id, generation, SessionNotice::Result(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::SlotConnected(notice)) => {
-            lifecycle.ingest_notice(relay_id, SessionNotice::SlotConnected(notice));
+            lifecycle.ingest_notice(relay_id, generation, SessionNotice::SlotConnected(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::SessionStarted(notice)) => {
-            lifecycle.ingest_notice(relay_id, SessionNotice::SessionStarted(notice));
+            lifecycle.ingest_notice(relay_id, generation, SessionNotice::SessionStarted(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::SlotStarted(notice)) => {
-            lifecycle.ingest_notice(relay_id, SessionNotice::SlotStarted(notice));
+            lifecycle.ingest_notice(relay_id, generation, SessionNotice::SlotStarted(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::LobbyViolation(notice)) => {
-            lifecycle.ingest_notice(relay_id, SessionNotice::LobbyViolation(notice));
+            lifecycle.ingest_notice(relay_id, generation, SessionNotice::LobbyViolation(notice));
             InboundAction::None
         }
         Ok(RelayToCoordinator::SessionClosed { tenant, session }) => {

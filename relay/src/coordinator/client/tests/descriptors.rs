@@ -71,6 +71,7 @@ fn a_delta_adds_removes_and_mutates_converging_to_a_full_reconcile() {
     apply_message(
         &delta_control,
         CoordinatorToRelay::DescriptorDelta {
+            ack_id: None,
             staged_at_unix_ms: None,
             upserts: vec![descriptor(3, &[2]), descriptor(2, &[3])],
             removals: vec![DescriptorKey {
@@ -124,6 +125,7 @@ fn a_delta_records_the_applied_set_size_after_the_delta_and_its_apply_lag() {
     apply_message(
         &control,
         CoordinatorToRelay::Descriptors {
+            ack_id: None,
             descriptors: vec![
                 descriptor(1, &[]),
                 descriptor(2, &[]),
@@ -141,6 +143,7 @@ fn a_delta_records_the_applied_set_size_after_the_delta_and_its_apply_lag() {
     apply_message(
         &control,
         CoordinatorToRelay::DescriptorDelta {
+            ack_id: None,
             staged_at_unix_ms: Some(staged),
             upserts: vec![],
             removals: vec![DescriptorKey {
@@ -192,6 +195,7 @@ fn a_delta_upsert_reconciles_dials_that_raced_it_and_starts_the_session() {
     apply_message(
         &control,
         CoordinatorToRelay::DescriptorDelta {
+            ack_id: None,
             staged_at_unix_ms: None,
             upserts: vec![desc],
             removals: vec![],
@@ -269,6 +273,7 @@ fn an_unknown_message_is_skipped_and_does_not_disturb_state_or_later_messages() 
     apply_message(
         &control,
         CoordinatorToRelay::Descriptors {
+            ack_id: None,
             descriptors: vec![descriptor(1, &[2])],
             staged_at_unix_ms: None,
         },
@@ -287,6 +292,7 @@ fn an_unknown_message_is_skipped_and_does_not_disturb_state_or_later_messages() 
     apply_message(
         &control,
         CoordinatorToRelay::Descriptors {
+            ack_id: None,
             descriptors: vec![],
             staged_at_unix_ms: None,
         },
@@ -308,6 +314,7 @@ fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
     apply_message(
         &control,
         CoordinatorToRelay::Descriptors {
+            ack_id: None,
             descriptors: vec![descriptor(1, &[]), descriptor(2, &[])],
             staged_at_unix_ms: Some(staged),
         },
@@ -329,6 +336,7 @@ fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
     apply_message(
         &control,
         CoordinatorToRelay::Descriptors {
+            ack_id: None,
             descriptors: vec![descriptor(1, &[])],
             staged_at_unix_ms: None,
         },
@@ -347,6 +355,7 @@ fn an_applied_descriptor_set_records_its_apply_lag_and_length() {
     apply_message(
         &control,
         CoordinatorToRelay::Descriptors {
+            ack_id: None,
             descriptors: vec![],
             staged_at_unix_ms: Some(rally_point_proto::time::unix_millis() + 60_000),
         },

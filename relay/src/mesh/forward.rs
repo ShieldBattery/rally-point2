@@ -36,9 +36,9 @@ pub fn forward_client_turn(
     slot: SlotId,
     payload: Payload,
 ) {
-    // On a coordinator-managed relay, a session with no decision-maker is a
-    // session no descriptor has named here yet — and until one does, the
-    // relay cannot tell a current slot from one that already departed with an
+    // A library embedding can opt into provisional admission. Its session with
+    // no decision-maker is one no descriptor has named here yet. Until one does,
+    // the relay cannot tell a current slot from one that already departed with an
     // exact final turn count (a re-homed group's dial racing its resumed
     // descriptor). A departed slot's turn fanned out in that window is a turn
     // past the leave's synchronization point, consumed by co-admitted

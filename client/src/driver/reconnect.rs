@@ -226,17 +226,19 @@ pub(super) fn is_link_failure(error: &DriverError) -> bool {
     )
 }
 
-/// The relay's close code when it closed `connection` to evict the slot
-/// ([`close_codes::DESYNC_EVICTED`], [`close_codes::LOBBY_VIOLATION`]). The relay
-/// refuses every later dial for an evicted slot as slot-departed, so the link
-/// failure this close surfaces as is terminal, not something to re-dial through.
+/// A terminal relay refusal on an established connection. These policy outcomes
+/// cannot be resolved by reconnecting or trying another address.
 pub(super) fn eviction_code(connection: &noq::Connection) -> Option<u32> {
     let Some(noq::ConnectionError::ApplicationClosed(close)) = connection.close_reason() else {
         return None;
     };
-    [close_codes::DESYNC_EVICTED, close_codes::LOBBY_VIOLATION]
-        .into_iter()
-        .find(|&code| close.error_code == noq::VarInt::from_u32(code))
+    [
+        close_codes::DESYNC_EVICTED,
+        close_codes::LOBBY_VIOLATION,
+        close_codes::EVIDENCE_REJECTED,
+    ]
+    .into_iter()
+    .find(|&code| close.error_code == noq::VarInt::from_u32(code))
 }
 
 /// Whether the identity's authorization token has expired against the wall clock —
@@ -386,6 +388,9 @@ pub(super) async fn reconnect_link(
             Err(DialError::SlotDeparted) => {
                 return Reconnected::Terminal(DriverError::SlotDeparted);
             }
+            Err(DialError::EvidenceRejected) => {
+                return Reconnected::Terminal(DriverError::EvidenceRejected);
+            }
             // A transient same-relay failure. Retry — over the relay's next address,
             // in case it was this one's path that died rather than the relay — and,
             // for an in-game session with a provider, escalate to
@@ -523,6 +528,11 @@ pub(super) async fn reconnect_link(
                                                 DriverError::SlotDeparted,
                                             );
                                         }
+                                        Err(DialError::EvidenceRejected) => {
+                                            return Reconnected::Terminal(
+                                                DriverError::EvidenceRejected,
+                                            );
+                                        }
                                         Err(new_error) => {
                                             next_escalate_at = Instant::now() + rc.escalate_retry;
                                             tracing::info!(
@@ -579,7 +589,8 @@ async fn dial_each_address(
         {
             Ok(link) => return Ok(link),
             Err(error)
-                if index + 1 < target.addrs.len() && !matches!(error, DialError::SlotDeparted) =>
+                if index + 1 < target.addrs.len()
+                    && !matches!(error, DialError::SlotDeparted | DialError::EvidenceRejected) =>
             {
                 tracing::info!(%error, relay = %addr, "re-home dial failed; trying the relay's next address");
                 index += 1;

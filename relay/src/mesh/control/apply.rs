@@ -220,7 +220,9 @@ impl MeshControl {
         // atomic empty-check resolves the session — so nothing is ever
         // announced ahead of ingress it should have ordered behind, and
         // nothing deposits past the completed drain.
-        if let Some(mut batch) = self.mesh.session.provisional_turns.begin_drain(&key) {
+        if self.mesh.session.provisional_turns.armed()
+            && let Some(mut batch) = self.mesh.session.provisional_turns.begin_drain(&key)
+        {
             loop {
                 // The batch stays charged against the journal's byte budget
                 // until replayed — the budget tracks resident memory, and

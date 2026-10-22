@@ -380,6 +380,49 @@ impl SessionSetup {
             .is_some_and(|&home| home == relay)
     }
 
+    pub(crate) fn has_session_refs(&self, tenant: &TenantId, session: SessionId) -> bool {
+        self.session_refs
+            .lock()
+            .contains_key(&(tenant.clone(), session))
+    }
+
+    /// The revision of a slot's current assignment, only for its authoritative home.
+    pub(crate) fn evidence_assignment(
+        &self,
+        relay: RelayId,
+        tenant: &TenantId,
+        session: SessionId,
+        slot: SlotId,
+    ) -> Option<u64> {
+        let refs = self.session_refs.lock();
+        let refs = refs.get(&(tenant.clone(), session))?;
+        (refs.homes.get(&slot) == Some(&relay))
+            .then(|| refs.evidence_assignments.get(&slot).copied().unwrap_or(0))
+    }
+
+    pub(crate) fn evidence_assignments(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+    ) -> std::collections::BTreeMap<SlotId, (RelayId, u64)> {
+        let refs = self.session_refs.lock();
+        let Some(refs) = refs.get(&(tenant.clone(), session)) else {
+            return Default::default();
+        };
+        refs.homes
+            .iter()
+            .map(|(&slot, &relay)| {
+                (
+                    slot,
+                    (
+                        relay,
+                        refs.evidence_assignments.get(&slot).copied().unwrap_or(0),
+                    ),
+                )
+            })
+            .collect()
+    }
+
     /// The number of live sessions `relay` currently serves — how many recorded
     /// serving sets, across every tenant, name it. Zero means the relay homes no
     /// session's slots right now: a reconcile scale-down reads this to find a relay

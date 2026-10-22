@@ -133,10 +133,12 @@ fn provisioning_state(region_ids: &[&str], provisioning: bool) -> CoordinatorSta
 /// `external_id`.
 fn region_create_body(region: &str, external_id: &str) -> Vec<u8> {
     let req = SessionRequest {
+        evidence_keys: Vec::new(),
         lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: vec![PlayerHandoff {
+            require_evidence: false,
             slot: SlotId(0),
             client_pubkey: ClientPublicKey([0xAA; 32]),
             external_ref: None,

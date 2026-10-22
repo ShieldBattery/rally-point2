@@ -86,9 +86,7 @@ pub(super) enum ControlDisconnect {
 /// coordinated-drain seam; `control_connected` reports whether this relay is
 /// enrolled and receiving coordinator pushes — set `true` on the first inbound
 /// application frame (which an accepted enroll always sends and a refusal never
-/// does), cleared on every disconnect — so the provisional-admission sweep
-/// ([`crate::session::provisional::run_sweep`]) arms only while it is `true` rather than
-/// reaping across a reconnect gap, and the idle self-exit
+/// does), cleared on every disconnect. The idle self-exit
 /// ([`crate::coordinator::idle_exit::run`]) reads it as the "not enrolled" half of its exit
 /// condition.
 ///
@@ -191,7 +189,7 @@ pub async fn run_descriptor_subscriber_with(
         };
         // The connection just ended, however it ended -- report it down
         // uniformly here rather than at each of `connect_and_stream`'s several
-        // exit points, so the provisional-admission sweep never observes a
+        // exit points, so the idle self-exit never observes a
         // stale "connected" reading across a reconnect gap.
         let _ = control_connected.send(false);
         tokio::time::sleep(delay).await;
@@ -347,6 +345,11 @@ async fn connect_and_stream(
     // than queue them behind a caller that has already given up.
     let (load_state_tx, load_state_rx) = tokio::sync::mpsc::channel(LOAD_STATE_ASK_CAPACITY);
 
+    // Created only after the enroll proof, and discarded with this connection.
+    // One latest id covers all prior applies without an unbounded acknowledgement
+    // queue or any wait in the read half.
+    let (descriptor_ack_tx, descriptor_ack_rx) = watch::channel(None);
+
     // Run both halves until either ends; the first to finish is the connection's
     // outcome, and dropping the other closes its half of the socket. There is no
     // spawned task to leak, and the caller-owned `outbound` slots — mutated in place
@@ -361,6 +364,7 @@ async fn connect_and_stream(
                 challenge_tx,
                 flight_grant_tx,
                 load_state_tx,
+                descriptor_ack_tx,
             },
             read_stats,
             control_connected,
@@ -376,6 +380,7 @@ async fn connect_and_stream(
                 challenge_rx,
                 flight_grant_rx,
                 load_state_rx,
+                descriptor_ack_rx,
             },
         ) => result,
     }

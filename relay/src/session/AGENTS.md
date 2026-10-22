@@ -54,10 +54,10 @@ module's teardown).
   create-on-first-touch) runs through: `with_ingress` refuses once `retire`
   marks the session, and `retire` drains in-flight ingress first, closing
   check-then-mutate races. Lock order: gate then registry, never reversed.
-- `provisional.rs` — admit-first bookkeeping for a client dial that beat its
-  descriptor; deadline on the mark, reaped by `run_sweep` if no descriptor
-  claims the session. Sweep arms only on a coordinator-driven relay with a
-  live control connection.
+- `provisional.rs` — optional library bookkeeping for admit-first callers.
+  Production relays wait for descriptors and neither arm the journal nor run
+  its sweep. A library caller that opts in must gate the sweep on a live
+  descriptor source.
 - `provisional_turns/` — pre-descriptor ingress **journal** (turns +
   departures) for a session with no maker yet: Gathering → Draining →
   Resolved. Nothing is deleted while undrained; only descriptor retirement

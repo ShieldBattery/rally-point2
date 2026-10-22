@@ -2,11 +2,13 @@
 //! per-session facts captured for `crate::persist` and restored from it, and the
 //! bounded wait a shutdown makes for queued webhooks to deliver.
 //!
-//! Only facts are persisted, never timers or evidence. The serving set and the
-//! player/observer split are re-derived from the setup record, every reap timer
-//! is re-armed from the restored facts, and heartbeat-derived evidence (empty
-//! rosters, close marks) is left to the relays' next beats — a relay re-enrolling
-//! reopens its close evidence anyway, and silence is never proof.
+//! Accumulated facts and connection observations are persisted, including the
+//! assignment, process, and activation fences that scope those observations.
+//! Timers and transient liveness evidence (empty rosters, close marks) are not.
+//! The serving set and player/observer split are re-derived from the setup record,
+//! every reap timer is re-armed from the restored facts, and the relays' next beats
+//! rebuild liveness evidence. A relay re-enrolling reopens its close evidence,
+//! and silence is never proof.
 //!
 //! [`LifecycleFacts`] is a persisted format: a field added later must deserialize
 //! from a record written before it existed (the container-level `serde(default)`).
@@ -19,6 +21,7 @@ use super::*;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct LifecycleFacts {
+    evidence: Vec<(SlotId, evidence::StoredEvidence)>,
     /// Whether a client was ever observed for the session.
     started: bool,
     /// The relay-reported session start instant (unix epoch ms).
@@ -73,6 +76,11 @@ impl Lifecycle {
                     .collect();
                 departures.sort_by_key(|d| d.slot);
                 let facts = LifecycleFacts {
+                    evidence: state
+                        .evidence
+                        .iter()
+                        .map(|(&slot, value)| (slot, value.clone()))
+                        .collect(),
                     started: state.started,
                     started_at_ms: state.started_at_ms,
                     attestable: state.attestable,
@@ -116,6 +124,7 @@ impl Lifecycle {
         state.started_at_ms = facts.started_at_ms;
         state.accounted.extend(facts.accounted);
         state.connected_slots.extend(facts.connected_slots);
+        state.evidence.extend(facts.evidence);
         state.started_slots.extend(facts.started_slots);
         state.forwarded_slots.extend(facts.forwarded_slots);
         state

@@ -280,6 +280,9 @@ async fn push_and_watch(
     let (grants_tx, grants) = tokio::sync::mpsc::unbounded_channel::<CoordinatorToRelay>();
 
     let mut sources = WriterSources::new(setup, relay_id, regions, drain, grants);
+    if !sources.enable_acknowledgements(setup, relay_id, inbound.generation) {
+        return;
+    }
 
     // The two halves run concurrently until one returns; the other's future is then
     // dropped (cancelled) here. A drop is safe on both sides: the reader only ever

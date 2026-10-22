@@ -18,6 +18,7 @@ mod clock;
 mod connection;
 mod departure;
 mod eviction;
+mod evidence;
 mod homing;
 mod leave;
 mod lobby_policy;
@@ -228,6 +229,9 @@ pub struct DecisionMaker {
     pub(in crate::consensus) results: HashMap<SlotId, ResultEcho>,
     /// Immutable descriptor allow-list for client lobby commands before a slot starts.
     pub(in crate::consensus) lobby_policy: Option<LobbyPolicy>,
+    pub(in crate::consensus) evidence_config: EvidenceConfig,
+    pub(in crate::consensus) evidence:
+        HashMap<SlotId, rally_point_proto::control::EvidenceObservation>,
     /// Whether an attested failed-setup read closed future home-authored lobby ingress.
     pub(in crate::consensus) lobby_closed: bool,
     /// The per-session desync comparator. Only meaningful while this relay is the
@@ -523,6 +527,8 @@ impl DecisionMaker {
             observers,
             results: HashMap::new(),
             lobby_policy: None,
+            evidence_config: EvidenceConfig::default(),
+            evidence: HashMap::new(),
             lobby_closed: false,
             sync: SyncTracker::default(),
             sync_turns: SyncTurns::default(),

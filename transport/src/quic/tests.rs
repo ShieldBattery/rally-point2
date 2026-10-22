@@ -239,3 +239,51 @@ async fn every_side_of_every_link_runs_the_floored_controller() {
         }
     }
 }
+
+#[tokio::test]
+async fn client_edge_negotiates_current_or_legacy_in_both_rollout_orders() {
+    for (old_server, old_client) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (chain, key, ca) = self_signed();
+        let server_cfg = if old_server {
+            let mut tls = rustls::ServerConfig::builder_with_provider(ring_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(chain, key)
+                .unwrap();
+            tls.alpn_protocols = vec![LEGACY_ALPN.to_vec()];
+            noq::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()))
+        } else {
+            server_config(chain, key).unwrap()
+        };
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca).unwrap();
+        let client_cfg = if old_client {
+            let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            tls.alpn_protocols = vec![LEGACY_ALPN.to_vec()];
+            noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()))
+        } else {
+            client_config(roots).unwrap()
+        };
+        let bind = (Ipv4Addr::LOCALHOST, 0).into();
+        let server = noq::Endpoint::server(server_cfg, bind).unwrap();
+        let client = noq::Endpoint::client(bind).unwrap();
+        client.set_default_client_config(client_cfg);
+        let address = server.local_addr().unwrap();
+        let accept = async { server.accept().await.unwrap().await.unwrap() };
+        let dial = async { client.connect(address, "localhost").unwrap().await.unwrap() };
+        let (accepted, dialed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(accept, dial)
+        })
+        .await
+        .unwrap();
+        let expected = !old_server && !old_client;
+        assert_eq!(supports_evidence(&accepted), expected);
+        assert_eq!(supports_evidence(&dialed), expected);
+        dialed.close(noq::VarInt::from_u32(0), b"done");
+    }
+}

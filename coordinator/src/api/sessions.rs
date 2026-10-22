@@ -149,6 +149,7 @@ pub(super) async fn create_session(
                 registry::SessionSetupError::IdempotentCreateMismatch => StatusCode::CONFLICT,
                 registry::SessionSetupError::TenantNotFound(_)
                 | registry::SessionSetupError::SlotOutOfRange(_)
+                | registry::SessionSetupError::InvalidEvidenceKeys
                 | registry::SessionSetupError::NoPlayers
                 | registry::SessionSetupError::DuplicateSlot(_)
                 | registry::SessionSetupError::ExternalIdTooLong
@@ -174,6 +175,9 @@ pub(super) async fn create_session(
     // an `external_id`) and flushes again.
     persist_before_answering(&state)?;
 
+    let resp = super::descriptor_readiness::ready_create(&state, &tenant, resp).await?;
+    // A concurrent rehome may have refreshed the returned topology during the wait.
+    persist_before_answering(&state)?;
     tracing::info!(
         session = %resp.session,
         home_relay = %resp.home_relay.relay_id,
@@ -339,9 +343,12 @@ pub(super) async fn rehome_session(
     // starve a real survivor's ask for the same session's bucket. A fully-closed
     // session records nothing here (its rehomes are cleared at close), so this can
     // never revive a dead session.
-    if let Some(endpoint) = session::recorded_rehome(&state.setup, &tenant, session, dead_relay) {
+    if session::recorded_rehome(&state.setup, &tenant, session, dead_relay).is_some() {
         // The recorded move may be the one an earlier ask committed but failed to
         // persist; it must be durable before this ask points a client at it.
+        persist_before_answering(&state)?;
+        let endpoint =
+            super::descriptor_readiness::ready_rehome(&state, &tenant, session, dead_relay).await?;
         persist_before_answering(&state)?;
         return Ok(Json(RehomeResponse::from_outcome(
             &state.setup,
@@ -374,7 +381,7 @@ pub(super) async fn rehome_session(
     // rehome reads it at descriptor-build time under that same lock, so a
     // departure notice landing while this request is in flight still seeds the
     // resumed descriptors (see `rehome_inner`).
-    let outcome = session::rehome_with_assignment_commit(
+    let mut outcome = session::rehome_with_assignment_commit(
         &state.setup,
         &tenant,
         session,
@@ -393,10 +400,12 @@ pub(super) async fn rehome_session(
     if matches!(outcome, RehomeOutcome::NewTarget(_)) {
         persist_before_answering(&state)?;
     }
-    // Let the descriptor push reach R_new's control task before responding, so the
-    // relay is likelier to hold the resumed descriptor before a client dials it
-    // (the client's reconnect backoff absorbs whatever race remains).
-    tokio::task::yield_now().await;
+    if matches!(outcome, RehomeOutcome::NewTarget(_)) {
+        outcome = RehomeOutcome::NewTarget(
+            super::descriptor_readiness::ready_rehome(&state, &tenant, session, dead_relay).await?,
+        );
+        persist_before_answering(&state)?;
+    }
 
     Ok(Json(RehomeResponse::from_outcome(
         &state.setup,

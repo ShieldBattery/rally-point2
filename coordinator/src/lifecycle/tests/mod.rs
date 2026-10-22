@@ -96,6 +96,9 @@ fn stage_assignments(setup: &SessionSetup, session: SessionId, relays: &[RelayId
         setup.descriptors().record(
             relay,
             SessionDescriptor {
+                evidence_keys: Vec::new(),
+                required_evidence_slots: Vec::new(),
+                evidence_assignments: Vec::new(),
                 lobby_policy: None,
                 lobby_settled: false,
                 rollback: false,
@@ -139,6 +142,7 @@ fn heartbeat_load(
 
 mod close;
 mod empty_reap;
+mod evidence;
 mod heartbeat;
 mod notices;
 mod reaps;

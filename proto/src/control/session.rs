@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{RelayId, SessionId, SlotId};
 use crate::token::{ClientPublicKey, KeyId};
 
-use super::{DepartureKind, RegionId, RelayEndpoint, RelayPeer, TenantId};
+use super::{
+    DepartureKind, EvidenceKey, RegionId, RelayEndpoint, RelayPeer, SlotEvidenceAssignment,
+    TenantId,
+};
 
 // ---------------------------------------------------------------------------
 // Consensus policy (coordinator → relay, at session setup)
@@ -131,6 +134,9 @@ pub enum PolicyError {
 /// DLL at launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlayerHandoff {
+    /// Whether this slot requires valid connection evidence.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_evidence: bool,
     /// The slot this player occupies in the game (0-based, matches the slot
     /// the relay binds every submitted turn to).
     pub slot: SlotId,
@@ -177,6 +183,9 @@ pub struct PlayerHandoff {
 /// at game launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRequest {
+    /// Session-scoped keys accepted for connection evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_keys: Vec<EvidenceKey>,
     /// The tenant requesting the session — its signing key will sign the
     /// tokens.
     pub tenant: TenantId,
@@ -368,6 +377,15 @@ pub struct SlotExternalRef {
 /// themselves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDescriptor {
+    /// Session-scoped keys accepted for connection evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_keys: Vec<EvidenceKey>,
+    /// Slots whose connections require valid evidence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_evidence_slots: Vec<SlotId>,
+    /// Home revisions used to order observations across assignments.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_assignments: Vec<SlotEvidenceAssignment>,
     /// The tenant the session belongs to.
     pub tenant: TenantId,
     /// The coordinator-assigned session id.

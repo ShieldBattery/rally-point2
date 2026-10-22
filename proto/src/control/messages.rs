@@ -14,7 +14,8 @@ use crate::ids::{SessionId, SlotId};
 use super::{
     DepartureNotice, DescriptorKey, DesyncNotice, LobbyViolationNotice, MeshPeerIdentity,
     RegionBeaconTarget, RegionRttReport, RelayHello, ResultNotice, SessionDescriptor,
-    SessionStartedNotice, SlotConnectedNotice, SlotStartedNotice, TenantId, TenantVerifyingKey,
+    SessionStartedNotice, SlotConnectedNotice, SlotEvidence, SlotStartedNotice, TenantId,
+    TenantVerifyingKey,
 };
 
 /// `serde(skip_serializing_if)` helper: keep a field off the wire when it is
@@ -63,6 +64,12 @@ pub enum CoordinatorToRelay {
     /// relay should serve, each naming that session's mesh peers. The relay
     /// joins the named peers' links and leaves any session no longer present.
     Descriptors {
+        /// Optional installation barrier, increasing within this control connection.
+        /// Echoed only after the full update, including removals, has been applied.
+        /// Acknowledging a later id also covers earlier updates on the same ordered
+        /// connection. Absent means no acknowledgement is requested.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack_id: Option<u64>,
         /// The descriptors, one per session this relay currently serves.
         descriptors: Vec<SessionDescriptor>,
         /// The coordinator's wall-clock, unix epoch milliseconds, at the moment
@@ -105,6 +112,12 @@ pub enum CoordinatorToRelay {
     /// dropped connection is corrected by the next connection's re-sync, exactly as
     /// for a full set. The drain exchange keeps pushing the full set, never a delta.
     DescriptorDelta {
+        /// Optional installation barrier, increasing within this control connection.
+        /// Echoed only after the full update, including removals, has been applied.
+        /// Acknowledging a later id also covers earlier updates on the same ordered
+        /// connection. Absent means no acknowledgement is requested.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack_id: Option<u64>,
         /// The coordinator's wall-clock, unix epoch milliseconds, at the moment
         /// this delta left its outbox — the same staging stamp
         /// [`Descriptors`](Self::Descriptors) carries, with the same coarse
@@ -317,6 +330,13 @@ pub enum CoordinatorToRelay {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayToCoordinator {
+    /// Confirms a requested descriptor update was applied, including removals.
+    /// Ids belong only to this control connection; a later acknowledgement also
+    /// covers earlier updates, so a relay may coalesce pending acknowledgements.
+    DescriptorsApplied {
+        /// The coordinator's id from the applied full set or delta.
+        ack_id: u64,
+    },
     /// The relay's identity and reachable address, sent as the first frame to
     /// enroll into the coordinator's registry.
     Hello(RelayHello),
@@ -609,6 +629,9 @@ pub enum RelayToCoordinator {
 /// added claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPresence {
+    /// Latest connection evidence observations retained by this relay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<SlotEvidence>,
     /// The tenant the session belongs to.
     pub tenant: TenantId,
     /// The session the reporting relay is describing.

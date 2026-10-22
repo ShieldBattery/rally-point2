@@ -5,7 +5,9 @@ use super::*;
 
 impl DecisionMakers {
     /// Every session this relay holds a decision-maker for, paired with the load
-    /// state that maker has retained — the heartbeat builder's session universe.
+    /// progress facts that maker has retained — the heartbeat builder's session universe.
+    /// Opaque connection observations travel in notices and requested single-session
+    /// snapshots, keeping periodic roster size independent of their bodies.
     ///
     /// A maker lives from the descriptor apply that created it until the session
     /// retires, which outlasts every local link: a session whose slots have all
@@ -17,7 +19,7 @@ impl DecisionMakers {
     pub fn retained_load_states(&self) -> Vec<(SessionKey, RetainedLoadState)> {
         self.lock()
             .iter()
-            .map(|(key, maker)| (key.clone(), maker.load_state()))
+            .map(|(key, maker)| (key.clone(), maker.heartbeat_load_state()))
             .collect()
     }
 

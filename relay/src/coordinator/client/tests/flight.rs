@@ -207,6 +207,7 @@ async fn the_read_half_applies_a_descriptor_while_an_upload_awaits_its_grant() {
         // Read (and never answer) the upload request.
         let _request = ws.next().await.unwrap().unwrap();
         let descriptors = serde_json::to_string(&CoordinatorToRelay::Descriptors {
+            ack_id: None,
             descriptors: vec![descriptor(1, &[])],
             staged_at_unix_ms: None,
         })
@@ -359,6 +360,7 @@ impl WriterHarness {
                 challenge_rx,
                 flight_grant_rx,
                 load_state_rx,
+                descriptor_ack_rx: watch::channel(None).1,
             }),
             _keepalive: (drain_tx, challenge_tx, load_state_tx),
         }

@@ -81,6 +81,7 @@ pub async fn run_session(config: SessionConfig) -> SessionReport {
             client_pubkey,
             external_ref: None,
             observer: false,
+            require_evidence: false,
             region,
         });
         pkcs8_by_slot.insert(slot, pkcs8);
@@ -88,6 +89,7 @@ pub async fn run_session(config: SessionConfig) -> SessionReport {
 
     let request = SessionRequest {
         lobby_policy: None,
+        evidence_keys: Vec::new(),
         rollback: false,
         tenant: rally_point_proto::control::TenantId(config.tenant.clone()),
         players: handoffs,

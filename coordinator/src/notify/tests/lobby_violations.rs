@@ -77,7 +77,11 @@ async fn a_serving_peer_cannot_report_another_homes_lobby_violation() {
     .build();
     let lifecycle = Lifecycle::new(setup.clone());
 
-    lifecycle.ingest_notice(RelayId(2), SessionNotice::LobbyViolation(notice(session)));
+    lifecycle.ingest_notice(
+        RelayId(2),
+        0,
+        SessionNotice::LobbyViolation(notice(session)),
+    );
     no_further_webhook(
         &mut rx,
         "a serving peer cannot attribute a violation to a slot it does not home",

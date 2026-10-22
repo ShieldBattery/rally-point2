@@ -166,6 +166,12 @@ impl RegionRttIngest<'_> {
 /// accumulated sets. Truncated rather than rejected: the legitimate entries that
 /// precede the excess are still worth folding in.
 pub(crate) fn bound_session_slot_lists(relay_id: RelayId, session: &mut SessionPresence) {
+    session.evidence.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+    let mut evidence_slots = std::collections::HashSet::new();
+    session.evidence.retain(|entry| {
+        entry.observation.body.len() <= rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
+            && evidence_slots.insert(entry.slot)
+    });
     for (label, slots) in [
         ("connected", &mut session.slots),
         ("ever-connected", &mut session.ever_connected),
@@ -338,6 +344,7 @@ impl Lifecycle {
             });
             retain_home_turn_evidence(setup, relay, session, "heartbeat");
         }
+        self.merge_connection_evidence(relay, generation, &sessions);
         presence::apply_heartbeat(
             setup.presence(),
             relay,

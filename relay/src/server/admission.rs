@@ -80,6 +80,10 @@ pub(super) enum RefusalKind {
     /// The provisional journal's session ceiling refused a pre-descriptor
     /// admission.
     ProvisionalCapacity,
+    /// Supplied evidence failed a required check.
+    EvidenceRejected,
+    /// Required evidence was unavailable on this attempt.
+    EvidenceUnavailable,
 }
 
 impl RefusalKind {
@@ -104,6 +108,16 @@ impl RefusalKind {
                 slot,
             },
             RefusalKind::SlotTaken => ConnError::SlotTaken {
+                tenant,
+                session,
+                slot,
+            },
+            RefusalKind::EvidenceUnavailable => ConnError::EvidenceUnavailable {
+                tenant,
+                session,
+                slot,
+            },
+            RefusalKind::EvidenceRejected => ConnError::EvidenceRejected {
                 tenant,
                 session,
                 slot,
@@ -193,6 +207,30 @@ pub(super) const PROVISIONAL_CAPACITY: Refusal = Refusal {
     reason: b"provisional capacity exhausted",
     kind: RefusalKind::ProvisionalCapacity,
     rollback: Rollback::Scaffolding,
+};
+
+/// The descriptor assignment changed while the handshake was in flight.
+pub(super) const ASSIGNMENT_CHANGED: Refusal = Refusal {
+    code: close_codes::SLOT_NOT_HOMED,
+    reason: b"slot assignment changed",
+    kind: RefusalKind::SlotNotHomed,
+    rollback: Rollback::Scaffolding,
+};
+
+/// Evidence is checked before registration, so refusal owns no session state.
+pub(super) const EVIDENCE_REJECTED: Refusal = Refusal {
+    code: close_codes::EVIDENCE_REJECTED,
+    reason: b"evidence refused",
+    kind: RefusalKind::EvidenceRejected,
+    rollback: Rollback::Untouched,
+};
+
+/// A missing frame can be retried when the provider becomes available.
+pub(super) const EVIDENCE_UNAVAILABLE: Refusal = Refusal {
+    code: close_codes::EVIDENCE_UNAVAILABLE,
+    reason: b"evidence unavailable",
+    kind: RefusalKind::EvidenceUnavailable,
+    rollback: Rollback::Untouched,
 };
 
 /// One gate: a pure read of the session's state that either lets the dial past

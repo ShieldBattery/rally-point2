@@ -36,6 +36,13 @@ pub const CAPABILITY_FINALIZED_DROP_V1: &str = "finalized_drop_v1";
 /// re-homes one only onto such relays.
 pub const CAPABILITY_ROLLBACK_V1: &str = "rollback_v1";
 
+/// The relay supports session evidence configuration and observations.
+pub const CAPABILITY_EVIDENCE_V1: &str = "evidence_v1";
+
+/// The relay acknowledges explicitly requested descriptor installation barriers.
+/// Coordinators omit barriers for relays without this capability during rollout.
+pub const CAPABILITY_DESCRIPTOR_ACK_V1: &str = "descriptor_ack_v1";
+
 /// The fleet-wide ceiling on a player token's lifetime, in seconds (24 hours).
 ///
 /// A shared contract, not a tuning knob: the coordinator clamps its configured

@@ -11,7 +11,9 @@ use crate::registry::{self, cert_fingerprint};
 
 use super::RehomeOutcome;
 use super::descriptor::build_descriptor;
-use super::placement::{nearest_relay, relay_finalize_capable, relay_rollback_capable};
+use super::placement::{
+    nearest_relay, relay_evidence_capable, relay_finalize_capable, relay_rollback_capable,
+};
 use super::setup::SessionSetup;
 
 /// The replacement relay a prior [`rehome`] already recorded for
@@ -57,7 +59,8 @@ pub fn recorded_rehome(
         .lock()
         .get(&(tenant.clone(), session, dead_relay))?;
     let entry = registry::entry(&setup.registry, existing)?;
-    Some(RelayEndpoint::from(&entry))
+    evidence_capability_matches(setup, &(tenant.clone(), session), &entry)
+        .then(|| RelayEndpoint::from(&entry))
 }
 
 /// Coordinator-mediated failover: the client believes `dead_relay` has died and
@@ -222,6 +225,7 @@ pub(super) fn rehome_inner(
     // token; this copy stays here so the read-and-mutate below is atomic.)
     if let Some(&existing) = rehomes.get(&(tenant.clone(), session, dead_relay))
         && let Some(entry) = registry::entry(&setup.registry, existing)
+        && evidence_capability_matches(setup, &key, &entry)
     {
         return RehomeOutcome::NewTarget(RelayEndpoint::from(&entry));
     }
@@ -247,6 +251,7 @@ pub(super) fn rehome_inner(
         && serving.contains(&dead_relay)
         && let Some(entry) = registry::entry(&setup.registry, dead_relay)
         && cert_matches_pin(setup, &key, dead_relay, &entry.cert_der)
+        && evidence_capability_matches(setup, &key, &entry)
     {
         return RehomeOutcome::Stay;
     }
@@ -312,7 +317,9 @@ pub(super) fn rehome_inner(
     // the boundary the placement kept apart.
     // A rollback session also needs every relay it moves to to compare state hash reports.
     let entry_matches = |e: &RelayEntry| {
-        relay_finalize_capable(e) == cohort_capable && (!rollback || relay_rollback_capable(e))
+        relay_finalize_capable(e) == cohort_capable
+            && (!rollback || relay_rollback_capable(e))
+            && evidence_capability_matches(setup, &key, e)
     };
     let mut entries = registry::available_entries(&setup.registry);
     entries.retain(entry_matches);
@@ -334,6 +341,26 @@ pub(super) fn rehome_inner(
     let Some(new_entry) = registry::entry(&setup.registry, r_new) else {
         return RehomeOutcome::Unavailable;
     };
+
+    // Compute every successor before mutating membership: a revision must never
+    // wrap and make an old assignment current again.
+    let mut assignment_revisions = Vec::new();
+    if let Some(refs) = setup.session_refs.lock().get(&key) {
+        for (&slot, &home) in &refs.homes {
+            if home == dead_relay {
+                let Some(revision) = refs
+                    .evidence_assignments
+                    .get(&slot)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                else {
+                    return RehomeOutcome::Unavailable;
+                };
+                assignment_revisions.push((slot, revision));
+            }
+        }
+    }
 
     // Test seam: a full close landing between the serving-set snapshot above and
     // the mutation below (in production this is a no-op).
@@ -408,6 +435,7 @@ pub(super) fn rehome_inner(
                 *home_relay = r_new;
             }
         }
+        refs.evidence_assignments.extend(assignment_revisions);
         refs.relay_certs.remove(&dead_relay);
         refs.relay_certs
             .insert(r_new, cert_fingerprint(&new_entry.cert_der));
@@ -526,4 +554,14 @@ pub(crate) fn refresh_resumed_descriptors(
             setup.descriptors.record(relay_id, descriptor);
         }
     }
+}
+
+fn evidence_capability_matches(
+    setup: &SessionSetup,
+    key: &(TenantId, SessionId),
+    entry: &RelayEntry,
+) -> bool {
+    setup.session_refs.lock().get(key).is_some_and(|refs| {
+        refs.required_evidence_slots.is_empty() || relay_evidence_capable(entry)
+    })
 }

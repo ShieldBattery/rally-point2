@@ -460,6 +460,10 @@ impl<'a> EnrollHandshake<'a> {
             .capabilities
             .iter()
             .any(|c| c == rally_point_proto::control::CAPABILITY_ROLLBACK_V1);
+        let evidence_capable = hello
+            .capabilities
+            .iter()
+            .any(|c| c == rally_point_proto::control::CAPABILITY_EVIDENCE_V1);
         // Read out before the hello is consumed by the enroll below.
         let boot_id = hello.boot_id;
         // The enrollment's registry mutation and the capability-transition
@@ -474,7 +478,7 @@ impl<'a> EnrollHandshake<'a> {
         // rehome-first leaves a staged descriptor this snapshot picks up. The
         // eviction rehomes themselves run after the lock drops — each re-acquires
         // it internally.
-        let (enroll_result, evict) = {
+        let (enroll_result, evict, evidence_evict) = {
             let _assign = setup.lock_assignment();
             // The reconcile loop tombstones an id under this same lock before it
             // stops the relay's task, as the terminal step of a drain. The ledger
@@ -544,7 +548,18 @@ impl<'a> EnrollHandshake<'a> {
                 }
                 Err(_) => Vec::new(),
             };
-            (result, evict)
+            let evidence_evict: Vec<_> = if result.is_ok() && !evidence_capable {
+                setup
+                    .descriptors()
+                    .current_for(relay_id)
+                    .iter()
+                    .filter(|descriptor| !descriptor.required_evidence_slots.is_empty())
+                    .map(|descriptor| (descriptor.tenant.clone(), descriptor.session))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (result, evict, evidence_evict)
         };
         let generation = match enroll_result {
             Ok(generation) => generation,
@@ -569,6 +584,12 @@ impl<'a> EnrollHandshake<'a> {
             "relay enrolled over control connection"
         );
 
+        // Evict before the writer publishes its initial descriptor set. The relay
+        // remains available for sessions whose policy it can satisfy.
+        for (tenant, session) in evidence_evict {
+            lifecycle.evict_evidence_session(&tenant, session, relay_id);
+        }
+
         // A relay that re-enrolled on the other side of the finalized-drop
         // capability boundary while still assigned sessions of the old cohort
         // must never silently serve them — the two build classes deliver
@@ -576,16 +597,16 @@ impl<'a> EnrollHandshake<'a> {
         // counted-drop behavior, the other strips it), so a mixed session hands
         // different clients different leave schedules. The mismatch snapshot
         // (and, for a downgrade, the drain mark) was taken under the assignment
-        // lock above; move each mismatched session off it here. A session with
-        // no in-cohort replacement ends (Unavailable) rather than continuing
-        // mixed. In this deployment upgrades arrive as fresh relay ids, so the
+        // lock above; try moving each mismatched session off it here. Without
+        // a replacement, its assignment remains pending a later rehome attempt.
+        // In this deployment upgrades arrive as fresh relay ids, so the
         // upgrade direction firing at all is itself a signal worth the warn.
         if !evict.is_empty() {
             tracing::warn!(
                 relay_id = relay_id.0,
                 sessions = evict.len(),
                 finalize_capable,
-                "relay re-enrolled across the finalized-drop capability boundary while assigned                  sessions of the other cohort; evicting them",
+                "relay re-enrolled with capabilities incompatible with assigned sessions; evicting them",
             );
             for (tenant, session) in evict {
                 let departed = lifecycle.departed_slots(&tenant, session);
@@ -595,7 +616,7 @@ impl<'a> EnrollHandshake<'a> {
                     tenant = tenant.as_ref(),
                     session = session.0,
                     ?outcome,
-                    "evicted a cohort-mismatched session from a capability-changed relay",
+                    "attempted eviction of a session from a capability-changed relay",
                 );
             }
         }

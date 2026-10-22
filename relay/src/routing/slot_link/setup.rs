@@ -6,6 +6,73 @@ use super::*;
 
 use super::inbound::sample_slot_conditions;
 
+pub(super) struct Activation {
+    pub connection_epoch: u64,
+    pub resumed_dial: bool,
+    pub evidence: crate::auth::CheckedEvidence,
+}
+
+static EVIDENCE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActivationRefusal {
+    Retired,
+    AssignmentChanged,
+}
+
+impl ActivationRefusal {
+    pub(super) fn code(self) -> u32 {
+        match self {
+            Self::Retired => close_codes::SESSION_RETIRED,
+            Self::AssignmentChanged => close_codes::SLOT_NOT_HOMED,
+        }
+    }
+
+    pub(super) fn reason(self) -> &'static [u8] {
+        match self {
+            Self::Retired => b"session retired",
+            Self::AssignmentChanged => b"slot assignment changed",
+        }
+    }
+}
+
+fn with_activation(
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+    slot: SlotId,
+    activation: Activation,
+    publish: impl FnOnce(),
+) -> Result<(), ActivationRefusal> {
+    // The handshake acknowledgement is an await outside the ingress gate.
+    // Retirement or an assignment change can win before activation; neither
+    // may publish a notice, presence, connectivity, or conditions afterward.
+    // Keep the check and all activation mutations in the same ingress section.
+    mesh.session
+        .gates
+        .with_ingress(key, || {
+            let evidence = activation.evidence;
+            let observation = rally_point_proto::control::EvidenceObservation {
+                connection_id: evidence.connection_id,
+                sequence: EVIDENCE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                assignment_revision: evidence.assignment_revision,
+                verdict: evidence.verdict,
+                key_id: evidence.key_id,
+                body: evidence.body,
+            };
+            if !mesh.session.decision_makers.note_slot_connected(
+                key,
+                slot,
+                activation.resumed_dial,
+                Some(observation),
+            ) {
+                return Err(ActivationRefusal::AssignmentChanged);
+            }
+            publish();
+            Ok(())
+        })
+        .unwrap_or(Err(ActivationRefusal::Retired))
+}
+
 /// Runs the activation prologue for a freshly registered slot, reporting whether
 /// it landed (a session retired mid-activation refuses it and the link is torn
 /// down instead of serving).
@@ -15,19 +82,11 @@ pub(super) fn activate_slot(
     mesh: &crate::mesh::MeshState,
     key: &SessionKey,
     slot: SlotId,
-    connection_epoch: u64,
-    resumed_dial: bool,
-) -> bool {
+    activation: Activation,
+) -> Result<(), ActivationRefusal> {
     let decision_makers = &mesh.session.decision_makers;
-    // The activation prologue runs as ONE ingress critical section: the
-    // admission gate (the client edge's `Admission`) necessarily released across the
-    // handshake-ack await before this task started, so a retirement can land
-    // in between — and these mutations would then recreate the close-report,
-    // presence, and condition state the sweep just removed, for a session the
-    // coordinator already ended. Under the gate, either the sweep waits for
-    // this block or this block observes the retirement and the link is torn
-    // down instead of serving.
-    let activated = mesh.session.gates.with_ingress(key, || {
+    let connection_epoch = activation.connection_epoch;
+    with_activation(mesh, key, slot, activation, || {
         // A slot link is serving this session (again): any session-closed report an
         // earlier emptying latched no longer describes this relay, so the next
         // emptying must report anew. See `DecisionMakers::claim_close_report`.
@@ -51,13 +110,6 @@ pub(super) fn activate_slot(
         let handshake_sample = sample_slot_conditions(link, slot, connection_epoch).conditions;
         crate::mesh::activate_conditions(&mesh.conditions, key, slot, handshake_sample);
         let _ = decision_makers.ingest_local_condition(key, &handshake_sample);
-
-        // Tell the coordinator this slot's client is here, so the tenant can name
-        // who actually arrived instead of inferring it from a load deadline. Fired
-        // on every activation (a reconnect included); the coordinator keeps the
-        // ever-connected set and dedups the tenant notification itself. Inside the
-        // ingress section so a session retired mid-activation reports nothing.
-        decision_makers.note_slot_connected(key, slot, resumed_dial);
 
         // Announce this slot's presence to the mesh and record it into the session's
         // live-slot set. On the authority relay, this slot completing the descriptor's
@@ -83,8 +135,7 @@ pub(super) fn activate_slot(
             Some(connection_epoch),
             mesh.session.decision_makers.flight_recorder(),
         );
-    });
-    activated.is_some()
+    })
 }
 
 /// The pushes a slot gets for state the session reached before its link came up:
@@ -393,3 +444,6 @@ pub(super) async fn replay_to_reconnecting_client(
     }
     ControlFlow::Continue(())
 }
+
+#[cfg(test)]
+mod tests;

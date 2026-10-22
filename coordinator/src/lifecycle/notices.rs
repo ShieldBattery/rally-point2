@@ -146,7 +146,13 @@ impl NoticeKey {
 
     /// Warns that `relay` reported a notice it is not allowed to report,
     /// carrying the reporter alongside the fields [`debug`](Self::debug) logs.
-    fn warn_refused(&self, relay: RelayId, tenant: &TenantId, session: SessionId, message: &str) {
+    pub(super) fn warn_refused(
+        &self,
+        relay: RelayId,
+        tenant: &TenantId,
+        session: SessionId,
+        message: &str,
+    ) {
         match self {
             Self::Slot(slot) => tracing::warn!(
                 relay_id = relay.0,
@@ -182,7 +188,14 @@ impl Lifecycle {
     /// only the current home relay for its authenticated slot may report it.
     /// Adding a notice kind means adding a [`SessionNotice`] variant and an arm
     /// below; there is no second path that could quietly bypass the check.
-    pub fn ingest_notice(&self, relay: RelayId, notice: SessionNotice) {
+    pub fn ingest_notice(&self, relay: RelayId, generation: u64, notice: SessionNotice) {
+        let notice = match notice {
+            SessionNotice::SlotConnected(connected) if connected.evidence.is_some() => {
+                self.ingest_evidence_notice(relay, generation, connected);
+                return;
+            }
+            notice => notice,
+        };
         let (tenant, session) = (notice.tenant(), notice.session());
         if !self
             .inner

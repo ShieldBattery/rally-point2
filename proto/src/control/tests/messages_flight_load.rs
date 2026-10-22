@@ -75,6 +75,7 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
     let message = RelayToCoordinator::LoadStateSnapshot {
         request_id: 1,
         state: SessionPresence {
+            evidence: vec![],
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(1),
             slots: vec![],
@@ -104,6 +105,7 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
     let populated = RelayToCoordinator::LoadStateSnapshot {
         request_id: 9,
         state: SessionPresence {
+            evidence: vec![],
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(42),
             slots: vec![SlotId(1)],

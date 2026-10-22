@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{SessionId, SlotId};
 
-use super::TenantId;
+use super::{EvidenceObservation, TenantId};
 
 /// Whether a departing player left cleanly or was dropped, classified by the
 /// relay from the synced leave's native reason. Rides the departure webhook as
@@ -249,9 +249,8 @@ pub struct ResultNotice {
 /// Only the relay that homes the slot sends it, at the moment the slot link
 /// activates, and it fires on *every* activation, reconnects included:
 /// `resumed` distinguishes a re-dial that presented resume cursors from a fresh
-/// first connect. The coordinator keeps the ever-connected set and fires the
-/// webhook only on first sight per slot, so the repeats cost nothing beyond the
-/// frame.
+/// first connect. The coordinator keeps the ever-connected set independently of
+/// the observations carried by each connection.
 ///
 /// Like [`DepartureNotice`] it carries its own `tenant`/`session`/`slot` because
 /// one control connection serves many sessions, and it stamps its own
@@ -259,6 +258,9 @@ pub struct ResultNotice {
 /// self-describing across a coordinator restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotConnectedNotice {
+    /// The evidence observation associated with this connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<EvidenceObservation>,
     /// The tenant the session belongs to.
     pub tenant: TenantId,
     /// The session the slot connected to.

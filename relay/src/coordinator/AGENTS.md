@@ -25,8 +25,11 @@ coordinator outage must leave running games untouched.
   a notice is parked *before* its send await and cleared only after; a shipment
   stays in `pending_flights` until stored or dropped. Don't move it into the loop.
 - Descriptor sets are declarative — a full set replaces (absences are leaves), a
-  delta mutates what the connect-time full set established. Add no version or
-  sequence tracking: one ordered connection already orders full-set before delta.
+  delta mutates what the connect-time full set established. One ordered connection
+  orders full-set before delta. Requested installation barrier ids only correlate
+  acknowledgements; they do not reorder or suppress descriptor application. The
+  reader publishes the latest id after synchronous reconciliation, and the writer
+  echoes it using a connection-local watch, never a reconnect-persistent queue.
 - Refusals only a deploy or provisioner fixes (version, region, identity, ledger)
   take the long backoff; a duplicate-relay-id close deliberately does not — it ages
   out on its own, so prompt retry is what makes it converge.

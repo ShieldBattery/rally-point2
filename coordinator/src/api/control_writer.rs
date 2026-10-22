@@ -34,6 +34,7 @@ pub(super) struct WriterSources {
     /// This relay's current descriptor set, latest-wins, re-synced on connect and
     /// pushed on every change.
     descriptors: tokio::sync::watch::Receiver<Vec<SessionDescriptor>>,
+    delivery: Option<DescriptorDeliveryConnection>,
     /// The fleet mesh-peer set, shared across every connection and pushed on
     /// membership changes.
     mesh_peers: tokio::sync::watch::Receiver<Vec<MeshPeerIdentity>>,
@@ -58,7 +59,60 @@ pub(super) struct WriterSources {
     beacon_targets: Vec<RegionBeaconTarget>,
 }
 
+struct DescriptorDeliveryConnection {
+    delivery: crate::descriptors::DescriptorDelivery,
+    relay: RelayId,
+    generation: u64,
+}
+
+impl DescriptorDeliveryConnection {
+    fn stamp(&self, set: &[SessionDescriptor]) -> Option<u64> {
+        self.delivery.sent(self.relay, self.generation, set)
+    }
+}
+
+impl Drop for DescriptorDeliveryConnection {
+    fn drop(&mut self) {
+        self.delivery.end(self.relay, self.generation);
+    }
+}
+
 impl WriterSources {
+    /// Only an opted-in, current connection receives acknowledgement requests.
+    /// Replacing the connection invalidates every proof from its predecessor.
+    pub(super) fn enable_acknowledgements(
+        &mut self,
+        setup: &SessionSetup,
+        relay: RelayId,
+        generation: u64,
+    ) -> bool {
+        let _assignment = setup.lock_assignment();
+        let Some((entry, current)) = registry::entry_with_generation(setup.registry(), relay)
+        else {
+            return false;
+        };
+        if current != generation {
+            return false;
+        }
+        if !entry
+            .capabilities
+            .iter()
+            .any(|c| c == rally_point_proto::control::CAPABILITY_DESCRIPTOR_ACK_V1)
+        {
+            return true;
+        }
+        let delivery = setup.descriptors().delivery().clone();
+        if !delivery.begin(relay, generation) {
+            return false;
+        }
+        self.delivery = Some(DescriptorDeliveryConnection {
+            delivery,
+            relay,
+            generation,
+        });
+        true
+    }
+
     /// Subscribes this connection to every coordinator→relay source the writer
     /// draws from, and snapshots the connect-time lead.
     ///
@@ -78,6 +132,7 @@ impl WriterSources {
     ) -> Self {
         Self {
             descriptors: setup.descriptors().subscribe(relay_id),
+            delivery: None,
             mesh_peers: registry::subscribe_mesh_peers(setup.registry()),
             reaps: setup.reaps().subscribe(relay_id),
             load_state: setup.attest().subscribe(relay_id),
@@ -126,6 +181,7 @@ pub(super) async fn run_writer<S>(
     // they are disjoint fields, so each arm borrows its own.
     let WriterSources {
         descriptors: rx,
+        delivery,
         mesh_peers: mesh_peers_rx,
         reaps,
         load_state: load_state_rx,
@@ -178,9 +234,12 @@ pub(super) async fn run_writer<S>(
     // diffs against, so `last_sent` is seeded from it before it goes out.
     let initial = rx.borrow_and_update().clone();
     let mut last_sent = index_descriptors(&initial);
+    let Ok(ack_id) = stamp_delivery(delivery, &initial) else {
+        return;
+    };
     if !writer_send(
         write_half,
-        descriptors_frame(initial),
+        descriptors_frame(initial, ack_id),
         relay_id,
         liveness_timeout,
         "descriptor",
@@ -223,9 +282,12 @@ pub(super) async fn run_writer<S>(
                 // baseline from it so a later steady-state delta diffs against what
                 // the relay actually now holds.
                 let set = rx.borrow_and_update().clone();
+                let Ok(ack_id) = stamp_delivery(delivery, &set) else {
+                    break LoopExit::SourceClosed;
+                };
                 if !writer_send(
                     write_half,
-                    descriptors_frame(set.clone()),
+                    descriptors_frame(set.clone(), ack_id),
                     relay_id,
                     liveness_timeout,
                     "descriptor",
@@ -256,6 +318,7 @@ pub(super) async fn run_writer<S>(
                 if !send_descriptor_change(
                     write_half,
                     &mut last_sent,
+                    delivery,
                     set,
                     negotiated,
                     relay_id,
@@ -428,13 +491,24 @@ fn control_frame(message: &CoordinatorToRelay) -> Message {
     Message::Text(json.into())
 }
 
+fn stamp_delivery(
+    delivery: &Option<DescriptorDeliveryConnection>,
+    set: &[SessionDescriptor],
+) -> Result<Option<u64>, ()> {
+    match delivery {
+        None => Ok(None),
+        Some(connection) => connection.stamp(set).map(Some).ok_or(()),
+    }
+}
+
 /// Builds a `Descriptors` control frame, stamping the coordinator's wall-clock at
 /// the moment the set snapshot leaves the outbox so the relay can measure how far
 /// its apply lags staging. Called at each `borrow_and_update` site — the
 /// connect-time resync, the steady-state change arm, and the drain exchange's set
 /// push — so every descriptor push carries a fresh stamp.
-fn descriptors_frame(descriptors: Vec<SessionDescriptor>) -> Message {
+fn descriptors_frame(descriptors: Vec<SessionDescriptor>, ack_id: Option<u64>) -> Message {
     control_frame(&CoordinatorToRelay::Descriptors {
+        ack_id,
         descriptors,
         staged_at_unix_ms: Some(unix_millis()),
     })
@@ -452,6 +526,7 @@ fn descriptors_frame(descriptors: Vec<SessionDescriptor>) -> Message {
 async fn send_descriptor_change<S>(
     write_half: &mut S,
     last_sent: &mut std::collections::HashMap<DescriptorKey, SessionDescriptor>,
+    delivery: &Option<DescriptorDeliveryConnection>,
     set: Vec<SessionDescriptor>,
     negotiated: ProtocolVersion,
     relay_id: RelayId,
@@ -461,13 +536,16 @@ where
     S: futures_util::Sink<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
+    let Ok(ack_id) = stamp_delivery(delivery, &set) else {
+        return false;
+    };
     if negotiated < ProtocolVersion::DESCRIPTOR_DELTA_MIN {
         // An older relay decodes a DescriptorDelta as an unknown frame and would
         // silently drift, so it always gets the whole current set. Its baseline is
         // never diffed, so there is nothing to advance.
         if !writer_send(
             write_half,
-            descriptors_frame(set),
+            descriptors_frame(set.clone(), ack_id),
             relay_id,
             liveness_timeout,
             "descriptor",
@@ -481,7 +559,7 @@ where
     }
 
     let (upserts, removals) = diff_descriptors(last_sent, &set);
-    if upserts.is_empty() && removals.is_empty() {
+    if upserts.is_empty() && removals.is_empty() && delivery.is_none() {
         // The relay already holds exactly this set — a coalesced wake that produced
         // no net change. An empty delta would be pure overhead, so send nothing and
         // leave the metrics untouched.
@@ -489,7 +567,10 @@ where
     }
     let upsert_count = upserts.len();
     let removal_count = removals.len();
+    // A remove/re-add can coalesce to the same set while invalidating its proof.
+    // An empty delta still requests a fresh acknowledgement on capable relays.
     let frame = control_frame(&CoordinatorToRelay::DescriptorDelta {
+        ack_id,
         staged_at_unix_ms: Some(unix_millis()),
         upserts,
         removals,

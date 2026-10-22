@@ -209,7 +209,7 @@ async fn a_resumed_descriptor_fans_seeded_leaves_to_already_connected_survivors(
     assert_eq!(inbox.try_recv_leave(), None);
 }
 
-/// On a coordinator-managed relay (pen armed), a turn arriving before any
+/// With provisional admission explicitly armed, a turn arriving before any
 /// descriptor names its session is held, not fanned out — and descriptor
 /// application drains it through the ordinary forward path, where a
 /// current slot's turn reaches the survivors exactly as if it had arrived
@@ -469,4 +469,16 @@ fn a_descriptor_replay_does_not_unseal_a_closed_flight_recording() {
         },
     );
     assert_eq!(recorder.recorded_sessions(), vec![key(1)]);
+}
+
+#[test]
+fn applying_a_descriptor_with_the_journal_disarmed_creates_no_journal_state() {
+    let (control, mesh, _) = control_over(1);
+    assert!(!mesh.session.provisional_turns.armed());
+    control.apply_descriptor(&descriptor(1, &[]));
+    assert!(!mesh.session.provisional_turns.is_unresolved(&key(1)));
+    assert!(
+        mesh.session.provisional_turns.discard_if_empty(&key(1)),
+        "no resolved journal marker should be retained for disarmed admission"
+    );
 }

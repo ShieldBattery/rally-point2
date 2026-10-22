@@ -31,6 +31,7 @@ mod cohorts;
 mod create;
 mod descriptors;
 mod drain;
+mod evidence;
 mod fallback;
 mod idempotency;
 mod placement;

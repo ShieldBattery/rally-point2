@@ -50,6 +50,7 @@ fn result_notice() -> ResultNotice {
 
 fn slot_connected_notice() -> SlotConnectedNotice {
     SlotConnectedNotice {
+        evidence: None,
         tenant: TenantId(TENANT.to_owned()),
         session: SessionId(42),
         slot: SlotId(1),
@@ -277,6 +278,7 @@ async fn a_notice_parked_mid_send_survives_the_write_half_being_dropped() {
             challenge_rx,
             flight_grant_rx,
             load_state_rx,
+            descriptor_ack_rx: watch::channel(None).1,
         },
     );
     assert!(

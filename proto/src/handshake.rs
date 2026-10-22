@@ -1,7 +1,7 @@
 //! Sans-I/O codec for the post-QUIC authorization handshake.
 //!
 //! Right after the QUIC handshake, a client proves it may submit turns over a
-//! single client-opened bidirectional stream, in a fixed five-step exchange:
+//! single client-opened bidirectional stream:
 //!
 //! ```text
 //!   client → relay   u16-LE length, then that many token bytes
@@ -11,13 +11,13 @@
 //!                    resume-cursor entries — an empty (zero-count) frame on a
 //!                    fresh connect, and never skipped: the relay reads it
 //!                    unconditionally, so omitting it deadlocks the handshake
+//!   client → relay   negotiated evidence frame: u16-LE length, then payload
 //!   relay  → client  one HANDSHAKE_OK byte (only once the slot is routable)
 //! ```
 //!
 //! The two endpoints live in different crates and must agree on this shape to the
 //! byte, so the framing is defined here once and consumed by both. This module is
-//! pure: it frames and unframes the two variable-length messages — the
-//! length-prefixed token and the count-prefixed resume cursors — and owns the
+//! pure: it frames and unframes the token, resume cursors, and evidence, and owns the
 //! fixed sizes and the acknowledgement sentinel. The actual stream reads and
 //! writes, and the Ed25519 sign/verify, stay with the caller, so neither async
 //! I/O nor a crypto backend leaks in here.
@@ -30,6 +30,9 @@
 
 use crate::ids::SlotId;
 use crate::token::{SignedToken, TokenError};
+
+mod evidence;
+pub use evidence::*;
 
 /// Width of the little-endian length prefix that precedes the presented token, in
 /// bytes. The prefix is a `u16`, so the relay reads exactly this many bytes before
@@ -85,6 +88,12 @@ pub enum HandshakeError {
     /// client is trying to resume more slots than a game can hold.
     #[error("resume-cursor count {count} exceeds the maximum of {MAX_RESUME_CURSORS}")]
     TooManyResumeCursors { count: usize },
+    /// The evidence payload exceeds the negotiated frame limit.
+    #[error("evidence frame length {len} exceeds the maximum of {MAX_EVIDENCE_LEN}")]
+    EvidenceTooLong { len: usize },
+    /// A nonempty evidence payload does not contain its fixed header.
+    #[error("invalid evidence frame length {len}")]
+    MalformedEvidence { len: usize },
 }
 
 /// Frames a token for presentation: a little-endian [`TOKEN_LEN_PREFIX_LEN`]-byte

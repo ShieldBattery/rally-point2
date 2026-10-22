@@ -1,4 +1,4 @@
-//! Bounds "admit-first" client admission: a session with no applied
+//! Optional library support for "admit-first" client admission: a session with no applied
 //! descriptor yet is admitted onto any relay a client's token names --
 //! tolerating the create-response-to-client-dial race beating the
 //! coordinator's asynchronous descriptor push (see
@@ -26,16 +26,16 @@
 //!
 //! # Arming
 //!
-//! Marking always happens at admission, coordinator-driven relay or not --
-//! it is cheap, and correct even if a coordinator attaches later. Only the
-//! sweep itself ([`run_sweep`]) is conditionally armed: a standalone relay
-//! (`--mesh-peer`, no coordinator) never spawns it, since nothing will ever
-//! apply a descriptor to clear a mark there, and reaping would just be timed
-//! demolition of every session the relay serves. A coordinator-driven relay
-//! arms the sweep only while its control connection is up -- an outage that
-//! stops descriptor pushes from arriving must not be mistaken for a session
-//! nobody will ever describe. See [`run_sweep`] for how a reconnect resumes
-//! marks it had paused on rather than reaping them on stale time debt.
+//! Library callers that explicitly arm the provisional journal can also run
+//! [`run_sweep`] to bound undescribed sessions. Marking happens only with that
+//! journal armed. Production coordinator-managed relays wait for a descriptor
+//! before admitting a client, so they leave this machinery disarmed and run no
+//! sweep. Standalone relays likewise leave it disarmed because they have no
+//! descriptor source.
+//!
+//! A caller using the sweep must arm it only while the descriptor source is
+//! connected: an outage must not be mistaken for a session nobody will describe.
+//! See [`run_sweep`] for restarting paused marks across reconnects.
 
 use std::collections::HashMap;
 use std::sync::Arc;

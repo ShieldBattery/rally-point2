@@ -12,11 +12,9 @@
 //! are sent the other way, by a client abandoning its own dial. A number may
 //! therefore appear in both groups and mean two unrelated things.
 //!
-//! Three of these are terminal for a reconnecting client, which must stop
-//! retrying since no later dial can bring the slot back: [`SLOT_DEPARTED`] on a
-//! re-dial, and the evictions [`DESYNC_EVICTED`] and [`LOBBY_VIOLATION`] on a
-//! live link. Every other relay close is treated as an ordinary transport
-//! failure and retried.
+//! [`SLOT_DEPARTED`], [`DESYNC_EVICTED`], [`LOBBY_VIOLATION`], and
+//! [`EVIDENCE_REJECTED`] are terminal for a reconnecting client. Every other
+//! relay close is treated as an ordinary transport failure and retried.
 
 /// The client sent a turn that failed validation. Closing the link routes the
 /// offender through the ordinary departure machinery, so survivors get a synced
@@ -103,6 +101,14 @@ pub const DESYNC_EVICTED: u32 = 0x0E;
 /// dropped the command before any other player saw it and evicted the slot.
 /// Every later dial for the slot is refused with [`SLOT_DEPARTED`].
 pub const LOBBY_VIOLATION: u32 = 0x0F;
+
+/// The supplied evidence has an unknown key or invalid signature. Terminal for
+/// the client's reconnect loop.
+pub const EVIDENCE_REJECTED: u32 = 0x10;
+
+/// Required evidence was absent. Retryable: a later connection can obtain it
+/// after a provider's timeout or temporary unavailability.
+pub const EVIDENCE_UNAVAILABLE: u32 = 0x11;
 
 /// Sent **by a client** abandoning a dial because the authorization exchange
 /// did not finish within its deadline. Client-space, so it shares a number with

@@ -11,6 +11,7 @@ use crate::ids::{RelayId, SessionId, SlotId};
 use crate::token::{ClientPublicKey, KeyId, PUBLIC_KEY_LEN};
 use crate::version::ProtocolVersion;
 
+mod evidence;
 mod messages_flight_load;
 mod messages_frames;
 mod messages_heartbeat;
@@ -23,6 +24,9 @@ mod session;
 /// different shape build on it with struct-update syntax.
 fn a_descriptor() -> SessionDescriptor {
     SessionDescriptor {
+        evidence_keys: vec![],
+        required_evidence_slots: vec![],
+        evidence_assignments: vec![],
         lobby_policy: None,
         lobby_settled: false,
         rollback: false,

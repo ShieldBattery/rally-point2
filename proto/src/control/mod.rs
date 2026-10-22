@@ -26,11 +26,13 @@
 
 use serde::{Deserialize, Serialize};
 
+mod evidence;
 mod messages;
 mod notices;
 mod relay;
 mod session;
 
+pub use evidence::*;
 pub use messages::*;
 pub use notices::*;
 pub use relay::*;

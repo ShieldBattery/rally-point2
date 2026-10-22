@@ -58,6 +58,9 @@ use rally_point_proto::control::{DescriptorKey, SessionDescriptor, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use tokio::sync::{mpsc, watch};
 
+mod delivery;
+pub(crate) use delivery::DescriptorDelivery;
+
 /// One relay's current descriptor set, behind a `watch` so a connected relay's
 /// control task is woken to push it on every change.
 type RelayChannel = watch::Sender<Vec<SessionDescriptor>>;
@@ -243,6 +246,8 @@ pub struct RelayDescriptors {
     /// and kept thereafter (a relay's channel outlives any single connection, so
     /// a reconnect re-subscribes to the same current set).
     channels: Arc<Mutex<HashMap<RelayId, RelayChannel>>>,
+    /// Connection-local installation proofs; never part of persisted assignments.
+    delivery: DescriptorDelivery,
 }
 
 impl RelayDescriptors {
@@ -260,7 +265,9 @@ impl RelayDescriptors {
         let channel = channels
             .entry(relay_id)
             .or_insert_with(|| watch::channel(Vec::new()).0);
-        channel.send_if_modified(|set| upsert(set, descriptor));
+        if channel.send_if_modified(|set| upsert(set, descriptor)) {
+            self.delivery.notify_changed();
+        }
     }
 
     /// Drops `relay_id`'s descriptor for one session (the session ended), pushing
@@ -268,13 +275,22 @@ impl RelayDescriptors {
     /// removing an absent session changes nothing and wakes no connection.
     pub fn remove(&self, relay_id: RelayId, tenant: &TenantId, session: SessionId) {
         let channels = self.channels.lock();
-        if let Some(channel) = channels.get(&relay_id) {
-            channel.send_if_modified(|set| {
+        if let Some(channel) = channels.get(&relay_id)
+            && channel.send_if_modified(|set| {
                 let before = set.len();
                 set.retain(|d| !(d.tenant == *tenant && d.session == session));
                 set.len() != before
-            });
+            })
+        {
+            self.delivery.remove(relay_id, tenant, session);
+            self.delivery.notify_changed();
         }
+    }
+
+    /// Connection-local descriptor installation proofs shared by the control
+    /// channel and session-response barriers.
+    pub(crate) fn delivery(&self) -> &DescriptorDelivery {
+        &self.delivery
     }
 
     /// Subscribes to `relay_id`'s descriptor set for a control connection,
@@ -297,6 +313,23 @@ impl RelayDescriptors {
             .get(&relay_id)
             .map(|channel| channel.borrow().clone())
             .unwrap_or_default()
+    }
+
+    /// The current descriptor for one assigned session, without cloning the
+    /// other sessions sharing its relay.
+    pub(crate) fn current_descriptor(
+        &self,
+        relay_id: RelayId,
+        tenant: &TenantId,
+        session: SessionId,
+    ) -> Option<SessionDescriptor> {
+        self.channels.lock().get(&relay_id).and_then(|channel| {
+            channel
+                .borrow()
+                .iter()
+                .find(|descriptor| descriptor.tenant == *tenant && descriptor.session == session)
+                .cloned()
+        })
     }
 
     /// The keys of the sessions currently assigned to `relay_id`, without
@@ -332,6 +365,7 @@ impl RelayDescriptors {
     /// no-op.
     pub fn forget(&self, relay_id: RelayId) {
         self.channels.lock().remove(&relay_id);
+        self.delivery.forget(relay_id);
     }
 
     /// Every relay's current descriptor set, omitting relays whose set is empty

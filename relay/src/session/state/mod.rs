@@ -16,6 +16,8 @@ use crate::session::provisional_turns::ProvisionalTurnPen;
 use crate::session::side_channel::SideChannels;
 use crate::session::turn_ring::TurnRing;
 
+mod evidence;
+
 /// The windows and ceilings a [`SessionState`] builds its registries with.
 ///
 /// [`Default`] is the production relay: every field is the constant its own
@@ -116,8 +118,9 @@ pub struct SessionState {
     /// decision-maker, the turn funnel deposits turns here instead of fanning
     /// them out, and descriptor application drains them through the ordinary
     /// forward path — where freshly seeded decided leaves fence a departed
-    /// slot's turns. Armed only on a coordinator-managed relay (`main.rs`);
-    /// disarmed (every test constructor), the funnel behaves exactly as before.
+    /// slot's turns. Explicitly armed only by library callers opting into
+    /// provisional admission; production keeps it disarmed and waits for the
+    /// descriptor before admitting a client.
     /// See [`crate::session::provisional_turns`].
     pub provisional_turns: ProvisionalTurnPen,
     /// The load-state fence broker: the outstanding stream-position probes this

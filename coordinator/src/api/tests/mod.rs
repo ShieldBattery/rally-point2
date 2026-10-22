@@ -39,6 +39,7 @@ use super::sessions::*;
 mod control_enroll;
 mod control_inbound;
 mod control_writer;
+mod descriptor_readiness;
 mod flight;
 mod load_state;
 mod notices;
@@ -190,6 +191,7 @@ fn state_over(setup: SessionSetup) -> CoordinatorState {
 fn two_players() -> Vec<PlayerHandoff> {
     vec![
         PlayerHandoff {
+            require_evidence: false,
             slot: SlotId(0),
             client_pubkey: ClientPublicKey([0xAA; 32]),
             external_ref: None,
@@ -197,6 +199,7 @@ fn two_players() -> Vec<PlayerHandoff> {
             region: None,
         },
         PlayerHandoff {
+            require_evidence: false,
             slot: SlotId(1),
             client_pubkey: ClientPublicKey([0xBB; 32]),
             external_ref: None,
@@ -350,10 +353,12 @@ fn enroll_second_relay(state: &CoordinatorState, region: Option<&'static str>) {
 /// existence and its `(tenant, session)` ownership matter.
 fn create_rehome_session(state: &CoordinatorState) -> SessionId {
     let req = SessionRequest {
+        evidence_keys: Vec::new(),
         lobby_policy: None,
         rollback: false,
         tenant: tenant_id(),
         players: vec![PlayerHandoff {
+            require_evidence: false,
             slot: SlotId(0),
             client_pubkey: ClientPublicKey([0xAA; 32]),
             external_ref: None,
@@ -402,10 +407,12 @@ fn create_session_with_user(state: &CoordinatorState, user: &str) -> SessionId {
     crate::session::create_session(
         &state.setup,
         SessionRequest {
+            evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,
             tenant: tenant_id(),
             players: vec![PlayerHandoff {
+                require_evidence: false,
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0xAA; 32]),
                 external_ref: Some(user.to_owned()),

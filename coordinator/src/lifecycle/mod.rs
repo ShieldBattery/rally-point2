@@ -147,13 +147,16 @@ type SessionRef = (TenantId, SessionId);
 /// attributing a failed load — the caller wants "who never got here", not "who is
 /// here right now" (which is what the presence store answers).
 ///
-/// They are also only ever *positive* evidence, and always safe to merge. What
-/// takes qualifying is reading a slot's **absence** as proof it never arrived,
-/// which needs the record to be complete. Two of these fields are the coordinator's
-/// half of that question; the other half — whether every serving relay just
-/// attested — belongs to whoever asked them.
+/// The slot sets contain positive facts that merge by union. Reading a slot's
+/// absence as proof it never arrived requires a complete record and fresh answers
+/// from every serving relay. Connection observations are separate: only the latest
+/// accepted activation within a relay process and slot assignment is retained,
+/// and only observations matching the current assignment appear here. Their absence
+/// makes no claim about a connection's evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLoadState {
+    /// Latest retained connection observations, in slot order.
+    pub evidence: Vec<rally_point_proto::control::SlotEvidence>,
     /// Whether `register_session` created this state: the session was set up
     /// against *this* coordinator process, so the sets start at the session's
     /// beginning rather than wherever a restarted process came up.
@@ -242,6 +245,7 @@ struct DepartureSeed {
 
 /// One session's lifecycle state.
 struct SessionState {
+    evidence: std::collections::BTreeMap<SlotId, evidence::StoredEvidence>,
     /// The relays the coordinator assigned to serve the session — the distinct
     /// home relays of its slots — or empty for a webhook-only state lazily created
     /// for a session this coordinator lifetime never created (restart amnesia). The
@@ -556,6 +560,7 @@ async fn drain_queue(
 }
 
 mod close;
+mod evidence;
 mod heartbeat;
 mod notices;
 mod persist;

@@ -71,6 +71,7 @@ fn every_kind(session: SessionId) -> Vec<(&'static str, SessionNotice)> {
         (
             "slotConnected",
             SessionNotice::SlotConnected(SlotConnectedNotice {
+                evidence: None,
                 tenant: tenant.clone(),
                 session,
                 slot: SlotId(0),
@@ -150,7 +151,7 @@ async fn a_notice_from_a_relay_outside_the_serving_set_reaches_nothing() {
 
     for (event, notice) in every_kind(session) {
         // Relay 2 never served this session; relay 1 is its only serving relay.
-        lifecycle.ingest_notice(RelayId(2), notice);
+        lifecycle.ingest_notice(RelayId(2), 0, notice);
         no_further_webhook(
             &mut rx,
             &format!("a {event} from outside the serving set posts nothing"),

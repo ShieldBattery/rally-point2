@@ -186,11 +186,13 @@ pub(crate) async fn coordinator_with_session(
     let resp = session::create_session(
         &served.setup,
         SessionRequest {
+            evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,
             tenant: TenantId(TENANT.to_owned()),
             players: vec![
                 PlayerHandoff {
+                    require_evidence: false,
                     slot: SlotId(0),
                     client_pubkey: ClientPublicKey([0xAA; 32]),
                     external_ref: None,
@@ -198,6 +200,7 @@ pub(crate) async fn coordinator_with_session(
                     region: None,
                 },
                 PlayerHandoff {
+                    require_evidence: false,
                     slot: SlotId(1),
                     client_pubkey: ClientPublicKey([0xBB; 32]),
                     external_ref: None,
@@ -250,6 +253,9 @@ pub(crate) async fn serve_coordinator_returning_setup(
 /// the descriptor outbox directly.
 pub(crate) fn a_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        evidence_keys: Vec::new(),
+        required_evidence_slots: Vec::new(),
+        evidence_assignments: Vec::new(),
         lobby_policy: None,
         lobby_settled: false,
         rollback: false,
@@ -393,10 +399,12 @@ pub(crate) fn try_create_one_slot_session(
     session::create_session(
         setup,
         SessionRequest {
+            evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,
             tenant: TenantId(TENANT.to_owned()),
             players: vec![PlayerHandoff {
+                require_evidence: false,
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0xAA; 32]),
                 external_ref: None,

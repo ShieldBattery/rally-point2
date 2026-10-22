@@ -3,6 +3,7 @@ use super::*;
 #[test]
 fn coordinator_to_relay_descriptors_roundtrips_json() {
     let message = CoordinatorToRelay::Descriptors {
+        ack_id: None,
         staged_at_unix_ms: None,
         descriptors: vec![a_descriptor()],
     };
@@ -18,6 +19,7 @@ fn coordinator_to_relay_descriptors_roundtrips_json() {
 fn coordinator_to_relay_descriptors_staging_stamp_roundtrips_and_defaults_absent() {
     // A stamped set round-trips carrying the millisecond stamp.
     let stamped = CoordinatorToRelay::Descriptors {
+        ack_id: None,
         descriptors: vec![],
         staged_at_unix_ms: Some(1_700_000_000_123),
     };
@@ -31,6 +33,7 @@ fn coordinator_to_relay_descriptors_staging_stamp_roundtrips_and_defaults_absent
     // An absent stamp stays off the wire (byte-identical to the pre-field form)
     // and round-trips back to `None`.
     let unstamped = CoordinatorToRelay::Descriptors {
+        ack_id: None,
         descriptors: vec![],
         staged_at_unix_ms: None,
     };
@@ -56,6 +59,7 @@ fn coordinator_to_relay_descriptor_delta_roundtrips_json() {
     // A steady-state delta carrying an upsert, a removal, and the staging stamp
     // round-trips through its tagged frame intact.
     let message = CoordinatorToRelay::DescriptorDelta {
+        ack_id: None,
         staged_at_unix_ms: Some(1_700_000_000_123),
         upserts: vec![a_descriptor()],
         removals: vec![DescriptorKey {
@@ -75,6 +79,7 @@ fn coordinator_to_relay_descriptor_delta_without_stamp_omits_empty_fields_and_de
     // A removal-only delta with no stamp keeps the stamp and the (empty) upserts
     // off the wire, and round-trips back to the same value.
     let removal_only = CoordinatorToRelay::DescriptorDelta {
+        ack_id: None,
         staged_at_unix_ms: None,
         upserts: vec![],
         removals: vec![DescriptorKey {
@@ -96,6 +101,7 @@ fn coordinator_to_relay_descriptor_delta_without_stamp_omits_empty_fields_and_de
     assert_eq!(
         serde_json::from_str::<CoordinatorToRelay>(bare).unwrap(),
         CoordinatorToRelay::DescriptorDelta {
+            ack_id: None,
             staged_at_unix_ms: None,
             upserts: vec![],
             removals: vec![],
@@ -246,4 +252,52 @@ fn relay_to_coordinator_session_closed_roundtrips_json() {
     assert!(json.contains("\"type\":\"session_closed\""));
     let back: RelayToCoordinator = serde_json::from_str(&json).unwrap();
     assert_eq!(back, message);
+}
+
+#[test]
+fn descriptor_acknowledgements_are_optional_and_roundtrip() {
+    for (kind, mut frame) in [
+        (
+            "descriptors",
+            serde_json::json!({"type": "descriptors", "descriptors": []}),
+        ),
+        (
+            "descriptor_delta",
+            serde_json::json!({"type": "descriptor_delta"}),
+        ),
+    ] {
+        let legacy: CoordinatorToRelay = serde_json::from_value(frame.clone()).unwrap();
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("ack_id")
+                .is_none()
+        );
+        frame["ack_id"] = serde_json::json!(42);
+        let requested: CoordinatorToRelay = serde_json::from_value(frame).unwrap();
+        assert!(matches!(
+            requested,
+            CoordinatorToRelay::Descriptors {
+                ack_id: Some(42),
+                ..
+            } | CoordinatorToRelay::DescriptorDelta {
+                ack_id: Some(42),
+                ..
+            }
+        ));
+        let serialized = serde_json::to_value(&requested).unwrap();
+        assert_eq!(serialized["type"], kind);
+        assert_eq!(serialized["ack_id"], 42);
+        assert_eq!(
+            serde_json::from_value::<CoordinatorToRelay>(serialized).unwrap(),
+            requested
+        );
+    }
+    let ack = RelayToCoordinator::DescriptorsApplied { ack_id: 42 };
+    let json = serde_json::to_string(&ack).unwrap();
+    assert_eq!(json, r#"{"type":"descriptors_applied","ack_id":42}"#);
+    assert_eq!(
+        serde_json::from_str::<RelayToCoordinator>(&json).unwrap(),
+        ack
+    );
 }

@@ -16,6 +16,7 @@
 mod common;
 mod helpers;
 
+mod descriptor_acks;
 mod descriptor_deltas;
 mod drain;
 mod enrollment;

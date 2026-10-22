@@ -29,6 +29,7 @@ use crate::test_support::*;
 #[test]
 fn the_load_progress_webhook_bodies_serialize_to_their_documented_shapes() {
     let connected = SlotConnectedWebhook {
+        evidence: None,
         event: "slotConnected",
         tenant: "sb-staging".to_owned(),
         session: 42,
@@ -182,7 +183,7 @@ pub(super) fn setup_without_session(url: String) -> SessionSetup {
 /// point, as relay 1, the serving relay of every session these fixtures create.
 /// A test that wants the authorization refused names a different relay itself.
 pub(super) fn report(lifecycle: &Lifecycle, notice: SessionNotice) {
-    lifecycle.ingest_notice(RelayId(1), notice);
+    lifecycle.ingest_notice(RelayId(1), 0, notice);
 }
 
 /// The next webhook delivered, asserted to be signed by the test tenant's own

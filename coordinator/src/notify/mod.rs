@@ -84,6 +84,9 @@ pub(crate) use payloads::session_closed_dispatch;
 // `*Webhook` bodies via `use super::*;` without knowing they actually live in
 // the `payloads` submodule (see `payloads` for why they're `pub(super)`
 // rather than private there).
+#[cfg(test)]
+pub(crate) use payloads::EvidencePayload;
+pub(crate) use payloads::SlotEvidencePayload;
 use payloads::{
     DepartureWebhook, DesyncWebhook, DivergedSlotWebhook, LobbyViolationWebhook, ResultEchoWebhook,
     ResultWebhook, SessionStartedWebhook, SlotConnectedWebhook, SlotStartedWebhook,
@@ -115,11 +118,8 @@ pub type DesyncDedup = Arc<Mutex<HashSet<(TenantId, SessionId, u64)>>>;
 /// report to a single webhook.
 pub type ResultDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
 
-/// Slot arrivals already notified, keyed by `(tenant, session, slot)` — the
-/// sibling of [`DepartureDedup`] with the same key shape. A relay reports a slot
-/// connected on *every* activation (reconnects included) so the coordinator's
-/// ever-connected set follows the truth; this set is what keeps the tenant
-/// notification to the first arrival per slot.
+/// Legacy slot arrivals already notified, keyed by `(tenant, session, slot)`.
+/// Evidence-bearing arrivals use the lifecycle's persisted activation highwater.
 pub type SlotConnectedDedup = Arc<Mutex<HashSet<(TenantId, SessionId, SlotId)>>>;
 
 /// Session starts already notified, keyed by `(tenant, session)` — one start per

@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
+mod descriptor_acks;
 mod descriptors;
 mod drain;
 mod enroll;
@@ -173,6 +174,9 @@ fn key(session: u64) -> SessionKey {
 
 fn descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        evidence_keys: vec![],
+        required_evidence_slots: vec![],
+        evidence_assignments: vec![],
         lobby_policy: None,
         lobby_settled: false,
         rollback: false,

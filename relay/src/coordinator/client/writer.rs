@@ -42,6 +42,8 @@ pub(super) struct WriterRoutes {
     /// A routed load-state request for the writer to fence and answer with a
     /// snapshot send.
     pub(super) load_state_rx: Receiver<LoadStateAsk>,
+    /// Latest requested descriptor barrier completed on this connection.
+    pub(super) descriptor_ack_rx: watch::Receiver<Option<u64>>,
 }
 
 /// A coordinator's answer to a [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest),
@@ -101,8 +103,8 @@ pub(super) enum FlightStage {
 
 /// The write half of an enrolled control connection: owns every send and drives a
 /// `biased` priority order so bulk can never delay control. Highest first: a drain
-/// re-assert, then queued notices, then a routed identity-proof answer, then the
-/// flight-upload arms (a routed grant/refusal, a completed upload, an expired grant
+/// re-assert, then queued notices, then a routed identity-proof answer, then a
+/// descriptor installation acknowledgement, then the flight-upload arms (a routed grant/refusal, a completed upload, an expired grant
 /// wait), then the periodic heartbeat, and last a fresh flight shipment — so a
 /// close-bearing notice always outruns flight work, and a small upload request never
 /// rides ahead of a webhook-bearing notice.
@@ -145,6 +147,7 @@ pub(super) async fn write_control_frames(
         mut challenge_rx,
         mut flight_grant_rx,
         mut load_state_rx,
+        mut descriptor_ack_rx,
     } = routes;
     // Split the caller-owned queues into their fields. The park/clear discipline
     // below mutates these in place, so whatever stays parked here is exactly what the
@@ -166,6 +169,7 @@ pub(super) async fn write_control_frames(
     // Once the notifier's senders are all dropped (relay shutdown) `recv` yields
     // `None` forever; stop selecting on it so the loop doesn't spin.
     let mut notifier_open = true;
+    let mut descriptor_ack_open = true;
     // Likewise for the flight channel: a standalone relay never installs the
     // coordinator sink, so its sender is dropped and `recv` yields `None` forever;
     // disable the arm on the first `None` rather than spin.
@@ -288,6 +292,23 @@ pub(super) async fn write_control_frames(
                         answer_identity_challenge(&mut sink, identity_key, &nonce, relay_id).await?;
                     }
                     None => challenge_open = false,
+                }
+            }
+
+            // A later id covers all prior applies on the ordered control stream,
+            // so a slow writer needs only the latest completed installation barrier.
+            changed = descriptor_ack_rx.changed(), if descriptor_ack_open => {
+                match changed {
+                    Ok(()) => {
+                        let ack_id = *descriptor_ack_rx.borrow_and_update();
+                        if let Some(ack_id) = ack_id {
+                            let frame = serde_json::to_string(
+                                &RelayToCoordinator::DescriptorsApplied { ack_id },
+                            ).expect("a descriptor acknowledgement serializes");
+                            sink.send(Message::Text(frame.into())).await?;
+                        }
+                    }
+                    Err(_) => descriptor_ack_open = false,
                 }
             }
 

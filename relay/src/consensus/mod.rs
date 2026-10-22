@@ -286,7 +286,7 @@ pub use maker::{
 pub use registry::LobbyCommandVerdict;
 
 pub use registry::{
-    DecisionMakers, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,
+    DecisionMakers, EvidenceConfig, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,
     new_decision_makers, new_decision_makers_with_region_delay, normalize_observed_leave,
 };
 pub use sync::SyncDivergence;

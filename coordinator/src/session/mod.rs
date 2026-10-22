@@ -81,6 +81,12 @@ type SessionRefsStore =
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SessionRefs {
+    /// Verification keys retained across descriptor rebuilds.
+    pub evidence_keys: Vec<rally_point_proto::control::EvidenceKey>,
+    /// Slots whose connections require valid evidence.
+    pub required_evidence_slots: Vec<SlotId>,
+    /// Per-slot assignment revisions, changed whenever a slot is rehomed.
+    pub evidence_assignments: std::collections::BTreeMap<SlotId, u64>,
     /// The tenant's own id for the session (ShieldBattery's `gameId`).
     pub external_id: Option<String>,
     /// Whether this session runs home-side drop finalization

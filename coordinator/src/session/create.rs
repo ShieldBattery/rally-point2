@@ -360,6 +360,14 @@ fn create_body(
     // them — the notification is then self-describing (the coordinator keeps no
     // other session→game map, and the tenant needs none either).
     let refs = SessionRefs {
+        evidence_keys: request.evidence_keys.clone(),
+        required_evidence_slots: request
+            .players
+            .iter()
+            .filter(|p| p.require_evidence)
+            .map(|p| p.slot)
+            .collect(),
+        evidence_assignments: request.players.iter().map(|p| (p.slot, 1)).collect(),
         external_id: request.external_id.clone(),
         slots: request
             .players
@@ -482,6 +490,18 @@ pub(super) const MAX_LOBBY_POLICY_PAYLOAD_BYTES: usize = 256 * 1024;
 fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
     if request.players.is_empty() {
         return Err(SessionSetupError::NoPlayers);
+    }
+    if request.evidence_keys.len() > rally_point_proto::control::MAX_EVIDENCE_KEYS {
+        return Err(SessionSetupError::InvalidEvidenceKeys);
+    }
+    let mut key_ids = std::collections::HashSet::new();
+    if request
+        .evidence_keys
+        .iter()
+        .any(|key| !key_ids.insert(key.key_id))
+        || (request.evidence_keys.is_empty() && request.players.iter().any(|p| p.require_evidence))
+    {
+        return Err(SessionSetupError::InvalidEvidenceKeys);
     }
     let mut seen_slots = std::collections::HashSet::with_capacity(request.players.len());
     for player in &request.players {

@@ -338,12 +338,29 @@ once. Mesh datagrams also carry an additive **tenant tag** on the wire, so two t
 assigned the same numeric session id can share a mesh link between the same relay pair without ever
 cross-delivering.
 
-Client → relay trust is the same fingerprint-pinning story: 1:1 (one relay per client), cert pinned from
-the session response, no CA there either. A client's own admission is additionally **bounded**: a session
-with no applied descriptor yet is still admitted on the strength of a valid token alone (tolerating the
-create-response-to-dial race beating the coordinator's descriptor push), but that admission is now
-**provisional** — if no descriptor names the session within a bounded window, the relay's sweep tears it
-down, so a stale or misrouted token can no longer hold a session open on a relay indefinitely.
+Clients pin their relay's certificate from the session response, with no CA in between. On a
+coordinator-managed relay, authorization also requires an installed session descriptor. The coordinator
+waits for installation acknowledgements from every assigned relay advertising `descriptor_ack_v1`
+before returning create or new-target rehome details, including idempotent retries. The five-second
+response deadline returns retryable `503` without discarding committed session state. A keyed create
+retry preserves its session and tokens; requests without `external_id` have no deduplication key.
+Older relays bypass this wait immediately. New relays acknowledge only explicitly requested `ack_id`
+fields on full or delta descriptor frames, so older coordinators need no change.
+
+Acknowledgements prove synchronous local installation, not mesh-link establishment. Their ids are
+cumulative on one ordered control connection, fenced by its enrollment generation, and never persisted.
+A reconnect must acknowledge its full resync. The coordinator checks exact current descriptors, keeps
+unchanged sessions ready through unrelated updates, and refreshes response topology under the assignment
+lock after waiting. Capability-only reenrollment wakes waiters even when mesh identities did not change.
+
+Relay admission still handles an older coordinator or a relay restart after acknowledgement: its
+handshake waits for installation within the existing five-second authorization deadline and shared
+handshake cap. An already-installed descriptor is read immediately, including on ordinary same-relay
+reconnects, and a retired session is refused immediately. The relay does not register or activate the
+client while waiting: the descriptor supplies admission policy for all its traffic, whereas journaling
+turns alone would leave side channels and connection reports unguarded. Managed startup leaves
+provisional admission and its journal disarmed. Standalone relays, which have no descriptor source,
+keep descriptor-free admission.
 
 ### Failover and reconnect
 
@@ -383,10 +400,11 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
   session's life and across any connection churn. Those are the forward gate's seen registry
   (every turn that passed the gate, pre-start included — unlike the bounded replay ring, it never evicts;
   its sparse-cap collapse already treats swallowed gaps as delivered, so seeding from a collapsed prefix
-  mirrors the gate's documented failure direction rather than adding one) and the provisional journal
-  (turns accepted before a descriptor named the session — read before the gate, so a descriptor drain
-  moving entries journal → gate can't hide one from both reads, and a journal overflow seals its slot
-  against readmission, so no resumable slot ever lost an entry to it). "Session-lifetime" is enforced
+  mirrors the gate's documented failure direction rather than adding one) and, when explicitly armed by
+  an embedding, the provisional journal (managed startup leaves it disarmed). Its receipts are read
+  before the gate, so a descriptor drain moving entries from journal to gate cannot hide one from both
+  reads. A journal overflow seals its slot against readmission, so no resumable slot ever lost an entry
+  to it. "Session-lifetime" is enforced
   against every reconnect-admission token, not just a live roster: a never-started session's emptying
   closes immediately but keeps the undecided drop hold that admits a quick re-dial, so the emptied-session
   teardown retains the seen state (and replay ring) for as long as a surviving hold still promises a
@@ -1502,7 +1520,7 @@ every running game the moment its relays redialed, and the tenant's **batch live
 force-reconcile them. A ledger-backed coordinator therefore persists each live session into the ledger:
 its setup half (membership, correlation ids, the create-idempotency entry, every relay's staged descriptor
 and pending slot-closes, recorded re-homes) and its lifecycle half (accounting, departure seeds, the
-load-state sets, started), plus each relay's last boot id so lineage still judges a relay that restarted
+load-state sets, connection observations and their notification high water, started), plus each relay's last boot id so lineage still judges a relay that restarted
 while the coordinator was down. Only a session live in *both* halves is written — a create registers its
 lifecycle inside its commit, before the response becomes replayable to a concurrent identical create; a
 close removes the lifecycle before it retires membership — so a restart can neither resurrect a closing
@@ -1799,9 +1817,27 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   memory); the coordinator's own per-session webhook queues are bounded (128) with a drop counter
   on `/metrics`. Relay-reported webhook events take precedence over coordinator-derived ones by
   design, for restart survival. μs-seeded session ids stay in JS safe-integer range until ~2255.
-- **Home-relay enforcement fails open for unknown sessions** (an empty homed set is unenforced) —
-  this preserves the descriptor-arrival race's admit-first behavior; the fleet-amplification angle
-  is closed by mesh peer auth.
+- **Session responses wait for descriptor installation on capable relays.** `descriptor_ack_v1`
+  opts a relay into requested full/delta acknowledgements. Legacy relays bypass the response barrier;
+  a new relay sends no acknowledgement to an old coordinator. Proof is connection-scoped and covers
+  the exact current descriptor, with bounded memory and timeout. Create and new-target rehome retries
+  recheck readiness and current topology; ordinary same-relay client reconnects never contact the
+  coordinator. Relay admission retains its local descriptor check across restart and rollout races.
+- **Coordinator-managed client admissions wait for the session descriptor.** Both client-edge
+  protocol versions share the authorization deadline and admission cap while waiting. An absent
+  descriptor cannot establish whether a slot requires evidence, so no routing state or readiness
+  acknowledgement is created before it arrives. Installed descriptors have no waiting period; retirement
+  wakes pending admissions to refuse immediately. Managed startup leaves the provisional path disarmed.
+  Standalone relays retain optional descriptor-free admission. An empty homed set remains unenforced once
+  the descriptor is known.
+- **Connection evidence is optional unless the tenant requires it for a slot.** The negotiated
+  client-edge ALPN selects whether the bounded frame follows resume cursors; legacy connections
+  have no evidence. Required sessions are placed and rehomed only on capable relays. Reports carry
+  an assignment revision and a relay-process sequence so delayed notices and snapshots cannot
+  replace evidence from a newer connection or a different home assignment. Missing required evidence
+  is retryable because a provider can be temporarily unavailable; a supplied signature that fails
+  verification is terminal. Only valid evidence retains its body. A capability downgrade moves affected
+  sessions to a capable relay or retires them if no replacement exists, leaving unrelated sessions served.
 - **Empty sessions cannot pin the relay fleet indefinitely.** After observing any local or peer player
   live, a relay uses its authoritative local roster plus explicit zero reports from every peer, so even an
   assigned relay whose own slot never connected runs the ordinary close once the session transitions to

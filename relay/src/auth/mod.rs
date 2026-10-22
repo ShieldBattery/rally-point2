@@ -34,6 +34,7 @@
 //!   client → relay   u16-LE entry count, then that many (u8 slot, u64-LE cursor)
 //!                    resume-cursor entries (zero-count on a fresh connect; read
 //!                    unconditionally, only after the challenge proof passes)
+//!   client → relay   u16-LE evidence length, then payload (only with rp2/2)
 //!   relay  → client  one HANDSHAKE_OK byte (only after the slot is registered)
 //! ```
 //!
@@ -65,6 +66,9 @@ use rally_point_transport::noq;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{ED25519, UnparsedPublicKey};
 use tokio::sync::watch;
+
+mod evidence;
+pub use evidence::{Authenticated, CheckedEvidence, verify_evidence};
 
 /// The byte the relay writes to acknowledge an authorized, routable connection.
 /// Re-exported from the shared handshake codec so callers reading the relay's
@@ -382,8 +386,8 @@ pub fn verify_challenge(
 }
 
 /// Runs the full authorization handshake on `connection` and returns the
-/// authorized client, the per-slot resume cursors it presented, a connection
-/// epoch, and the still-open send stream.
+/// authenticated identity, resume cursors, connection context, optional evidence,
+/// and the still-open send stream.
 ///
 /// The caller writes [`HANDSHAKE_OK`] on the returned stream once it has wired the
 /// client into routing, so a client only learns it's accepted after its slot can
@@ -399,7 +403,7 @@ pub async fn authenticate(
     connection: &noq::Connection,
     registry: &Registry,
     now_unix_secs: u64,
-) -> Result<(AuthorizedClient, HashMap<SlotId, u64>, u64, noq::SendStream), AuthError> {
+) -> Result<Authenticated, AuthError> {
     let (mut send, mut recv) = connection.accept_bi().await?;
 
     let mut len_buf = [0u8; handshake::TOKEN_LEN_PREFIX_LEN];
@@ -447,7 +451,32 @@ pub async fn authenticate(
 
     let resume_cursors = read_resume_cursors(&mut recv).await?;
 
-    Ok((authorized, resume_cursors, connection_epoch, send))
+    let evidence = if rally_point_transport::quic::supports_evidence(connection) {
+        let mut len = [0; handshake::EVIDENCE_LEN_PREFIX_LEN];
+        recv.read_exact(&mut len).await?;
+        let len = handshake::decode_evidence_len(len)?;
+        let mut bytes = vec![0; len];
+        recv.read_exact(&mut bytes).await?;
+        handshake::decode_evidence(&bytes)?
+    } else {
+        None
+    };
+    let evidence_request = handshake::EvidenceRequest {
+        challenge: nonce,
+        channel_binding,
+        tenant: authorized.tenant.clone(),
+        session: authorized.session,
+        slot: authorized.slot,
+        client_pubkey: authorized.client_pubkey,
+    };
+    Ok(Authenticated {
+        authorized,
+        resume_cursors,
+        connection_epoch,
+        send,
+        evidence,
+        evidence_request,
+    })
 }
 
 /// Reads the client's resume-cursor frame off the authenticated handshake stream:

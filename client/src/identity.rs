@@ -15,7 +15,10 @@
 
 use ring::signature::Ed25519KeyPair;
 
+use rally_point_proto::handshake::{Evidence, EvidenceRequest};
 use rally_point_proto::token::SignedToken;
+
+mod evidence;
 
 /// A client's per-session connection credentials: its signed authorization token
 /// and the Ed25519 signing key that proves possession of the public key the token
@@ -23,6 +26,7 @@ use rally_point_proto::token::SignedToken;
 pub struct Identity {
     pub(crate) token: SignedToken,
     pub(crate) signing_key: Ed25519KeyPair,
+    evidence: Option<evidence::Provider>,
 }
 
 /// Why a client's signing key could not be loaded.
@@ -44,7 +48,27 @@ impl Identity {
     pub fn from_pkcs8(token: SignedToken, pkcs8: &[u8]) -> Result<Self, IdentityError> {
         let signing_key =
             Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|err| IdentityError::Key(err.to_string()))?;
-        Ok(Self { token, signing_key })
+        Ok(Self {
+            token,
+            signing_key,
+            evidence: None,
+        })
+    }
+
+    /// Supplies optional connection evidence. Called off the async runtime's worker threads.
+    /// A failed, oversized, panicking, or timed-out callback supplies no evidence.
+    /// The callback must return promptly: timing out cannot cancel a running blocking task,
+    /// and only one callback per identity may run at a time.
+    pub fn with_evidence_provider<F>(mut self, provider: F) -> Self
+    where
+        F: Fn(EvidenceRequest) -> Option<Evidence> + Send + Sync + 'static,
+    {
+        self.evidence = Some(evidence::Provider::new(provider));
+        self
+    }
+
+    pub(crate) async fn collect_evidence(&self, request: EvidenceRequest) -> Option<Evidence> {
+        self.evidence.as_ref()?.collect(request).await
     }
 
     /// The authorization token this identity presents.

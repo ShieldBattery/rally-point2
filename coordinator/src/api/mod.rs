@@ -96,6 +96,7 @@ mod control_flight;
 mod control_hello;
 mod control_inbound;
 mod control_writer;
+mod descriptor_readiness;
 mod load_state;
 mod queries;
 mod request_auth;
@@ -255,6 +256,8 @@ pub struct CoordinatorState {
     /// fan-out, so this bounds the read however many relays serve the session. A
     /// field so tests can shorten it.
     pub attest_timeout: Duration,
+    /// Bound on waiting for capable relays to install session descriptors.
+    pub descriptor_ack_timeout: Duration,
     /// The configured placement regions (immutable after startup). Read by
     /// `GET /regions` to serve the client-facing list, and at relay enroll to
     /// refuse a relay tagged with a region not listed here. Empty (the default,
@@ -328,6 +331,7 @@ impl CoordinatorState {
             hello_timeout: HELLO_TIMEOUT,
             liveness_timeout: LIVENESS_TIMEOUT,
             attest_timeout: LOAD_STATE_ATTEST_TIMEOUT,
+            descriptor_ack_timeout: Duration::from_secs(5),
             regions: RegionsConfig::default(),
             player_token_lifetime: DEFAULT_PLAYER_TOKEN_LIFETIME,
             ledger: None,

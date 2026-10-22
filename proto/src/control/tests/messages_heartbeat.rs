@@ -22,6 +22,7 @@ fn a_presence_bearing_heartbeat_roundtrips_json() {
     let message = RelayToCoordinator::Heartbeat {
         roster_complete: true,
         sessions: vec![SessionPresence {
+            evidence: vec![],
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(42),
             slots: vec![SlotId(0), SlotId(3)],
@@ -50,6 +51,7 @@ fn a_load_state_bearing_heartbeat_roundtrips_json() {
     let message = RelayToCoordinator::Heartbeat {
         roster_complete: true,
         sessions: vec![SessionPresence {
+            evidence: vec![],
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(42),
             slots: vec![SlotId(0), SlotId(3)],
@@ -78,6 +80,7 @@ fn a_heartbeat_without_load_state_omits_the_fields_and_decodes() {
     let message = RelayToCoordinator::Heartbeat {
         roster_complete: true,
         sessions: vec![SessionPresence {
+            evidence: vec![],
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(42),
             slots: vec![SlotId(0)],
@@ -183,6 +186,7 @@ fn a_presence_bearing_heartbeat_decodes_on_a_pre_presence_decoder() {
     let json = serde_json::to_string(&RelayToCoordinator::Heartbeat {
         roster_complete: true,
         sessions: vec![SessionPresence {
+            evidence: vec![],
             tenant: TenantId("sb-staging".to_owned()),
             session: SessionId(42),
             slots: vec![SlotId(0)],

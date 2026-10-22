@@ -89,6 +89,8 @@ struct SessionLoadStateRequest {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionLoadStateResponse {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    evidence: Vec<crate::notify::SlotEvidencePayload>,
     known: bool,
     turns_known: bool,
     setup_final: bool,
@@ -176,6 +178,7 @@ pub(super) async fn session_load_state(
             setup_final: false,
             started_at_ms: None,
             connected_slots: Vec::new(),
+            evidence: Vec::new(),
             started_slots: Vec::new(),
             forwarded_slots: Vec::new(),
             turns_known: false,
@@ -202,6 +205,7 @@ pub(super) async fn session_load_state(
             setup_final: false,
             started_at_ms: before.started_at_ms,
             connected_slots: before.connected_slots.iter().map(|s| s.0).collect(),
+            evidence: before.evidence.into_iter().map(Into::into).collect(),
             started_slots: before.started_slots.iter().map(|s| s.0).collect(),
             forwarded_slots: before.forwarded_slots.iter().map(|s| s.0).collect(),
             turns_known: false,
@@ -255,6 +259,7 @@ pub(super) async fn session_load_state(
         setup_final,
         started_at_ms: after.started_at_ms,
         connected_slots: after.connected_slots.iter().map(|s| s.0).collect(),
+        evidence: after.evidence.into_iter().map(Into::into).collect(),
         started_slots: after.started_slots.iter().map(|s| s.0).collect(),
         forwarded_slots: after.forwarded_slots.iter().map(|s| s.0).collect(),
         turns_known,

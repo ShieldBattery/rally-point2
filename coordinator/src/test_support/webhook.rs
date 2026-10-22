@@ -262,6 +262,7 @@ fn create_fixture_session(
     let players = players
         .iter()
         .map(|player| PlayerHandoff {
+            require_evidence: false,
             slot: SlotId(player.slot),
             client_pubkey: ClientPublicKey(
                 [0xAAu8.wrapping_add(player.slot.wrapping_mul(0x11)); 32],
@@ -274,6 +275,7 @@ fn create_fixture_session(
     session::create_session(
         setup,
         SessionRequest {
+            evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,
             tenant: TenantId(TEST_TENANT.to_owned()),
@@ -302,6 +304,7 @@ pub(crate) fn presence_entry(
     connected: &[u8],
 ) -> SessionPresence {
     SessionPresence {
+        evidence: Vec::new(),
         tenant: tenant.clone(),
         session,
         slots: slots(connected),

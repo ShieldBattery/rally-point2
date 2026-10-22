@@ -307,7 +307,9 @@ impl Lifecycle {
     /// running, which had turns forwarded by their home relay, plus the two facts a
     /// completeness claim rests on — whether this coordinator created the session
     /// and whether relay memory covering it is unbroken — and the relays that would
-    /// have to attest for such a claim. Every slot list is sorted ascending.
+    /// have to attest for such a claim. It also returns the latest retained connection
+    /// observations matching each slot's current assignment. Every slot list is sorted
+    /// ascending; observations do not inherit the slot sets' completeness claim.
     ///
     /// `Some` for every session the coordinator holds any state for, whatever built
     /// that state: the facts it has accumulated are positive evidence and worth
@@ -319,11 +321,24 @@ impl Lifecycle {
     /// never arrived. That also requires the serving relays to have just answered
     /// for themselves, which only the caller that asked them can know.
     pub fn load_state(&self, tenant: &TenantId, session: SessionId) -> Option<SessionLoadState> {
+        let assignments = self.inner.setup.evidence_assignments(tenant, session);
         self.inner
             .sessions
             .lock()
             .get(&(tenant.clone(), session))
             .map(|state| SessionLoadState {
+                evidence: state
+                    .evidence
+                    .iter()
+                    .filter(|(slot, stored)| {
+                        assignments.get(slot)
+                            == Some(&(stored.relay, stored.observation.assignment_revision))
+                    })
+                    .map(|(&slot, stored)| rally_point_proto::control::SlotEvidence {
+                        slot,
+                        observation: stored.observation.clone(),
+                    })
+                    .collect(),
                 created_here: state.created_here,
                 attestable: state.attestable,
                 serving_relays: state.serving_relays.clone(),
@@ -348,6 +363,8 @@ impl Lifecycle {
     /// committing one — or restarted — recovers within a beat); the snapshot is
     /// what a caller with a deadline asks for.
     ///
+    /// Connection observations use `merge_connection_evidence` separately, because
+    /// their assignment, process, and activation fences do not merge by union.
     /// Deliberately fires no webhook: these are re-statements of facts already
     /// notified, and the tenant's feed must not repeat them every ten seconds.
     ///
@@ -409,6 +426,7 @@ impl Lifecycle {
             if state.serving_relays.contains(&relay) {
                 state.attestable = false;
             }
+            state.evidence.retain(|_, evidence| evidence.relay != relay);
         }
     }
 

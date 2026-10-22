@@ -196,6 +196,7 @@ fn result_without_optionals_decodes() {
 #[test]
 fn slot_connected_roundtrips_json() {
     let notice = SlotConnectedNotice {
+        evidence: None,
         tenant: TenantId("sb-staging".to_owned()),
         session: SessionId(42),
         slot: SlotId(1),

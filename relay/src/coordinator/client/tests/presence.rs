@@ -1,5 +1,5 @@
 //! What the relay reports about the sessions it holds: the heartbeat's roster
-//! entries, the one-session load-state snapshot that must match them, and the
+//! entries, requested snapshots with retained connection observations, and the
 //! measured region round-trips a beat carries.
 
 use super::*;
@@ -38,8 +38,8 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
     // The session's decision-maker holds the load state the beat restates:
     // slot 2 arrived and dropped again (so it is off the live roster but
     // still ever-connected), slot 3 arrived and reported its game loop.
-    decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(2), false);
-    decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(3), false);
+    decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(2), false, None);
+    decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(3), false, None);
     decision_makers.note_slot_started(&key(7), rally_point_proto::ids::SlotId(3));
 
     SubscriberFixture {
@@ -85,6 +85,7 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
                 // instant to restate.
                 started_at_ms: None,
                 lobby_violations: vec![],
+                evidence: vec![],
             }],
             region_rtts: vec![],
         },
@@ -105,7 +106,7 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
     let (sessions, decision_makers) = fence_fixture();
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
     decision_makers.note_slot_started(&key(7), SlotId(0));
 
     // The slot's link ends: the routing group goes with it, the maker stays.
@@ -132,6 +133,7 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
             forwarded: vec![],
             started_at_ms: None,
             lobby_violations: vec![],
+            evidence: vec![],
         }],
         "the session is still named, with no connected slot and its retained sets",
     );
@@ -192,7 +194,12 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
             .expect("slot 3 registers");
     guard.disarm();
     for slot in [2u8, 3] {
-        decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(slot), false);
+        decision_makers.note_slot_connected(
+            &key(7),
+            rally_point_proto::ids::SlotId(slot),
+            false,
+            None,
+        );
     }
     decision_makers.note_slot_started(&key(7), rally_point_proto::ids::SlotId(3));
     decision_makers.note_unframed_home_turn(&key(7), rally_point_proto::ids::SlotId(2));
@@ -244,6 +251,7 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
                 ],
                 started_at_ms: None,
                 lobby_violations: vec![],
+                evidence: vec![],
             },
             // Slot 2 arrived here and is gone: no stream to probe, and its
             // client may be holding a report for the stream it opens next, so
@@ -266,7 +274,7 @@ fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
     let (sessions, decision_makers) = fence_fixture();
     let (_registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
     decision_makers.note_slot_started(&key(7), SlotId(0));
 
     let sources = HeartbeatSources {
@@ -312,6 +320,7 @@ fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
             forwarded: vec![],
             started_at_ms: None,
             lobby_violations: vec![],
+            evidence: vec![],
         },
     );
 }
@@ -343,5 +352,84 @@ fn heartbeat_region_rtts_snapshots_the_cache_sorted_by_region() {
                 rtt_ms: 87,
             },
         ],
+    );
+}
+
+#[test]
+fn heartbeat_roster_stays_compact_while_requested_snapshots_retain_full_observations() {
+    use rally_point_proto::control::{EvidenceObservation, EvidenceVerdict};
+    use rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN;
+    use rally_point_proto::ids::SlotId;
+
+    let sessions: Sessions = Arc::default();
+    let decision_makers = Arc::new(crate::consensus::new_decision_makers());
+    let mut registrations = Vec::new();
+    let mut inboxes = Vec::new();
+    for session in 0..256 {
+        let key = key(session);
+        let _ = decision_makers.sync_maker(
+            &key,
+            crate::consensus::MakerSync::new(
+                BufferBounds { min: 1, max: 6 },
+                crate::consensus::Authority::SelfRelay,
+            ),
+        );
+        for slot in [SlotId(0), SlotId(1)] {
+            let (registration, inbox) = crate::routing::register(&sessions, &key, slot, 1).unwrap();
+            registrations.push(registration);
+            inboxes.push(inbox);
+            assert!(decision_makers.note_slot_connected(
+                &key,
+                slot,
+                false,
+                Some(EvidenceObservation {
+                    connection_id: [255; 32],
+                    sequence: 1,
+                    assignment_revision: 0,
+                    verdict: EvidenceVerdict::Valid,
+                    key_id: Some(7),
+                    body: vec![255; MAX_EVIDENCE_BODY_LEN],
+                })
+            ));
+        }
+    }
+    let sources = HeartbeatSources {
+        session_gates: crate::session::gate::SessionGates::default(),
+        provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),
+        sessions: Arc::clone(&sessions),
+        decision_makers: Arc::clone(&decision_makers),
+        region_rtt_cache: RegionRttCache::default(),
+        load_fence: crate::coordinator::load_fence::LoadStateFence::new(),
+    };
+    let roster = heartbeat_presence(&sources);
+    assert_eq!(roster.len(), 256);
+    for entry in &roster {
+        assert_eq!(entry.slots, vec![SlotId(0), SlotId(1)]);
+        assert_eq!(entry.ever_connected, entry.slots);
+        assert!(entry.evidence.is_empty());
+    }
+    let frame = serde_json::to_vec(&RelayToCoordinator::Heartbeat {
+        roster_complete: true,
+        sessions: roster,
+        region_rtts: vec![],
+    })
+    .unwrap();
+    assert!(
+        frame.len() < 128 * 1024,
+        "the complete roster stays comfortably below the control-message cap"
+    );
+
+    let (snapshot, _) = session_load_snapshot(&sessions, &decision_makers, key(0));
+    assert_eq!(snapshot.slots, vec![SlotId(0), SlotId(1)]);
+    assert_eq!(snapshot.evidence.len(), 2);
+    for entry in &snapshot.evidence {
+        assert_eq!(entry.observation.body, vec![255; MAX_EVIDENCE_BODY_LEN]);
+        assert_eq!(entry.observation.verdict, EvidenceVerdict::Valid);
+    }
+    let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap();
+    assert!(snapshot_bytes.len() < 2 * 1024 * 1024);
+    assert!(
+        snapshot_bytes.len() * 256 > 2 * 1024 * 1024,
+        "repeating these bodies in the roster would exceed the control cap"
     );
 }

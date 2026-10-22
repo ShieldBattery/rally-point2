@@ -21,6 +21,7 @@ mod desync_ordering;
 mod desync_ordinals;
 mod directive;
 mod epochs;
+mod evidence;
 mod finalize;
 mod homing;
 mod initial_depth;

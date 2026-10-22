@@ -1,11 +1,12 @@
 //! What the relay tells the coordinator about the sessions it holds: the periodic
 //! heartbeat's roster and the answer to a one-session load-state question.
 //!
-//! Both are built from the same two sources — the live routing roster and the
-//! per-session decision-makers — through one shared presence builder, so a beat's
-//! entry and an attested snapshot can never drift apart. The load-state side adds
-//! the fence: probe every slot that could still be holding a report back, wait for
-//! the acks off the connection's write half, and only then snapshot.
+//! Both use the live routing roster and per-session decision-makers. Heartbeats
+//! restate every session's roster and progress facts; requested snapshots also
+//! carry retained connection observations. Opaque bodies stay out of periodic
+//! rosters so their size does not multiply by every session on the relay. The
+//! load-state side adds the fence: probe every slot that could still be holding
+//! a report back, wait for the acks, and only then snapshot.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -55,9 +56,9 @@ pub(super) struct LoadStateAsk {
 /// maker (a provisional admission no descriptor ever claimed) still gets its
 /// entry, with the load fields empty.
 ///
-/// The roster is the whole current truth every time, load state included: a beat
-/// restates every session's full sets rather than reporting what changed, so a
-/// lost or reordered beat is corrected by the next one.
+/// The roster and progress sets are complete every time, so a lost beat is
+/// corrected by the next one. Connection observations are recovered by requesting
+/// the affected session's load state instead of repeating bodies in every roster.
 pub(super) fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPresence> {
     let mut live: HashMap<SessionKey, _> = crate::routing::live_slots(&sources.sessions)
         .into_iter()
@@ -82,9 +83,9 @@ pub(super) fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPrese
 /// [`SessionPresence`] shape a heartbeat's roster entry carries — the answer to a
 /// [`CoordinatorToRelay::LoadStateRequest`](rally_point_proto::control::CoordinatorToRelay::LoadStateRequest).
 ///
-/// Reads exactly the two sources a beat reads, so an attested snapshot and a
-/// restated one describe the session identically: the session's currently-connected
-/// slots from the live roster, and its retained load state from its decision-maker.
+/// Reads the same roster and progress facts as a heartbeat, plus the session's
+/// retained connection observations. The single-session bound keeps opaque bodies
+/// out of the relay-wide periodic roster without losing requested recovery.
 /// A session this relay holds nothing for — no maker, no live slot — snapshots to
 /// empty lists, which is this relay attesting that it knows of no arrival rather
 /// than declining to answer.
@@ -313,9 +314,8 @@ pub(super) async fn fenced_load_state_snapshot(
 }
 
 /// Assembles one [`SessionPresence`] from a session's key, its connected slots, and
-/// the load state its decision-maker retained — the single place the wire shape is
-/// built, so a heartbeat's roster entry and an attested snapshot can never drift
-/// apart in what they report.
+/// the retained state selected for that report. Heartbeats select progress facts;
+/// requested single-session snapshots additionally select connection observations.
 fn presence_entry(key: SessionKey, slots: Vec<SlotId>, load: RetainedLoadState) -> SessionPresence {
     SessionPresence {
         tenant: key.tenant,
@@ -325,6 +325,7 @@ fn presence_entry(key: SessionKey, slots: Vec<SlotId>, load: RetainedLoadState) 
         started: load.started,
         forwarded: load.forwarded,
         lobby_violations: load.lobby_violations,
+        evidence: load.evidence,
         started_at_ms: load.started_at_ms,
     }
 }

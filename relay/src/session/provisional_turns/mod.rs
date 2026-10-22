@@ -1,8 +1,9 @@
 //! A journal for ingress from provisionally admitted clients.
 //!
-//! A valid token is deliberately admitted before any descriptor names its
-//! session (the descriptor push races the first dials, and a re-homed group
-//! can dial its replacement relay before the resumed descriptor lands there).
+//! Library callers can opt into admitting a valid token before any descriptor names its
+//! session. Production relays leave this journal disarmed and wait for the
+//! descriptor before admission. In admit-first mode, a re-homed group
+//! can dial its replacement relay before the resumed descriptor lands there.
 //! Provisional admission itself is safe — the bounded-admission sweep reaps a
 //! session no descriptor ever claims — but provisional *ingress effects* are
 //! not, in both directions:

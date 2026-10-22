@@ -32,10 +32,12 @@ fn create_session(served: &ServedCoordinator) -> SessionId {
     let created = session::create_session(
         &served.setup,
         SessionRequest {
+            evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,
             tenant: tenant.clone(),
             players: vec![PlayerHandoff {
+                require_evidence: false,
                 slot: SlotId(0),
                 client_pubkey: ClientPublicKey([0xAA; 32]),
                 external_ref: None,

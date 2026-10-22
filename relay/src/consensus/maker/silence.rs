@@ -358,13 +358,22 @@ impl DecisionMaker {
         self.started_at_ms.get_or_insert(started_at_ms);
     }
 
-    /// This session's retained load state, as every heartbeat carries it.
+    /// This session's full retained state for a requested single-session snapshot.
     pub fn load_state(&self) -> RetainedLoadState {
+        RetainedLoadState {
+            evidence: self.evidence_snapshot(),
+            ..self.heartbeat_load_state()
+        }
+    }
+
+    /// Progress facts restated periodically without copying opaque observations.
+    pub fn heartbeat_load_state(&self) -> RetainedLoadState {
         RetainedLoadState {
             ever_connected: sorted_slots(&self.connected_slots),
             started: sorted_slots(&self.started_slots),
             forwarded: sorted_slots(&self.forwarded_slots),
             lobby_violations: self.lobby_violations(),
+            evidence: Vec::new(),
             started_at_ms: self.started_at_ms,
         }
     }

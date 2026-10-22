@@ -185,6 +185,9 @@ fn every_refusal_carries_the_rollback_its_cause_implies() {
     // the roster was touched has nothing to undo.
     let table = [
         (NOT_HOMED, Rollback::Untouched),
+        (EVIDENCE_REJECTED, Rollback::Untouched),
+        (EVIDENCE_UNAVAILABLE, Rollback::Untouched),
+        (ASSIGNMENT_CHANGED, Rollback::Scaffolding),
         (ALREADY_DEPARTED, Rollback::Untouched),
         (DEPARTED_AT_ADMISSION, Rollback::Scaffolding),
         (SLOT_TAKEN, Rollback::Scaffolding),

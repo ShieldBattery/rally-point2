@@ -19,8 +19,8 @@ fn retained_load_state_outlives_the_links_it_was_recorded_from() {
         },
     );
 
-    registry.note_slot_connected(&k, SlotId(2), false);
-    registry.note_slot_connected(&k, SlotId(1), false);
+    registry.note_slot_connected(&k, SlotId(2), false, None);
+    registry.note_slot_connected(&k, SlotId(1), false, None);
     registry.note_slot_started(&k, SlotId(2));
     assert!(!registry.note_slot_present(&k, SlotId(1)));
     assert!(
@@ -50,7 +50,7 @@ fn retained_load_state_outlives_the_links_it_was_recorded_from() {
     );
 
     // A reconnect re-reports an arrival; the union absorbs it unchanged.
-    registry.note_slot_connected(&k, SlotId(1), true);
+    registry.note_slot_connected(&k, SlotId(1), true, None);
     assert_eq!(
         load_state_of(&registry, &k).ever_connected,
         load.ever_connected
@@ -64,7 +64,7 @@ fn a_session_without_a_maker_retains_no_load_state() {
     // sets for it, which omits the fields from the wire entirely.
     let registry = new_decision_makers();
     let k = key();
-    registry.note_slot_connected(&k, SlotId(0), false);
+    registry.note_slot_connected(&k, SlotId(0), false, None);
     registry.note_slot_started(&k, SlotId(0));
     assert_eq!(load_state_of(&registry, &k), RetainedLoadState::default());
 }
@@ -76,8 +76,8 @@ fn turn_evidence_is_home_first_hand_and_outlives_the_link() {
     let registry = new_decision_makers();
     let k = key();
     let _ = registry.sync_maker(&k, MakerSync::new(bounds(1, 6), Authority::Peer));
-    registry.note_slot_connected(&k, SlotId(1), false);
-    registry.note_slot_connected(&k, SlotId(2), false);
+    registry.note_slot_connected(&k, SlotId(1), false, None);
+    registry.note_slot_connected(&k, SlotId(2), false, None);
     // Slot 1 claims its loop is running but no turn of its ever arrived.
     registry.note_slot_started(&k, SlotId(1));
     // Slot 2 never claimed anything, yet its seed and its loop's turns flow.

@@ -1,0 +1,65 @@
+use super::*;
+use rally_point_proto::control::{EvidenceObservation, EvidenceVerdict};
+
+fn config(revision: u64) -> EvidenceConfig {
+    EvidenceConfig {
+        required_slots: [SlotId(0)].into_iter().collect(),
+        assignments: [(SlotId(0), revision)].into_iter().collect(),
+        ..Default::default()
+    }
+}
+
+fn install(registry: &DecisionMakers, key: &SessionKey, evidence: EvidenceConfig) {
+    let _ = registry.sync_maker(
+        key,
+        MakerSync {
+            evidence,
+            ..MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay)
+        },
+    );
+}
+
+#[test]
+fn stale_assignment_cannot_activate_or_replace_retained_evidence() {
+    let registry = new_decision_makers();
+    let key = SessionKey {
+        tenant: TenantId("tenant".into()),
+        session: SessionId(1),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    registry.set_notice_notifier(tx);
+    registry.require_descriptors();
+    install(&registry, &key, config(1));
+    let observation = EvidenceObservation {
+        connection_id: [1; 32],
+        sequence: 1,
+        assignment_revision: 1,
+        verdict: EvidenceVerdict::Valid,
+        key_id: Some(7),
+        body: vec![8],
+    };
+    assert!(registry.note_slot_connected(&key, SlotId(0), false, Some(observation.clone())));
+    let first = registry.retained_load_state(&key).evidence;
+    assert_eq!(first[0].observation, observation);
+    assert!(
+        matches!(rx.try_recv().unwrap(), RelayNotice::SlotConnected(notice) if notice.evidence == Some(observation.clone()))
+    );
+    install(&registry, &key, config(2));
+    assert!(!registry.evidence_assignment_current(&key, SlotId(0), 1));
+    assert!(!registry.note_slot_connected(&key, SlotId(0), true, Some(observation.clone())));
+    assert_eq!(registry.retained_load_state(&key).evidence, first);
+    assert!(rx.try_recv().is_err());
+    let next = EvidenceObservation {
+        connection_id: [2; 32],
+        sequence: 2,
+        assignment_revision: 2,
+        ..observation
+    };
+    assert!(registry.note_slot_connected(&key, SlotId(0), true, Some(next.clone())));
+    assert_eq!(
+        registry.retained_load_state(&key).evidence[0].observation,
+        next
+    );
+    registry.deregister_maker(&key);
+    assert!(!registry.note_slot_connected(&key, SlotId(0), true, Some(next)));
+}

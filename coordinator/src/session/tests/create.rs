@@ -207,6 +207,7 @@ fn slot_11_is_accepted_and_slot_12_is_rejected() {
     // refused before placement ever runs.
     let setup = two_relay_fleet();
     let player = |slot: u8| PlayerHandoff {
+        require_evidence: false,
         slot: SlotId(slot),
         client_pubkey: ClientPublicKey([slot; 32]),
         external_ref: None,

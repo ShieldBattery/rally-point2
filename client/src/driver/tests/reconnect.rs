@@ -64,6 +64,7 @@ async fn an_eviction_ends_the_driver_without_a_re_dial() {
     for code in [
         rally_point_proto::close_codes::DESYNC_EVICTED,
         rally_point_proto::close_codes::LOBBY_VIOLATION,
+        rally_point_proto::close_codes::EVIDENCE_REJECTED,
     ] {
         let (link_a, link_b, ea, _eb) = connected_links().await;
         let (driver_a, chan_a) = test_driver(link_a);

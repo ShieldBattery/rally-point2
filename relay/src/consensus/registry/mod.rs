@@ -14,6 +14,7 @@ mod authority;
 mod buffer;
 mod clock;
 mod departure;
+mod evidence;
 mod homing;
 mod leave;
 mod lobby_policy;
@@ -24,6 +25,7 @@ mod state_hash;
 mod sync_coverage;
 
 pub use authority::{FrameRegression, MakerSync};
+pub use evidence::EvidenceConfig;
 pub use leave::normalize_observed_leave;
 pub use lobby_policy::LobbyCommandVerdict;
 
@@ -123,6 +125,8 @@ pub enum RelayNotice {
 #[derive(Default)]
 pub struct DecisionMakers {
     pub(in crate::consensus) makers: parking_lot::Mutex<MakerMap>,
+    pub(in crate::consensus) descriptors_changed: tokio::sync::Notify,
+    pub(in crate::consensus) require_descriptors: std::sync::atomic::AtomicBool,
     /// Set once at startup, drains into the coordinator control connection.
     /// Absent for a standalone relay. Unbounded so queueing a notice while the
     /// coordinator link is down never blocks the turn path — the drain end holds
@@ -393,6 +397,7 @@ impl DecisionMakers {
         key: &SessionKey,
         slot: SlotId,
         resumed: bool,
+        evidence: Option<rally_point_proto::control::EvidenceObservation>,
     ) -> SlotConnectedNotice {
         let (external_id, external_ref) = self.session_refs(key).stamps(slot);
         SlotConnectedNotice {
@@ -403,6 +408,7 @@ impl DecisionMakers {
             external_ref,
             resumed,
             connected_at_ms: unix_millis(),
+            evidence,
         }
     }
 
@@ -501,6 +507,8 @@ pub fn new_decision_makers() -> DecisionMakers {
 pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> DecisionMakers {
     DecisionMakers {
         makers: parking_lot::Mutex::new(HashMap::new()),
+        descriptors_changed: tokio::sync::Notify::new(),
+        require_descriptors: std::sync::atomic::AtomicBool::new(false),
         notices: OnceLock::new(),
         refs: parking_lot::Mutex::new(HashMap::new()),
         flight: crate::observability::flight_recorder::FlightRecorder::default(),
@@ -515,10 +523,9 @@ pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> 
 /// wire output is deterministic rather than following a hash set's iteration
 /// order.
 ///
-/// This is the durable half of the load-progress reporting: the matching notices
-/// are dropped the moment their send succeeds, while every heartbeat restates
-/// this in full, so a coordinator that lost a notice — or restarted — converges
-/// on the truth within one beat.
+/// Heartbeats restate progress facts after a lost notice or coordinator restart.
+/// Opaque connection observations remain available in requested single-session
+/// snapshots instead of multiplying the periodic roster's size by their bodies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetainedLoadState {
     /// Slots whose links ever activated on this relay, ascending.
@@ -529,6 +536,8 @@ pub struct RetainedLoadState {
     pub forwarded: Vec<SlotId>,
     /// Home slots this relay evicted for a pre-game lobby policy violation.
     pub lobby_violations: Vec<SlotId>,
+    /// The latest evidence observation for each home slot, ascending by slot.
+    pub evidence: Vec<rally_point_proto::control::SlotEvidence>,
     /// Relay wall-clock (unix epoch milliseconds) for the session's start, as
     /// this relay knows it. `None` on a relay that has not seen the session
     /// start at all.

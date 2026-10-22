@@ -36,6 +36,8 @@ pub(super) struct ReaderRoutes {
     /// Bounded ([`LOAD_STATE_ASK_CAPACITY`](super::LOAD_STATE_ASK_CAPACITY)): a full channel drops the question
     /// rather than parking the read half.
     pub(super) load_state_tx: Sender<LoadStateAsk>,
+    /// Latest completed installation barrier; coalesces without blocking applies.
+    pub(super) descriptor_ack_tx: watch::Sender<Option<u64>>,
 }
 
 /// The read half of an enrolled control connection: receives coordinator frames
@@ -71,6 +73,7 @@ pub(super) async fn read_control_frames(
         challenge_tx,
         flight_grant_tx,
         load_state_tx,
+        descriptor_ack_tx,
     } = routes;
     // Set once, on the first decoded application frame: it is the accepted-enroll
     // signal (see this function's doc). The reconnect loop clears it uniformly on
@@ -167,12 +170,25 @@ pub(super) async fn read_control_frames(
                             );
                         }
                     }
-                    other => apply_message(
-                        &apply_targets.control,
-                        other,
-                        &apply_targets.applied,
-                        &stats,
-                    ),
+                    other => {
+                        let ack_id = match &other {
+                            CoordinatorToRelay::Descriptors { ack_id, .. }
+                            | CoordinatorToRelay::DescriptorDelta { ack_id, .. } => *ack_id,
+                            _ => None,
+                        };
+                        apply_message(
+                            &apply_targets.control,
+                            other,
+                            &apply_targets.applied,
+                            &stats,
+                        );
+                        // Reconciliation is synchronous. Publish only after every
+                        // upsert and removal has reached the local stores; the
+                        // writer may skip intermediate ids on this ordered stream.
+                        if let Some(ack_id) = ack_id {
+                            descriptor_ack_tx.send_replace(Some(ack_id));
+                        }
+                    }
                 }
             }
             Message::Close(frame) => {
@@ -206,6 +222,7 @@ pub(super) fn apply_message(
 ) {
     match message {
         CoordinatorToRelay::Descriptors {
+            ack_id: _,
             descriptors,
             staged_at_unix_ms,
         } => {
@@ -216,6 +233,7 @@ pub(super) fn apply_message(
             reconcile(control, &descriptors, applied);
         }
         CoordinatorToRelay::DescriptorDelta {
+            ack_id: _,
             staged_at_unix_ms,
             upserts,
             removals,

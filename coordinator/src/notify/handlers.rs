@@ -321,26 +321,26 @@ pub(crate) fn handle_result(
     );
 }
 
-/// Handles one relay's slot-connected notice.
+/// Resolves an arriving slot's correlation ids and tenant configuration, then
+/// queues its signed webhook after lifecycle accounting has recorded the arrival.
+/// Legacy arrivals notify once per slot: repeating the same arrival fact adds no
+/// information. Evidence-bearing arrivals can describe a different connection on
+/// each reconnect or rehome, so they instead use the lifecycle's activation high
+/// water to suppress duplicates without losing changed observations.
 ///
-/// A sibling of [`handle_departure`]: first sight of a `(tenant, session, slot)`
-/// resolves the arriving slot's correlation ids and the tenant's notify config,
-/// then spawns a signed webhook. Later activations of the same slot (reconnects,
-/// re-home re-dials) are duplicates here and fire nothing — the lifecycle
-/// accounting the api layer feeds first still records them, so the load-state
-/// pull stays current either way.
-///
-/// Correlation ids come notice-first, stored-session as fallback — the same rule
-/// as departures.
+/// Correlation ids come from the notice first, with the stored session as fallback,
+/// so a self-describing arrival can still reach the tenant after coordinator state
+/// was lost. The load-state pull retains facts independently of webhook delivery.
 pub(crate) fn handle_slot_connected(
     setup: &SessionSetup,
     dedup: &SlotConnectedDedup,
     lifecycle: &Lifecycle,
     notice: SlotConnectedNotice,
 ) {
-    let is_new = dedup
+    let first = dedup
         .lock()
         .insert((notice.tenant.clone(), notice.session, notice.slot));
+    let is_new = notice.evidence.is_some() || first;
 
     let Some(resolved) = resolve_or_drop(
         setup,
@@ -360,6 +360,7 @@ pub(crate) fn handle_slot_connected(
         .or_else(|| resolved.stored_slot_ref(notice.slot));
 
     let payload = SlotConnectedWebhook {
+        evidence: notice.evidence.map(Into::into),
         event: "slotConnected",
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
