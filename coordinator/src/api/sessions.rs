@@ -9,7 +9,7 @@ use axum::{
     Json,
     body::Bytes,
     extract::State,
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri, header::RETRY_AFTER},
     response::{IntoResponse, Response},
 };
 use rally_point_proto::control::{
@@ -23,6 +23,7 @@ use crate::registry;
 use crate::session::{self, RehomeOutcome, SessionSetup};
 
 use super::CoordinatorState;
+use super::descriptor_readiness::ReadinessError;
 use super::request_auth::{TenantAccess, verify_tenant_request};
 
 /// Creates a game session: assigns relays, mints tokens.
@@ -173,11 +174,19 @@ pub(super) async fn create_session(
     // forget. A failed write refuses with a retryable 503, and the retry replays
     // this same response through the idempotency cache (for a create that carries
     // an `external_id`) and flushes again.
-    persist_before_answering(&state)?;
+    if persist_before_answering(&state).is_err() {
+        return Ok(retryable_create_response());
+    }
 
-    let resp = super::descriptor_readiness::ready_create(&state, &tenant, resp).await?;
+    let resp = match super::descriptor_readiness::ready_create(&state, &tenant, resp).await {
+        Ok(resp) => resp,
+        Err(ReadinessError::TimedOut) => return Ok(retryable_create_response()),
+        Err(ReadinessError::Unavailable) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+    };
     // A concurrent rehome may have refreshed the returned topology during the wait.
-    persist_before_answering(&state)?;
+    if persist_before_answering(&state).is_err() {
+        return Ok(retryable_create_response());
+    }
     tracing::info!(
         session = %resp.session,
         home_relay = %resp.home_relay.relay_id,
@@ -185,6 +194,14 @@ pub(super) async fn create_session(
         "session created"
     );
     Ok((StatusCode::OK, Json(resp)).into_response())
+}
+
+/// Marks a committed create that can recover through an idempotent retry. Capacity
+/// refusals and retired sessions carry no hint, so callers fail promptly instead
+/// of repeatedly submitting work the coordinator cannot accept. A caller must
+/// still supply an `external_id` to safely retry the identical request.
+fn retryable_create_response() -> Response {
+    (StatusCode::SERVICE_UNAVAILABLE, [(RETRY_AFTER, "1")]).into_response()
 }
 
 /// How long (milliseconds) a `202 provisioning` response tells the caller to wait

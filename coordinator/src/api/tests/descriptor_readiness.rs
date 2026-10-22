@@ -74,6 +74,7 @@ fn assert_pending(future: Pin<&mut impl Future>) {
 
 async fn created(response: axum::http::Response<axum::body::Body>) -> SessionResponse {
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(RETRY_AFTER));
     serde_json::from_value(body_json(response).await).unwrap()
 }
 
@@ -165,6 +166,7 @@ async fn create_timeout_retry_reuses_the_committed_session_and_tokens() {
     let app = router(state.clone());
     let response = signed_post(app.clone(), "/session/create", &body, &TEST_CLIENT_SEED).await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()[RETRY_AFTER], "1");
     let descriptors = state.setup.descriptors().current_for(RelayId(1));
     assert_eq!(descriptors.len(), 1);
     let session = descriptors[0].session;
@@ -264,6 +266,7 @@ async fn retirement_while_create_waits_refuses_the_response() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key(RETRY_AFTER));
 }
 
 #[tokio::test]

@@ -345,10 +345,16 @@ before returning create details, including idempotent retries. New-target rehome
 the current replacement relay to be ready: another disconnected home must not prevent this group from
 reconnecting. The target is resolved again on each check so concurrent moves cannot release an obsolete
 assignment. Other homes converge through asynchronous descriptor and mesh updates. The five-second
-response deadline returns retryable `503` without discarding committed session state. A keyed create
-retry preserves its session and tokens; requests without `external_id` have no deduplication key.
-Older relays bypass this wait immediately. New relays acknowledge only explicitly requested `ack_id`
-fields on full or delta descriptor frames, so older coordinators need no change.
+response deadline returns `503` without discarding committed session state. For create, a descriptor
+wait timeout or persistence failure includes `Retry-After: 1` (integer seconds) to identify a committed
+request worth retrying. Capacity refusals (`NoRelaysAvailable` or `SessionCeilingReached`) and a session
+retired during the wait return an unmarked `503`: callers must fail promptly rather than amplify load
+shedding. A create caller retries only a marked `503`, after at least the hinted delay and within its
+bounded retry budget. It must resend identical body bytes with a fresh request signature and a nonempty
+`external_id`, preserving its session and tokens; requests without that key cannot be safely retried.
+Unmarked failures from older coordinators fail promptly during a gradual rollout. Rehome keeps its
+existing client-driven retry behavior. Older relays bypass this wait immediately. New relays acknowledge
+only explicitly requested `ack_id` fields on full or delta descriptor frames, so older coordinators need no change.
 
 Acknowledgements prove synchronous local installation, not mesh-link establishment. Their ids are
 cumulative on one ordered control connection, fenced by its enrollment generation, and never persisted.

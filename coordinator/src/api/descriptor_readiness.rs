@@ -13,6 +13,11 @@ use super::CoordinatorState;
 use crate::session::SessionRefs;
 use crate::{registry, session};
 
+pub(super) enum ReadinessError {
+    TimedOut,
+    Unavailable,
+}
+
 #[derive(Clone, Copy)]
 enum ReadinessScope {
     AllHomes,
@@ -23,7 +28,7 @@ pub(super) async fn ready_create(
     state: &CoordinatorState,
     tenant: &TenantId,
     original: SessionResponse,
-) -> Result<SessionResponse, StatusCode> {
+) -> Result<SessionResponse, ReadinessError> {
     wait_ready(
         state,
         tenant,
@@ -101,6 +106,7 @@ pub(super) async fn ready_rehome(
         },
     )
     .await
+    .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
 }
 
 async fn wait_ready<T>(
@@ -109,7 +115,7 @@ async fn wait_ready<T>(
     session: SessionId,
     scope: ReadinessScope,
     mut answer: impl FnMut(&SessionRefs, &BTreeMap<RelayId, RelayEndpoint>) -> Result<T, StatusCode>,
-) -> Result<T, StatusCode> {
+) -> Result<T, ReadinessError> {
     let wait = async {
         loop {
             let changed = state.setup.descriptors().delivery().changed();
@@ -117,7 +123,9 @@ async fn wait_ready<T>(
             tokio::pin!(changed, registry_changed);
             changed.as_mut().enable();
             registry_changed.as_mut().enable();
-            if let Some(value) = current_ready(state, tenant, session, scope, &mut answer)? {
+            if let Some(value) = current_ready(state, tenant, session, scope, &mut answer)
+                .map_err(|_| ReadinessError::Unavailable)?
+            {
                 return Ok(value);
             }
             tokio::select! {
@@ -134,7 +142,7 @@ async fn wait_ready<T>(
                 session = session.0,
                 "waiting for descriptor installation timed out; refusing with a retryable 503"
             );
-            Err(StatusCode::SERVICE_UNAVAILABLE)
+            Err(ReadinessError::TimedOut)
         })
 }
 

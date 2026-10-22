@@ -64,17 +64,23 @@ async fn a_create_that_cannot_be_persisted_is_refused_and_its_retry_replays() {
         "no token leaves for a session a restart would forget",
     );
 
+    assert_eq!(resp.headers()[RETRY_AFTER], "1");
+    let committed = state.setup.descriptors().current_for(RelayId(1));
+    assert_eq!(committed.len(), 1);
+
     // Storage recovers; the tenant's retry replays the session the refused
     // request committed, and only now answers — with it durable.
     ledger.set_session_writes_failing(false);
     let resp = signed_post(router(state), "/session/create", &body, &TEST_CLIENT_SEED).await;
     assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp.headers().contains_key(RETRY_AFTER));
     let created: SessionResponse = serde_json::from_slice(
         &axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
             .unwrap(),
     )
     .unwrap();
+    assert_eq!(created.session, committed[0].session);
     assert_eq!(
         restored_sessions(&ledger),
         vec![(created.session, vec![RelayId(1)])],
@@ -111,6 +117,8 @@ async fn a_rehome_that_cannot_be_persisted_is_refused_and_its_re_ask_persists_it
         StatusCode::SERVICE_UNAVAILABLE,
         "no client is pointed at a move a restart would forget",
     );
+
+    assert!(!resp.headers().contains_key(RETRY_AFTER));
 
     // The re-ask takes the recorded fast path for the move the refused ask
     // committed, and answers only once that move is durable.

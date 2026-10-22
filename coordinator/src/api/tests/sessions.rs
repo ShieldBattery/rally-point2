@@ -244,7 +244,7 @@ async fn sessions_alive_reports_live_and_omits_gone_or_unknown_and_caps() {
 }
 
 #[tokio::test]
-async fn create_session_no_relays_returns_503() {
+async fn create_session_no_relays_returns_503_without_a_retry_hint() {
     // A tenant enrolled (with a client key, so the request authenticates) but
     // no relays registered — the 503 path is reached only past the auth gate.
     let setup = SessionFixture {
@@ -260,13 +260,54 @@ async fn create_session_no_relays_returns_503() {
         rollback: false,
         tenant: tenant_id(),
         players: two_players(),
-        external_id: None,
+        external_id: Some("game-1".to_owned()),
         latency_estimate_ms: None,
     };
     let body = serde_json::to_vec(&req).unwrap();
     let resp = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
 
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!resp.headers().contains_key(RETRY_AFTER));
+}
+
+#[tokio::test]
+async fn create_session_ceiling_sheds_new_work_without_a_retry_hint_but_allows_replay() {
+    let setup = SessionFixture::default()
+        .setup_only()
+        .with_session_ceiling(Some(1));
+    let state = state_over(setup);
+    let app = router(state.clone());
+    let mut request = SessionRequest {
+        evidence_keys: Vec::new(),
+        lobby_policy: None,
+        rollback: false,
+        tenant: tenant_id(),
+        players: two_players(),
+        external_id: Some("game-1".to_owned()),
+        latency_estimate_ms: None,
+    };
+    let body = serde_json::to_vec(&request).unwrap();
+    let response = signed_post(app.clone(), "/session/create", &body, &TEST_CLIENT_SEED).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let original = body_json(response).await;
+
+    request.external_id = Some("game-2".to_owned());
+    let second_body = serde_json::to_vec(&request).unwrap();
+    let response = signed_post(
+        app.clone(),
+        "/session/create",
+        &second_body,
+        &TEST_CLIENT_SEED,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!response.headers().contains_key(RETRY_AFTER));
+    assert_eq!(state.setup.descriptors().current_for(RelayId(1)).len(), 1);
+
+    let response = signed_post(app, "/session/create", &body, &TEST_CLIENT_SEED).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(RETRY_AFTER));
+    assert_eq!(body_json(response).await, original);
 }
 
 #[tokio::test]
