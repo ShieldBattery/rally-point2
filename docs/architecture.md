@@ -1548,6 +1548,15 @@ game. A coordinator with no ledger keeps the old amnesia: a departure/result web
 forgotten session still delivers (a webhook-only queue is created lazily) but its `sessionClosed` and
 reaps do not re-arm, and the liveness probe force-reconciles it.
 
+`POST /session/evidence` reads the coordinator's retained latest per-slot observations for a signed
+`{ tenant, session }` request and returns `{ evidence: [...] }`, empty when the session is unknown.
+Only the latest retained observation per slot is available; this is not an archival log. Observations
+that were never received, were overwritten, or belonged to a reaped session cannot be recovered here.
+It makes no completeness claim, performs no relay exchange or lobby settlement, and uses a separate
+per-tenant budget (burst 200, one token per 100 ms). Background recovery uses this cached read so it
+cannot consume the load-attribution budget or repeatedly fence active clients. A missing endpoint on
+an older coordinator is a `404`; callers defer recovery instead of falling back to load-state.
+
 Beside it sits the **load-state pull** (`POST /session/load-state`), which answers one session's accumulated
 load progress: when it started, which slots ever connected, which ever reported their game loop running, and
 which had turns forwarded by their home relay (`forwardedSlots`, below).

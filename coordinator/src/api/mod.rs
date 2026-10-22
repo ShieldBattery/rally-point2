@@ -97,6 +97,7 @@ mod control_hello;
 mod control_inbound;
 mod control_writer;
 mod descriptor_readiness;
+mod evidence;
 mod load_state;
 mod queries;
 mod request_auth;
@@ -106,6 +107,7 @@ mod sessions;
 mod tests;
 
 use control::relay_control;
+use evidence::session_evidence;
 use load_state::session_load_state;
 use queries::{flight_blob, flight_blobs, presence_query, regions, tenant_pubkey, warm_regions};
 use sessions::{create_session, rehome_session, sessions_alive};
@@ -258,6 +260,9 @@ pub struct CoordinatorState {
     pub attest_timeout: Duration,
     /// Bound on waiting for capable relays to install session descriptors.
     pub descriptor_ack_timeout: Duration,
+    /// Independent budget for cached observation reads, shared across router clones.
+    pub evidence_limiter:
+        crate::endpoint_limits::EndpointLimiter<rally_point_proto::control::TenantId>,
     /// The configured placement regions (immutable after startup). Read by
     /// `GET /regions` to serve the client-facing list, and at relay enroll to
     /// refuse a relay tagged with a region not listed here. Empty (the default,
@@ -332,6 +337,10 @@ impl CoordinatorState {
             liveness_timeout: LIVENESS_TIMEOUT,
             attest_timeout: LOAD_STATE_ATTEST_TIMEOUT,
             descriptor_ack_timeout: Duration::from_secs(5),
+            evidence_limiter: crate::endpoint_limits::EndpointLimiter::new(
+                crate::endpoint_limits::EVIDENCE_BURST,
+                crate::endpoint_limits::EVIDENCE_REFILL_INTERVAL,
+            ),
             regions: RegionsConfig::default(),
             player_token_lifetime: DEFAULT_PLAYER_TOKEN_LIFETIME,
             ledger: None,
@@ -353,6 +362,7 @@ pub fn router(state: CoordinatorState) -> Router {
         .route("/session/rehome", post(rehome_session))
         .route("/sessions/alive", post(sessions_alive))
         .route("/session/load-state", post(session_load_state))
+        .route("/session/evidence", post(session_evidence))
         .route("/presence/query", post(presence_query))
         .route("/flight/blobs", post(flight_blobs))
         .route("/flight/blob", post(flight_blob))

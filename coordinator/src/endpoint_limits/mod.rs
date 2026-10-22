@@ -1,11 +1,7 @@
-//! Rate limiting for the tenant-authenticated endpoints that need it: the
-//! coordinator-mediated re-home and the load-state read.
+//! Rate limiting for tenant-authenticated coordinator endpoints.
 //!
-//! Both are tenant-authenticated (the tenant's app server signs each request; game
-//! clients never call the coordinator directly) and both are cheap to re-ask, so
-//! both limits are lenient — sized only to stop a misbehaving caller from hammering
-//! the endpoint. They differ in what they key on, which is what decides whose
-//! traffic can starve whose.
+//! The limits share bucket mechanics but keep independent budgets, so background recovery cannot
+//! consume capacity reserved for live-game operations.
 //!
 //! `POST /session/rehome` is limited per `(tenant, session)`: an app server may
 //! legitimately re-ask every few seconds while a session's home relay is
@@ -18,7 +14,9 @@
 //! capping. A refused read is a `429`; the answer is a snapshot the caller can
 //! simply take again.
 //!
-//! Both are built on the shared [`KeyedTokenBuckets`](crate::rate_limit) machinery:
+//! Cached evidence reads have their own per-tenant budget and never ask relays for snapshots.
+//!
+//! The limiters are built on the shared [`KeyedTokenBuckets`](crate::rate_limit) machinery:
 //! in-memory buckets behind a plain mutex, pruned lazily on access and hard-capped
 //! by cardinality. A coordinator restart forgets them, which only grants a fresh
 //! burst — harmless for limits that exist to bound abuse, not to enforce
@@ -62,6 +60,12 @@ pub const LOAD_STATE_BURST: u32 = 10;
 /// a healthy tenant spends far less than this; the rate is what a caller re-reading
 /// after an incomplete answer can sustain without the fleet feeling it.
 pub const LOAD_STATE_REFILL_INTERVAL: Duration = Duration::from_millis(2000);
+
+/// Cached observation reads have no relay fan-out. Two recovery pages can arrive together.
+pub const EVIDENCE_BURST: u32 = 200;
+
+/// Ten reads per second sustains recovery pages of 100 every thirty seconds with headroom.
+pub const EVIDENCE_REFILL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// One endpoint's rate limit, keyed on `K` — whatever the request authenticated
 /// as, so one caller's misbehaviour never starves another's. Clone it cheaply to

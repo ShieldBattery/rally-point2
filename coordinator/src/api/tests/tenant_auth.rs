@@ -105,6 +105,11 @@ fn tenant_authed_routes(session: SessionId) -> Vec<(&'static str, Vec<u8>)> {
             .unwrap(),
         ),
         (
+            "/session/evidence",
+            serde_json::to_vec(&serde_json::json!({"tenant": TEST_TENANT, "session": session.0}))
+                .unwrap(),
+        ),
+        (
             "/session/load-state",
             serde_json::to_vec(&serde_json::json!({"tenant": TEST_TENANT, "session": session.0}))
                 .unwrap(),
