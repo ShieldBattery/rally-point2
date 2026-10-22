@@ -341,7 +341,10 @@ cross-delivering.
 Clients pin their relay's certificate from the session response, with no CA in between. On a
 coordinator-managed relay, authorization also requires an installed session descriptor. The coordinator
 waits for installation acknowledgements from every assigned relay advertising `descriptor_ack_v1`
-before returning create or new-target rehome details, including idempotent retries. The five-second
+before returning create details, including idempotent retries. New-target rehome responses require only
+the current replacement relay to be ready: another disconnected home must not prevent this group from
+reconnecting. The target is resolved again on each check so concurrent moves cannot release an obsolete
+assignment. Other homes converge through asynchronous descriptor and mesh updates. The five-second
 response deadline returns retryable `503` without discarding committed session state. A keyed create
 retry preserves its session and tokens; requests without `external_id` have no deduplication key.
 Older relays bypass this wait immediately. New relays acknowledge only explicitly requested `ack_id`

@@ -10,6 +10,8 @@ use rally_point_proto::control::CAPABILITY_DESCRIPTOR_ACK_V1;
 
 use super::*;
 
+mod rehome;
+
 fn create_body(players: Vec<PlayerHandoff>) -> Vec<u8> {
     serde_json::to_vec(&SessionRequest {
         evidence_keys: Vec::new(),
