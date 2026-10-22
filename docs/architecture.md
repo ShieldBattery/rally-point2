@@ -1551,7 +1551,8 @@ reaps do not re-arm, and the liveness probe force-reconciles it.
 `POST /session/evidence` reads the coordinator's retained latest per-slot observations for a signed
 `{ tenant, session }` request and returns `{ evidence: [...] }`, empty when the session is unknown.
 Only the latest retained observation per slot is available; this is not an archival log. Observations
-that were never received, were overwritten, or belonged to a reaped session cannot be recovered here.
+that were never received or were overwritten cannot be recovered here. Session retirement, including
+normal close, discards observations immediately; there is no post-close recovery grace period.
 It makes no completeness claim, performs no relay exchange or lobby settlement, and uses a separate
 per-tenant budget (burst 200, one token per 100 ms). Background recovery uses this cached read so it
 cannot consume the load-attribution budget or repeatedly fence active clients. A missing endpoint on

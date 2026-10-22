@@ -43,13 +43,11 @@ pub(super) async fn session_evidence(
         &body,
         TenantAccess::LiveGame,
     )?;
-    if !state.evidence_limiter.check(&request.tenant) {
+    let limiter = state.setup.evidence_limiter();
+    if !limiter.check(&request.tenant) {
         return Ok((
             StatusCode::TOO_MANY_REQUESTS,
-            [(
-                RETRY_AFTER,
-                state.evidence_limiter.retry_after_secs().to_string(),
-            )],
+            [(RETRY_AFTER, limiter.retry_after_secs().to_string())],
         )
             .into_response());
     }
@@ -57,8 +55,9 @@ pub(super) async fn session_evidence(
     // relays to fence clients, and cannot spend the load-attribution endpoint's rate budget.
     let evidence = state
         .lifecycle
-        .load_state(&request.tenant, SessionId(request.session))
-        .map(|snapshot| snapshot.evidence.into_iter().map(Into::into).collect())
-        .unwrap_or_default();
+        .connection_evidence(&request.tenant, SessionId(request.session))
+        .into_iter()
+        .map(Into::into)
+        .collect();
     Ok(Json(EvidenceResponse { evidence }).into_response())
 }

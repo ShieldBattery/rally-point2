@@ -1,7 +1,8 @@
 //! Rate limiting for tenant-authenticated coordinator endpoints.
 //!
 //! The limits share bucket mechanics but keep independent budgets, so background recovery cannot
-//! consume capacity reserved for live-game operations.
+//! consume capacity reserved for live-game operations. Each limit's key determines whose
+//! traffic can starve whose: sessions share a budget only when the cost is tenant-wide.
 //!
 //! `POST /session/rehome` is limited per `(tenant, session)`: an app server may
 //! legitimately re-ask every few seconds while a session's home relay is

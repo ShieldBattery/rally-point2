@@ -139,6 +139,10 @@ async fn current_home_generation_and_assignment_all_gate_evidence() {
 async fn a_return_to_the_same_home_does_not_revive_old_assignment_evidence() {
     let (lc, session, generation) = setup_evidence();
     lc.ingest_notice(RelayId(1), generation, notice(session, observation(90, 1)));
+    assert_eq!(
+        lc.connection_evidence(&tid(), session),
+        lc.load_state(&tid(), session).unwrap().evidence,
+    );
     let setup = &lc.inner.setup;
     registry::remove(setup.registry(), RelayId(1));
     enroll(&lc, 2, 8);
@@ -147,6 +151,7 @@ async fn a_return_to_the_same_home_does_not_revive_old_assignment_evidence() {
         crate::session::RehomeOutcome::NewTarget(_)
     ));
     assert!(lc.load_state(&tid(), session).unwrap().evidence.is_empty());
+    assert!(lc.connection_evidence(&tid(), session).is_empty());
     registry::remove(setup.registry(), RelayId(2));
     let generation = enroll(&lc, 1, 7);
     assert!(matches!(
@@ -159,6 +164,7 @@ async fn a_return_to_the_same_home_does_not_revive_old_assignment_evidence() {
         &[snapshot(session, observation(100, 1))],
     );
     assert!(lc.load_state(&tid(), session).unwrap().evidence.is_empty());
+    assert!(lc.connection_evidence(&tid(), session).is_empty());
     lc.merge_connection_evidence(
         RelayId(1),
         generation,
@@ -167,6 +173,10 @@ async fn a_return_to_the_same_home_does_not_revive_old_assignment_evidence() {
     assert_eq!(
         lc.load_state(&tid(), session).unwrap().evidence[0].observation,
         observation(101, 3)
+    );
+    assert_eq!(
+        lc.connection_evidence(&tid(), session),
+        lc.load_state(&tid(), session).unwrap().evidence,
     );
 }
 
@@ -362,4 +372,37 @@ async fn unverified_bodies_never_reach_retained_state_or_webhooks() {
         let persisted = serde_json::to_value(&lc.export_facts()[&(tid(), session)]).unwrap();
         assert_eq!(persisted["evidence"][0][1]["observation"]["body"], "");
     }
+}
+
+#[tokio::test]
+async fn cached_evidence_is_tenant_scoped_and_removed_on_close() {
+    let (lc, session, generation) = setup_evidence();
+    let expected = vec![SlotEvidence {
+        slot: SlotId(0),
+        observation: observation(1, 1),
+    }];
+    lc.merge_connection_evidence(
+        RelayId(1),
+        generation,
+        &[snapshot(session, observation(1, 1))],
+    );
+    assert_eq!(lc.connection_evidence(&tid(), session), expected);
+    assert_eq!(
+        lc.connection_evidence(&tid(), session),
+        lc.load_state(&tid(), session).unwrap().evidence,
+    );
+    assert!(
+        lc.connection_evidence(&TenantId("other".to_owned()), session)
+            .is_empty()
+    );
+
+    lc.on_session_closed(tid(), session, RelayId(1), generation);
+    assert!(lc.load_state(&tid(), session).is_none());
+    assert!(lc.connection_evidence(&tid(), session).is_empty());
+    assert!(
+        lc.inner
+            .setup
+            .evidence_assignments(&tid(), session)
+            .is_empty()
+    );
 }

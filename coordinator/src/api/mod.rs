@@ -260,9 +260,6 @@ pub struct CoordinatorState {
     pub attest_timeout: Duration,
     /// Bound on waiting for capable relays to install session descriptors.
     pub descriptor_ack_timeout: Duration,
-    /// Independent budget for cached observation reads, shared across router clones.
-    pub evidence_limiter:
-        crate::endpoint_limits::EndpointLimiter<rally_point_proto::control::TenantId>,
     /// The configured placement regions (immutable after startup). Read by
     /// `GET /regions` to serve the client-facing list, and at relay enroll to
     /// refuse a relay tagged with a region not listed here. Empty (the default,
@@ -337,10 +334,6 @@ impl CoordinatorState {
             liveness_timeout: LIVENESS_TIMEOUT,
             attest_timeout: LOAD_STATE_ATTEST_TIMEOUT,
             descriptor_ack_timeout: Duration::from_secs(5),
-            evidence_limiter: crate::endpoint_limits::EndpointLimiter::new(
-                crate::endpoint_limits::EVIDENCE_BURST,
-                crate::endpoint_limits::EVIDENCE_REFILL_INTERVAL,
-            ),
             regions: RegionsConfig::default(),
             player_token_lifetime: DEFAULT_PLAYER_TOKEN_LIFETIME,
             ledger: None,

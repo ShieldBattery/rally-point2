@@ -19,6 +19,22 @@ pub(super) struct StoredEvidence {
 }
 
 impl Lifecycle {
+    /// Latest retained observations matching each slot's current assignment, sorted by slot.
+    /// Unknown or retired sessions have no observations; this makes no completeness claim.
+    pub fn connection_evidence(
+        &self,
+        tenant: &TenantId,
+        session: SessionId,
+    ) -> Vec<rally_point_proto::control::SlotEvidence> {
+        let assignments = self.inner.setup.evidence_assignments(tenant, session);
+        self.inner
+            .sessions
+            .lock()
+            .get(&(tenant.clone(), session))
+            .map(|state| current_evidence(state, &assignments))
+            .unwrap_or_default()
+    }
+
     /// Moves required sessions off an incapable relay, retiring only the affected
     /// session when no compatible replacement exists.
     pub(crate) fn evict_evidence_session(
@@ -257,4 +273,22 @@ impl Lifecycle {
         }
         true
     }
+}
+
+/// Shared assignment filter for cached reads and load-state snapshots.
+pub(super) fn current_evidence(
+    state: &super::SessionState,
+    assignments: &std::collections::BTreeMap<SlotId, (RelayId, u64)>,
+) -> Vec<rally_point_proto::control::SlotEvidence> {
+    state
+        .evidence
+        .iter()
+        .filter(|(slot, stored)| {
+            assignments.get(slot) == Some(&(stored.relay, stored.observation.assignment_revision))
+        })
+        .map(|(&slot, stored)| rally_point_proto::control::SlotEvidence {
+            slot,
+            observation: stored.observation.clone(),
+        })
+        .collect()
 }

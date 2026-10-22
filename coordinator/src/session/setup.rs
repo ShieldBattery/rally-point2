@@ -14,7 +14,9 @@ use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 
 use crate::attest::LoadStateAttest;
 use crate::descriptors::{RelayDescriptors, RelayReaps};
-use crate::endpoint_limits::{LoadStateLimiter, RehomeLimiter};
+use crate::endpoint_limits::{
+    EVIDENCE_BURST, EVIDENCE_REFILL_INTERVAL, EndpointLimiter, LoadStateLimiter, RehomeLimiter,
+};
 use crate::pair_rtts::PairRttStore;
 use crate::presence::PresenceStore;
 use crate::registry::RelayRegistry;
@@ -80,6 +82,8 @@ pub struct SessionSetup {
     /// sessions is exactly the load worth capping. Nothing retires its buckets at
     /// session close: they are per-tenant and pruned by their own idle sweep.
     load_state_limiter: LoadStateLimiter,
+    /// The per-tenant cached observation budget, independent of relay snapshot reads.
+    evidence_limiter: EndpointLimiter<TenantId>,
     /// Linearizes an assignment's registry-read→commit span against a relay's drain
     /// mark, closing the coordinated-drain race. The window is: [`create_session`]
     /// (and [`rehome`]) reads the registry to pick a relay, then commits — records
@@ -170,6 +174,7 @@ impl SessionSetup {
             rehomes: Arc::new(Mutex::new(HashMap::new())),
             rehome_limiter: RehomeLimiter::default(),
             load_state_limiter: LoadStateLimiter::default(),
+            evidence_limiter: EndpointLimiter::new(EVIDENCE_BURST, EVIDENCE_REFILL_INTERVAL),
             assignment_lock: Arc::new(Mutex::new(())),
             create_idempotency: Arc::new(Mutex::new(HashMap::new())),
             provision: ProvisionGate::dormant(),
@@ -608,6 +613,18 @@ impl SessionSetup {
     #[must_use]
     pub fn with_load_state_limiter(mut self, limiter: LoadStateLimiter) -> Self {
         self.load_state_limiter = limiter;
+        self
+    }
+
+    /// The per-tenant cached observation limiter, separate from relay snapshot reads.
+    pub fn evidence_limiter(&self) -> &EndpointLimiter<TenantId> {
+        &self.evidence_limiter
+    }
+
+    /// Replaces the cached observation limiter for callers with a different budget.
+    #[must_use]
+    pub fn with_evidence_limiter(mut self, limiter: EndpointLimiter<TenantId>) -> Self {
+        self.evidence_limiter = limiter;
         self
     }
 

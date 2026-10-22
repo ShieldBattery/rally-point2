@@ -327,18 +327,7 @@ impl Lifecycle {
             .lock()
             .get(&(tenant.clone(), session))
             .map(|state| SessionLoadState {
-                evidence: state
-                    .evidence
-                    .iter()
-                    .filter(|(slot, stored)| {
-                        assignments.get(slot)
-                            == Some(&(stored.relay, stored.observation.assignment_revision))
-                    })
-                    .map(|(&slot, stored)| rally_point_proto::control::SlotEvidence {
-                        slot,
-                        observation: stored.observation.clone(),
-                    })
-                    .collect(),
+                evidence: evidence::current_evidence(state, &assignments),
                 created_here: state.created_here,
                 attestable: state.attestable,
                 serving_relays: state.serving_relays.clone(),

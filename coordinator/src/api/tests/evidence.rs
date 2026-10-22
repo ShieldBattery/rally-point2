@@ -129,9 +129,13 @@ async fn a_recovery_page_does_not_spend_load_state_tokens_or_vice_versa() {
 
 #[tokio::test]
 async fn evidence_reads_share_a_tenant_budget_and_refusals_supply_retry_after() {
-    let mut state = state_with_relay_and_tenant();
-    state.evidence_limiter =
-        crate::endpoint_limits::EndpointLimiter::new(1, Duration::from_secs(60));
+    let state = state_with_relay_and_tenant();
+    let state = CoordinatorState {
+        setup: state.setup.clone().with_evidence_limiter(
+            crate::endpoint_limits::EndpointLimiter::new(1, Duration::from_secs(60)),
+        ),
+        ..state
+    };
     let app = router(state);
     read_evidence(app.clone(), 1).await;
     let response = signed_post(
