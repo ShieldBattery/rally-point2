@@ -108,6 +108,18 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
     );
 }
 
+/// Closes a slot whose bounded turn retention overflowed. Its lost turn cannot
+/// be recovered by a same-relay resume; this is not an administrative revocation.
+pub(crate) fn close_slots_for_overflow(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
+    signal_close(
+        sessions,
+        key,
+        slots,
+        SlotCloseReason::LaggingSlot,
+        "closing slot link after turn retention overflow",
+    );
+}
+
 /// Closes the links of `slots` in the `key` routing group because their clients
 /// stopped producing turns while the session advanced past them (see
 /// [`crate::routing::run_silence_watch`]). Identical to [`close_slots`] but for

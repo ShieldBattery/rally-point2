@@ -82,6 +82,7 @@ mod state_hash;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use lifecycle::close_slots_for_overflow;
 pub use lifecycle::{
     after_authority_change, announce_slot_present, close_slots, close_slots_for_desync,
     close_slots_for_lobby_violation, close_slots_for_silence,
@@ -248,7 +249,7 @@ enum SlotCloseReason {
     LobbyViolation = 3,
     /// A terminal coordinator or mesh directive ended this assignment.
     Revoked = 4,
-    /// The slot exceeded a delivery queue or unacknowledged-window bound.
+    /// The slot exceeded a turn-retention, delivery-queue, or unacknowledged-window bound.
     LaggingSlot = 5,
     /// The client announced a normal departure.
     SlotDeparted = 6,

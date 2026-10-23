@@ -23,6 +23,25 @@ pub(super) struct StoredHistory {
     sources: Vec<SourceCounter>,
 }
 
+impl StoredHistory {
+    pub(super) fn has_known_semantics(&self) -> bool {
+        let known_pair = |admission: &EvidenceObservation, sample: &EvidenceObservation| {
+            super::evidence::has_known_semantics(admission)
+                && super::evidence::has_known_semantics(sample)
+        };
+        known_pair(&self.history.admission, &self.history.sample)
+            && self
+                .history
+                .latest
+                .as_ref()
+                .is_none_or(|latest| known_pair(&latest.admission, &latest.sample))
+            && self
+                .sources
+                .iter()
+                .all(|source| known_pair(&source.first.admission, &source.first.sample))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SourceCounter {
     relay: RelayId,
@@ -55,7 +74,9 @@ fn first(history: &EvidenceHistory) -> EvidenceFailure {
 }
 
 fn valid_pair(admission: &EvidenceObservation, sample: &EvidenceObservation) -> bool {
-    admission.sample_id == 0
+    super::evidence::has_known_semantics(admission)
+        && super::evidence::has_known_semantics(sample)
+        && admission.sample_id == 0
         && admission.sequence > 0
         && admission.interruption.is_none()
         && sample.sample_id > 0

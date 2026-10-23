@@ -106,7 +106,7 @@ pub fn forward_client_turn(
                     slot = slot.0,
                     "provisional journal overflowed; the slot is sealed — closing its link",
                 );
-                routing::close_slots(sessions, key, std::slice::from_ref(&slot));
+                routing::close_slots_for_overflow(sessions, key, std::slice::from_ref(&slot));
                 return;
             }
         }

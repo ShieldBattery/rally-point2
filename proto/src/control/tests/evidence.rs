@@ -121,6 +121,7 @@ fn verdict_names_are_stable() {
         (EvidenceVerdict::UnknownKey, "unknown_key"),
         (EvidenceVerdict::Invalid, "invalid"),
         (EvidenceVerdict::Valid, "valid"),
+        (EvidenceVerdict::Unrecognized, "unrecognized"),
     ] {
         let value = serde_json::to_value(verdict).unwrap();
         assert_eq!(value, name);
@@ -467,4 +468,31 @@ fn historical_report_and_memory_receipt_round_trip_without_capability_negotiatio
         serde_json::from_slice::<OlderReceiver>(&encoded).unwrap(),
         OlderReceiver::Unknown
     ));
+}
+
+#[test]
+fn future_evidence_enum_values_are_unrecognized() {
+    for value in ["future_value", "unknown", "unrecognized"] {
+        let value = serde_json::json!(value);
+        assert_eq!(
+            serde_json::from_value::<EvidenceVerdict>(value.clone()).unwrap(),
+            EvidenceVerdict::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<EvidenceInterruption>(value.clone()).unwrap(),
+            EvidenceInterruption::Unrecognized
+        );
+        assert_eq!(
+            serde_json::from_value::<EvidenceReceiptDisposition>(value).unwrap(),
+            EvidenceReceiptDisposition::Unrecognized
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(EvidenceInterruption::Unrecognized).unwrap(),
+        "unrecognized"
+    );
+    assert_eq!(
+        serde_json::to_value(EvidenceReceiptDisposition::Unrecognized).unwrap(),
+        "unrecognized"
+    );
 }

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use rally_point_proto::control::{EvidenceReceipt, EvidenceReport};
+use rally_point_proto::control::{EvidenceReceipt, EvidenceReceiptDisposition, EvidenceReport};
 
 const MAX_REPORTS: usize = 1024;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -115,6 +115,10 @@ impl EvidenceOutbox {
     }
 
     pub(super) fn acknowledge(&self, receipt: &EvidenceReceipt) {
+        // Only a disposition whose terminal meaning we know can retire a report.
+        if receipt.disposition == EvidenceReceiptDisposition::Unrecognized {
+            return;
+        }
         let mut inner = self.inner.lock();
         let Some(index) = inner
             .entries

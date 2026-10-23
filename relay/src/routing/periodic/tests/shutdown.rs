@@ -8,6 +8,7 @@ fn requested_shutdown_cause_wins_over_sampler_and_task_cleanup() {
             EvidenceInterruption::Revoked,
         ),
         (close_slots_for_silence, EvidenceInterruption::SilentSlot),
+        (close_slots_for_overflow, EvidenceInterruption::LaggingSlot),
         (close_slots_for_desync, EvidenceInterruption::DesyncEvicted),
         (
             close_slots_for_lobby_violation,

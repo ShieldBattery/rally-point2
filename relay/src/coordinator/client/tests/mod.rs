@@ -33,10 +33,12 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
+mod control_compat;
 mod descriptor_acks;
 mod descriptors;
 mod drain;
 mod enroll;
+mod evidence_compat;
 mod fence;
 mod flight;
 mod notices;

@@ -1,7 +1,8 @@
 //! Connection observations and their assignment, process, and activation fences.
 
 use rally_point_proto::control::{
-    EvidenceObservation, EvidenceVerdict, SessionPresence, SlotConnectedNotice, TenantId,
+    EvidenceInterruption, EvidenceObservation, EvidenceVerdict, SessionPresence,
+    SlotConnectedNotice, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,12 @@ pub(super) struct StoredEvidence {
     pub(super) boot_id: u64,
     pub(super) observation: EvidenceObservation,
     notified_sequence: Option<u64>,
+}
+
+/// Unsupported semantics cannot establish validity or a client-attributable failure.
+pub(super) fn has_known_semantics(observation: &EvidenceObservation) -> bool {
+    observation.verdict != EvidenceVerdict::Unrecognized
+        && observation.interruption != Some(EvidenceInterruption::Unrecognized)
 }
 
 impl Lifecycle {
@@ -120,7 +127,9 @@ impl Lifecycle {
             return;
         };
         if observation.sample_id != 0
-            || observation.interruption.is_some()
+            || observation
+                .interruption
+                .is_some_and(|reason| reason != EvidenceInterruption::Unrecognized)
             || observation.sequence == 0
             || observation.body.len() > rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
             || !setup.relay_serves_session(relay, &notice.tenant, notice.session)
@@ -147,6 +156,13 @@ impl Lifecycle {
                 notice.session,
                 "slot-connected notice from a relay not owning the assignment; rejecting",
             );
+            return;
+        }
+        if !has_known_semantics(observation) {
+            notice.evidence = None;
+            notice.predecessor = None;
+            self.on_slot_connected(notice.tenant.clone(), notice.session, notice.slot);
+            notify::handle_slot_connected(setup, &self.inner.notices.slot_connects, self, notice);
             return;
         }
         if let Some(boot_id) = registry::boot_id(setup.registry(), relay)
@@ -281,7 +297,8 @@ impl Lifecycle {
         notify: bool,
     ) -> bool {
         let (relay, boot_id) = source;
-        if observation.sample_id != 0
+        if !has_known_semantics(observation)
+            || observation.sample_id != 0
             || observation.interruption.is_some()
             || observation.sequence == 0
             || observation.body.len() > rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN

@@ -311,7 +311,7 @@ pub(super) fn note_inbound(
         // A second Hello or a future up-frame: presence is enough, content unused.
         Ok(_) => InboundAction::None,
         Err(error) => {
-            tracing::debug!(%error, relay_id = relay_id.0, "undecodable relay control frame");
+            tracing::warn!(%error, relay_id = relay_id.0, "undecodable relay control frame");
             InboundAction::None
         }
     }

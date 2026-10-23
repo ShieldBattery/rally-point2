@@ -86,7 +86,7 @@ fn collect_sample(
     makers.record_periodic_evidence(key, slot, epoch, observation)
 }
 
-fn reporting_fixture() -> (HeartbeatSources, EvidenceObservation, EvidenceObservation) {
+pub(super) fn reporting_fixture() -> (HeartbeatSources, EvidenceObservation, EvidenceObservation) {
     let sessions: Sessions = Arc::default();
     let makers = Arc::new(crate::consensus::new_decision_makers());
     let slot = SlotId(0);

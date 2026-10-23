@@ -407,3 +407,31 @@ fn a_game_result_is_admissible_only_when_non_empty_and_within_the_cap() {
         Err("oversize"),
     );
 }
+
+#[tokio::test]
+async fn provisional_journal_overflow_is_a_buffer_failure_not_revocation() {
+    let sessions = Sessions::default();
+    let k = key();
+    let mesh = crate::mesh::MeshState::default();
+    mesh.session.provisional_turns.arm();
+    let inbox = registered(&sessions, &k, SlotId(0));
+    for seq in 0..=crate::session::provisional_turns::PER_SESSION_CAP as u64 {
+        crate::mesh::forward_client_turn(
+            &sessions,
+            &mesh,
+            &k,
+            SlotId(0),
+            Payload {
+                seq,
+                slot: 0,
+                commands: vec![0x05].into(),
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(inbox.close_reason(), SlotCloseReason::LaggingSlot);
+    assert_eq!(
+        inbox.close_reason().interruption(),
+        rally_point_proto::control::EvidenceInterruption::LaggingSlot
+    );
+}

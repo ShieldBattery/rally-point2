@@ -54,7 +54,7 @@ pub(super) struct ReaderRoutes {
 /// read/decode error) ends the connection with the same classification a close
 /// carries anywhere.
 ///
-/// The first successfully decoded application frame reports the control connection
+/// The first recognized application frame reports the control connection
 /// established through `control_connected`: an accepted enroll always leads with a
 /// connect-time push (tenant keys first), while every refusal — version, region,
 /// identity, or ledger enrollment — closes without ever pushing one, so the first
@@ -75,7 +75,7 @@ pub(super) async fn read_control_frames(
         load_state_tx,
         descriptor_ack_tx,
     } = routes;
-    // Set once, on the first decoded application frame: it is the accepted-enroll
+    // Set once, on the first recognized application frame: it is the accepted-enroll
     // signal (see this function's doc). The reconnect loop clears it uniformly on
     // disconnect, so it never carries a stale reading into the next connection.
     let mut connected_reported = false;
@@ -87,6 +87,16 @@ pub(super) async fn read_control_frames(
         match message? {
             Message::Text(text) => {
                 let message: CoordinatorToRelay = serde_json::from_str(text.as_str())?;
+                // Unknown kinds carry no understood enrollment or descriptor semantics.
+                // Malformed known frames still fail decoding: reconnecting supplies a full
+                // descriptor baseline before any later delta can be acknowledged.
+                if matches!(message, CoordinatorToRelay::Unknown) {
+                    tracing::warn!(
+                        relay_id = relay_id.0,
+                        "ignoring an unrecognized coordinator control message"
+                    );
+                    continue;
+                }
                 if !connected_reported {
                     let _ = control_connected.send(true);
                     connected_reported = true;

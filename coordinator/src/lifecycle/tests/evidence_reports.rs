@@ -495,3 +495,106 @@ async fn legacy_missing_pinned_boot_rejects_counts_instead_of_recounting() {
     }
     assert!(restored.connection_evidence(&tid(), session).is_empty());
 }
+
+#[tokio::test]
+async fn restored_future_semantics_drop_only_affected_records_and_preserve_known_highwaters() {
+    for (collection, observation_path) in [
+        ("evidence", "/observation"),
+        ("periodic_evidence", "/observation"),
+        ("evidence_history", "/history/admission"),
+        ("evidence_history", "/history/sample"),
+        ("evidence_history", "/history/latest/admission"),
+        ("evidence_history", "/history/latest/sample"),
+        ("evidence_history", "/sources/0/first/admission"),
+        ("evidence_history", "/sources/0/first/sample"),
+    ] {
+        for field in ["verdict", "interruption"] {
+            let (lc, session, generation) = setup(true);
+            let mut presence = snapshot(session, Some(admission(30)), Some(sample(30, 1, 31)));
+            presence.evidence.push(SlotEvidence {
+                slot: SlotId(1),
+                ..presence.evidence[0].clone()
+            });
+            presence.periodic_evidence.push(SlotEvidence {
+                slot: SlotId(1),
+                ..presence.periodic_evidence[0].clone()
+            });
+            lc.merge_connection_evidence(RelayId(1), generation, &[presence]);
+            for slot in [SlotId(0), SlotId(1)] {
+                lc.on_slot_connected(tid(), session, slot);
+                let mut history = cumulative(session, 3, 10);
+                history.slot = slot;
+                assert!(
+                    lc.ingest_evidence_report(RelayId(1), generation, history)
+                        .is_some()
+                );
+            }
+            let original = lc.export_facts().remove(&(tid(), session)).unwrap();
+            let mut json = serde_json::to_value(&original).unwrap();
+            let entry = json[collection]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|entry| entry[0] == 0)
+                .unwrap();
+            entry[1].pointer_mut(observation_path).unwrap()[field] = "future_variant".into();
+            let restored = Lifecycle::new(lc.inner.setup.clone());
+            restored.restore_session(
+                tid(),
+                session,
+                vec![RelayId(1)],
+                HashSet::from([SlotId(0), SlotId(1)]),
+                HashSet::new(),
+                serde_json::from_value(json).unwrap(),
+            );
+            let exported = restored.export_facts().remove(&(tid(), session)).unwrap();
+            let mut actual = serde_json::to_value(&exported).unwrap();
+            assert!(
+                !actual.to_string().contains("unrecognized"),
+                "unsupported semantics leaked from {collection}{observation_path}/{field}"
+            );
+            let mut expected = serde_json::to_value(&original).unwrap();
+            for kind in ["evidence", "periodic_evidence", "evidence_history"] {
+                let records = actual[kind].as_array().unwrap();
+                assert_eq!(records.len(), if kind == collection { 1 } else { 2 });
+                let known = records.iter().find(|record| record[0] == 1).unwrap();
+                assert_eq!(
+                    Some(known),
+                    expected[kind]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|record| record[0] == 1)
+                );
+                actual.as_object_mut().unwrap().remove(kind);
+                expected.as_object_mut().unwrap().remove(kind);
+            }
+            assert_eq!(
+                actual, expected,
+                "evidence filtering must not erase lifecycle facts"
+            );
+            let generation = enroll(&restored, 7, true);
+            for slot in [SlotId(0), SlotId(1)] {
+                let mut history = cumulative(session, 3, 10);
+                history.slot = slot;
+                for _ in 0..2 {
+                    assert!(
+                        restored
+                            .ingest_evidence_report(RelayId(1), generation, history.clone())
+                            .is_some()
+                    );
+                }
+            }
+            let states = restored.inner.sessions.lock();
+            let state = &states[&(tid(), session)];
+            assert_eq!(state.evidence_history.len(), 2);
+            assert!(
+                state
+                    .evidence_history
+                    .values()
+                    .all(|stored| stored.history.failures == 3),
+                "known history must retain its highwater and discarded history must restart without its old total"
+            );
+        }
+    }
+}

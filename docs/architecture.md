@@ -1927,7 +1927,17 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   therefore expire during mixed-version operation. Interrupted challenges also occur on ordinary
   network failure and are not themselves proof of cheating.
 
-  Rollout order for additional interruption variants is tenant ingestion, coordinator, then relay.
+  Unrecognized evidence verdicts or interruption causes decode to `Unrecognized` and discard only
+  their observation; heartbeat presence and lifecycle arrivals remain usable. Restoring a snapshot also drops unsupported
+  observations; a history containing an unknown value in any retained observation or source counter
+  is discarded as a whole because its contribution cannot be safely subtracted from the total.
+  Other lifecycle facts and known histories retain their counters. An unrecognized receipt disposition
+  retains the report for bounded retry rather than guessing whether handling was terminal. Unknown coordinator
+  message kinds are skipped with a warning and do not establish enrollment acceptance. Malformed known
+  messages end the connection so a full descriptor resync precedes further acknowledged deltas.
+  Producers can add enum variants without dropping control frames on readers with these catch-alls;
+  older readers still
+  require rollout order tenant ingestion, coordinator, then relay to avoid lost observations.
   Coordinators with an older closed reason enum reject the whole control frame containing an unknown
   variant, including a heartbeat, so they must be upgraded before relays emit these labels. Do not
   roll back a coordinator beneath relays still emitting unsupported variants.

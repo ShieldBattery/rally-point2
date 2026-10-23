@@ -72,7 +72,8 @@ impl Lifecycle {
             && let Some(admission) = &notice.admission
         {
             let sample = &notice.evidence;
-            if admission.sample_id != 0
+            if !super::evidence::has_known_semantics(admission)
+                || admission.sample_id != 0
                 || admission.interruption.is_some()
                 || admission.sequence == 0
                 || sample.sample_id == 0
@@ -143,7 +144,8 @@ impl Lifecycle {
         let (observation, observed_at_ms) = observation;
         let (relay, boot_id) = source;
         let setup = &self.inner.setup;
-        if observation.sample_id == 0
+        if !super::evidence::has_known_semantics(observation)
+            || observation.sample_id == 0
             || (observation.interruption.is_some()
                 && observation.verdict != EvidenceVerdict::Missing)
             || matches!(

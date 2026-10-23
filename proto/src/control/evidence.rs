@@ -23,6 +23,9 @@ pub enum EvidenceVerdict {
     UnknownKey,
     Invalid,
     Valid,
+    /// An outcome this reader cannot interpret; it never establishes validity.
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// Why an outstanding periodic observation ended without evidence.
@@ -41,6 +44,9 @@ pub enum EvidenceInterruption {
     SlotDeparted,
     Revoked,
     SessionRetired,
+    /// A cause this reader cannot classify as a failure or cancellation.
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// A relay's observation of one admission or periodic sample.
@@ -303,6 +309,9 @@ pub enum EvidenceReceiptDisposition {
     Superseded,
     SessionClosed,
     Capacity,
+    /// An unrecognized response is not proof of terminal handling.
+    #[serde(other)]
+    Unrecognized,
 }
 
 impl EvidenceReceiptDisposition {

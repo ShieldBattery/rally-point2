@@ -136,9 +136,27 @@ impl Lifecycle {
         state.started_at_ms = facts.started_at_ms;
         state.accounted.extend(facts.accounted);
         state.connected_slots.extend(facts.connected_slots);
-        state.evidence.extend(facts.evidence);
-        state.periodic_evidence.extend(facts.periodic_evidence);
-        state.evidence_history.extend(facts.evidence_history);
+        state.evidence.extend(
+            facts
+                .evidence
+                .into_iter()
+                .filter(|(_, stored)| evidence::has_known_semantics(&stored.observation)),
+        );
+        state.periodic_evidence.extend(
+            facts
+                .periodic_evidence
+                .into_iter()
+                .filter(|(_, stored)| evidence::has_known_semantics(&stored.observation)),
+        );
+        // A history's total includes every retained source. If any observation has
+        // unsupported semantics, its contribution cannot be safely subtracted;
+        // discard the whole history together with its deduplication highwaters.
+        state.evidence_history.extend(
+            facts
+                .evidence_history
+                .into_iter()
+                .filter(|(_, stored)| stored.has_known_semantics()),
+        );
         state.started_slots.extend(facts.started_slots);
         state.forwarded_slots.extend(facts.forwarded_slots);
         state

@@ -320,3 +320,199 @@ async fn stale_generation_and_mismatched_pairs_draw_no_evidence_receipt() {
         InboundAction::EvidenceReceipt(report.receipt())
     );
 }
+
+fn future_value_frame(frame: RelayToCoordinator, pointer: &str) -> Message {
+    let mut json = serde_json::to_value(frame).unwrap();
+    *json.pointer_mut(pointer).unwrap() = "future_variant".into();
+    Message::Text(json.to_string().into())
+}
+
+fn apply_frame(state: &CoordinatorState, generation: u64, frame: &Message) -> InboundAction {
+    note_inbound_frame(
+        &state.setup,
+        &state.lifecycle,
+        RelayId(1),
+        generation,
+        frame,
+        &idle_rtt_ingest(&RegionsConfig::default(), &pair_rtts::PairRttStore::new()),
+    )
+}
+
+#[tokio::test]
+async fn future_evidence_variants_preserve_heartbeat_presence_and_known_observations() {
+    use rally_point_proto::control::{EvidenceInterruption, SlotEvidence, SlotEvidenceHistory};
+    for unknown_field in ["interruption", "verdict"] {
+        let (state, generation, mut report) = evidence_report_fixture();
+        report.history.sample.interruption = Some(EvidenceInterruption::Timeout);
+        let mut presence = presence_entry(&report.tenant, report.session, &[0]);
+        presence.evidence = vec![SlotEvidence {
+            slot: report.slot,
+            observation: report.history.admission.clone(),
+            observed_at_ms: None,
+            historical: false,
+            failure_count: None,
+        }];
+        presence.periodic_evidence = vec![SlotEvidence {
+            slot: report.slot,
+            observation: report.history.sample.clone(),
+            observed_at_ms: Some(42),
+            historical: false,
+            failure_count: None,
+        }];
+        presence.evidence_history = vec![SlotEvidenceHistory {
+            slot: report.slot,
+            history: report.history.clone(),
+        }];
+        let mut json = serde_json::to_value(RelayToCoordinator::Heartbeat {
+            roster_complete: true,
+            sessions: vec![presence],
+            region_rtts: vec![],
+        })
+        .unwrap();
+        json["sessions"][0]["periodic_evidence"][0]["observation"][unknown_field] =
+            "future_variant".into();
+        json["sessions"][0]["evidence_history"][0]["history"]["sample"][unknown_field] =
+            "future_variant".into();
+        apply_frame(&state, generation, &Message::Text(json.to_string().into()));
+        assert_eq!(
+            presence::fresh_slots(
+                state.setup.presence(),
+                &report.tenant,
+                std::time::Instant::now()
+            ),
+            vec![(report.session, report.slot)]
+        );
+        let evidence = state
+            .lifecycle
+            .connection_evidence(&report.tenant, report.session);
+        assert_eq!(
+            evidence.len(),
+            1,
+            "unsupported samples cannot become failure history"
+        );
+        assert_eq!(evidence[0].observation, report.history.admission);
+        // A known report still records normally after the unsupported snapshot.
+        assert_eq!(
+            report_action(&state, generation, report.clone()),
+            InboundAction::EvidenceReceipt(report.receipt())
+        );
+    }
+}
+
+#[tokio::test]
+async fn future_history_variants_are_not_acknowledged_or_counted() {
+    for pointer in [
+        "/history/admission/verdict",
+        "/history/sample/verdict",
+        "/history/sample/interruption",
+    ] {
+        let (state, generation, mut report) = evidence_report_fixture();
+        report.history.sample.interruption =
+            Some(rally_point_proto::control::EvidenceInterruption::Timeout);
+        let frame = future_value_frame(
+            RelayToCoordinator::EvidenceReport(Box::new(report.clone())),
+            pointer,
+        );
+        assert_eq!(apply_frame(&state, generation, &frame), InboundAction::None);
+        assert!(
+            state
+                .lifecycle
+                .connection_evidence(&report.tenant, report.session)
+                .is_empty()
+        );
+        assert_eq!(
+            report_action(&state, generation, report.clone()),
+            InboundAction::EvidenceReceipt(report.receipt())
+        );
+    }
+}
+
+#[tokio::test]
+async fn future_admission_variants_preserve_authorized_arrival_without_evidence() {
+    use rally_point_proto::control::{EvidenceInterruption, SlotConnectedNotice};
+    for field in ["verdict", "interruption"] {
+        let (state, generation, report) = evidence_report_fixture();
+        let mut admission = report.history.admission.clone();
+        if field == "interruption" {
+            admission.interruption = Some(EvidenceInterruption::Timeout);
+        }
+        let frame = future_value_frame(
+            RelayToCoordinator::SlotConnected(SlotConnectedNotice {
+                predecessor: None,
+                evidence: Some(admission),
+                tenant: report.tenant.clone(),
+                session: report.session,
+                slot: report.slot,
+                external_id: None,
+                external_ref: None,
+                resumed: false,
+                connected_at_ms: 42,
+            }),
+            &format!("/evidence/{field}"),
+        );
+        apply_frame(&state, generation + 1, &frame);
+        let Message::Text(text) = &frame else {
+            unreachable!()
+        };
+        let mut wrong_assignment: serde_json::Value = serde_json::from_str(text).unwrap();
+        wrong_assignment["evidence"]["assignment_revision"] = 2.into();
+        apply_frame(
+            &state,
+            generation,
+            &Message::Text(wrong_assignment.to_string().into()),
+        );
+        assert!(
+            state
+                .lifecycle
+                .load_state(&report.tenant, report.session)
+                .unwrap()
+                .connected_slots
+                .is_empty(),
+            "unsupported evidence cannot bypass connection or assignment authorization"
+        );
+        apply_frame(&state, generation, &frame);
+        let snapshot = state
+            .lifecycle
+            .load_state(&report.tenant, report.session)
+            .unwrap();
+        assert_eq!(snapshot.connected_slots, vec![report.slot]);
+        assert!(snapshot.evidence.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn future_admission_verdict_in_heartbeat_preserves_presence_without_trusting_body() {
+    use rally_point_proto::control::SlotEvidence;
+    let (state, generation, report) = evidence_report_fixture();
+    let mut presence = presence_entry(&report.tenant, report.session, &[0]);
+    presence.evidence = vec![SlotEvidence {
+        slot: report.slot,
+        observation: report.history.admission.clone(),
+        observed_at_ms: None,
+        historical: false,
+        failure_count: None,
+    }];
+    let frame = future_value_frame(
+        RelayToCoordinator::Heartbeat {
+            roster_complete: true,
+            sessions: vec![presence],
+            region_rtts: vec![],
+        },
+        "/sessions/0/evidence/0/observation/verdict",
+    );
+    apply_frame(&state, generation, &frame);
+    assert_eq!(
+        presence::fresh_slots(
+            state.setup.presence(),
+            &report.tenant,
+            std::time::Instant::now()
+        ),
+        vec![(report.session, report.slot)]
+    );
+    assert!(
+        state
+            .lifecycle
+            .connection_evidence(&report.tenant, report.session)
+            .is_empty()
+    );
+}
