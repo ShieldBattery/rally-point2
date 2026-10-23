@@ -2,7 +2,8 @@
 //! `handlers` because this layer knows nothing about notice kinds — it just
 //! takes a tenant, a config, and an already-serialized body and gets it
 //! delivered (or gives up), reusing [`super::WEBHOOK_CLIENT`] and
-//! [`super::DISPATCH_PERMITS`] across every notice kind and every tenant.
+//! [`super::DISPATCH_PERMITS`] across lifecycle notices and tenants. Periodic
+//! samples reuse request signing and bounded attempts with their own gate.
 
 use std::time::Duration;
 
@@ -199,7 +200,7 @@ pub(super) async fn send_attempt(
 /// message embeds the current timestamp, and the consumer enforces a replay
 /// window on it, so a retry must carry a fresh timestamp (and therefore a
 /// fresh signature) or it would be rejected as stale.
-fn build_request(
+pub(super) fn build_request(
     tenants: &TenantStore,
     tenant: &TenantId,
     config: &NotifyConfig,

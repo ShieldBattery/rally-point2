@@ -231,7 +231,7 @@ struct SessionClosedWebhook {
 /// if any). `None` when the tenant has no notify config — nothing to POST to. The
 /// [`crate::lifecycle::Lifecycle`] calls this once, when the last serving relay
 /// reports closed, and enqueues the returned job onto the session's ordered queue
-/// behind every prior notice.
+/// behind every prior lifecycle notice. Periodic samples are independent and may arrive later.
 pub(crate) fn session_closed_dispatch(
     setup: &SessionSetup,
     tenant: &TenantId,

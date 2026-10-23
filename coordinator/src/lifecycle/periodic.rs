@@ -72,7 +72,7 @@ impl Lifecycle {
         if notice.evidence.verdict != EvidenceVerdict::Valid {
             notice.evidence.body.clear();
         }
-        notify::handle_slot_evidence(setup, self, notice);
+        notify::handle_slot_evidence(setup, notice);
     }
 
     // The caller holds assignment and control-epoch locks through the mutation.

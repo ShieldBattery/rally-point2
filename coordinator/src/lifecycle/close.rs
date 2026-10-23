@@ -248,7 +248,7 @@ impl Lifecycle {
 
     /// Pushes the session's terminal `sessionClosed` job onto `queue`. Must
     /// never be dropped: its delivery is the proof (see the module doc) that
-    /// no earlier notice for the session is still in flight, so silently
+    /// no earlier lifecycle notice for the session is still in flight, so silently
     /// dropping it would break that guarantee for whatever the queue's
     /// ordering exists to prove in the first place.
     ///

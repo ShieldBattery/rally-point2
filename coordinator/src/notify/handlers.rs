@@ -538,10 +538,11 @@ pub(crate) fn handle_lobby_violation(
 }
 
 /// Serializes `payload` and enqueues its webhook onto the session's ordered
-/// dispatch queue ([`Lifecycle`]), so every notice for one `(tenant, session)` is
-/// delivered in the order it was enqueued — a notice's retry loop blocks the ones
+/// dispatch queue ([`Lifecycle`]), so lifecycle notices for one `(tenant, session)` are
+/// delivered in the order they were enqueued — a notice's retry loop blocks the ones
 /// behind it. This is what lets a delivered `sessionClosed` guarantee no earlier
-/// notice for the session is still in flight. `kind` labels the delivery in logs.
+/// lifecycle notice for the session is still in flight. Periodic evidence uses
+/// an independent best-effort path and may arrive later. `kind` labels delivery logs.
 fn enqueue_dispatch(
     lifecycle: &Lifecycle,
     tenant: TenantId,
@@ -563,7 +564,6 @@ fn enqueue_dispatch(
 /// Delivers a fenced periodic observation without recording a connection arrival.
 pub(crate) fn handle_slot_evidence(
     setup: &SessionSetup,
-    lifecycle: &Lifecycle,
     notice: rally_point_proto::control::SlotEvidenceNotice,
 ) {
     let Some(resolved) = resolve_or_drop(
@@ -590,12 +590,10 @@ pub(crate) fn handle_slot_evidence(
         observed_at_ms: notice.observed_at_ms,
         evidence: notice.evidence.into(),
     };
-    enqueue_dispatch(
-        lifecycle,
+    super::periodic::try_dispatch(
+        setup.tenants().clone(),
         notice.tenant,
-        notice.session,
         resolved.config,
         &payload,
-        "slotEvidence",
     );
 }

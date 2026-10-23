@@ -46,9 +46,11 @@
 //!   resolution, body construction, enqueue. The parts that do not vary per kind
 //!   live in its own `resolve_or_drop`.
 //! - `dispatch` — the signed-POST retry/backoff delivery loop shared by every
-//!   notice kind.
+//!   lifecycle notice kind.
+//! - `periodic` delivers one best-effort sample attempt behind its own bounded
+//!   gate. Samples may arrive after `sessionClosed` and have no lifecycle effects.
 //!
-//! This file keeps what all three share: the dedup sets, the desync marks, the
+//! This file keeps their shared state: the dedup sets, the desync marks, the
 //! process-wide webhook client + concurrency gate, and `resolve_notice_prefix`
 //! (the tenant-config + gameId resolution every handler starts with).
 
@@ -72,6 +74,7 @@ use crate::tenant::{self, NotifyConfig};
 mod dispatch;
 mod handlers;
 mod payloads;
+mod periodic;
 
 pub(crate) use dispatch::dispatch;
 pub(crate) use handlers::{

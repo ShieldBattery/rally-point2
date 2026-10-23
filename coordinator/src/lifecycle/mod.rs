@@ -6,11 +6,13 @@
 //! `SessionClosed` — and holds the global picture of a game's end. This module
 //! owns what it does with that picture:
 //!
-//! - **Ordered dispatch.** Every webhook for one `(tenant, session)` drains from
+//! - **Ordered dispatch.** Lifecycle webhooks for one `(tenant, session)` drain from
 //!   a single FIFO queue, one at a time; a notice's retry loop blocks the ones
 //!   behind it. Because `sessionClosed` is enqueued only after the all-relays-
 //!   closed condition, queue order alone guarantees a delivered `sessionClosed`
-//!   implies every earlier notice for the session was delivered or exhausted.
+//!   implies every earlier lifecycle notice was delivered or exhausted. Periodic
+//!   samples use a separate best-effort gate and can arrive after this signal;
+//!   they never change lifecycle state.
 //!
 //! - **`sessionClosed`.** The coordinator assigned each session's serving relay
 //!   set; when every one of them has reported `SessionClosed`, the final

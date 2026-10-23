@@ -1501,8 +1501,11 @@ emptiness, so restating a finished session's record can never keep that session 
 ### Session lifecycle and reaps
 
 The coordinator holds the global picture of a game's end and drives three things off it. **Ordered
-dispatch:** every webhook for one `(tenant, session)` drains from a single FIFO queue, one at a time, so a
-delivered `sessionClosed` implies every earlier notice for the session was delivered or exhausted.
+dispatch:** lifecycle webhooks for one `(tenant, session)` drain from a single FIFO queue, one at a time, so a
+delivered `sessionClosed` implies every earlier lifecycle notice was delivered or exhausted. Periodic
+evidence uses a separate process-wide four-request concurrency gate, with one bounded attempt per sample
+and no pending queue or retries. Busy delivery sheds samples; retained-cache recovery can retrieve the
+latest value. Samples may arrive after `sessionClosed` and have no lifecycle effects.
 **`sessionClosed`:** the coordinator assigned each session's serving-relay set, and when every one of them
 has reported `SessionClosed` (its last local slot deregistered), the final `sessionClosed` webhook fires
 and the session state is reaped. **Reaps:** two player-accounting timers keep a session from dangling — a
