@@ -452,6 +452,7 @@ fn periodic_heartbeat_attachment_budget_rotates_without_truncating_the_roster() 
         .map(|session| {
             let evidence: Vec<_> = (0..2)
                 .map(|slot| SlotEvidence {
+                    observed_at_ms: None,
                     historical: false,
                     failure_count: None,
                     slot: SlotId(slot),
@@ -593,6 +594,7 @@ fn near_full_roster_reserves_frame_space_before_cloning_observations() {
         })
         .collect();
     let sample = SlotEvidence {
+        observed_at_ms: None,
         historical: false,
         failure_count: None,
         slot: SlotId(0),

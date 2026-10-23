@@ -65,6 +65,14 @@ pub(super) fn handle_shutdown(link: &mut Link, ctx: &SlotLinkCtx, close_reason: 
     // a silenced or desync-evicted slot's link was healthy, so saying
     // "isolated" for it would send whoever reads the client's log after the
     // wrong problem.
+    teardown::settle_link_evidence(
+        &ctx.sessions,
+        &ctx.mesh_for_teardown,
+        &ctx.key,
+        ctx.slot,
+        ctx.connection_epoch,
+        ctx.leave_announced.then_some(SlotCloseReason::SlotDeparted),
+    );
     match SlotCloseReason::from_raw(close_reason.load(Ordering::Acquire)) {
         SlotCloseReason::SilentSlot => {
             tracing::info!(
@@ -102,7 +110,15 @@ pub(super) fn handle_shutdown(link: &mut Link, ctx: &SlotLinkCtx, close_reason: 
                 b"lobby policy violation",
             );
         }
-        SlotCloseReason::Unspecified => {
+        SlotCloseReason::Revoked | SlotCloseReason::SlotDeparted => {
+            tracing::info!(
+                tenant = ctx.key.tenant.as_ref(),
+                session = ctx.key.session.0,
+                slot = ctx.slot.0,
+                "closing slot after terminal directive"
+            );
+        }
+        SlotCloseReason::Unspecified | SlotCloseReason::LaggingSlot => {
             tracing::info!(
                 tenant = ctx.key.tenant.as_ref(),
                 session = ctx.key.session.0,
@@ -115,6 +131,14 @@ pub(super) fn handle_shutdown(link: &mut Link, ctx: &SlotLinkCtx, close_reason: 
 
 /// Answers the provisional-admission reap signal.
 pub(super) fn handle_provisional_reap(link: &mut Link, ctx: &SlotLinkCtx) {
+    teardown::settle_link_evidence(
+        &ctx.sessions,
+        &ctx.mesh_for_teardown,
+        &ctx.key,
+        ctx.slot,
+        ctx.connection_epoch,
+        ctx.leave_announced.then_some(SlotCloseReason::SlotDeparted),
+    );
     // This session was admitted with no applied descriptor and its
     // provisional deadline passed with none arriving. Close with a
     // distinct code so a redialing client can tell this apart from a

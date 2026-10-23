@@ -63,6 +63,7 @@ impl DecisionMaker {
             .iter()
             .map(
                 |(&slot, observation)| rally_point_proto::control::SlotEvidence {
+                    observed_at_ms: None,
                     historical: false,
                     failure_count: None,
                     slot,
@@ -190,12 +191,14 @@ impl DecisionMaker {
         *remaining -= cost;
         Ok(Some(PeriodicEvidencePair {
             admission: rally_point_proto::control::SlotEvidence {
+                observed_at_ms: None,
                 historical: false,
                 failure_count: None,
                 slot,
                 observation: admission.clone(),
             },
             sample: rally_point_proto::control::SlotEvidence {
+                observed_at_ms: Some(observed_at_ms),
                 historical: false,
                 failure_count: None,
                 slot,
@@ -248,12 +251,14 @@ impl DecisionMaker {
             self.reported_evidence(slot, sequence)?;
         Some(PeriodicEvidencePair {
             admission: rally_point_proto::control::SlotEvidence {
+                observed_at_ms: None,
                 historical: false,
                 failure_count: None,
                 slot,
                 observation: admission.clone(),
             },
             sample: rally_point_proto::control::SlotEvidence {
+                observed_at_ms: Some(observed_at_ms),
                 historical: false,
                 failure_count: None,
                 slot,
@@ -288,7 +293,8 @@ impl DecisionMaker {
                 self.evidence_assignment_current(**slot, observation.assignment_revision)
             })
             .map(
-                |(&slot, (observation, _))| rally_point_proto::control::SlotEvidence {
+                |(&slot, (observation, time))| rally_point_proto::control::SlotEvidence {
+                    observed_at_ms: Some(*time),
                     historical: false,
                     failure_count: None,
                     slot,
@@ -390,7 +396,9 @@ impl DecisionMaker {
         time: u64,
     ) {
         use rally_point_proto::control::{EvidenceFailure, EvidenceHistory};
-        if sample.verdict == rally_point_proto::control::EvidenceVerdict::Valid {
+        if sample.verdict == rally_point_proto::control::EvidenceVerdict::Valid
+            || sample.interruption == Some(EvidenceInterruption::SlotDeparted)
+        {
             return;
         }
         let Some(admission) = self.evidence.get(&slot) else {

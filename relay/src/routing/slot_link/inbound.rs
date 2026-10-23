@@ -160,6 +160,14 @@ pub(super) async fn handle_received(
             in_flight = link.payloads_in_flight(),
             "unacked window exhausted; isolating slot",
         );
+        teardown::settle_link_evidence(
+            &ctx.sessions,
+            &ctx.mesh_for_teardown,
+            &ctx.key,
+            ctx.slot,
+            ctx.connection_epoch,
+            Some(SlotCloseReason::LaggingSlot),
+        );
         link.connection().close(
             VarInt::from_u32(close_codes::ISOLATED),
             b"unacked window exhausted",
@@ -238,6 +246,14 @@ pub(super) async fn handle_forwarded(
                             in_flight = link.payloads_in_flight(),
                             "unacked window exhausted; isolating slot",
                         );
+                        teardown::settle_link_evidence(
+                            &ctx.sessions,
+                            &ctx.mesh_for_teardown,
+                            &ctx.key,
+                            ctx.slot,
+                            ctx.connection_epoch,
+                            Some(SlotCloseReason::LaggingSlot),
+                        );
                         link.connection().close(
                             VarInt::from_u32(close_codes::ISOLATED),
                             b"unacked window exhausted",
@@ -292,6 +308,14 @@ pub(super) fn handle_beacon_cursor(
             slot = ctx.slot.0,
             in_flight = link.payloads_in_flight(),
             "unacked window exhausted; isolating slot",
+        );
+        teardown::settle_link_evidence(
+            &ctx.sessions,
+            &ctx.mesh_for_teardown,
+            &ctx.key,
+            ctx.slot,
+            ctx.connection_epoch,
+            Some(SlotCloseReason::LaggingSlot),
         );
         link.connection().close(
             VarInt::from_u32(close_codes::ISOLATED),

@@ -262,7 +262,7 @@ impl Lifecycle {
                         &session.tenant,
                         session.session,
                         entry.slot,
-                        &entry.observation,
+                        (&entry.observation, entry.observed_at_ms),
                         false,
                     );
                 }
@@ -361,6 +361,7 @@ pub(super) fn current_evidence(
             assignments.get(slot) == Some(&(stored.relay, stored.observation.assignment_revision))
         })
         .map(|(&slot, stored)| rally_point_proto::control::SlotEvidence {
+            observed_at_ms: None,
             historical: false,
             failure_count: None,
 
@@ -383,6 +384,7 @@ pub(super) fn current_evidence(
                             .is_some_and(|admission| stored.matches_admission(admission))
                 })
                 .map(|(&slot, stored)| rally_point_proto::control::SlotEvidence {
+                    observed_at_ms: stored.observed_at_ms,
                     historical: false,
                     failure_count: None,
 
@@ -393,6 +395,7 @@ pub(super) fn current_evidence(
         .chain(state.evidence_history.iter().flat_map(|(&slot, stored)| {
             let history = &stored.history;
             let first = rally_point_proto::control::SlotEvidence {
+                observed_at_ms: Some(history.observed_at_ms),
                 slot,
                 observation: history.sample.clone(),
                 historical: true,
@@ -403,6 +406,7 @@ pub(super) fn current_evidence(
                 .as_ref()
                 .filter(|latest| latest.sample != history.sample)
                 .map(|latest| rally_point_proto::control::SlotEvidence {
+                    observed_at_ms: Some(latest.observed_at_ms),
                     slot,
                     observation: latest.sample.clone(),
                     historical: true,

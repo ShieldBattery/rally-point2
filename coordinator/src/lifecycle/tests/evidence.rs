@@ -67,6 +67,7 @@ fn notice(session: SessionId, observation: EvidenceObservation) -> SessionNotice
 fn snapshot(session: SessionId, observation: EvidenceObservation) -> SessionPresence {
     SessionPresence {
         evidence: vec![SlotEvidence {
+            observed_at_ms: None,
             historical: false,
             failure_count: None,
 
@@ -251,6 +252,7 @@ async fn duplicate_slot_entries_do_not_change_the_first_observation() {
     let (lc, session, generation) = setup_evidence();
     let mut values = snapshot(session, observation(1, 1));
     values.evidence.push(SlotEvidence {
+        observed_at_ms: None,
         historical: false,
         failure_count: None,
 
@@ -388,6 +390,7 @@ async fn unverified_bodies_never_reach_retained_state_or_webhooks() {
 async fn cached_evidence_is_tenant_scoped_and_removed_on_close() {
     let (lc, session, generation) = setup_evidence();
     let expected = vec![SlotEvidence {
+        observed_at_ms: None,
         historical: false,
         failure_count: None,
 

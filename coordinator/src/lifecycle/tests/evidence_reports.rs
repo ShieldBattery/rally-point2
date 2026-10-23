@@ -124,6 +124,7 @@ async fn unreported_old_home_history_arrives_after_rehome_and_new_admission() {
 
     let mut replacement = report.clone();
     replacement.history.admission = current.clone();
+    replacement.history.observed_at_ms = 84;
     replacement.history.sample = EvidenceObservation {
         sample_id: 1,
         sequence: 11,
@@ -149,6 +150,31 @@ async fn unreported_old_home_history_arrives_after_rehome_and_new_admission() {
             .iter()
             .all(|entry| entry.historical && entry.failure_count == Some(2))
     );
+
+    // An older observation can arrive after a replacement relay's report,
+    // even with a larger process-local sequence number.
+    let mut late = cumulative(session, 2, 1000);
+    late.history.latest.as_mut().unwrap().observed_at_ms = 70;
+    assert!(
+        lc.ingest_evidence_report(RelayId(1), generation, late.clone())
+            .is_some()
+    );
+    let after_late = lc.connection_evidence(&tid(), session);
+    assert_eq!(after_late[2].observation, retained[2].observation);
+    assert_eq!(after_late[1].observed_at_ms, Some(42));
+    assert_eq!(after_late[2].observed_at_ms, Some(84));
+    assert!(
+        after_late[1..]
+            .iter()
+            .all(|entry| entry.failure_count == Some(3))
+    );
+    assert_eq!(
+        lc.ingest_evidence_report(RelayId(1), generation, late)
+            .unwrap()
+            .disposition,
+        EvidenceReceiptDisposition::Superseded
+    );
+    let retained = after_late;
 
     let facts = lc.export_facts().remove(&(tid(), session)).unwrap();
     let facts = serde_json::from_slice(&serde_json::to_vec(&facts).unwrap()).unwrap();

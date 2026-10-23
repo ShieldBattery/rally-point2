@@ -304,6 +304,14 @@ pub(super) fn handle_control_frame(
                     return ControlFlow::Break(());
                 }
                 Some(LobbyIngress::Verdict(crate::consensus::LobbyCommandVerdict::Violation)) => {
+                    teardown::settle_link_evidence(
+                        &ctx.sessions,
+                        &ctx.mesh_for_teardown,
+                        &ctx.key,
+                        ctx.slot,
+                        ctx.connection_epoch,
+                        Some(SlotCloseReason::LobbyViolation),
+                    );
                     link.connection().close(
                         VarInt::from_u32(close_codes::LOBBY_VIOLATION),
                         b"lobby policy violation",
@@ -476,17 +484,14 @@ fn handle_leave_intent(link: &mut Link, ctx: &mut SlotLinkCtx) -> ControlFlow<()
         "client announced clean leave",
     );
     // Settle before closing the stream can race the sampler's receive failure.
-    ctx.mesh_for_teardown
-        .session
-        .gates
-        .with_ingress(&ctx.key, || {
-            ctx.decision_makers.interrupt_periodic_evidence(
-                &ctx.key,
-                ctx.slot,
-                ctx.connection_epoch,
-                rally_point_proto::control::EvidenceInterruption::SlotDeparted,
-            );
-        });
+    teardown::settle_link_evidence(
+        &ctx.sessions,
+        &ctx.mesh_for_teardown,
+        &ctx.key,
+        ctx.slot,
+        ctx.connection_epoch,
+        Some(SlotCloseReason::SlotDeparted),
+    );
     // Retire the active generation before its terminal
     // SlotDeparted is enqueued. A concurrently joining mesh
     // link snapshots this same registry, so it now observes

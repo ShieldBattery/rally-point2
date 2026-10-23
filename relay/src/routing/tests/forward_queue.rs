@@ -62,6 +62,10 @@ fn a_stamped_close_reason_round_trips_and_an_unknown_byte_degrades() {
         SlotCloseReason::Unspecified,
         SlotCloseReason::SilentSlot,
         SlotCloseReason::DesyncEvicted,
+        SlotCloseReason::LobbyViolation,
+        SlotCloseReason::Revoked,
+        SlotCloseReason::LaggingSlot,
+        SlotCloseReason::SlotDeparted,
     ] {
         assert_eq!(SlotCloseReason::from_raw(reason as u8), reason);
     }
@@ -99,20 +103,21 @@ async fn close_slots_signals_a_held_slot_with_a_reason_and_skips_an_absent_one()
     );
     assert_eq!(
         inbox0.close_reason(),
-        SlotCloseReason::Unspecified,
-        "a terminal directive names no more specific cause",
+        SlotCloseReason::Revoked,
+        "a terminal directive cancels pending evidence",
     );
 
-    // A silence eviction stamps its own reason before signaling, so the woken
-    // link task can close with the code that names it.
-    close_slots_for_silence(&sessions, &k, &[SlotId(0)]);
-    shutdown.notified().await;
-    assert_eq!(inbox0.close_reason(), SlotCloseReason::SilentSlot);
+    // A fresh slot's silence eviction stamps its own reason before signaling.
+    let inbox1 = registered(&sessions, &k, SlotId(1));
+    let shutdown1 = inbox1.shutdown_handle();
+    close_slots_for_silence(&sessions, &k, &[SlotId(1)]);
+    shutdown1.notified().await;
+    assert_eq!(inbox1.close_reason(), SlotCloseReason::SilentSlot);
 
-    // So does a desync eviction.
-    close_slots_for_desync(&sessions, &k, &[SlotId(0)]);
-    shutdown.notified().await;
-    assert_eq!(inbox0.close_reason(), SlotCloseReason::DesyncEvicted);
+    // Technical verdicts can refine another technical cause.
+    close_slots_for_desync(&sessions, &k, &[SlotId(1)]);
+    shutdown1.notified().await;
+    assert_eq!(inbox1.close_reason(), SlotCloseReason::DesyncEvicted);
 }
 
 #[tokio::test(start_paused = true)]

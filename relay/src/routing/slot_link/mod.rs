@@ -666,6 +666,14 @@ pub async fn run_slot_link(
     // last one. Without an explicit close, the connection — and the
     // relay-side slot it's still notionally serving — lingers until QUIC's
     // own idle timeout instead of freeing promptly.
+    teardown::settle_link_evidence(
+        &ctx.sessions,
+        &ctx.mesh_for_teardown,
+        &ctx.key,
+        ctx.slot,
+        ctx.connection_epoch,
+        ctx.leave_announced.then_some(SlotCloseReason::SlotDeparted),
+    );
     link.connection()
         .close(VarInt::from_u32(0), b"slot link ended");
     rollback_stats::record_final_rollback_stats(&ctx);

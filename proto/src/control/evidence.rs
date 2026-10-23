@@ -33,6 +33,11 @@ pub enum EvidenceInterruption {
     Timeout,
     ConnectionClosed,
     ConnectionReplaced,
+    StreamClosed,
+    SilentSlot,
+    DesyncEvicted,
+    LaggingSlot,
+    LobbyViolation,
     SlotDeparted,
     Revoked,
     SessionRetired,
@@ -93,6 +98,9 @@ mod body_encoding {
 /// The latest evidence observation for a slot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotEvidence {
+    /// Relay observation time, absent when an older producer did not retain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_ms: Option<u64>,
     pub slot: SlotId,
     pub observation: EvidenceObservation,
     #[serde(default, skip_serializing_if = "is_false")]

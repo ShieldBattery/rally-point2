@@ -15,6 +15,8 @@ pub(super) struct StoredPeriodic {
     pub(super) relay: RelayId,
     boot_id: u64,
     pub(super) observation: EvidenceObservation,
+    #[serde(default)]
+    pub(super) observed_at_ms: Option<u64>,
     notified_sample_id: Option<u64>,
 }
 
@@ -106,7 +108,7 @@ impl Lifecycle {
                 &notice.tenant,
                 notice.session,
                 notice.slot,
-                &notice.evidence,
+                (&notice.evidence, Some(notice.observed_at_ms)),
                 true,
             )
         };
@@ -135,9 +137,10 @@ impl Lifecycle {
         tenant: &TenantId,
         session: SessionId,
         slot: SlotId,
-        observation: &EvidenceObservation,
+        observation: (&EvidenceObservation, Option<u64>),
         notify: bool,
     ) -> bool {
+        let (observation, observed_at_ms) = observation;
         let (relay, boot_id) = source;
         let setup = &self.inner.setup;
         if observation.sample_id == 0
@@ -180,6 +183,7 @@ impl Lifecycle {
             relay,
             boot_id,
             observation: sanitized,
+            observed_at_ms,
             notified_sample_id: None,
         };
         if !candidate.matches_admission(admission) {
@@ -195,8 +199,12 @@ impl Lifecycle {
             && candidate.observation.sequence > stored.observation.sequence
         {
             stored.observation = candidate.observation;
+            stored.observed_at_ms = candidate.observed_at_ms;
         } else if candidate.observation != stored.observation {
             return false;
+        }
+        if stored.observed_at_ms.is_none() {
+            stored.observed_at_ms = observed_at_ms;
         }
         if notify {
             if stored

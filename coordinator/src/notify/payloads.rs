@@ -291,6 +291,8 @@ impl From<rally_point_proto::control::EvidenceObservation> for EvidencePayload {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SlotEvidencePayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed_at_ms: Option<u64>,
     slot: u8,
     observation: EvidencePayload,
     historical: bool,
@@ -302,6 +304,7 @@ impl From<rally_point_proto::control::SlotEvidence> for SlotEvidencePayload {
     fn from(value: rally_point_proto::control::SlotEvidence) -> Self {
         Self {
             slot: value.slot.0,
+            observed_at_ms: value.observed_at_ms,
             observation: value.observation.into(),
             historical: value.historical,
             failure_count: value.failure_count,

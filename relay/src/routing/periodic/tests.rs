@@ -45,6 +45,9 @@ fn admit(context: &Context, id: [u8; 32], epoch: u64) {
     ));
 }
 fn fixture() -> Context {
+    fixture_with_inbox().0
+}
+fn fixture_with_inbox() -> (Context, SlotInbox) {
     let context = Context {
         key: crate::test_support::session_key(42),
         slot: SlotId(0),
@@ -56,7 +59,7 @@ fn fixture() -> Context {
     };
     context.mesh.session.decision_makers.require_descriptors();
     install(&context, true, 1);
-    let (mut guard, _) = super::super::registry::register(
+    let (mut guard, inbox) = super::super::registry::register(
         &context.sessions,
         &context.key,
         context.slot,
@@ -65,7 +68,7 @@ fn fixture() -> Context {
     .unwrap();
     guard.disarm();
     admit(&context, context.connection_id, context.epoch);
-    context
+    (context, inbox)
 }
 fn checked() -> crate::auth::CheckedEvidence {
     crate::auth::CheckedEvidence {
@@ -237,7 +240,7 @@ async fn bounded_exchange_accepts_empty_and_rejects_bad_ids_lengths_and_stalls()
         match mode {
             0 => assert_eq!(result.unwrap(), Ok(None)),
             4 => assert!(result.is_err()),
-            3 => assert_eq!(result.unwrap(), Err(EvidenceInterruption::ConnectionClosed)),
+            3 => assert_eq!(result.unwrap(), Err(EvidenceInterruption::StreamClosed)),
             _ => assert_eq!(result.unwrap(), Err(EvidenceInterruption::NoAnswer)),
         }
     }
@@ -664,9 +667,9 @@ fn explicit_departure_reason_wins_over_stream_cleanup() {
         .session
         .decision_makers
         .retained_load_state(&context.key);
-    assert_eq!(state.evidence_history.len(), 1);
+    assert!(state.evidence_history.is_empty());
     assert_eq!(
-        state.evidence_history[0].history.sample.interruption,
+        state.periodic_evidence[0].observation.interruption,
         Some(EvidenceInterruption::SlotDeparted)
     );
 }
@@ -700,3 +703,5 @@ fn consecutive_silent_replacements_retain_first_latest_and_count() {
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].history.failures, 4);
 }
+
+mod shutdown;

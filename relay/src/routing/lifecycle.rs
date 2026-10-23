@@ -103,7 +103,7 @@ pub fn close_slots(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
         sessions,
         key,
         slots,
-        SlotCloseReason::Unspecified,
+        SlotCloseReason::Revoked,
         "closing slot link after terminal directive",
     );
 }
@@ -153,8 +153,9 @@ pub fn close_slots_for_lobby_violation(sessions: &Sessions, key: &SessionKey, sl
 }
 
 /// Stamps `reason` on each named slot's roster entry and fires its shutdown
-/// signal, logging `message`. The stamp lands before the signal, so the woken
-/// link task always reads the reason for the wake it is answering.
+/// signal, logging `message`. Administrative cancellation and normal departure
+/// take precedence over technical failures. The stamp lands before the signal,
+/// so the woken task sees the selected cause.
 fn signal_close(
     sessions: &Sessions,
     key: &SessionKey,
@@ -174,7 +175,18 @@ fn signal_close(
                 slot = slot.0,
                 "{message}",
             );
-            entry.close_reason.store(reason as u8, Ordering::Release);
+            let previous = SlotCloseReason::from_raw(entry.close_reason.load(Ordering::Acquire));
+            // A departure or administrative cancellation cannot become a client
+            // failure just because an eviction verdict arrives before teardown.
+            if !matches!(
+                previous,
+                SlotCloseReason::Revoked | SlotCloseReason::SlotDeparted
+            ) || matches!(
+                reason,
+                SlotCloseReason::Revoked | SlotCloseReason::SlotDeparted
+            ) {
+                entry.close_reason.store(reason as u8, Ordering::Release);
+            }
             entry.shutdown.notify_one();
         }
     }
@@ -247,6 +259,9 @@ pub(crate) fn reap_provisional(sessions: &Sessions, key: &SessionKey) {
         return;
     };
     for entry in group.values() {
+        entry
+            .close_reason
+            .store(SlotCloseReason::Revoked as u8, Ordering::Release);
         entry.provisional_reap.notify_one();
     }
 }

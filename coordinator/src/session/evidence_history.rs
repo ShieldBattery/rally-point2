@@ -94,6 +94,8 @@ impl SessionSetup {
     }
 
     /// Authorizes history only. Current admission and routing must use the live home.
+    /// Every authorized identity must also satisfy `retained_evidence_history_assignment`:
+    /// dropping its counter while reports remain authorized would count retries again.
     pub(crate) fn evidence_history_assignment(
         &self,
         relay: RelayId,
@@ -237,6 +239,8 @@ impl SessionSetup {
 }
 
 impl SessionSetup {
+    /// This predicate must retain every currently authorized identity, including
+    /// identities temporarily denied by the wall-clock check. It may retain more.
     /// Counter eviction follows removal of authority records, not a momentary
     /// wall-clock check that could become true again after a clock correction.
     pub(crate) fn retained_evidence_history_assignment(

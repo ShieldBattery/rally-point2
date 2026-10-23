@@ -382,7 +382,14 @@ impl Lifecycle {
             advanced = true;
             stored.sources.len() - 1
         };
-        if advanced && !inserted {
+        // Sequence numbers are local to a relay process. A late old-home report
+        // can advance its count without becoming the slot's most recent event.
+        // Equal timestamps preserve the retained event; cross-host clock skew
+        // limits the precision of this ordering.
+        if advanced
+            && !inserted
+            && history.latest_observed_at_ms() > stored.history.latest_observed_at_ms()
+        {
             stored.history.latest = Some(Box::new(EvidenceFailure {
                 admission: admission.clone(),
                 sample: sample.clone(),

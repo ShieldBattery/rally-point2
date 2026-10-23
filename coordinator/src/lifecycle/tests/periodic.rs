@@ -96,6 +96,7 @@ fn snapshot(
         evidence: admission
             .into_iter()
             .map(|observation| SlotEvidence {
+                observed_at_ms: None,
                 historical: false,
                 failure_count: None,
 
@@ -106,6 +107,7 @@ fn snapshot(
         periodic_evidence: periodic
             .into_iter()
             .map(|observation| SlotEvidence {
+                observed_at_ms: None,
                 historical: false,
                 failure_count: None,
 
@@ -543,3 +545,57 @@ async fn next_admission_and_snapshot_preserve_predecessor_without_current_sample
 
 #[path = "evidence_reports.rs"]
 mod reports;
+
+#[tokio::test]
+async fn observation_time_survives_heartbeat_notice_and_restart() {
+    let (lc, session, generation) = setup(true);
+    let observation = sample(1, 1, 2);
+    lc.merge_connection_evidence(
+        RelayId(1),
+        generation,
+        &[snapshot(
+            session,
+            Some(admission(1)),
+            Some(observation.clone()),
+        )],
+    );
+    assert_eq!(
+        lc.connection_evidence(&tid(), session)[1].observed_at_ms,
+        None
+    );
+    lc.ingest_notice(RelayId(1), generation, notice(session, observation.clone()));
+    assert_eq!(
+        lc.connection_evidence(&tid(), session)[1].observed_at_ms,
+        Some(42)
+    );
+    // An older producer's snapshot cannot replace the known event time with receipt time.
+    lc.merge_connection_evidence(
+        RelayId(1),
+        generation,
+        &[snapshot(session, Some(admission(1)), Some(observation))],
+    );
+    let facts = lc.export_facts().remove(&(tid(), session)).unwrap();
+    let restored = Lifecycle::new(lc.inner.setup.clone());
+    restored.restore_session(
+        tid(),
+        session,
+        vec![RelayId(1)],
+        HashSet::from([SlotId(0), SlotId(1)]),
+        HashSet::new(),
+        serde_json::from_slice(&serde_json::to_vec(&facts).unwrap()).unwrap(),
+    );
+    let retained = restored.connection_evidence(&tid(), session);
+    assert_eq!(retained[1].observed_at_ms, Some(42));
+    let json = serde_json::to_value(crate::notify::SlotEvidencePayload::from(
+        retained[1].clone(),
+    ))
+    .unwrap();
+    assert_eq!(json["observedAtMs"], 42);
+    let mut next = snapshot(session, Some(admission(1)), Some(sample(1, 2, 3)));
+    next.periodic_evidence[0].observed_at_ms = Some(99);
+    lc.merge_connection_evidence(RelayId(1), generation, &[next]);
+    assert_eq!(
+        lc.connection_evidence(&tid(), session)[1].observed_at_ms,
+        Some(99)
+    );
+}

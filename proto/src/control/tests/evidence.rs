@@ -100,6 +100,7 @@ fn notice_and_presence_defaults_and_observations_round_trip() {
             .is_none()
     );
     presence.evidence = vec![SlotEvidence {
+        observed_at_ms: None,
         historical: false,
         failure_count: None,
 
@@ -270,6 +271,7 @@ fn periodic_policy_notice_and_presence_round_trip_independently() {
         serde_json::from_value(serde_json::json!({"tenant":"test", "session":1, "slots":[]}))
             .unwrap();
     presence.periodic_evidence = vec![SlotEvidence {
+        observed_at_ms: None,
         historical: false,
         failure_count: None,
 
@@ -291,6 +293,7 @@ fn periodic_presence_bounds_sample_count_on_both_wire_directions() {
             .unwrap();
     presence.periodic_evidence = (0..16)
         .map(|slot| SlotEvidence {
+            observed_at_ms: None,
             historical: false,
             failure_count: None,
 

@@ -1556,7 +1556,9 @@ reaps do not re-arm, and the liveness probe force-reconciles it.
 The latest admission, latest periodic observation, and first/latest retained failures per slot are
 available, at most 64 observations for 16 slots; duplicate samples are returned only once. Historical
 samples carry `historical: true` and the same cumulative `failureCount` for the slot. That count is a
-highwater, not an increment to sum across samples. Accumulated failures survive subsequent admissions
+highwater, not an increment to sum across samples. `observedAtMs` carries the relay's original event
+time when available; absence means an older producer did not retain it, never the time of recovery.
+Accumulated failures survive subsequent admissions
 and rehomes once the coordinator accepts them. This is not an archival log. Intermediate periodic samples that were never received or
 were overwritten cannot be recovered here. Session retirement, including
 normal close, discards observations immediately; there is no post-close recovery grace period.
@@ -1879,9 +1881,13 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
 
   The relay registers an exact outstanding obligation before sending a challenge. Disconnect or
   replacement settles an unanswered obligation as missing; a late completion cannot overwrite it.
-  Missing samples distinguish no answer, timeout, connection closure, replacement, and normal slot
-  departure. Assignment revocation, policy disablement, and session retirement cancel outstanding
+  Missing samples distinguish no answer, timeout, connection closure, replacement, evidence-stream
+  closure, silence eviction, desync eviction, lagging isolation, lobby violation, and normal slot
+  departure. Shutdown causes are stamped before transport closure and fenced by the connection epoch. Assignment revocation, policy disablement, and session retirement cancel outstanding
   checks without recording a client failure. These administrative cancellations do not enter history.
+  Normal departures remain current `slot_departed` samples but do not increment failure counts or
+  replace first/latest failures. Legacy summaries may already include departures and cannot be
+  retrospectively reclassified.
   Each slot retains its first and latest failure with their original admissions and a saturating
   cumulative count. Reconnects preserve that count; a subsequent valid answer does not erase it.
 
@@ -1893,7 +1899,10 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   current-home report. The authenticated control generation and original process must still match.
   Per-source count highwaters prevent retries, reconnects, and overlapping retired/current reports
   from double-counting. Highwaters remain while their authority records remain; the slot's aggregate
-  survives their removal. This trusts the relay's report, not cryptographic proof that measurement
+  survives their removal. Aggregate latest selection uses observation time, so an older old-home
+  report can increase its source's count without replacing a newer event. Equal times retain the
+  existing event; cross-host clock skew limits this ordering's precision.
+  This trusts the relay's report, not cryptographic proof that measurement
   preceded revocation.
 
   Failed or unanswered samples synchronously update a process-local relay outbox. Reports coalesce
@@ -1917,6 +1926,11 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   updated peers. An older coordinator's receipt cannot clear a newer cumulative summary, which can
   therefore expire during mixed-version operation. Interrupted challenges also occur on ordinary
   network failure and are not themselves proof of cheating.
+
+  Rollout order for additional interruption variants is tenant ingestion, coordinator, then relay.
+  Coordinators with an older closed reason enum reject the whole control frame containing an unknown
+  variant, including a heartbeat, so they must be upgraded before relays emit these labels. Do not
+  roll back a coordinator beneath relays still emitting unsupported variants.
 
   Collection never closes or fences gameplay. Current samples retain the registration, assignment,
   control connection, relay process, and admission fences and cannot trigger load-progress callbacks.

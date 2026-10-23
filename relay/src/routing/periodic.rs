@@ -5,6 +5,7 @@ use rally_point_proto::control::{EvidenceInterruption, EvidenceObservation};
 use rally_point_proto::handshake::{self, EvidenceCheck, EvidenceRequest, PeriodicEvidenceContext};
 use rally_point_transport::noq::{RecvStream, SendStream};
 use ring::rand::{SecureRandom, SystemRandom};
+use std::sync::atomic::Ordering;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
@@ -41,7 +42,11 @@ impl Context {
             .gates
             .with_ingress(&self.key, || {
                 let roster = self.sessions.lock();
-                if roster.get(&self.key)?.get(&self.slot)?.connection_epoch != self.epoch {
+                let entry = roster.get(&self.key)?.get(&self.slot)?;
+                if entry.connection_epoch != self.epoch
+                    || SlotCloseReason::from_raw(entry.close_reason.load(Ordering::Acquire))
+                        != SlotCloseReason::Unspecified
+                {
                     return None;
                 }
                 self.mesh.session.decision_makers.periodic_evidence_config(
@@ -90,6 +95,18 @@ impl Context {
                     .and_then(|slots| slots.get(&self.slot))
                     .is_some_and(|entry| entry.connection_epoch == self.epoch)
                 {
+                    return false;
+                }
+                let entry = &roster[&self.key][&self.slot];
+                let reason = SlotCloseReason::from_raw(entry.close_reason.load(Ordering::Acquire));
+                if reason != SlotCloseReason::Unspecified {
+                    self.mesh.session.decision_makers.abandon_periodic_evidence(
+                        &self.key,
+                        self.slot,
+                        self.epoch,
+                        sample_id,
+                        reason.interruption(),
+                    );
                     return false;
                 }
                 self.mesh.session.decision_makers.record_periodic_evidence(
@@ -214,7 +231,11 @@ async fn run_with(
                 if !roster
                     .get(&context.key)
                     .and_then(|slots| slots.get(&context.slot))
-                    .is_some_and(|entry| entry.connection_epoch == context.epoch)
+                    .is_some_and(|entry| {
+                        entry.connection_epoch == context.epoch
+                            && SlotCloseReason::from_raw(entry.close_reason.load(Ordering::Acquire))
+                                == SlotCloseReason::Unspecified
+                    })
                 {
                     return false;
                 }
@@ -270,11 +291,11 @@ async fn exchange(
         .map_err(|_| EvidenceInterruption::NoAnswer)?;
     send.write_all(&encoded)
         .await
-        .map_err(|_| EvidenceInterruption::ConnectionClosed)?;
+        .map_err(|_| EvidenceInterruption::StreamClosed)?;
     let mut header = [0; handshake::PERIODIC_RESPONSE_HEADER_LEN];
     recv.read_exact(&mut header)
         .await
-        .map_err(|_| EvidenceInterruption::ConnectionClosed)?;
+        .map_err(|_| EvidenceInterruption::StreamClosed)?;
     let (id, len) = handshake::decode_periodic_response_header(&header)
         .map_err(|_| EvidenceInterruption::NoAnswer)?;
     if id != challenge.challenge_id {
@@ -283,7 +304,7 @@ async fn exchange(
     let mut payload = vec![0; len];
     recv.read_exact(&mut payload)
         .await
-        .map_err(|_| EvidenceInterruption::ConnectionClosed)?;
+        .map_err(|_| EvidenceInterruption::StreamClosed)?;
     let (_, evidence) = handshake::decode_periodic_response(&header, &payload)
         .map_err(|_| EvidenceInterruption::NoAnswer)?;
     Ok(evidence)
@@ -305,6 +326,15 @@ impl Drop for Obligation<'_> {
             .session
             .gates
             .with_ingress(&self.context.key, || {
+                let roster = self.context.sessions.lock();
+                let reason = roster
+                    .get(&self.context.key)
+                    .and_then(|slots| slots.get(&self.context.slot))
+                    .filter(|entry| entry.connection_epoch == self.context.epoch)
+                    .map(|entry| {
+                        SlotCloseReason::from_raw(entry.close_reason.load(Ordering::Acquire))
+                    })
+                    .unwrap_or(SlotCloseReason::Unspecified);
                 self.context
                     .mesh
                     .session
@@ -314,7 +344,7 @@ impl Drop for Obligation<'_> {
                         self.context.slot,
                         self.context.epoch,
                         self.sample,
-                        EvidenceInterruption::ConnectionClosed,
+                        reason.interruption(),
                     );
             });
     }

@@ -236,9 +236,7 @@ const RESUME_ANCHOR_LIE_MARGIN: u64 = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum SlotCloseReason {
-    /// No more specific cause: the slot fell hopelessly behind and is being
-    /// isolated, or a terminal directive (a coordinator reap, a final mesh
-    /// leave) asked for its link to end.
+    /// No shutdown has been requested.
     Unspecified = 0,
     /// The slot's client stopped producing turns while its session advanced past
     /// it, stalling every other player behind it.
@@ -248,14 +246,36 @@ enum SlotCloseReason {
     DesyncEvicted = 2,
     /// A pre-start lobby command violated the descriptor policy.
     LobbyViolation = 3,
+    /// A terminal coordinator or mesh directive ended this assignment.
+    Revoked = 4,
+    /// The slot exceeded a delivery queue or unacknowledged-window bound.
+    LaggingSlot = 5,
+    /// The client announced a normal departure.
+    SlotDeparted = 6,
 }
 
 impl SlotCloseReason {
+    fn interruption(self) -> rally_point_proto::control::EvidenceInterruption {
+        use rally_point_proto::control::EvidenceInterruption;
+        match self {
+            Self::Unspecified => EvidenceInterruption::ConnectionClosed,
+            Self::SilentSlot => EvidenceInterruption::SilentSlot,
+            Self::DesyncEvicted => EvidenceInterruption::DesyncEvicted,
+            Self::LobbyViolation => EvidenceInterruption::LobbyViolation,
+            Self::Revoked => EvidenceInterruption::Revoked,
+            Self::LaggingSlot => EvidenceInterruption::LaggingSlot,
+            Self::SlotDeparted => EvidenceInterruption::SlotDeparted,
+        }
+    }
+
     fn from_raw(raw: u8) -> Self {
         match raw {
             raw if raw == Self::SilentSlot as u8 => Self::SilentSlot,
             raw if raw == Self::DesyncEvicted as u8 => Self::DesyncEvicted,
             raw if raw == Self::LobbyViolation as u8 => Self::LobbyViolation,
+            raw if raw == Self::Revoked as u8 => Self::Revoked,
+            raw if raw == Self::LaggingSlot as u8 => Self::LaggingSlot,
+            raw if raw == Self::SlotDeparted as u8 => Self::SlotDeparted,
             _ => Self::Unspecified,
         }
     }

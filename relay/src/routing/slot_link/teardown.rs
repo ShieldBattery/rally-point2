@@ -1,6 +1,7 @@
 //! The single teardown path every way `run_slot_link` can end converges on.
 
 use super::*;
+use std::sync::atomic::Ordering;
 
 use crate::consensus::LEAVE_REASON_DROPPED;
 
@@ -30,18 +31,14 @@ pub(in crate::routing) fn end_slot_link(
         key,
         crate::observability::flight_recorder::FlightEvent::SlotDisconnected { slot: slot.0 },
     );
-    mesh.session.gates.with_ingress(key, || {
-        mesh.session.decision_makers.interrupt_periodic_evidence(
-            key,
-            slot,
-            connection_epoch,
-            if leave_announced {
-                rally_point_proto::control::EvidenceInterruption::SlotDeparted
-            } else {
-                rally_point_proto::control::EvidenceInterruption::ConnectionClosed
-            },
-        );
-    });
+    settle_link_evidence(
+        sessions,
+        mesh,
+        key,
+        slot,
+        connection_epoch,
+        leave_announced.then_some(SlotCloseReason::SlotDeparted),
+    );
     mesh.session.remove_slot(key, slot);
     let session_emptied = deregister(sessions, key, slot);
     let retired_connection =
@@ -151,4 +148,40 @@ pub(in crate::routing) fn end_slot_link(
     if session_emptied {
         maybe_close_emptied_session(sessions, mesh, key);
     }
+}
+
+/// Settles before transport closure can wake the independent evidence exchange.
+pub(super) fn settle_link_evidence(
+    sessions: &Sessions,
+    mesh: &crate::mesh::MeshState,
+    key: &SessionKey,
+    slot: SlotId,
+    connection_epoch: u64,
+    requested: Option<SlotCloseReason>,
+) {
+    mesh.session.gates.with_ingress(key, || {
+        let roster = sessions.lock();
+        let reason = roster
+            .get(key)
+            .and_then(|slots| slots.get(&slot))
+            .filter(|entry| entry.connection_epoch == connection_epoch)
+            .map(|entry| {
+                if let Some(requested) = requested {
+                    let _ = entry.close_reason.compare_exchange(
+                        SlotCloseReason::Unspecified as u8,
+                        requested as u8,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                SlotCloseReason::from_raw(entry.close_reason.load(Ordering::Acquire))
+            })
+            .unwrap_or(requested.unwrap_or(SlotCloseReason::Unspecified));
+        mesh.session.decision_makers.interrupt_periodic_evidence(
+            key,
+            slot,
+            connection_epoch,
+            reason.interruption(),
+        );
+    });
 }

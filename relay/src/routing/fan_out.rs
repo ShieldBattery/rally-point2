@@ -6,6 +6,7 @@
 //! client can park the caller.
 
 use super::*;
+use std::sync::atomic::Ordering;
 
 use super::forward::ForwardOutcome;
 use crate::observability::events::{FlightEvent, FlightEvents};
@@ -110,18 +111,25 @@ fn deliver_to_slot<T>(
 /// sender for it in the meantime. A send to an already-departed peer is ignored. A
 /// turn is therefore never silently dropped for a keeping-up peer.
 pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, payload: Payload) {
-    let targets: Vec<(SlotId, ForwardSink, Arc<Notify>)> = {
+    let targets = {
         let roster = sessions.lock();
         match roster.get(key) {
             Some(slots) => slots
                 .iter()
                 .filter(|(slot, _)| **slot != source)
-                .map(|(slot, entry)| (*slot, entry.forward.clone(), Arc::clone(&entry.shutdown)))
-                .collect(),
+                .map(|(slot, entry)| {
+                    (
+                        *slot,
+                        entry.forward.clone(),
+                        Arc::clone(&entry.shutdown),
+                        Arc::clone(&entry.close_reason),
+                    )
+                })
+                .collect::<Vec<_>>(),
             None => Vec::new(),
         }
     };
-    for (slot, sink, shutdown) in targets {
+    for (slot, sink, shutdown, close_reason) in targets {
         match sink.offer(&payload) {
             ForwardOutcome::Delivered => {}
             ForwardOutcome::QueueFull => {
@@ -131,6 +139,13 @@ pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, pay
                     slot = slot.0,
                     "forward queue full; signaling lagging slot to disconnect",
                 );
+                // Preserve an already requested administrative or eviction cause.
+                let _ = close_reason.compare_exchange(
+                    SlotCloseReason::Unspecified as u8,
+                    SlotCloseReason::LaggingSlot as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 shutdown.notify_one();
             }
             ForwardOutcome::OverBudget => {
@@ -139,6 +154,13 @@ pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, pay
                     session = key.session.0,
                     slot = slot.0,
                     "forward byte budget exceeded; signaling lagging slot to disconnect",
+                );
+                // Preserve an already requested administrative or eviction cause.
+                let _ = close_reason.compare_exchange(
+                    SlotCloseReason::Unspecified as u8,
+                    SlotCloseReason::LaggingSlot as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
                 );
                 shutdown.notify_one();
             }

@@ -233,6 +233,7 @@ fn stale_heartbeat_candidates_do_not_stop_later_reports() {
             }
             *remaining -= 1024;
             let admission = SlotEvidence {
+                observed_at_ms: None,
                 historical: false,
                 failure_count: None,
                 slot,
@@ -288,6 +289,7 @@ fn heartbeat_bounds_periodic_attachments_even_with_excess_candidates() {
             copied += 1;
             *remaining -= 1024;
             let admission = SlotEvidence {
+                observed_at_ms: None,
                 historical: false,
                 failure_count: None,
                 slot,

@@ -263,6 +263,7 @@ async fn cached_and_load_state_reads_include_admission_and_latest_periodic_sampl
         generation,
         &[rally_point_proto::control::SessionPresence {
             evidence: vec![SlotEvidence {
+                observed_at_ms: None,
                 historical: false,
                 failure_count: None,
 
