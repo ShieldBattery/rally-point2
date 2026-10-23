@@ -402,3 +402,48 @@ fn history_is_optional_for_older_notices_and_bounded_for_recovery() {
         connected
     );
 }
+
+#[test]
+fn historical_report_and_memory_receipt_round_trip_without_capability_negotiation() {
+    let admission = observation();
+    let report = EvidenceReport {
+        tenant: TenantId("test".into()),
+        session: SessionId(4),
+        slot: SlotId(2),
+        history: EvidenceHistory {
+            sample: EvidenceObservation {
+                sample_id: 3,
+                sequence: admission.sequence + 1,
+                verdict: EvidenceVerdict::Missing,
+                body: vec![],
+                ..admission.clone()
+            },
+            admission,
+            observed_at_ms: 5,
+        },
+    };
+    let receipt = report.receipt();
+    let frame = RelayToCoordinator::EvidenceReport(Box::new(report));
+    let encoded = serde_json::to_vec(&frame).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<RelayToCoordinator>(&encoded).unwrap(),
+        frame
+    );
+    let frame = CoordinatorToRelay::EvidenceReceipt(receipt);
+    let encoded = serde_json::to_vec(&frame).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<CoordinatorToRelay>(&encoded).unwrap(),
+        frame
+    );
+    // Older receivers use this same catch-all shape for unfamiliar message tags.
+    #[derive(serde::Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum OlderReceiver {
+        #[serde(other)]
+        Unknown,
+    }
+    assert!(matches!(
+        serde_json::from_slice::<OlderReceiver>(&encoded).unwrap(),
+        OlderReceiver::Unknown
+    ));
+}

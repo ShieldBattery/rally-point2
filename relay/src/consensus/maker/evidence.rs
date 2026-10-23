@@ -372,14 +372,25 @@ impl DecisionMaker {
         let Some(admission) = self.evidence.get(&slot) else {
             return;
         };
-        self.evidence_history.insert(
-            slot,
-            rally_point_proto::control::EvidenceHistory {
-                admission: admission.clone(),
-                sample: sample.clone(),
-                observed_at_ms: time,
-            },
-        );
+        let history = rally_point_proto::control::EvidenceHistory {
+            admission: admission.clone(),
+            sample: sample.clone(),
+            observed_at_ms: time,
+        };
+        // Capture exactly at the first-history transition, not from snapshots:
+        // receipts and expiry must not cause the same history to be enqueued again.
+        if let Some(outbox) = &self.evidence_outbox {
+            outbox.insert(
+                rally_point_proto::control::EvidenceReport {
+                    tenant: self.key.tenant.clone(),
+                    session: self.key.session,
+                    slot,
+                    history: history.clone(),
+                },
+                Instant::now(),
+            );
+        }
+        self.evidence_history.insert(slot, history);
     }
 
     pub(in crate::consensus) fn evidence_history_snapshot(
@@ -397,5 +408,34 @@ impl DecisionMaker {
             .collect();
         entries.sort_by_key(|entry| entry.slot);
         entries
+    }
+}
+
+impl DecisionMaker {
+    pub(in crate::consensus) fn settle_revoked_evidence(
+        &mut self,
+        pushed: &EvidenceConfig,
+        homed_slots: &HashSet<SlotId>,
+    ) {
+        let revoked: Vec<_> = self
+            .evidence_pending
+            .iter()
+            .filter_map(|(&slot, (_, sample))| {
+                (!pushed.periodic
+                    || !homed_slots.contains(&slot)
+                    || pushed.assignments.get(&slot) != Some(&sample.assignment_revision))
+                .then_some(slot)
+            })
+            .collect();
+        for slot in revoked {
+            self.abandon_periodic_evidence(slot, None);
+        }
+    }
+
+    pub(in crate::consensus) fn settle_pending_evidence(&mut self) {
+        let slots: Vec<_> = self.evidence_pending.keys().copied().collect();
+        for slot in slots {
+            self.abandon_periodic_evidence(slot, None);
+        }
     }
 }

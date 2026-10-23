@@ -217,7 +217,9 @@ impl DecisionMakers {
     /// Also forgets the session's correlation ids, so the refs map doesn't outlive
     /// the sessions it describes.
     pub fn deregister_maker(&self, key: &SessionKey) {
-        self.lock().remove(key);
+        if let Some(mut maker) = self.lock().remove(key) {
+            maker.settle_pending_evidence();
+        }
         self.forget_session_refs(key);
         self.descriptors_changed.notify_waiters();
     }

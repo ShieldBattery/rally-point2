@@ -160,7 +160,10 @@ impl SessionSetup {
             self.session_relays
                 .lock()
                 .insert(key.clone(), record.serving);
-            if let Some(refs) = record.refs {
+            if let Some(mut refs) = record.refs {
+                refs.prune_retired_evidence_assignments(
+                    rally_point_proto::time::unix_secs_fail_closed(),
+                );
                 self.session_refs.lock().insert(key.clone(), refs);
             }
             if let Some(create) = record.create {

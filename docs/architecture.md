@@ -1879,11 +1879,28 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   The relay registers an exact outstanding obligation before sending a challenge. Disconnect or
   replacement settles an unanswered obligation as missing; a late completion cannot overwrite it.
   Each slot retains its first failure with the original admission identity independently of current
-  evidence. A historical pair never establishes current ownership: newly learned history must still
-  pass the current assignment, relay process, and control-generation fences. Already accepted history
-  survives rehome and coordinator persistence. An old home's unsent history cannot be recovered after
-  its assignment is revoked, and relay process loss can lose facts not yet reported. Interrupted
-  challenges also occur on ordinary network failure; they are not themselves proof of cheating.
+  evidence. A historical pair never establishes current ownership. Live notices and heartbeat pairs
+  require the current assignment; independent historical reports may also use a retired assignment's
+  authority. Rehome retains the old slot, relay, process boot, and revision for ten minutes, bounded to
+  four retired assignments per slot and 64 per session. These records survive coordinator persistence;
+  a legacy persisted assignment without its process identity cannot grant historical authority.
+  The authenticated control generation and original process must still match. This trusts the relay's
+  report; it is not cryptographic proof that measurement preceded revocation.
+
+  First failed or unanswered samples enter a process-local relay outbox synchronously, including
+  pending checks settled before assignment or maker removal. The outbox outlives descriptors and
+  control connections, retains at most 1,024 reports and 8 MiB of accounted encoded data, and expires
+  reports after ten minutes. Overflow preserves older entries and counts/logs losses. Selection rotates
+  fairly through up to 16 reports each second, with at least ten seconds between attempts per report.
+  Exact receipts remove only the matching report. Neither challenge issuance nor rehome waits for
+  reporting. Receipts confirm coordinator memory acceptance, not webhook delivery or a durable write:
+  a coordinator crash before its normal persistence flush can lose acknowledged history, and relay
+  process loss can lose an unacknowledged outbox. Normal session close removes evidence and historical
+  authority. This remains a first-failure record per slot, not a journal: a different failure already
+  retained for that slot is preserved and a conflicting report is not acknowledged. Older peers ignore
+  the additive report/receipt messages; existing live delivery continues, but the retired-assignment
+  guarantee requires both updated peers. Interrupted challenges also occur on ordinary network
+  failure; they are not themselves proof of cheating.
 
   Collection never closes or fences gameplay. Current samples retain the registration, assignment,
   control connection, relay process, and admission fences and cannot trigger load-progress callbacks.

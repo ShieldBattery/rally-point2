@@ -279,7 +279,9 @@ async fn push_and_watch(
     // writer while the async presign runs off the read loop.
     let (grants_tx, grants) = tokio::sync::mpsc::unbounded_channel::<CoordinatorToRelay>();
 
-    let mut sources = WriterSources::new(setup, relay_id, regions, drain, grants);
+    let (receipts_tx, receipts) = tokio::sync::mpsc::channel(64);
+    let mut sources = WriterSources::new(setup, relay_id, regions, drain, grants)
+        .with_evidence_receipts(receipts);
     if !sources.enable_acknowledgements(setup, relay_id, inbound.generation) {
         return;
     }
@@ -291,7 +293,7 @@ async fn push_and_watch(
     // half-applied and nothing is double-run.
     tokio::select! {
         () = run_writer(&mut write_half, &mut sources, relay_id, liveness_timeout, negotiated) => {}
-        () = run_reader(&mut read_half, inbound, liveness_timeout, &drain_tx, grants_tx) => {}
+        () = run_reader(&mut read_half, inbound, liveness_timeout, &drain_tx, grants_tx, receipts_tx) => {}
         // A shutting-down coordinator drops the connection: the relay redials the
         // next process, keeping any notice it has not sent yet for that one.
         () = shutdown.wait() => {}

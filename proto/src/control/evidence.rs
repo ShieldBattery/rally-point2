@@ -193,3 +193,41 @@ pub(super) mod history_samples {
         deserializer.deserialize_seq(Samples)
     }
 }
+
+/// A retained historical observation, delivered independently of live descriptors.
+/// Receivers validate the source relay and assignment before acknowledging it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceReport {
+    pub tenant: super::TenantId,
+    pub session: crate::ids::SessionId,
+    pub slot: SlotId,
+    pub history: EvidenceHistory,
+}
+
+/// Receipt for one exact report accepted into coordinator memory. This is not a
+/// durability promise across coordinator process loss.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EvidenceReceipt {
+    pub tenant: super::TenantId,
+    pub session: crate::ids::SessionId,
+    pub slot: SlotId,
+    pub assignment_revision: u64,
+    pub connection_id: [u8; 32],
+    pub sample_id: u64,
+    pub sequence: u64,
+}
+
+impl EvidenceReport {
+    pub fn receipt(&self) -> EvidenceReceipt {
+        let sample = &self.history.sample;
+        EvidenceReceipt {
+            tenant: self.tenant.clone(),
+            session: self.session,
+            slot: self.slot,
+            assignment_revision: sample.assignment_revision,
+            connection_id: sample.connection_id,
+            sample_id: sample.sample_id,
+            sequence: sample.sequence,
+        }
+    }
+}

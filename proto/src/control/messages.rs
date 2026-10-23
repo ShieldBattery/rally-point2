@@ -60,6 +60,9 @@ pub const ENROLL_POP_CONTEXT: &[u8] = b"rp2-enroll-pop-v1:";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoordinatorToRelay {
+    /// Accepts an exact historical report into coordinator memory. Older relays
+    /// ignore this additive message; it changes no session ownership.
+    EvidenceReceipt(super::EvidenceReceipt),
     /// The relay's full current session-descriptor set — every session this
     /// relay should serve, each naming that session's mesh peers. The relay
     /// joins the named peers' links and leaves any session no longer present.
@@ -330,6 +333,10 @@ pub enum CoordinatorToRelay {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RelayToCoordinator {
+    /// A failed or interrupted observation retained independently of current
+    /// descriptors. Older coordinators skip this message without acknowledging;
+    /// senders bound retries and retention independently of gameplay.
+    EvidenceReport(Box<super::EvidenceReport>),
     /// Confirms a requested descriptor update was applied, including removals.
     /// Ids belong only to this control connection; a later acknowledgement also
     /// covers earlier updates, so a relay may coalesce pending acknowledgements.

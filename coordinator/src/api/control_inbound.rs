@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use axum::extract::ws::Message;
 use futures_util::StreamExt;
-use rally_point_proto::control::{CoordinatorToRelay, RelayToCoordinator};
+use rally_point_proto::control::{CoordinatorToRelay, EvidenceReceipt, RelayToCoordinator};
 use rally_point_proto::ids::RelayId;
 
 use crate::flight_store::S3FlightStore;
@@ -85,6 +85,7 @@ pub(super) async fn run_reader(
     liveness_timeout: Duration,
     drain_tx: &tokio::sync::mpsc::UnboundedSender<DrainSend>,
     grants_tx: tokio::sync::mpsc::UnboundedSender<CoordinatorToRelay>,
+    receipts_tx: tokio::sync::mpsc::Sender<EvidenceReceipt>,
 ) {
     let relay_id = inbound.relay_id;
     // The flight-upload grant state for this connection: the channel to the writer plus
@@ -110,11 +111,20 @@ pub(super) async fn run_reader(
                         // then hands the send half (its current descriptor set, then a
                         // DrainAck) to the writer so set-before-ack holds on the wire. A
                         // dropped writer (its half ended) means the connection is over.
-                        if action == InboundAction::DrainRequested
-                            && apply_drain_mark(inbound.setup, relay_id, inbound.generation)
-                            && drain_tx.send(DrainSend).is_err()
-                        {
-                            break;
+                        match action {
+                            InboundAction::DrainRequested => {
+                                if apply_drain_mark(inbound.setup, relay_id, inbound.generation)
+                                    && drain_tx.send(DrainSend).is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            InboundAction::EvidenceReceipt(receipt) => {
+                                // Dropping a receipt under backpressure is safe: the
+                                // relay retries its immutable report until acknowledged.
+                                let _ = receipts_tx.try_send(receipt);
+                            }
+                            InboundAction::None => {}
                         }
                     }
                     Some(Err(error)) => {
@@ -141,13 +151,15 @@ pub(super) async fn run_reader(
 /// a [`RelayToCoordinator::Draining`] asks the loop to run the drain exchange
 /// ([`DrainRequested`](Self::DrainRequested)), which needs the connection's
 /// generation and socket that only the loop holds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum InboundAction {
     /// Nothing beyond the liveness refresh.
     None,
     /// The relay asked to drain: mark it ineligible and run the set-before-ack
     /// exchange.
     DrainRequested,
+    /// A repeatable receipt for an accepted historical observation.
+    EvidenceReceipt(EvidenceReceipt),
 }
 
 /// Handles an inbound relay frame, returning what the connection loop should do
@@ -227,6 +239,9 @@ pub(super) fn note_inbound(
             lifecycle.ingest_notice(relay_id, generation, SessionNotice::Result(notice));
             InboundAction::None
         }
+        Ok(RelayToCoordinator::EvidenceReport(report)) => lifecycle
+            .ingest_evidence_report(relay_id, generation, *report)
+            .map_or(InboundAction::None, InboundAction::EvidenceReceipt),
         Ok(RelayToCoordinator::SlotEvidence(notice)) => {
             lifecycle.ingest_notice(relay_id, generation, SessionNotice::SlotEvidence(notice));
             InboundAction::None

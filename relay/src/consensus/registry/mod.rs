@@ -125,6 +125,10 @@ pub enum RelayNotice {
 /// [`new_decision_makers`] — the same empty state.
 #[derive(Default)]
 pub struct DecisionMakers {
+    // Makers may acquire this leaf lock while holding the registry. Outbox reads
+    // and receipts never acquire the maker registry in the opposite order.
+    pub(in crate::consensus) evidence_outbox:
+        std::sync::Arc<super::evidence_outbox::EvidenceOutbox>,
     pub(in crate::consensus) makers: parking_lot::Mutex<MakerMap>,
     pub(in crate::consensus) descriptors_changed: tokio::sync::Notify,
     pub(in crate::consensus) evidence_changes: OnceLock<tokio::sync::watch::Sender<u64>>,
@@ -512,6 +516,7 @@ pub fn new_decision_makers() -> DecisionMakers {
 /// [`new_decision_makers`] with the real constant.
 pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> DecisionMakers {
     DecisionMakers {
+        evidence_outbox: Default::default(),
         makers: parking_lot::Mutex::new(HashMap::new()),
         descriptors_changed: tokio::sync::Notify::new(),
         evidence_changes: OnceLock::new(),

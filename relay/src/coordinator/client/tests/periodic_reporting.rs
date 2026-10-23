@@ -497,3 +497,216 @@ fn older_sticky_failure_is_reported_after_a_newer_sample_was_sent() {
     assert!(unchanged[0].periodic_evidence.is_empty());
     assert!(unchanged[0].evidence_history.is_empty());
 }
+
+#[tokio::test]
+async fn historical_report_survives_revocation_and_control_reconnect_until_reader_receipt() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let (sources, admission, _) = reporting_fixture();
+    let makers = sources.decision_makers.clone();
+    let mesh = crate::mesh::MeshState::new(crate::session::SessionState {
+        decision_makers: makers.clone(),
+        ..Default::default()
+    });
+    let control = MeshControl::new(RelayId(1), &mesh, sources.sessions.clone());
+    assert!(makers.begin_periodic_evidence(
+        &key(7),
+        SlotId(0),
+        1,
+        EvidenceObservation {
+            sample_id: 2,
+            ..admission.clone()
+        }
+    ));
+    // The removal path settles the outstanding sample before deleting its maker.
+    control.end_session(&key(7));
+    assert!(!makers.maker_exists(&key(7)));
+    let (notices, notice_rx) = mpsc::unbounded_channel();
+    notices
+        .send(RelayNotice::SessionClosed {
+            tenant: key(99).tenant,
+            session: SessionId(99),
+        })
+        .unwrap();
+    SubscriberFixture {
+        control,
+        notices: notice_rx,
+        heartbeat: HeartbeatConfig {
+            sources,
+            interval: Duration::from_secs(3600),
+        },
+        ..Default::default()
+    }
+    .spawn(listener.local_addr().unwrap());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        accept_enroll(&mut ws).await;
+        assert!(
+            matches!(
+                decode(ws.next().await.unwrap().unwrap()),
+                RelayToCoordinator::SessionClosed {
+                    session: SessionId(99),
+                    ..
+                }
+            ),
+            "queued lifecycle notice outranks historical reports"
+        );
+        let RelayToCoordinator::EvidenceReport(first) = decode(ws.next().await.unwrap().unwrap())
+        else {
+            panic!("revoked session still reports its outstanding sample");
+        };
+        assert_eq!(first.history.admission, admission);
+        assert_eq!(first.history.sample.verdict, EvidenceVerdict::Missing);
+        ws.close(None).await.unwrap();
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        accept_enroll(&mut ws).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), ws.next())
+                .await
+                .is_err(),
+            "a control reconnect cannot bypass the report retry interval"
+        );
+        let RelayToCoordinator::EvidenceReport(repeated) =
+            decode(ws.next().await.unwrap().unwrap())
+        else {
+            panic!("the unacknowledged report is retried");
+        };
+        assert_eq!(repeated, first);
+        for frame in [
+            CoordinatorToRelay::EvidenceReceipt(first.receipt()),
+            CoordinatorToRelay::Descriptors {
+                ack_id: Some(77),
+                staged_at_unix_ms: None,
+                descriptors: vec![],
+            },
+        ] {
+            ws.send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            decode(ws.next().await.unwrap().unwrap()),
+            RelayToCoordinator::DescriptorsApplied { ack_id: 77 }
+        );
+        // The ordered descriptor acknowledgement fences the preceding receipt's
+        // read-half application, without waiting another real retry interval.
+        assert!(
+            makers
+                .evidence_reports(std::time::Instant::now() + Duration::from_secs(20), 16)
+                .is_empty()
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn historical_report_batch_yields_to_load_state_asks_and_ready_answers() {
+    let (sources, admission, _) = reporting_fixture();
+    let makers = sources.decision_makers.clone();
+    let mut config = makers.evidence_config(&key(7)).unwrap();
+    config.assignments.insert(SlotId(1), 1);
+    let _ = makers.sync_maker(
+        &key(7),
+        MakerSync {
+            evidence: config,
+            homed_slots: [SlotId(0), SlotId(1)].into(),
+            expected_slots: [SlotId(0), SlotId(1)].into(),
+            ..MakerSync::new(BufferBounds { min: 1, max: 6 }, Authority::SelfRelay)
+        },
+    );
+    assert!(makers.activate_connection_epoch(&key(7), SlotId(1), 1));
+    assert!(makers.note_slot_connected(&key(7), SlotId(1), false, Some(admission.clone())));
+    for slot in [SlotId(0), SlotId(1)] {
+        assert!(makers.begin_periodic_evidence(
+            &key(7),
+            slot,
+            1,
+            EvidenceObservation {
+                sample_id: 2,
+                ..admission.clone()
+            }
+        ));
+    }
+    makers.deregister_maker(&key(7));
+    let (asks, load_state_rx) = mpsc::channel(LOAD_STATE_ASK_CAPACITY);
+    asks.try_send(LoadStateAsk {
+        request_id: 99,
+        key: key(999),
+        settle_lobby: false,
+    })
+    .unwrap();
+    let (frames_tx, mut frames_rx) = mpsc::unbounded_channel();
+    let sink = Box::pin(futures_util::sink::unfold((), move |(), frame: Message| {
+        let frames_tx = frames_tx.clone();
+        let asks = asks.clone();
+        async move {
+            let message = decode(frame);
+            if matches!(message, RelayToCoordinator::EvidenceReport(_)) {
+                assert_eq!(
+                    asks.capacity(),
+                    LOAD_STATE_ASK_CAPACITY,
+                    "the pending load-state ask was consumed before a historical report"
+                );
+                // A pending empty-session fence can complete while this send is
+                // in flight; its ready answer must outrank the next report.
+                tokio::task::yield_now().await;
+            }
+            frames_tx.send(message).unwrap();
+            Ok::<(), tokio_tungstenite::tungstenite::Error>(())
+        }
+    }));
+    let mut outbound = OutboundQueues::new(
+        mpsc::unbounded_channel().1,
+        no_flight(),
+        ControlConnStats::new(),
+    );
+    let mut drain = watch::channel(false).1;
+    let heartbeat = HeartbeatConfig {
+        sources,
+        interval: Duration::from_secs(3600),
+    };
+    let identity = throwaway_identity_key();
+    let writer = write_control_frames(
+        sink,
+        &mut outbound,
+        &mut drain,
+        &heartbeat,
+        &identity,
+        RelayId(1),
+        WriterRoutes {
+            challenge_rx: mpsc::unbounded_channel().1,
+            flight_grant_rx: mpsc::unbounded_channel().1,
+            load_state_rx,
+            descriptor_ack_rx: watch::channel(None).1,
+        },
+    );
+    let verify = async {
+        let mut answered = false;
+        let mut reports = 0;
+        loop {
+            match frames_rx.recv().await.unwrap() {
+                RelayToCoordinator::LoadStateSnapshot { request_id: 99, .. } => answered = true,
+                RelayToCoordinator::EvidenceReport(_) => {
+                    reports += 1;
+                    if reports == 2 {
+                        assert!(
+                            answered,
+                            "a ready load-state answer outranks the second historical report"
+                        );
+                        break;
+                    }
+                }
+                _ => panic!("unexpected writer frame"),
+            }
+        }
+    };
+    tokio::select! {
+        _ = writer => panic!("writer ended before the expected reports"),
+        result = tokio::time::timeout(Duration::from_secs(5), verify) => result.unwrap(),
+    }
+}

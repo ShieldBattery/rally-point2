@@ -11,6 +11,7 @@ use super::*;
 
 #[tokio::test]
 async fn a_blocked_periodic_webhook_does_not_block_same_session_result_delivery() {
+    let _delivery = crate::test_support::PERIODIC_WEBHOOK_TEST_LOCK.lock().await;
     let gate = Arc::new(Notify::new());
     let (url, mut rx) = WebhookReceiver {
         gate: Some(gate.clone()),

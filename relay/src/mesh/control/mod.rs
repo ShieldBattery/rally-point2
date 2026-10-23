@@ -197,6 +197,17 @@ impl MeshControl {
         true
     }
 
+    /// Applies a memory receipt without requiring a live session descriptor.
+    pub(crate) fn acknowledge_evidence(
+        &self,
+        receipt: &rally_point_proto::control::EvidenceReceipt,
+    ) {
+        self.mesh
+            .session
+            .decision_makers
+            .acknowledge_evidence(receipt);
+    }
+
     /// Closes the named slots' links for a session — the coordinator's reap
     /// directive. Fires each slot's shutdown signal in the roster; a slot this
     /// relay does not currently hold is a no-op. The closed link then flows through

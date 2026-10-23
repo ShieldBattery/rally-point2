@@ -111,6 +111,7 @@ fn snapshot(
 
 #[tokio::test]
 async fn periodic_notifications_are_separate_private_and_do_not_activate_slots() {
+    let _delivery = crate::test_support::PERIODIC_WEBHOOK_TEST_LOCK.lock().await;
     let (lc, session, generation) = setup(true);
     let (url, mut receiver) = WebhookReceiver::default().spawn().await;
     crate::tenant::set_notify(
@@ -347,6 +348,7 @@ fn history_notice(session: SessionId, connection: u64, sequence: u64) -> Session
 
 #[tokio::test]
 async fn historical_failure_survives_new_admission_before_notice_and_two_reconnects() {
+    let _delivery = crate::test_support::PERIODIC_WEBHOOK_TEST_LOCK.lock().await;
     let (lc, session, generation) = setup(true);
     let (url, mut receiver) = WebhookReceiver::default().spawn().await;
     crate::tenant::set_notify(
@@ -527,3 +529,6 @@ async fn next_admission_and_snapshot_preserve_predecessor_without_current_sample
         lc.connection_evidence(&tid(), session)
     );
 }
+
+#[path = "evidence_reports.rs"]
+mod reports;

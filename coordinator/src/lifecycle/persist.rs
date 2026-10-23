@@ -23,7 +23,7 @@ use super::*;
 pub(crate) struct LifecycleFacts {
     evidence: Vec<(SlotId, evidence::StoredEvidence)>,
     periodic_evidence: Vec<(SlotId, periodic::StoredPeriodic)>,
-    evidence_history: Vec<(SlotId, periodic::StoredHistory)>,
+    evidence_history: Vec<(SlotId, evidence_history::StoredHistory)>,
     /// Whether a client was ever observed for the session.
     started: bool,
     /// The relay-reported session start instant (unix epoch ms).

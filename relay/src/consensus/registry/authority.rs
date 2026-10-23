@@ -165,6 +165,9 @@ impl DecisionMakers {
                     let maker = existing.get_mut();
                     maker.set_observers(observers);
                     maker.set_expected_slots(expected_slots);
+                    // Settle outstanding checks while their original ownership
+                    // and admission still exist, before either set is replaced.
+                    maker.settle_revoked_evidence(&evidence, &homed_slots);
                     maker.rehome_homed_slots(homed_slots);
                     maker.reconcile_finalized_drops(finalized_drops);
                     maker.reconcile_rollback(rollback);
@@ -199,6 +202,7 @@ impl DecisionMakers {
                     maker.latch_rollback(rollback);
                     maker.latch_lobby_policy(lobby_policy);
                     maker.evidence_config = evidence;
+                    maker.evidence_outbox = Some(self.evidence_outbox.clone());
                     if lobby_settled {
                         maker.settle_lobby();
                     }

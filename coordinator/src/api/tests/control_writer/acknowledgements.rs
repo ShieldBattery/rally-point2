@@ -351,3 +351,96 @@ async fn a_failed_send_drops_connection_proofs_with_the_writer_sources() {
     ack(&state, generation, 1);
     assert!(!delivery.is_ready(RelayId(1), generation, &descriptor));
 }
+
+#[tokio::test]
+async fn evidence_receipts_yield_to_descriptors_grants_and_load_state_and_closed_queue_is_idle() {
+    let Fixture {
+        state,
+        mut sources,
+        drain: _drain,
+        _grants: grants,
+        ..
+    } = fixture(true);
+    let (receipts, receipt_rx) = tokio::sync::mpsc::channel(64);
+    sources = sources.with_evidence_receipts(receipt_rx);
+    let mut sink = WireSink::default();
+    let wire = sink.clone();
+    let mut writer = Box::pin(run_writer(
+        &mut sink,
+        &mut sources,
+        RelayId(1),
+        Duration::from_secs(5),
+        ProtocolVersion::CURRENT,
+    ));
+    assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    wire.take();
+
+    let receipt = rally_point_proto::control::EvidenceReceipt {
+        tenant: tenant_id(),
+        session: SessionId(1),
+        slot: SlotId(0),
+        assignment_revision: 2,
+        connection_id: [9; 32],
+        sample_id: 3,
+        sequence: 5,
+    };
+    receipts.send(receipt.clone()).await.unwrap();
+    state
+        .setup
+        .descriptors()
+        .record(RelayId(1), diff_descriptor(1, &[3]));
+    grants
+        .send(CoordinatorToRelay::FlightUploadRefused { request: 11 })
+        .unwrap();
+    let pending = state
+        .setup
+        .attest()
+        .request(RelayId(1), &tenant_id(), SessionId(1), false)
+        .unwrap();
+    assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    let frames = decoded(wire.take());
+    assert!(
+        matches!(frames.as_slice(), [
+        CoordinatorToRelay::DescriptorDelta { .. },
+        CoordinatorToRelay::FlightUploadRefused { request: 11 },
+        CoordinatorToRelay::LoadStateRequest { .. },
+        CoordinatorToRelay::EvidenceReceipt(actual),
+    ] if actual == &receipt),
+        "unexpected delivery order: {frames:?}"
+    );
+    drop(pending);
+
+    drop(receipts);
+    struct WakeCounter(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let wakes = Arc::new(WakeCounter(std::sync::atomic::AtomicUsize::new(0)));
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut context = Context::from_waker(&waker);
+    assert!(std::future::Future::poll(writer.as_mut(), &mut context).is_pending());
+    assert!(std::future::Future::poll(writer.as_mut(), &mut context).is_pending());
+    assert_eq!(
+        wakes.0.load(Ordering::Relaxed),
+        0,
+        "a closed receipt queue must not repeatedly reschedule the writer"
+    );
+    assert!(
+        wire.take().is_empty(),
+        "closing only the receipt queue leaves the connection idle"
+    );
+    state
+        .setup
+        .descriptors()
+        .record(RelayId(1), diff_descriptor(1, &[4]));
+    assert!(futures_util::poll!(writer.as_mut()).is_pending());
+    assert!(matches!(
+        decoded(wire.take()).as_slice(),
+        [CoordinatorToRelay::DescriptorDelta { .. }]
+    ));
+}

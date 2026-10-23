@@ -38,6 +38,7 @@ mod placement;
 mod provisioning;
 mod rehome;
 mod rehome_close;
+mod retired_evidence;
 mod rollback;
 
 /// A fleet of two untagged, incapable relays (ids 1 and 2) and the tenant --

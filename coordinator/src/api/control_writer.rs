@@ -54,6 +54,9 @@ pub(super) struct WriterSources {
     /// The tenant verifying keys, led out first so a relay can verify a session's
     /// client tokens before that session's descriptor arrives.
     tenant_keys: Vec<TenantVerifyingKey>,
+    /// Bounded, connection-local receipts; observation delivery yields to fleet work.
+    evidence_receipts:
+        Option<tokio::sync::mpsc::Receiver<rally_point_proto::control::EvidenceReceipt>>,
     /// The region ping-beacon targets, led out after the keys; empty on a
     /// region-blind coordinator.
     beacon_targets: Vec<RegionBeaconTarget>,
@@ -78,6 +81,14 @@ impl Drop for DescriptorDeliveryConnection {
 }
 
 impl WriterSources {
+    pub(super) fn with_evidence_receipts(
+        mut self,
+        receipts: tokio::sync::mpsc::Receiver<rally_point_proto::control::EvidenceReceipt>,
+    ) -> Self {
+        self.evidence_receipts = Some(receipts);
+        self
+    }
+
     /// Only an opted-in, current connection receives acknowledgement requests.
     /// Replacing the connection invalidates every proof from its predecessor.
     pub(super) fn enable_acknowledgements(
@@ -133,6 +144,7 @@ impl WriterSources {
         Self {
             descriptors: setup.descriptors().subscribe(relay_id),
             delivery: None,
+            evidence_receipts: None,
             mesh_peers: registry::subscribe_mesh_peers(setup.registry()),
             reaps: setup.reaps().subscribe(relay_id),
             load_state: setup.attest().subscribe(relay_id),
@@ -150,9 +162,10 @@ impl WriterSources {
 /// the initial descriptor set, the initial mesh-peer set — strictly before any
 /// steady-state push, then serves a `biased` priority loop: the drain exchange
 /// first, then the latest-wins descriptor watch, the mesh-peer watch, the
-/// flight-upload grants, the reap receiver, and the load-state questions last. Every
-/// arm above the last is fleet machinery whose delay costs a relay correctness or a
-/// session its teardown; a load-state question is tenant-driven, arrives in bursts,
+/// flight-upload grants, the reap receiver, load-state questions, and evidence
+/// receipts last. The arms above load-state are fleet machinery whose delay costs
+/// a relay correctness or a session its teardown; a load-state question is
+/// tenant-driven, arrives in bursts,
 /// and is cheap for its caller to repeat, so it yields to all of them — and a
 /// question whose waiter has since gone is dropped rather than sent. Returns (ending
 /// the connection) when a send stalls or errors, the relay's id is retired (after a
@@ -190,6 +203,7 @@ pub(super) async fn run_writer<S>(
         grants: grants_rx,
         tenant_keys,
         beacon_targets,
+        evidence_receipts,
     } = sources;
     // Tenant keys first — a descriptor is meaningless to a relay that cannot yet
     // verify the session's client tokens.
@@ -381,7 +395,8 @@ pub(super) async fn run_writer<S>(
                 // channel (a reconnect took over) or the relay was retired, so this
                 // half ends too.
                 //
-                // Ranked LAST deliberately. Every arm above it is the fleet's own
+                // Below fleet work and above best-effort evidence receipts. Each
+                // arm above it is the fleet's own
                 // machinery — a drain exchange, the descriptor set, the mesh-peer
                 // set, an upload grant, a reap directive — where a delayed frame
                 // costs a relay correctness or a session its teardown. A load-state
@@ -405,6 +420,26 @@ pub(super) async fn run_writer<S>(
                 if !writer_send(write_half, frame, relay_id, liveness_timeout, "load-state-request")
                     .await
                 {
+                    break LoopExit::SendFailed;
+                }
+            }
+            receipt = async {
+                match evidence_receipts {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let Some(receipt) = receipt else {
+                    *evidence_receipts = None;
+                    continue;
+                };
+                if !writer_send(
+                    write_half,
+                    control_frame(&CoordinatorToRelay::EvidenceReceipt(receipt)),
+                    relay_id,
+                    liveness_timeout,
+                    "evidence-receipt",
+                ).await {
                     break LoopExit::SendFailed;
                 }
             }

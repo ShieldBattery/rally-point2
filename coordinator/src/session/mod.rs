@@ -26,6 +26,7 @@
 
 mod create;
 mod descriptor;
+mod evidence_history;
 mod gate;
 mod persist;
 mod placement;
@@ -89,6 +90,10 @@ pub struct SessionRefs {
     pub required_evidence_slots: Vec<SlotId>,
     /// Per-slot assignment revisions, changed whenever a slot is rehomed.
     pub evidence_assignments: std::collections::BTreeMap<SlotId, u64>,
+    /// Process identity captured when each current home assignment was committed.
+    pub(crate) evidence_home_boots: std::collections::BTreeMap<SlotId, u64>,
+    /// Expiring authority to report history, never to serve a slot.
+    pub(crate) retired_evidence_assignments: Vec<evidence_history::RetiredAssignment>,
     /// The tenant's own id for the session (ShieldBattery's `gameId`).
     pub external_id: Option<String>,
     /// Whether this session runs home-side drop finalization

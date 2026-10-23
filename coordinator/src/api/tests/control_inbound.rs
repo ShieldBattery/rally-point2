@@ -151,3 +151,166 @@ fn a_drain_mark_from_a_superseded_connection_cannot_mark_its_live_successor() {
         "the relay its own connection drained is excluded from new assignments",
     );
 }
+
+fn evidence_report_fixture() -> (
+    CoordinatorState,
+    u64,
+    rally_point_proto::control::EvidenceReport,
+) {
+    use rally_point_proto::control::{
+        CAPABILITY_PERIODIC_EVIDENCE_V1, EvidenceHistory, EvidenceKey, EvidenceObservation,
+        EvidenceReport, EvidenceVerdict,
+    };
+    let state = state_with_relay_and_tenant();
+    let generation = state
+        .lifecycle
+        .enroll_relay_epoch(RelayId(1), || {
+            Ok::<_, ()>(registry::enroll(
+                state.setup.registry(),
+                hello(1, 14901)
+                    .with_boot_id(7)
+                    .with_capabilities(vec![CAPABILITY_PERIODIC_EVIDENCE_V1.into()]),
+            ))
+        })
+        .unwrap();
+    registry::note_boot_id(state.setup.registry(), RelayId(1), Some(7));
+    let mut req = request(vec![player(0)]);
+    req.periodic_evidence = true;
+    req.evidence_keys = vec![EvidenceKey {
+        key_id: 7,
+        public_key: ClientPublicKey([4; 32]),
+    }];
+    let session = session::create_session(&state.setup, req, ExpiresAt(u64::MAX))
+        .unwrap()
+        .response
+        .session;
+    state.lifecycle.register_session(
+        tenant_id(),
+        session,
+        vec![RelayId(1)],
+        std::collections::HashSet::from([SlotId(0)]),
+        Default::default(),
+    );
+    let admission = EvidenceObservation {
+        sample_id: 0,
+        connection_id: [9; 32],
+        sequence: 1,
+        assignment_revision: 1,
+        verdict: EvidenceVerdict::Valid,
+        key_id: Some(7),
+        body: vec![1, 2, 3],
+    };
+    let report = EvidenceReport {
+        tenant: tenant_id(),
+        session,
+        slot: SlotId(0),
+        history: EvidenceHistory {
+            sample: EvidenceObservation {
+                sample_id: 3,
+                sequence: 5,
+                verdict: EvidenceVerdict::Missing,
+                key_id: None,
+                body: vec![],
+                ..admission.clone()
+            },
+            admission,
+            observed_at_ms: 42,
+        },
+    };
+    (state, generation, report)
+}
+
+fn report_action(
+    state: &CoordinatorState,
+    generation: u64,
+    report: rally_point_proto::control::EvidenceReport,
+) -> InboundAction {
+    let message = Message::Text(
+        serde_json::to_string(&RelayToCoordinator::EvidenceReport(Box::new(report)))
+            .unwrap()
+            .into(),
+    );
+    let regions = RegionsConfig::default();
+    let rtts = pair_rtts::PairRttStore::new();
+    note_inbound_frame(
+        &state.setup,
+        &state.lifecycle,
+        RelayId(1),
+        generation,
+        &message,
+        &idle_rtt_ingest(&regions, &rtts),
+    )
+}
+
+#[tokio::test]
+async fn decoded_evidence_report_returns_the_exact_receipt_again_after_receipt_loss() {
+    let (state, generation, report) = evidence_report_fixture();
+    let receipt = report.receipt();
+    assert_eq!(
+        report_action(&state, generation, report.clone()),
+        InboundAction::EvidenceReceipt(receipt.clone())
+    );
+    assert_eq!(
+        report_action(&state, generation, report.clone()),
+        InboundAction::EvidenceReceipt(receipt)
+    );
+    let snapshot = state
+        .lifecycle
+        .load_state(&report.tenant, report.session)
+        .unwrap();
+    assert!(
+        snapshot.connected_slots.is_empty(),
+        "historical delivery cannot activate a slot"
+    );
+    assert_eq!(
+        snapshot.evidence.len(),
+        1,
+        "retry delivery does not duplicate history"
+    );
+    assert_eq!(snapshot.evidence[0].observation, report.history.sample);
+}
+
+#[tokio::test]
+async fn stale_generation_and_mismatched_pairs_draw_no_evidence_receipt() {
+    let (state, stale_generation, report) = evidence_report_fixture();
+    let generation = state
+        .lifecycle
+        .enroll_relay_epoch(RelayId(1), || {
+            Ok::<_, ()>(registry::enroll(
+                state.setup.registry(),
+                hello(1, 14901).with_boot_id(7).with_capabilities(vec![
+                    rally_point_proto::control::CAPABILITY_PERIODIC_EVIDENCE_V1.into(),
+                ]),
+            ))
+        })
+        .unwrap();
+    assert_ne!(generation, stale_generation);
+    assert_eq!(
+        report_action(&state, stale_generation, report.clone()),
+        InboundAction::None
+    );
+    let mut wrong_connection = report.clone();
+    wrong_connection.history.sample.connection_id = [8; 32];
+    let mut wrong_revision = report.clone();
+    wrong_revision.history.sample.assignment_revision += 1;
+    let mut wrong_sequence = report.clone();
+    wrong_sequence.history.sample.sequence = report.history.admission.sequence;
+    for invalid in [wrong_connection, wrong_revision, wrong_sequence] {
+        assert_eq!(
+            report_action(&state, generation, invalid),
+            InboundAction::None
+        );
+    }
+    assert!(
+        state
+            .lifecycle
+            .load_state(&report.tenant, report.session)
+            .unwrap()
+            .evidence
+            .is_empty()
+    );
+    assert_eq!(
+        report_action(&state, generation, report.clone()),
+        InboundAction::EvidenceReceipt(report.receipt())
+    );
+}

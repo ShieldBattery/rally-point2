@@ -11,3 +11,8 @@ pub(crate) mod webhook;
 pub(crate) use fixtures::*;
 #[allow(unused_imports)]
 pub(crate) use webhook::*;
+
+// Production periodic dispatch has a process-wide budget. Tests that exercise
+// that budget through the lifecycle must not consume each other's reservations.
+pub(crate) static PERIODIC_WEBHOOK_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());

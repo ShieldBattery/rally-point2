@@ -221,6 +221,7 @@ pub(super) fn apply_message(
     stats: &ControlConnStats,
 ) {
     match message {
+        CoordinatorToRelay::EvidenceReceipt(receipt) => control.acknowledge_evidence(&receipt),
         CoordinatorToRelay::Descriptors {
             ack_id: _,
             descriptors,

@@ -229,6 +229,8 @@ pub struct DecisionMaker {
     pub(in crate::consensus) results: HashMap<SlotId, ResultEcho>,
     /// Immutable descriptor allow-list for client lobby commands before a slot starts.
     pub(in crate::consensus) lobby_policy: Option<LobbyPolicy>,
+    pub(in crate::consensus) evidence_outbox:
+        Option<std::sync::Arc<super::evidence_outbox::EvidenceOutbox>>,
     pub(in crate::consensus) evidence_history:
         HashMap<SlotId, rally_point_proto::control::EvidenceHistory>,
     pub(in crate::consensus) evidence_pending:
@@ -533,6 +535,7 @@ impl DecisionMaker {
             observers,
             results: HashMap::new(),
             lobby_policy: None,
+            evidence_outbox: None,
             evidence_history: HashMap::new(),
             evidence_pending: HashMap::new(),
             periodic_evidence: HashMap::new(),

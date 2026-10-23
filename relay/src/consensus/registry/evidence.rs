@@ -240,3 +240,31 @@ impl DecisionMakers {
         self.notify_evidence_changed();
     }
 }
+
+impl DecisionMakers {
+    /// Selects a fair bounded retry batch without consulting live session makers.
+    pub(crate) fn evidence_reports(
+        &self,
+        now: Instant,
+        limit: usize,
+    ) -> Vec<rally_point_proto::control::EvidenceReport> {
+        self.evidence_outbox.reports(now, limit)
+    }
+
+    /// Rechecks a queued selection after higher-priority control work ran.
+    pub(crate) fn evidence_report_pending(
+        &self,
+        receipt: &rally_point_proto::control::EvidenceReceipt,
+        now: Instant,
+    ) -> bool {
+        self.evidence_outbox.contains(receipt, now)
+    }
+
+    /// Removes only the exact report named by a coordinator memory receipt.
+    pub(crate) fn acknowledge_evidence(
+        &self,
+        receipt: &rally_point_proto::control::EvidenceReceipt,
+    ) {
+        self.evidence_outbox.acknowledge(receipt);
+    }
+}

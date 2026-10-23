@@ -10,7 +10,7 @@ use rally_point_proto::ids::{RelayId, SessionId};
 use rally_point_proto::time::unix_secs_fail_closed;
 use rally_point_proto::token::ExpiresAt;
 
-use crate::registry::SessionSetupError;
+use crate::registry::{self, SessionSetupError};
 use crate::tenant;
 
 use super::descriptor::{descriptor_for, relay_region_labels};
@@ -369,6 +369,13 @@ fn create_body(
             .map(|p| p.slot)
             .collect(),
         evidence_assignments: request.players.iter().map(|p| (p.slot, 1)).collect(),
+        evidence_home_boots: homes
+            .iter()
+            .filter_map(|(&slot, &relay)| {
+                registry::boot_id(&setup.registry, relay).map(|boot| (slot, boot))
+            })
+            .collect(),
+        retired_evidence_assignments: Vec::new(),
         external_id: request.external_id.clone(),
         slots: request
             .players

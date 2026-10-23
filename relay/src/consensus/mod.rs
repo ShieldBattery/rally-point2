@@ -231,6 +231,7 @@ pub mod phase;
 mod buffer_law_sim;
 
 mod clock;
+mod evidence_outbox;
 mod law;
 mod lead;
 mod maker;

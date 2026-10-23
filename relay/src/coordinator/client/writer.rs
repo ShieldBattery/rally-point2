@@ -128,8 +128,10 @@ pub(super) enum FlightStage {
 /// its own id and cycle stage, several can be awaiting grants or uploading at once
 /// without interfering.
 ///
-/// The caller-owned `outbound` state (`pending`, `pending_flights`) is this half's
-/// only durable state across a reconnect. A notice is parked *before* its send await
+/// The caller-owned `outbound` state (`pending`, `pending_flights`) retains notice
+/// and flight work across reconnects. Historical evidence lives in a separate,
+/// relay-wide bounded outbox and clears only on an exact memory receipt or expiry.
+/// A notice is parked *before* its send await
 /// and cleared only *after* it returns; a shipment is pushed onto `pending_flights`
 /// *before* its request send and removed only on ack (stored) or drop (lost) — so if
 /// this future is dropped (the read half ended the connection) or a send errors
@@ -175,6 +177,9 @@ pub(super) async fn write_control_frames(
     let mut periodic_refresh = true;
     let mut periodic_cursor = 0;
     let mut periodic_pending = VecDeque::new();
+    let mut report_pending = VecDeque::new();
+    let mut report_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut heartbeat_tick = tokio::time::interval(heartbeat.interval);
     heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat_tick.tick().await;
@@ -496,6 +501,28 @@ pub(super) async fn write_control_frames(
                     Some(ask) => start_load_state_answer(&heartbeat.sources, ask, &answers_tx),
                     None => load_state_open = false,
                 }
+            }
+
+            // Retry selection is relay-wide across control reconnects. Receipts
+            // alone clear records; a successful socket write is not acceptance.
+            _ = report_tick.tick(), if report_pending.is_empty() => {
+                report_pending.extend(heartbeat.sources.decision_makers.evidence_reports(
+                    std::time::Instant::now(), 16,
+                ));
+            }
+
+            // One report per iteration lets lifecycle and load-state work above
+            // this arm preempt every frame, even when the outbox is full.
+            _ = std::future::ready(()), if !report_pending.is_empty() => {
+                let report = report_pending.pop_front().expect("guarded by nonempty");
+                if !heartbeat.sources.decision_makers.evidence_report_pending(
+                    &report.receipt(), std::time::Instant::now(),
+                ) {
+                    continue;
+                }
+                let frame = serde_json::to_string(&RelayToCoordinator::EvidenceReport(Box::new(report)))
+                    .expect("a retained evidence report serializes");
+                sink.send(Message::Text(frame.into())).await?;
             }
 
             // A watch coalesces collector changes instead of queueing sample

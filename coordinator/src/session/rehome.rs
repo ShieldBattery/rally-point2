@@ -430,6 +430,18 @@ pub(super) fn rehome_inner(
     // of what this leaves in `homes`/`relay_certs`. Must still run before the
     // descriptor-rebuild loop below, which is what this position guarantees.
     if let Some(refs) = setup.session_refs.lock().get_mut(&key) {
+        refs.retire_evidence_assignments(
+            dead_relay,
+            rally_point_proto::time::unix_secs_fail_closed(),
+        );
+        let replacement_boot = registry::boot_id(&setup.registry, r_new);
+        for &(slot, _) in &assignment_revisions {
+            if let Some(boot) = replacement_boot {
+                refs.evidence_home_boots.insert(slot, boot);
+            } else {
+                refs.evidence_home_boots.remove(&slot);
+            }
+        }
         for home_relay in refs.homes.values_mut() {
             if *home_relay == dead_relay {
                 *home_relay = r_new;
