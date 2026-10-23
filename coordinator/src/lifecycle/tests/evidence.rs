@@ -38,6 +38,8 @@ fn setup_evidence() -> (Lifecycle, SessionId, u64) {
 
 fn observation(sequence: u64, assignment_revision: u64) -> EvidenceObservation {
     EvidenceObservation {
+        interruption: None,
+
         sample_id: 0,
         connection_id: [sequence as u8; 32],
         sequence,
@@ -65,6 +67,9 @@ fn notice(session: SessionId, observation: EvidenceObservation) -> SessionNotice
 fn snapshot(session: SessionId, observation: EvidenceObservation) -> SessionPresence {
     SessionPresence {
         evidence: vec![SlotEvidence {
+            historical: false,
+            failure_count: None,
+
             slot: SlotId(0),
             observation,
         }],
@@ -246,6 +251,9 @@ async fn duplicate_slot_entries_do_not_change_the_first_observation() {
     let (lc, session, generation) = setup_evidence();
     let mut values = snapshot(session, observation(1, 1));
     values.evidence.push(SlotEvidence {
+        historical: false,
+        failure_count: None,
+
         slot: SlotId(0),
         observation: observation(99, 1),
     });
@@ -380,6 +388,9 @@ async fn unverified_bodies_never_reach_retained_state_or_webhooks() {
 async fn cached_evidence_is_tenant_scoped_and_removed_on_close() {
     let (lc, session, generation) = setup_evidence();
     let expected = vec![SlotEvidence {
+        historical: false,
+        failure_count: None,
+
         slot: SlotId(0),
         observation: observation(1, 1),
     }];

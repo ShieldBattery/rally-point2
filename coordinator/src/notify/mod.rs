@@ -79,7 +79,7 @@ mod periodic;
 pub(crate) use dispatch::dispatch;
 pub(crate) use handlers::{
     handle_departure, handle_desync, handle_lobby_violation, handle_result, handle_session_started,
-    handle_slot_connected, handle_slot_evidence, handle_slot_started,
+    handle_slot_connected, handle_slot_evidence_summary, handle_slot_started,
 };
 pub(crate) use payloads::session_closed_dispatch;
 
@@ -400,3 +400,6 @@ fn resolve_notice_prefix(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use handlers::handle_slot_evidence;

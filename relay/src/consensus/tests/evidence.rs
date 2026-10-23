@@ -31,6 +31,7 @@ fn stale_assignment_cannot_activate_or_replace_retained_evidence() {
     registry.require_descriptors();
     install(&registry, &key, config(1));
     let observation = EvidenceObservation {
+        interruption: None,
         sample_id: 0,
         connection_id: [1; 32],
         sequence: 1,
@@ -51,6 +52,7 @@ fn stale_assignment_cannot_activate_or_replace_retained_evidence() {
     assert_eq!(registry.retained_load_state(&key).evidence, first);
     assert!(rx.try_recv().is_err());
     let next = EvidenceObservation {
+        interruption: None,
         connection_id: [2; 32],
         sequence: 2,
         assignment_revision: 2,
@@ -93,6 +95,7 @@ fn pending_obligations_and_failure_history_are_bounded_even_with_an_oversized_de
     for slot in 0..18 {
         assert!(registry.activate_connection_epoch(&key, SlotId(slot), 1));
         let admission = EvidenceObservation {
+            interruption: None,
             sample_id: 0,
             sequence: next_evidence_sequence().unwrap(),
             connection_id: [slot; 32],
@@ -103,6 +106,7 @@ fn pending_obligations_and_failure_history_are_bounded_even_with_an_oversized_de
         };
         assert!(registry.note_slot_connected(&key, SlotId(slot), false, Some(admission.clone())));
         let sample = EvidenceObservation {
+            interruption: None,
             sample_id: 1,
             ..admission
         };
@@ -116,7 +120,13 @@ fn pending_obligations_and_failure_history_are_bounded_even_with_an_oversized_de
         }
     }
     for slot in 1..17 {
-        registry.abandon_periodic_evidence(&key, SlotId(slot), 1, 1);
+        registry.abandon_periodic_evidence(
+            &key,
+            SlotId(slot),
+            1,
+            1,
+            rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+        );
     }
     let state = registry.retained_load_state(&key);
     assert_eq!(state.evidence_history.len(), 16);
@@ -162,6 +172,7 @@ fn pending_outbox_fixture() -> (DecisionMakers, SessionKey, EvidenceObservation)
     );
     assert!(registry.activate_connection_epoch(&key, SlotId(0), 1));
     let admission = EvidenceObservation {
+        interruption: None,
         sample_id: 0,
         sequence: next_evidence_sequence().unwrap(),
         connection_id: [5; 32],
@@ -172,6 +183,7 @@ fn pending_outbox_fixture() -> (DecisionMakers, SessionKey, EvidenceObservation)
     };
     assert!(registry.note_slot_connected(&key, SlotId(0), false, Some(admission.clone())));
     let pending = EvidenceObservation {
+        interruption: None,
         sample_id: 1,
         ..admission.clone()
     };
@@ -180,8 +192,8 @@ fn pending_outbox_fixture() -> (DecisionMakers, SessionKey, EvidenceObservation)
 }
 
 #[test]
-fn revocation_captures_pending_sample_before_homed_set_and_revision_change() {
-    let (registry, key, admission) = pending_outbox_fixture();
+fn revocation_cancels_pending_sample_before_homed_set_and_revision_change() {
+    let (registry, key, _) = pending_outbox_fixture();
     let mut changed = registry.evidence_config(&key).unwrap();
     changed.assignments.remove(&SlotId(0));
     changed.assignments.insert(SlotId(1), 2);
@@ -199,16 +211,11 @@ fn revocation_captures_pending_sample_before_homed_set_and_revision_change() {
             .evidence_history
             .is_empty()
     );
-    let reports = registry.evidence_reports(Instant::now(), 16);
-    assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].history.admission, admission);
-    assert_eq!(reports[0].history.sample.verdict, EvidenceVerdict::Missing);
-    assert_eq!(reports[0].history.sample.assignment_revision, 1);
-    assert!(reports[0].history.sample.sequence > admission.sequence);
+    assert!(registry.evidence_reports(Instant::now(), 16).is_empty());
 }
 
 #[test]
-fn removing_maker_retains_completed_and_pending_reports() {
+fn removing_maker_retains_completed_reports_and_cancels_pending_checks() {
     for completed in [false, true] {
         let (registry, key, admission) = pending_outbox_fixture();
         if completed {
@@ -217,6 +224,7 @@ fn removing_maker_retains_completed_and_pending_reports() {
                 SlotId(0),
                 1,
                 EvidenceObservation {
+                    interruption: None,
                     sample_id: 1,
                     verdict: EvidenceVerdict::Invalid,
                     ..admission.clone()
@@ -226,23 +234,24 @@ fn removing_maker_retains_completed_and_pending_reports() {
         registry.deregister_maker(&key);
         assert!(!registry.maker_exists(&key));
         let reports = registry.evidence_reports(Instant::now(), 16);
-        assert_eq!(reports.len(), 1);
-        assert_eq!(reports[0].history.admission, admission);
-        assert_eq!(
-            reports[0].history.sample.verdict,
-            if completed {
-                EvidenceVerdict::Invalid
-            } else {
-                EvidenceVerdict::Missing
-            }
-        );
+        assert_eq!(reports.len(), usize::from(completed));
+        if completed {
+            assert_eq!(reports[0].history.admission, admission);
+            assert_eq!(reports[0].history.sample.verdict, EvidenceVerdict::Invalid);
+        }
     }
 }
 
 #[test]
 fn acknowledged_history_is_not_reenqueued_by_snapshots_reconnect_or_revocation() {
     let (registry, key, admission) = pending_outbox_fixture();
-    registry.abandon_periodic_evidence(&key, SlotId(0), 1, 1);
+    registry.abandon_periodic_evidence(
+        &key,
+        SlotId(0),
+        1,
+        1,
+        rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+    );
     let now = Instant::now();
     let report = registry.evidence_reports(now, 16).pop().unwrap();
     registry.acknowledge_evidence(&report.receipt());
@@ -253,6 +262,7 @@ fn acknowledged_history_is_not_reenqueued_by_snapshots_reconnect_or_revocation()
         SlotId(0),
         true,
         Some(EvidenceObservation {
+            interruption: None,
             connection_id: [9; 32],
             sequence: next_evidence_sequence().unwrap(),
             ..admission
@@ -267,9 +277,15 @@ fn acknowledged_history_is_not_reenqueued_by_snapshots_reconnect_or_revocation()
 }
 
 #[test]
-fn expired_history_is_not_reenqueued_by_later_failure_or_removal() {
+fn later_failure_reenqueues_cumulative_history_but_removal_does_not() {
     let (registry, key, admission) = pending_outbox_fixture();
-    registry.abandon_periodic_evidence(&key, SlotId(0), 1, 1);
+    registry.abandon_periodic_evidence(
+        &key,
+        SlotId(0),
+        1,
+        1,
+        rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+    );
     let future = Instant::now() + Duration::from_secs(601);
     assert!(registry.evidence_reports(future, 16).is_empty());
     assert!(registry.begin_periodic_evidence(
@@ -277,11 +293,23 @@ fn expired_history_is_not_reenqueued_by_later_failure_or_removal() {
         SlotId(0),
         1,
         EvidenceObservation {
+            interruption: None,
             sample_id: 2,
             ..admission
         }
     ));
-    registry.abandon_periodic_evidence(&key, SlotId(0), 1, 2);
+    registry.abandon_periodic_evidence(
+        &key,
+        SlotId(0),
+        1,
+        2,
+        rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+    );
+    let reports = registry.evidence_reports(Instant::now(), 16);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].history.failures, 2);
+    assert_eq!(reports[0].history.latest_sample().sample_id, 2);
+    registry.acknowledge_evidence(&reports[0].receipt());
     registry.deregister_maker(&key);
     assert!(registry.evidence_reports(future, 16).is_empty());
 }
@@ -289,7 +317,13 @@ fn expired_history_is_not_reenqueued_by_later_failure_or_removal() {
 #[test]
 fn a_new_assignment_can_report_its_own_first_failure_after_prior_receipt() {
     let (registry, key, mut admission) = pending_outbox_fixture();
-    registry.abandon_periodic_evidence(&key, SlotId(0), 1, 1);
+    registry.abandon_periodic_evidence(
+        &key,
+        SlotId(0),
+        1,
+        1,
+        rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+    );
     let first = registry.evidence_reports(Instant::now(), 16).pop().unwrap();
     registry.acknowledge_evidence(&first.receipt());
     let mut evidence = registry.evidence_config(&key).unwrap();
@@ -305,10 +339,18 @@ fn a_new_assignment_can_report_its_own_first_failure_after_prior_receipt() {
         SlotId(0),
         2,
         EvidenceObservation {
+            interruption: None,
             sample_id: 1,
             ..admission
         }
     ));
+    registry.abandon_periodic_evidence(
+        &key,
+        SlotId(0),
+        2,
+        1,
+        rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+    );
     registry.deregister_maker(&key);
     let next = registry.evidence_reports(Instant::now(), 16).pop().unwrap();
     assert_eq!(next.history.sample.assignment_revision, 2);

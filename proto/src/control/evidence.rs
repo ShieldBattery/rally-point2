@@ -25,6 +25,19 @@ pub enum EvidenceVerdict {
     Valid,
 }
 
+/// Why an outstanding periodic observation ended without evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceInterruption {
+    NoAnswer,
+    Timeout,
+    ConnectionClosed,
+    ConnectionReplaced,
+    SlotDeparted,
+    Revoked,
+    SessionRetired,
+}
+
 /// A relay's observation of one admission or periodic sample.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceObservation {
@@ -35,6 +48,8 @@ pub struct EvidenceObservation {
     pub sequence: u64,
     pub assignment_revision: u64,
     pub verdict: EvidenceVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interruption: Option<EvidenceInterruption>,
     pub key_id: Option<u32>,
     #[serde(with = "body_encoding")]
     pub body: Vec<u8>,
@@ -80,6 +95,10 @@ mod body_encoding {
 pub struct SlotEvidence {
     pub slot: SlotId,
     pub observation: EvidenceObservation,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub historical: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_count: Option<u32>,
 }
 
 /// A slot's coordinator-assigned home revision.
@@ -87,6 +106,17 @@ pub struct SlotEvidence {
 pub struct SlotEvidenceAssignment {
     pub slot: SlotId,
     pub revision: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn one() -> u32 {
+    1
+}
+fn is_one(value: &u32) -> bool {
+    *value == 1
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -138,13 +168,44 @@ pub(super) mod periodic_samples {
     }
 }
 
-/// One retained failed or interrupted sample, paired with its original admission.
-/// This never establishes the currently active connection.
+/// Cumulative failures for one relay process and assignment: immutable first
+/// failure, optional latest failure, and a saturating count. Each sample carries
+/// its own admission; none establishes the currently active connection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceHistory {
     pub admission: EvidenceObservation,
     pub sample: EvidenceObservation,
     pub observed_at_ms: u64,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<Box<EvidenceFailure>>,
+}
+
+/// A failure and the admission on the connection that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceFailure {
+    pub admission: EvidenceObservation,
+    pub sample: EvidenceObservation,
+    pub observed_at_ms: u64,
+}
+
+impl EvidenceHistory {
+    pub fn latest_sample(&self) -> &EvidenceObservation {
+        self.latest
+            .as_ref()
+            .map_or(&self.sample, |latest| &latest.sample)
+    }
+    pub fn latest_admission(&self) -> &EvidenceObservation {
+        self.latest
+            .as_ref()
+            .map_or(&self.admission, |latest| &latest.admission)
+    }
+    pub fn latest_observed_at_ms(&self) -> u64 {
+        self.latest
+            .as_ref()
+            .map_or(self.observed_at_ms, |latest| latest.observed_at_ms)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,8 +265,9 @@ pub struct EvidenceReport {
     pub history: EvidenceHistory,
 }
 
-/// Receipt for one exact report accepted into coordinator memory. This is not a
-/// durability promise across coordinator process loss.
+/// Terminal handling of one exact report snapshot. The disposition distinguishes
+/// memory acceptance from redundant or declined reports; it never promises
+/// durability across coordinator process loss.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct EvidenceReceipt {
     pub tenant: super::TenantId,
@@ -215,11 +277,35 @@ pub struct EvidenceReceipt {
     pub connection_id: [u8; 32],
     pub sample_id: u64,
     pub sequence: u64,
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub failures: u32,
+    #[serde(
+        default,
+        skip_serializing_if = "EvidenceReceiptDisposition::is_accepted"
+    )]
+    pub disposition: EvidenceReceiptDisposition,
+}
+
+/// Terminal handling of an authenticated report; none promises durable storage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceReceiptDisposition {
+    #[default]
+    Accepted,
+    Superseded,
+    SessionClosed,
+    Capacity,
+}
+
+impl EvidenceReceiptDisposition {
+    fn is_accepted(&self) -> bool {
+        *self == Self::Accepted
+    }
 }
 
 impl EvidenceReport {
     pub fn receipt(&self) -> EvidenceReceipt {
-        let sample = &self.history.sample;
+        let sample = self.history.latest_sample();
         EvidenceReceipt {
             tenant: self.tenant.clone(),
             session: self.session,
@@ -228,6 +314,8 @@ impl EvidenceReport {
             connection_id: sample.connection_id,
             sample_id: sample.sample_id,
             sequence: sample.sequence,
+            failures: self.history.failures,
+            disposition: EvidenceReceiptDisposition::Accepted,
         }
     }
 }

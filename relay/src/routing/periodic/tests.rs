@@ -33,6 +33,7 @@ fn admit(context: &Context, id: [u8; 32], epoch: u64) {
         context.slot,
         false,
         Some(EvidenceObservation {
+            interruption: None,
             sample_id: 0,
             connection_id: id,
             assignment_revision: context.revision,
@@ -234,9 +235,10 @@ async fn bounded_exchange_accepts_empty_and_rejects_bad_ids_lengths_and_stalls()
         };
         let (result, ()) = tokio::join!(server, client_task);
         match mode {
-            0 => assert_eq!(result.unwrap(), Some(None)),
+            0 => assert_eq!(result.unwrap(), Ok(None)),
             4 => assert!(result.is_err()),
-            _ => assert!(result.unwrap().is_none()),
+            3 => assert_eq!(result.unwrap(), Err(EvidenceInterruption::ConnectionClosed)),
+            _ => assert_eq!(result.unwrap(), Err(EvidenceInterruption::NoAnswer)),
         }
     }
 }
@@ -319,6 +321,12 @@ async fn worker_waits_for_game_start_and_keeps_empty_responses_off_gameplay_life
     let second = handshake::decode_periodic_challenge(&frame).unwrap();
     assert_eq!(second.challenge_id, 2);
     assert_ne!(first.nonce, second.nonce);
+    assert_eq!(
+        makers.retained_load_state(&key).periodic_evidence[0]
+            .observation
+            .interruption,
+        Some(EvidenceInterruption::NoAnswer)
+    );
     let state = makers.retained_load_state(&key);
     assert_eq!(state.evidence[0].observation.sample_id, 0);
     assert_eq!(
@@ -366,6 +374,12 @@ async fn stalled_worker_stops_only_evidence_and_policy_off_sends_nothing() {
         );
         let state = makers.retained_load_state(&key);
         assert_eq!(state.periodic_evidence.len(), usize::from(policy));
+        if policy {
+            assert_eq!(
+                state.periodic_evidence[0].observation.interruption,
+                Some(EvidenceInterruption::Timeout)
+            );
+        }
     }
 }
 
@@ -376,6 +390,7 @@ fn record(context: &Context, sample: u64, checked: crate::auth::CheckedEvidence)
         context.slot,
         context.epoch,
         EvidenceObservation {
+            interruption: None,
             sample_id: sample,
             sequence: 0,
             connection_id: context.connection_id,
@@ -387,7 +402,7 @@ fn record(context: &Context, sample: u64, checked: crate::auth::CheckedEvidence)
     ) {
         return false;
     }
-    context.record(sample, checked)
+    context.record(sample, checked, None)
 }
 
 #[test]
@@ -422,6 +437,7 @@ fn optional_missing_admission_is_ineligible_but_required_missing_is_eligible() {
         );
         assert!(makers.activate_connection_epoch(&other_key, context.slot, context.epoch));
         let observation = EvidenceObservation {
+            interruption: None,
             sample_id: 0,
             sequence: crate::consensus::next_evidence_sequence().unwrap(),
             connection_id: context.connection_id,
@@ -456,6 +472,7 @@ fn begin(context: &Context, sample: u64) -> bool {
             context.slot,
             context.epoch,
             EvidenceObservation {
+                interruption: None,
                 sample_id: sample,
                 sequence: 0,
                 connection_id: context.connection_id,
@@ -485,6 +502,10 @@ fn unanswered_challenge_survives_two_replacements_before_task_drop() {
     let history = &state.evidence_history[0].history;
     assert_eq!(history.admission, admission);
     assert_eq!(history.sample.verdict, EvidenceVerdict::Missing);
+    assert_eq!(
+        history.sample.interruption,
+        Some(EvidenceInterruption::ConnectionReplaced)
+    );
     assert!(history.sample.body.is_empty());
     assert_eq!(history.sample.key_id, None);
     assert!(history.sample.sequence < state.evidence[0].observation.sequence);
@@ -495,16 +516,31 @@ fn unanswered_challenge_survives_two_replacements_before_task_drop() {
         assert_eq!(notice.predecessor.as_deref(), Some(history));
     }
     // Old callback completion and old task destruction cannot mutate the history.
-    assert!(!context.record(1, checked()));
-    makers.abandon_periodic_evidence(&context.key, context.slot, 1, 1);
+    assert!(!context.record(1, checked(), None));
+    makers.abandon_periodic_evidence(
+        &context.key,
+        context.slot,
+        1,
+        1,
+        rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+    );
     assert_eq!(makers.retained_load_state(&context.key), state);
     context.epoch = 3;
     context.connection_id = [3; 32];
     assert!(begin(&context, 1));
-    makers.abandon_periodic_evidence(&context.key, context.slot, 3, 1);
+    makers.abandon_periodic_evidence(
+        &context.key,
+        context.slot,
+        3,
+        1,
+        rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+    );
+    let next = makers.retained_load_state(&context.key).evidence_history;
+    assert_eq!(next[0].history.failures, 2);
+    assert_eq!(next[0].history.sample, history.sample);
     assert_eq!(
-        makers.retained_load_state(&context.key).evidence_history,
-        state.evidence_history
+        next[0].history.latest_sample().interruption,
+        Some(EvidenceInterruption::ConnectionClosed)
     );
 }
 
@@ -563,5 +599,104 @@ fn cancelled_obligation_cannot_complete_after_policy_reenabled() {
     assert!(begin(&context, 1));
     install(&context, false, 1);
     install(&context, true, 1);
-    assert!(!context.record(1, checked()));
+    assert!(!context.record(1, checked(), None));
+}
+
+#[test]
+fn invalidation_and_retirement_gate_cancel_obligation_without_failure() {
+    for change in 0..4 {
+        let context = fixture();
+        assert!(begin(&context, 1));
+        let guard = Obligation {
+            context: &context,
+            sample: 1,
+        };
+        match change {
+            0 => install(&context, false, 1),
+            1 => install(&context, true, 2),
+            2 => context.mesh.session.gates.retire(&context.key),
+            _ => context
+                .mesh
+                .session
+                .decision_makers
+                .deregister_maker(&context.key),
+        }
+        drop(guard);
+        let state = context
+            .mesh
+            .session
+            .decision_makers
+            .retained_load_state(&context.key);
+        assert!(state.evidence_history.is_empty());
+        assert!(state.periodic_evidence.is_empty());
+        assert!(
+            context
+                .mesh
+                .session
+                .decision_makers
+                .evidence_reports(std::time::Instant::now(), 16)
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn explicit_departure_reason_wins_over_stream_cleanup() {
+    let context = fixture();
+    assert!(begin(&context, 1));
+    let guard = Obligation {
+        context: &context,
+        sample: 1,
+    };
+    context
+        .mesh
+        .session
+        .decision_makers
+        .interrupt_periodic_evidence(
+            &context.key,
+            context.slot,
+            context.epoch,
+            EvidenceInterruption::SlotDeparted,
+        );
+    drop(guard);
+    let state = context
+        .mesh
+        .session
+        .decision_makers
+        .retained_load_state(&context.key);
+    assert_eq!(state.evidence_history.len(), 1);
+    assert_eq!(
+        state.evidence_history[0].history.sample.interruption,
+        Some(EvidenceInterruption::SlotDeparted)
+    );
+}
+
+#[test]
+fn consecutive_silent_replacements_retain_first_latest_and_count() {
+    let mut context = fixture();
+    let makers = context.mesh.session.decision_makers.clone();
+    let mut changes = makers.periodic_evidence_changes();
+    let mut first = None;
+    for epoch in 1..=4 {
+        context.epoch = epoch;
+        context.connection_id = [epoch as u8; 32];
+        assert!(begin(&context, 1));
+        admit(&context, [(epoch + 1) as u8; 32], epoch + 1);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        let state = makers.retained_load_state(&context.key);
+        assert!(state.periodic_evidence.is_empty());
+        let history = &state.evidence_history[0].history;
+        assert_eq!(history.failures, epoch as u32);
+        let original = first.get_or_insert_with(|| history.sample.clone());
+        assert_eq!(&history.sample, original);
+        assert_eq!(history.latest_sample().connection_id, [epoch as u8; 32]);
+        assert_eq!(
+            history.latest_sample().interruption,
+            Some(EvidenceInterruption::ConnectionReplaced)
+        );
+    }
+    let reports = makers.evidence_reports(std::time::Instant::now(), 16);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].history.failures, 4);
 }

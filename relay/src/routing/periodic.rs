@@ -1,7 +1,7 @@
 //! A bounded observation exchange isolated from the gameplay link's serve loop.
 
 use super::*;
-use rally_point_proto::control::EvidenceObservation;
+use rally_point_proto::control::{EvidenceInterruption, EvidenceObservation};
 use rally_point_proto::handshake::{self, EvidenceCheck, EvidenceRequest, PeriodicEvidenceContext};
 use rally_point_transport::noq::{RecvStream, SendStream};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -74,7 +74,12 @@ impl Context {
         }
     }
 
-    fn record(&self, sample_id: u64, checked: crate::auth::CheckedEvidence) -> bool {
+    fn record(
+        &self,
+        sample_id: u64,
+        checked: crate::auth::CheckedEvidence,
+        interruption: Option<EvidenceInterruption>,
+    ) -> bool {
         self.mesh
             .session
             .gates
@@ -92,6 +97,7 @@ impl Context {
                     self.slot,
                     self.epoch,
                     EvidenceObservation {
+                        interruption,
                         sample_id,
                         connection_id: self.connection_id,
                         assignment_revision: self.revision,
@@ -190,6 +196,7 @@ async fn run_with(
             check: EvidenceCheck::FullImage,
         };
         let pending = EvidenceObservation {
+            interruption: None,
             sample_id,
             connection_id: context.connection_id,
             assignment_revision: context.revision,
@@ -227,15 +234,20 @@ async fn run_with(
         };
         let response = tokio::select! {
             _ = context.invalidated() => return,
-            response = tokio::time::timeout(EXCHANGE_TIMEOUT, exchange(&mut send, &mut recv, &challenge)) => response.ok().flatten(),
+            response = tokio::time::timeout(EXCHANGE_TIMEOUT, exchange(&mut send, &mut recv, &challenge)) => response.unwrap_or(Err(EvidenceInterruption::Timeout)),
         };
         let request = EvidenceRequest {
             periodic: Some(challenge),
             ..request.clone()
         };
-        let ended = response.is_none();
-        let checked = crate::auth::verify_evidence(&request, response.flatten(), &config);
-        if !context.record(sample_id, checked) {
+        let ended = response.is_err();
+        let (evidence, interruption) = match response {
+            Ok(Some(evidence)) => (Some(evidence), None),
+            Ok(None) => (None, Some(EvidenceInterruption::NoAnswer)),
+            Err(reason) => (None, Some(reason)),
+        };
+        let checked = crate::auth::verify_evidence(&request, evidence, &config);
+        if !context.record(sample_id, checked, interruption) {
             return;
         }
         // A partial or timed-out frame cannot be safely resumed on this stream.
@@ -253,20 +265,28 @@ async fn exchange(
     send: &mut (impl AsyncWrite + Unpin),
     recv: &mut (impl AsyncRead + Unpin),
     challenge: &PeriodicEvidenceContext,
-) -> Option<Option<handshake::Evidence>> {
-    send.write_all(&handshake::encode_periodic_challenge(challenge).ok()?)
+) -> Result<Option<handshake::Evidence>, EvidenceInterruption> {
+    let encoded = handshake::encode_periodic_challenge(challenge)
+        .map_err(|_| EvidenceInterruption::NoAnswer)?;
+    send.write_all(&encoded)
         .await
-        .ok()?;
+        .map_err(|_| EvidenceInterruption::ConnectionClosed)?;
     let mut header = [0; handshake::PERIODIC_RESPONSE_HEADER_LEN];
-    recv.read_exact(&mut header).await.ok()?;
-    let (id, len) = handshake::decode_periodic_response_header(&header).ok()?;
+    recv.read_exact(&mut header)
+        .await
+        .map_err(|_| EvidenceInterruption::ConnectionClosed)?;
+    let (id, len) = handshake::decode_periodic_response_header(&header)
+        .map_err(|_| EvidenceInterruption::NoAnswer)?;
     if id != challenge.challenge_id {
-        return None;
+        return Err(EvidenceInterruption::NoAnswer);
     }
     let mut payload = vec![0; len];
-    recv.read_exact(&mut payload).await.ok()?;
-    let (_, evidence) = handshake::decode_periodic_response(&header, &payload).ok()?;
-    Some(evidence)
+    recv.read_exact(&mut payload)
+        .await
+        .map_err(|_| EvidenceInterruption::ConnectionClosed)?;
+    let (_, evidence) = handshake::decode_periodic_response(&header, &payload)
+        .map_err(|_| EvidenceInterruption::NoAnswer)?;
+    Ok(evidence)
 }
 
 #[cfg(test)]
@@ -283,12 +303,19 @@ impl Drop for Obligation<'_> {
         self.context
             .mesh
             .session
-            .decision_makers
-            .abandon_periodic_evidence(
-                &self.context.key,
-                self.context.slot,
-                self.context.epoch,
-                self.sample,
-            );
+            .gates
+            .with_ingress(&self.context.key, || {
+                self.context
+                    .mesh
+                    .session
+                    .decision_makers
+                    .abandon_periodic_evidence(
+                        &self.context.key,
+                        self.context.slot,
+                        self.context.epoch,
+                        self.sample,
+                        EvidenceInterruption::ConnectionClosed,
+                    );
+            });
     }
 }

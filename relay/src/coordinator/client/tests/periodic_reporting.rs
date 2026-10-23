@@ -111,6 +111,7 @@ fn reporting_fixture() -> (HeartbeatSources, EvidenceObservation, EvidenceObserv
     registration.disarm();
     let _ = makers.activate_connection_epoch(&key(7), slot, 1);
     let admission = EvidenceObservation {
+        interruption: None,
         sample_id: 0,
         connection_id: [1; 32],
         sequence: crate::consensus::next_evidence_sequence().unwrap(),
@@ -126,6 +127,7 @@ fn reporting_fixture() -> (HeartbeatSources, EvidenceObservation, EvidenceObserv
         slot,
         1,
         EvidenceObservation {
+            interruption: None,
             sample_id: 1,
             body: vec![2],
             ..admission.clone()
@@ -177,6 +179,7 @@ async fn periodic_collection_wakes_writer_without_waiting_for_heartbeat() {
             SlotId(0),
             1,
             EvidenceObservation {
+                interruption: None,
                 sample_id: 2,
                 body: vec![3],
                 ..admission
@@ -230,8 +233,11 @@ fn stale_heartbeat_candidates_do_not_stop_later_reports() {
             }
             *remaining -= 1024;
             let admission = SlotEvidence {
+                historical: false,
+                failure_count: None,
                 slot,
                 observation: EvidenceObservation {
+                    interruption: None,
                     sample_id: 0,
                     connection_id: [1; 32],
                     sequence: 1,
@@ -246,7 +252,7 @@ fn stale_heartbeat_candidates_do_not_stop_later_reports() {
             Ok(Some(crate::consensus::PeriodicEvidencePair {
                 admission,
                 sample,
-                historical: false,
+                history: None,
                 observed_at_ms: 1,
             }))
         },
@@ -282,8 +288,11 @@ fn heartbeat_bounds_periodic_attachments_even_with_excess_candidates() {
             copied += 1;
             *remaining -= 1024;
             let admission = SlotEvidence {
+                historical: false,
+                failure_count: None,
                 slot,
                 observation: EvidenceObservation {
+                    interruption: None,
                     sample_id: 0,
                     connection_id: [1; 32],
                     sequence: 1,
@@ -298,7 +307,7 @@ fn heartbeat_bounds_periodic_attachments_even_with_excess_candidates() {
             Ok(Some(crate::consensus::PeriodicEvidencePair {
                 admission,
                 sample,
-                historical: false,
+                history: None,
                 observed_at_ms: 1,
             }))
         },
@@ -345,6 +354,7 @@ async fn periodic_notices_yield_to_load_state_asks_and_ready_answers() {
                     SlotId(0),
                     1,
                     EvidenceObservation {
+                        interruption: None,
                         sample_id: 2,
                         body: vec![3],
                         ..admission
@@ -420,6 +430,7 @@ fn older_sticky_failure_is_reported_after_a_newer_sample_was_sent() {
         slot,
         1,
         EvidenceObservation {
+            interruption: None,
             sample_id: 2,
             verdict: EvidenceVerdict::Missing,
             ..admission.clone()
@@ -431,6 +442,7 @@ fn older_sticky_failure_is_reported_after_a_newer_sample_was_sent() {
         slot,
         1,
         EvidenceObservation {
+            interruption: None,
             sample_id: 3,
             body: vec![3],
             ..admission.clone()
@@ -515,11 +527,28 @@ async fn historical_report_survives_revocation_and_control_reconnect_until_reade
         SlotId(0),
         1,
         EvidenceObservation {
+            interruption: None,
             sample_id: 2,
             ..admission.clone()
         }
     ));
-    // The removal path settles the outstanding sample before deleting its maker.
+    makers.abandon_periodic_evidence(
+        &key(7),
+        SlotId(0),
+        1,
+        2,
+        rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+    );
+    // Completed observations outlive removal; pending checks are canceled.
+    assert!(makers.begin_periodic_evidence(
+        &key(7),
+        SlotId(0),
+        1,
+        EvidenceObservation {
+            sample_id: 3,
+            ..admission.clone()
+        }
+    ));
     control.end_session(&key(7));
     assert!(!makers.maker_exists(&key(7)));
     let (notices, notice_rx) = mpsc::unbounded_channel();
@@ -555,7 +584,7 @@ async fn historical_report_survives_revocation_and_control_reconnect_until_reade
         );
         let RelayToCoordinator::EvidenceReport(first) = decode(ws.next().await.unwrap().unwrap())
         else {
-            panic!("revoked session still reports its outstanding sample");
+            panic!("revoked session still reports its completed sample");
         };
         assert_eq!(first.history.admission, admission);
         assert_eq!(first.history.sample.verdict, EvidenceVerdict::Missing);
@@ -627,10 +656,20 @@ async fn historical_report_batch_yields_to_load_state_asks_and_ready_answers() {
             slot,
             1,
             EvidenceObservation {
+                interruption: None,
                 sample_id: 2,
                 ..admission.clone()
             }
         ));
+    }
+    for slot in [SlotId(0), SlotId(1)] {
+        makers.abandon_periodic_evidence(
+            &key(7),
+            slot,
+            1,
+            2,
+            rally_point_proto::control::EvidenceInterruption::ConnectionClosed,
+        );
     }
     makers.deregister_maker(&key(7));
     let (asks, load_state_rx) = mpsc::channel(LOAD_STATE_ASK_CAPACITY);
@@ -708,5 +747,75 @@ async fn historical_report_batch_yields_to_load_state_asks_and_ready_answers() {
     tokio::select! {
         _ = writer => panic!("writer ended before the expected reports"),
         result = tokio::time::timeout(Duration::from_secs(5), verify) => result.unwrap(),
+    }
+}
+
+#[test]
+fn cumulative_heartbeat_updates_use_latest_identity_and_charge_both_failures() {
+    let (sources, admission, _) = reporting_fixture();
+    let makers = &sources.decision_makers;
+    let slot = SlotId(0);
+    let mut sent = std::collections::HashSet::new();
+    for sample_id in 2..=3 {
+        assert!(collect_sample(
+            makers,
+            &key(7),
+            slot,
+            1,
+            EvidenceObservation {
+                sample_id,
+                verdict: EvidenceVerdict::Invalid,
+                ..admission.clone()
+            }
+        ));
+        let roster = super::super::heartbeat::heartbeat_presence_with_evidence(
+            &sources,
+            &mut 0,
+            &[],
+            &mut sent,
+        );
+        let history = &roster[0].evidence_history[0].history;
+        assert_eq!(history.failures, (sample_id - 1) as u32);
+        assert_eq!(history.sample.sample_id, 2);
+        assert_eq!(history.latest_sample().sample_id, sample_id);
+        assert!(roster[0].periodic_evidence.is_empty());
+        sent.insert((key(7), slot, history.latest_sample().sequence));
+        let next = super::super::heartbeat::heartbeat_presence_with_evidence(
+            &sources,
+            &mut 0,
+            &[],
+            &mut sent,
+        );
+        assert!(next[0].evidence_history.is_empty());
+        if sample_id == 3 {
+            let mut first_only_budget = serde_json::to_vec(&(&history.admission, &history.sample))
+                .unwrap()
+                .len()
+                + 256;
+            let unchanged = first_only_budget;
+            assert!(
+                makers
+                    .periodic_evidence_pair(
+                        &key(7),
+                        slot,
+                        history.latest_sample().sequence,
+                        &mut first_only_budget
+                    )
+                    .is_err()
+            );
+            assert_eq!(first_only_budget, unchanged);
+            let mut full_budget = serde_json::to_vec(history).unwrap().len() + 256;
+            let pair = makers
+                .periodic_evidence_pair(
+                    &key(7),
+                    slot,
+                    history.latest_sample().sequence,
+                    &mut full_budget,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(pair.history.as_deref(), Some(history));
+            assert_eq!(full_budget, 0);
+        }
     }
 }

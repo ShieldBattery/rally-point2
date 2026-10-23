@@ -46,6 +46,34 @@ impl EvidenceOutbox {
         let bytes = encoded.len() + std::mem::size_of::<Entry>();
         let mut inner = self.inner.lock();
         inner.expire(now);
+        if let Some(index) = inner.entries.iter().position(|entry| {
+            entry.report.tenant == report.tenant
+                && entry.report.session == report.session
+                && entry.report.slot == report.slot
+                && entry.report.history.sample.assignment_revision
+                    == report.history.sample.assignment_revision
+        }) {
+            let previous = &inner.entries[index];
+            if report.history.failures < previous.report.history.failures
+                || report.history.latest_sample().sequence
+                    <= previous.report.history.latest_sample().sequence
+            {
+                return;
+            }
+            let previous_bytes = previous.bytes;
+            if bytes > MAX_BYTES.saturating_sub(inner.bytes - previous_bytes) {
+                inner.lost_capacity = inner.lost_capacity.saturating_add(1);
+                inner.log_loss(now);
+                return;
+            }
+            inner.bytes = inner.bytes - previous_bytes + bytes;
+            let entry = &mut inner.entries[index];
+            entry.report = report;
+            entry.bytes = bytes;
+            entry.expires = now + RETENTION;
+            // A newly settled failure refreshes retention, never the retry pace.
+            return;
+        }
         if inner.entries.len() >= MAX_REPORTS || bytes > MAX_BYTES.saturating_sub(inner.bytes) {
             inner.lost_capacity = inner.lost_capacity.saturating_add(1);
             inner.log_loss(now);
@@ -103,7 +131,7 @@ impl EvidenceOutbox {
 impl Entry {
     fn matches(&self, receipt: &EvidenceReceipt) -> bool {
         let report = &self.report;
-        let sample = &report.history.sample;
+        let sample = report.history.latest_sample();
         report.tenant == receipt.tenant
             && report.session == receipt.session
             && report.slot == receipt.slot
@@ -111,6 +139,7 @@ impl Entry {
             && sample.connection_id == receipt.connection_id
             && sample.sample_id == receipt.sample_id
             && sample.sequence == receipt.sequence
+            && report.history.failures == receipt.failures
     }
 }
 

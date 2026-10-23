@@ -50,6 +50,7 @@ fn with_activation(
         .with_ingress(key, || {
             let evidence = activation.evidence;
             let observation = rally_point_proto::control::EvidenceObservation {
+                interruption: None,
                 sample_id: 0,
                 connection_id: evidence.connection_id,
                 sequence: crate::consensus::next_evidence_sequence()

@@ -19,8 +19,9 @@ pub(super) struct StoredEvidence {
 }
 
 impl Lifecycle {
-    /// Admission then latest periodic observations matching each current assignment.
-    /// Each group is sorted by slot; earlier periodic samples are not retained.
+    /// Current admissions and latest periodic samples, followed by each slot's
+    /// retained first and latest failure with its cumulative count. Groups are
+    /// sorted by slot; matching current and historical samples appear only once.
     /// Unknown or retired sessions have no observations; this makes no completeness claim.
     pub fn connection_evidence(
         &self,
@@ -119,6 +120,7 @@ impl Lifecycle {
             return;
         };
         if observation.sample_id != 0
+            || observation.interruption.is_some()
             || observation.sequence == 0
             || observation.body.len() > rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
             || !setup.relay_serves_session(relay, &notice.tenant, notice.session)
@@ -151,7 +153,7 @@ impl Lifecycle {
             && has_assignment
         {
             if let Some(history) = &notice.predecessor
-                && history.sample.sequence < observation.sequence
+                && history.latest_sample().sequence < observation.sequence
                 && self.record_evidence_history(
                     (relay, boot_id),
                     &notice.tenant,
@@ -161,7 +163,7 @@ impl Lifecycle {
                     true,
                 )
             {
-                notify::handle_slot_evidence(
+                notify::handle_slot_evidence_summary(
                     setup,
                     rally_point_proto::control::SlotEvidenceNotice {
                         admission: None,
@@ -171,12 +173,14 @@ impl Lifecycle {
                         slot: notice.slot,
                         external_id: notice.external_id.clone(),
                         external_ref: notice.external_ref.clone(),
-                        observed_at_ms: history.observed_at_ms,
+                        observed_at_ms: history.latest_observed_at_ms(),
                         evidence: rally_point_proto::control::EvidenceObservation {
                             body: Vec::new(),
-                            ..history.sample.clone()
+                            ..history.latest_sample().clone()
                         },
                     },
+                    true,
+                    self.history_failure_count(&notice.tenant, notice.session, notice.slot),
                 );
             }
             if !self.record_connection_evidence(
@@ -278,6 +282,7 @@ impl Lifecycle {
     ) -> bool {
         let (relay, boot_id) = source;
         if observation.sample_id != 0
+            || observation.interruption.is_some()
             || observation.sequence == 0
             || observation.body.len() > rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
             || self
@@ -356,6 +361,9 @@ pub(super) fn current_evidence(
             assignments.get(slot) == Some(&(stored.relay, stored.observation.assignment_revision))
         })
         .map(|(&slot, stored)| rally_point_proto::control::SlotEvidence {
+            historical: false,
+            failure_count: None,
+
             slot,
             observation: stored.observation.clone(),
         })
@@ -364,27 +372,43 @@ pub(super) fn current_evidence(
                 .periodic_evidence
                 .iter()
                 .filter(|(slot, stored)| {
-                    !state
-                        .evidence_history
-                        .get(slot)
-                        .is_some_and(|history| history.history.sample == stored.observation)
-                        && assignments.get(slot)
-                            == Some(&(stored.relay, stored.observation.assignment_revision))
+                    !state.evidence_history.get(slot).is_some_and(|history| {
+                        history.history.sample == stored.observation
+                            || history.history.latest_sample() == &stored.observation
+                    }) && assignments.get(slot)
+                        == Some(&(stored.relay, stored.observation.assignment_revision))
                         && state
                             .evidence
                             .get(slot)
                             .is_some_and(|admission| stored.matches_admission(admission))
                 })
                 .map(|(&slot, stored)| rally_point_proto::control::SlotEvidence {
+                    historical: false,
+                    failure_count: None,
+
                     slot,
                     observation: stored.observation.clone(),
                 }),
         )
-        .chain(state.evidence_history.iter().map(|(&slot, stored)| {
-            rally_point_proto::control::SlotEvidence {
+        .chain(state.evidence_history.iter().flat_map(|(&slot, stored)| {
+            let history = &stored.history;
+            let first = rally_point_proto::control::SlotEvidence {
                 slot,
-                observation: stored.history.sample.clone(),
-            }
+                observation: history.sample.clone(),
+                historical: true,
+                failure_count: Some(history.failures),
+            };
+            let latest = history
+                .latest
+                .as_ref()
+                .filter(|latest| latest.sample != history.sample)
+                .map(|latest| rally_point_proto::control::SlotEvidence {
+                    slot,
+                    observation: latest.sample.clone(),
+                    historical: true,
+                    failure_count: Some(history.failures),
+                });
+            std::iter::once(first).chain(latest)
         }))
         .collect()
 }

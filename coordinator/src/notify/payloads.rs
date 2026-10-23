@@ -269,6 +269,8 @@ pub(crate) struct EvidencePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     key_id: Option<u32>,
     body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interruption: Option<rally_point_proto::control::EvidenceInterruption>,
 }
 
 impl From<rally_point_proto::control::EvidenceObservation> for EvidencePayload {
@@ -281,14 +283,19 @@ impl From<rally_point_proto::control::EvidenceObservation> for EvidencePayload {
             verdict: value.verdict,
             key_id: value.key_id,
             body: BASE64_STANDARD.encode(value.body),
+            interruption: value.interruption,
         }
     }
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct SlotEvidencePayload {
     slot: u8,
     observation: EvidencePayload,
+    historical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_count: Option<u32>,
 }
 
 impl From<rally_point_proto::control::SlotEvidence> for SlotEvidencePayload {
@@ -296,6 +303,8 @@ impl From<rally_point_proto::control::SlotEvidence> for SlotEvidencePayload {
         Self {
             slot: value.slot.0,
             observation: value.observation.into(),
+            historical: value.historical,
+            failure_count: value.failure_count,
         }
     }
 }
@@ -317,4 +326,7 @@ pub(super) struct SlotEvidenceWebhook {
     pub(super) external_ref: Option<String>,
     pub(super) observed_at_ms: u64,
     pub(super) evidence: EvidencePayload,
+    pub(super) historical: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) failure_count: Option<u32>,
 }

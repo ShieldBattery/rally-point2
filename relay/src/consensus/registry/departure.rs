@@ -74,9 +74,12 @@ impl DecisionMakers {
     #[must_use]
     pub fn activate_connection_epoch(&self, key: &SessionKey, slot: SlotId, epoch: u64) -> bool {
         let now = Instant::now();
-        self.lock()
+        let activated = self
+            .lock()
             .get_mut(key)
-            .is_some_and(|maker| maker.activate_connection_epoch(slot, epoch, now))
+            .is_some_and(|maker| maker.activate_connection_epoch(slot, epoch, now));
+        self.notify_evidence_changed();
+        activated
     }
 
     /// Resolves a reliable connection-up event against the decision-maker's
@@ -103,13 +106,15 @@ impl DecisionMakers {
         hold_pending: bool,
         after_reinstate: impl FnOnce(),
     ) -> ReconnectTransition {
-        self.lock().get_mut(key).map_or(
+        let transition = self.lock().get_mut(key).map_or(
             ReconnectTransition {
                 admission: ReconnectAdmission::Admitted { reinstated: false },
                 consume_hold: hold_pending,
             },
             |maker| maker.resolve_reconnect_with(slot, epoch, hold_pending, after_reinstate),
-        )
+        );
+        self.notify_evidence_changed();
+        transition
     }
 
     /// Commits a reliable level=false frame. A duplicate Down(E) is idempotent;

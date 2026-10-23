@@ -1553,10 +1553,11 @@ reaps do not re-arm, and the liveness probe force-reconciles it.
 
 `POST /session/evidence` reads the coordinator's retained latest per-slot observations for a signed
 `{ tenant, session }` request and returns `{ evidence: [...] }`, empty when the session is unknown.
-The latest admission, latest periodic observation, and first retained failed or unanswered sample per
-slot are available, at most 48 observations for 16 slots; duplicate samples are returned only once.
-The first failure is an accumulated session fact and survives a subsequent admission or rehome once
-the coordinator accepts it. This is not an archival log. Intermediate periodic samples that were never received or
+The latest admission, latest periodic observation, and first/latest retained failures per slot are
+available, at most 64 observations for 16 slots; duplicate samples are returned only once. Historical
+samples carry `historical: true` and the same cumulative `failureCount` for the slot. That count is a
+highwater, not an increment to sum across samples. Accumulated failures survive subsequent admissions
+and rehomes once the coordinator accepts them. This is not an archival log. Intermediate periodic samples that were never received or
 were overwritten cannot be recovered here. Session retirement, including
 normal close, discards observations immediately; there is no post-close recovery grace period.
 It makes no completeness claim, performs no relay exchange or lobby settlement, and uses a separate
@@ -1878,29 +1879,44 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
 
   The relay registers an exact outstanding obligation before sending a challenge. Disconnect or
   replacement settles an unanswered obligation as missing; a late completion cannot overwrite it.
-  Each slot retains its first failure with the original admission identity independently of current
-  evidence. A historical pair never establishes current ownership. Live notices and heartbeat pairs
-  require the current assignment; independent historical reports may also use a retired assignment's
-  authority. Rehome retains the old slot, relay, process boot, and revision for ten minutes, bounded to
-  four retired assignments per slot and 64 per session. These records survive coordinator persistence;
-  a legacy persisted assignment without its process identity cannot grant historical authority.
-  The authenticated control generation and original process must still match. This trusts the relay's
-  report; it is not cryptographic proof that measurement preceded revocation.
+  Missing samples distinguish no answer, timeout, connection closure, replacement, and normal slot
+  departure. Assignment revocation, policy disablement, and session retirement cancel outstanding
+  checks without recording a client failure. These administrative cancellations do not enter history.
+  Each slot retains its first and latest failure with their original admissions and a saturating
+  cumulative count. Reconnects preserve that count; a subsequent valid answer does not erase it.
 
-  First failed or unanswered samples enter a process-local relay outbox synchronously, including
-  pending checks settled before assignment or maker removal. The outbox outlives descriptors and
-  control connections, retains at most 1,024 reports and 8 MiB of accounted encoded data, and expires
-  reports after ten minutes. Overflow preserves older entries and counts/logs losses. Selection rotates
-  fairly through up to 16 reports each second, with at least ten seconds between attempts per report.
-  Exact receipts remove only the matching report. Neither challenge issuance nor rehome waits for
-  reporting. Receipts confirm coordinator memory acceptance, not webhook delivery or a durable write:
-  a coordinator crash before its normal persistence flush can lose acknowledged history, and relay
-  process loss can lose an unacknowledged outbox. Normal session close removes evidence and historical
-  authority. This remains a first-failure record per slot, not a journal: a different failure already
-  retained for that slot is preserved and a conflicting report is not acknowledged. Older peers ignore
-  the additive report/receipt messages; existing live delivery continues, but the retired-assignment
-  guarantee requires both updated peers. Interrupted challenges also occur on ordinary network
-  failure; they are not themselves proof of cheating.
+  Historical pairs never establish current ownership. Live notices and heartbeat pairs require the
+  current assignment; independent reports may also use a retired assignment's authority. Rehome
+  retains the old slot, relay, process boot, and revision for ten minutes, bounded to four retired
+  assignments per slot and 64 per session. These records survive coordinator persistence; a legacy
+  persisted assignment without its process identity cannot grant historical authority, even for a
+  current-home report. The authenticated control generation and original process must still match.
+  Per-source count highwaters prevent retries, reconnects, and overlapping retired/current reports
+  from double-counting. Highwaters remain while their authority records remain; the slot's aggregate
+  survives their removal. This trusts the relay's report, not cryptographic proof that measurement
+  preceded revocation.
+
+  Failed or unanswered samples synchronously update a process-local relay outbox. Reports coalesce
+  per assignment; each update carries the complete first/latest/count summary. The outbox outlives
+  descriptors and control connections, retains at most 1,024 reports and 8 MiB of accounted encoded
+  data, and expires reports ten minutes after their last new failure. Snapshots never recreate a
+  removed report. Overflow preserves older entries and counts/logs losses. Selection rotates fairly
+  through up to 16 reports each second, with at least ten seconds between attempts per entry, including
+  after updates. Receipts match both the latest sample identity and cumulative count, so an older
+  receipt cannot delete a newer summary. Neither challenge issuance nor rehome waits for reporting.
+
+  Authenticated reports receive terminal dispositions for acceptance, already-covered reports,
+  closed sessions, or exhausted capacity. Closed-session receipts use an exact-authority tombstone
+  retained in memory for at most ten minutes, bounded to 4,096 sessions and 65,536 assignments; they
+  never restore evidence or acknowledge an unknown reporter. Invalid or unauthorized reports receive
+  no receipt. Receipts promise neither webhook delivery nor a durable write: a coordinator crash
+  before its normal persistence flush can lose acknowledged history, and relay process loss can lose
+  an unacknowledged outbox. Normal session close still removes evidence; tombstones authorize only
+  dropping reports. This is bounded first/latest history and repetition counts, not a sample journal.
+  Older peers retain their first-only behavior; cumulative counts and terminal dispositions require
+  updated peers. An older coordinator's receipt cannot clear a newer cumulative summary, which can
+  therefore expire during mixed-version operation. Interrupted challenges also occur on ordinary
+  network failure and are not themselves proof of cheating.
 
   Collection never closes or fences gameplay. Current samples retain the registration, assignment,
   control connection, relay process, and admission fences and cannot trigger load-progress callbacks.

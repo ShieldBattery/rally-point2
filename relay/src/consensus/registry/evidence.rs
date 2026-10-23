@@ -173,7 +173,7 @@ impl DecisionMakers {
         let (external_id, external_ref) = self.session_refs(key).stamps(slot);
         let observed_at_ms = pair.observed_at_ms;
         let evidence = pair.sample.observation;
-        let (admission, predecessor) = if pair.historical {
+        let (admission, predecessor) = if pair.history.is_some() {
             (None, Some(pair.admission.observation))
         } else {
             (Some(pair.admission.observation), None)
@@ -192,11 +192,11 @@ impl DecisionMakers {
     }
 }
 
-/// A byte-budgeted current sample or immutable historical failure with its admission.
+/// A byte-budgeted current sample or cumulative historical failures.
 pub(crate) struct PeriodicEvidencePair {
     pub admission: rally_point_proto::control::SlotEvidence,
     pub sample: rally_point_proto::control::SlotEvidence,
-    pub historical: bool,
+    pub history: Option<Box<rally_point_proto::control::EvidenceHistory>>,
     pub observed_at_ms: u64,
 }
 
@@ -231,17 +231,34 @@ impl DecisionMakers {
         slot: SlotId,
         epoch: u64,
         sample: u64,
+        reason: rally_point_proto::control::EvidenceInterruption,
     ) {
-        let _ = self
-            .lock()
-            .get_mut(key)
-            .is_some_and(|maker| maker.abandon_periodic_evidence(slot, Some((epoch, sample))));
+        let _ = self.lock().get_mut(key).is_some_and(|maker| {
+            maker.abandon_periodic_evidence(slot, Some((epoch, sample)), reason)
+        });
         // Epoch replacement may already have settled this obligation synchronously.
         self.notify_evidence_changed();
     }
 }
 
 impl DecisionMakers {
+    /// Settles a connection's pending check before teardown loses its cause.
+    pub(crate) fn interrupt_periodic_evidence(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        epoch: u64,
+        reason: rally_point_proto::control::EvidenceInterruption,
+    ) {
+        let changed = self.lock().get_mut(key).is_some_and(|maker| {
+            maker.connection_epoch_matches(slot, Some(epoch))
+                && maker.abandon_periodic_evidence(slot, None, reason)
+        });
+        if changed {
+            self.notify_evidence_changed();
+        }
+    }
+
     /// Selects a fair bounded retry batch without consulting live session makers.
     pub(crate) fn evidence_reports(
         &self,

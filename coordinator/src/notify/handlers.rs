@@ -562,9 +562,20 @@ fn enqueue_dispatch(
 }
 
 /// Delivers a fenced periodic observation without recording a connection arrival.
+#[cfg(test)]
 pub(crate) fn handle_slot_evidence(
     setup: &SessionSetup,
     notice: rally_point_proto::control::SlotEvidenceNotice,
+) {
+    let historical = notice.historical_admission.is_some();
+    handle_slot_evidence_summary(setup, notice, historical, None);
+}
+
+pub(crate) fn handle_slot_evidence_summary(
+    setup: &SessionSetup,
+    notice: rally_point_proto::control::SlotEvidenceNotice,
+    historical: bool,
+    failure_count: Option<u32>,
 ) {
     let Some(resolved) = resolve_or_drop(
         setup,
@@ -582,6 +593,8 @@ pub(crate) fn handle_slot_evidence(
         .or_else(|| resolved.stored_slot_ref(notice.slot));
     let payload = SlotEvidenceWebhook {
         event: "slotEvidence",
+        historical,
+        failure_count,
         tenant: notice.tenant.as_ref().to_owned(),
         session: notice.session.0,
         external_id: Some(resolved.external_id),

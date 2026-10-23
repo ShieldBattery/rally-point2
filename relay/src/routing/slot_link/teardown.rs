@@ -30,6 +30,18 @@ pub(in crate::routing) fn end_slot_link(
         key,
         crate::observability::flight_recorder::FlightEvent::SlotDisconnected { slot: slot.0 },
     );
+    mesh.session.gates.with_ingress(key, || {
+        mesh.session.decision_makers.interrupt_periodic_evidence(
+            key,
+            slot,
+            connection_epoch,
+            if leave_announced {
+                rally_point_proto::control::EvidenceInterruption::SlotDeparted
+            } else {
+                rally_point_proto::control::EvidenceInterruption::ConnectionClosed
+            },
+        );
+    });
     mesh.session.remove_slot(key, slot);
     let session_emptied = deregister(sessions, key, slot);
     let retired_connection =

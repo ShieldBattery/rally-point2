@@ -192,6 +192,8 @@ fn evidence_report_fixture() -> (
         Default::default(),
     );
     let admission = EvidenceObservation {
+        interruption: None,
+
         sample_id: 0,
         connection_id: [9; 32],
         sequence: 1,
@@ -205,6 +207,9 @@ fn evidence_report_fixture() -> (
         session,
         slot: SlotId(0),
         history: EvidenceHistory {
+            failures: 1,
+            latest: None,
+
             sample: EvidenceObservation {
                 sample_id: 3,
                 sequence: 5,
@@ -245,11 +250,12 @@ fn report_action(
 #[tokio::test]
 async fn decoded_evidence_report_returns_the_exact_receipt_again_after_receipt_loss() {
     let (state, generation, report) = evidence_report_fixture();
-    let receipt = report.receipt();
+    let mut receipt = report.receipt();
     assert_eq!(
         report_action(&state, generation, report.clone()),
         InboundAction::EvidenceReceipt(receipt.clone())
     );
+    receipt.disposition = rally_point_proto::control::EvidenceReceiptDisposition::Superseded;
     assert_eq!(
         report_action(&state, generation, report.clone()),
         InboundAction::EvidenceReceipt(receipt)

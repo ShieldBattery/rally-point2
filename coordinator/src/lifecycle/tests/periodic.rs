@@ -56,6 +56,8 @@ fn setup(periodic: bool) -> (Lifecycle, SessionId, u64) {
 
 fn admission(sequence: u64) -> EvidenceObservation {
     EvidenceObservation {
+        interruption: None,
+
         sample_id: 0,
         connection_id: [sequence as u8; 32],
         sequence,
@@ -94,6 +96,9 @@ fn snapshot(
         evidence: admission
             .into_iter()
             .map(|observation| SlotEvidence {
+                historical: false,
+                failure_count: None,
+
                 slot: SlotId(0),
                 observation,
             })
@@ -101,6 +106,9 @@ fn snapshot(
         periodic_evidence: periodic
             .into_iter()
             .map(|observation| SlotEvidence {
+                historical: false,
+                failure_count: None,
+
                 slot: SlotId(0),
                 observation,
             })
@@ -491,6 +499,9 @@ async fn malformed_current_pair_cannot_advance_admission() {
 async fn next_admission_and_snapshot_preserve_predecessor_without_current_sample() {
     let (lc, session, generation) = setup(true);
     let history = rally_point_proto::control::EvidenceHistory {
+        failures: 1,
+        latest: None,
+
         admission: admission(1),
         sample: EvidenceObservation {
             verdict: EvidenceVerdict::Missing,

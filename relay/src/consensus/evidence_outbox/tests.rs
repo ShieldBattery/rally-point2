@@ -4,6 +4,7 @@ use rally_point_proto::ids::{SessionId, SlotId};
 
 fn report(sequence: u64) -> EvidenceReport {
     let admission = EvidenceObservation {
+        interruption: None,
         sample_id: 0,
         connection_id: [3; 32],
         sequence: 1,
@@ -14,10 +15,13 @@ fn report(sequence: u64) -> EvidenceReport {
     };
     EvidenceReport {
         tenant: TenantId("test".into()),
-        session: SessionId(1),
+        session: SessionId(sequence),
         slot: SlotId(0),
         history: EvidenceHistory {
+            failures: 1,
+            latest: None,
             sample: EvidenceObservation {
+                interruption: None,
                 sequence,
                 sample_id: 1,
                 verdict: EvidenceVerdict::Missing,
@@ -37,16 +41,17 @@ fn receipt_requires_every_identity_field() {
     let report = report(2);
     outbox.insert(report.clone(), now);
     let exact = report.receipt();
-    for field in 0..7 {
+    for field in 0..8 {
         let mut wrong = exact.clone();
         match field {
             0 => wrong.tenant = TenantId("other".into()),
-            1 => wrong.session = SessionId(2),
+            1 => wrong.session.0 += 1,
             2 => wrong.slot = SlotId(1),
             3 => wrong.assignment_revision += 1,
             4 => wrong.connection_id = [4; 32],
             5 => wrong.sample_id += 1,
-            _ => wrong.sequence += 1,
+            6 => wrong.sequence += 1,
+            _ => wrong.failures += 1,
         }
         outbox.acknowledge(&wrong);
         assert_eq!(outbox.inner.lock().entries.len(), 1);
@@ -120,4 +125,85 @@ fn byte_limit_can_fill_before_count_limit_and_does_not_evict_oldest() {
             .sequence,
         2
     );
+}
+
+fn advance(mut report: EvidenceReport, sequence: u64) -> EvidenceReport {
+    report.history.failures = report.history.failures.saturating_add(1);
+    report.history.latest = Some(Box::new(rally_point_proto::control::EvidenceFailure {
+        admission: report.history.admission.clone(),
+        sample: EvidenceObservation {
+            sequence,
+            sample_id: sequence,
+            ..report.history.sample.clone()
+        },
+        observed_at_ms: sequence,
+    }));
+    report
+}
+
+#[test]
+fn updates_coalesce_preserve_retry_floor_and_require_exact_latest_receipt() {
+    let outbox = EvidenceOutbox::default();
+    let now = Instant::now();
+    let first = report(2);
+    outbox.insert(first.clone(), now);
+    assert_eq!(outbox.reports(now, 16), vec![first.clone()]);
+    let second = advance(first.clone(), 3);
+    outbox.insert(second.clone(), now + RETRY / 2);
+    assert_eq!(outbox.inner.lock().entries.len(), 1);
+    assert!(outbox.reports(now + RETRY / 2, 16).is_empty());
+    outbox.acknowledge(&first.receipt());
+    assert!(outbox.contains(&second.receipt(), now + RETRY / 2));
+    assert_eq!(outbox.reports(now + RETRY, 16), vec![second.clone()]);
+    outbox.acknowledge(&second.receipt());
+    assert_eq!(outbox.inner.lock().bytes, 0);
+}
+
+#[test]
+fn a_new_failure_refreshes_expiry_and_recreates_an_expired_summary() {
+    let outbox = EvidenceOutbox::default();
+    let now = Instant::now();
+    let first = report(2);
+    outbox.insert(first.clone(), now);
+    let second = advance(first, 3);
+    outbox.insert(second.clone(), now + RETENTION / 2);
+    assert_eq!(outbox.reports(now + RETENTION, 16), vec![second.clone()]);
+    assert!(outbox.reports(now + RETENTION * 2, 16).is_empty());
+    let third = advance(second, 4);
+    outbox.insert(third.clone(), now + RETENTION * 2);
+    assert_eq!(outbox.reports(now + RETENTION * 2, 16), vec![third]);
+}
+
+#[test]
+fn byte_limited_update_preserves_deliverable_old_summary() {
+    let outbox = EvidenceOutbox::default();
+    let now = Instant::now();
+    let first = report(2);
+    outbox.insert(first.clone(), now);
+    let previous_bytes = outbox.inner.lock().bytes;
+    let mut oversized = advance(first.clone(), 3);
+    oversized.tenant = first.tenant.clone();
+    oversized.history.latest.as_mut().unwrap().admission.body =
+        vec![1; rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN];
+    // Reserve the remaining capacity as other entries without allocating it.
+    outbox.inner.lock().bytes = MAX_BYTES;
+    outbox.insert(oversized, now);
+    assert!(outbox.contains(&first.receipt(), now));
+    assert_eq!(outbox.inner.lock().lost_capacity, 1);
+    outbox.inner.lock().bytes = previous_bytes;
+    outbox.acknowledge(&first.receipt());
+    assert_eq!(outbox.inner.lock().bytes, 0);
+}
+
+#[test]
+fn saturated_count_still_advances_latest_and_fences_old_receipts() {
+    let outbox = EvidenceOutbox::default();
+    let now = Instant::now();
+    let mut first = report(2);
+    first.history.failures = u32::MAX;
+    outbox.insert(first.clone(), now);
+    let next = advance(first.clone(), 3);
+    outbox.insert(next.clone(), now);
+    outbox.acknowledge(&first.receipt());
+    assert_eq!(outbox.reports(now, 16), vec![next]);
 }

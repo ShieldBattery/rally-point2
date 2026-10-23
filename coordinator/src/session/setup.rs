@@ -39,6 +39,8 @@ pub struct SessionSetup {
     /// The tenant's correlation ids per session. Populated by `create_session`,
     /// read by [`session_refs`] when a departure webhook is built.
     pub(super) session_refs: SessionRefsStore,
+    pub(super) closed_evidence_assignments:
+        Arc<Mutex<super::evidence_history::ClosedEvidenceAssignments>>,
     /// Per-relay descriptor outbox — what each relay should currently apply on
     /// its mesh links. Populated by `create_session`; read by the relay's
     /// descriptor-fetch endpoint.
@@ -166,6 +168,7 @@ impl SessionSetup {
             tenants,
             session_relays: Arc::new(Mutex::new(HashMap::new())),
             session_refs: Arc::new(Mutex::new(HashMap::new())),
+            closed_evidence_assignments: Arc::new(Mutex::new(Default::default())),
             descriptors: RelayDescriptors::new(),
             reaps: RelayReaps::new(),
             attest: LoadStateAttest::new(),
@@ -503,9 +506,13 @@ impl SessionSetup {
     pub fn take_session_membership(&self, tenant: &TenantId, session: SessionId) -> Vec<RelayId> {
         let key = (tenant.clone(), session);
         let taken = self.session_relays.lock().remove(&key).unwrap_or_default();
-        if let Some(refs) = self.session_refs.lock().remove(&key)
-            && let Some(external_id) = refs.external_id
-        {
+        let refs = self.session_refs.lock().remove(&key);
+        if let Some(refs) = &refs {
+            self.closed_evidence_assignments
+                .lock()
+                .retain_session(tenant, session, refs);
+        }
+        if let Some(external_id) = refs.and_then(|refs| refs.external_id) {
             let idem_key = (tenant.clone(), external_id);
             let mut idempotency = self.create_idempotency.lock();
             if idempotency

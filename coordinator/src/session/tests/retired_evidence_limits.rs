@@ -49,3 +49,25 @@ fn restore_clock_correction_bounds_remaining_grace() {
         vec![assignment(0, 1, 700)]
     );
 }
+
+#[test]
+fn closed_assignment_receipts_are_bounded_and_expire() {
+    let tenant = TenantId("test".into());
+    let refs = SessionRefs {
+        periodic_evidence: true,
+        homes: [(SlotId(0), RelayId(1))].into_iter().collect(),
+        evidence_home_boots: [(SlotId(0), 7)].into_iter().collect(),
+        evidence_assignments: [(SlotId(0), 1)].into_iter().collect(),
+        ..Default::default()
+    };
+    let mut closed = ClosedEvidenceAssignments::default();
+    for session in 0..4097 {
+        closed.retain_session(&tenant, SessionId(session), &refs);
+    }
+    assert_eq!(closed.entries.len(), 4096);
+    assert_eq!(closed.assignments, 4096);
+    assert_eq!(closed.entries.front().unwrap().session, SessionId(1));
+    closed.expire(std::time::Instant::now() + std::time::Duration::from_secs(601));
+    assert!(closed.entries.is_empty());
+    assert_eq!(closed.assignments, 0);
+}

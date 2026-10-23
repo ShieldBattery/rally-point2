@@ -376,6 +376,8 @@ async fn evidence_receipts_yield_to_descriptors_grants_and_load_state_and_closed
     wire.take();
 
     let receipt = rally_point_proto::control::EvidenceReceipt {
+        failures: 1,
+        disposition: rally_point_proto::control::EvidenceReceiptDisposition::Accepted,
         tenant: tenant_id(),
         session: SessionId(1),
         slot: SlotId(0),

@@ -475,6 +475,18 @@ fn handle_leave_intent(link: &mut Link, ctx: &mut SlotLinkCtx) -> ControlFlow<()
         slot = ctx.slot.0,
         "client announced clean leave",
     );
+    // Settle before closing the stream can race the sampler's receive failure.
+    ctx.mesh_for_teardown
+        .session
+        .gates
+        .with_ingress(&ctx.key, || {
+            ctx.decision_makers.interrupt_periodic_evidence(
+                &ctx.key,
+                ctx.slot,
+                ctx.connection_epoch,
+                rally_point_proto::control::EvidenceInterruption::SlotDeparted,
+            );
+        });
     // Retire the active generation before its terminal
     // SlotDeparted is enqueued. A concurrently joining mesh
     // link snapshots this same registry, so it now observes

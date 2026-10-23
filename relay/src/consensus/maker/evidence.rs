@@ -1,6 +1,7 @@
 //! Descriptor configuration and retained connection observations.
 
 use super::*;
+use rally_point_proto::control::EvidenceInterruption;
 
 impl DecisionMaker {
     pub(in crate::consensus) fn evidence_assignment_current(
@@ -49,7 +50,7 @@ impl DecisionMaker {
         slot: SlotId,
         evidence: rally_point_proto::control::EvidenceObservation,
     ) {
-        self.abandon_periodic_evidence(slot, None);
+        self.abandon_periodic_evidence(slot, None, EvidenceInterruption::ConnectionReplaced);
         self.periodic_evidence.remove(&slot);
         self.evidence.insert(slot, evidence);
     }
@@ -62,6 +63,8 @@ impl DecisionMaker {
             .iter()
             .map(
                 |(&slot, observation)| rally_point_proto::control::SlotEvidence {
+                    historical: false,
+                    failure_count: None,
                     slot,
                     observation: observation.clone(),
                 },
@@ -151,9 +154,9 @@ impl DecisionMaker {
         }
         for (&slot, history) in &self.evidence_history {
             if self.evidence_assignment_current(slot, history.sample.assignment_revision)
-                && !entries.contains(&(slot, history.sample.sequence))
+                && !entries.contains(&(slot, history.latest_sample().sequence))
             {
-                entries.push((slot, history.sample.sequence));
+                entries.push((slot, history.latest_sample().sequence));
             }
         }
         entries
@@ -170,9 +173,16 @@ impl DecisionMaker {
         else {
             return Ok(None);
         };
-        let cost = serde_json::to_vec(&(admission, sample))
-            .expect("observations serialize")
-            .len()
+        let history = historical
+            .then(|| self.evidence_history.get(&slot))
+            .flatten();
+        let cost = if let Some(history) = history {
+            serde_json::to_vec(history)
+        } else {
+            serde_json::to_vec(&(admission, sample))
+        }
+        .expect("observations serialize")
+        .len()
             + 256;
         if cost > *remaining {
             return Err(());
@@ -180,15 +190,19 @@ impl DecisionMaker {
         *remaining -= cost;
         Ok(Some(PeriodicEvidencePair {
             admission: rally_point_proto::control::SlotEvidence {
+                historical: false,
+                failure_count: None,
                 slot,
                 observation: admission.clone(),
             },
             sample: rally_point_proto::control::SlotEvidence {
+                historical: false,
+                failure_count: None,
                 slot,
                 observation: sample.clone(),
             },
             observed_at_ms,
-            historical,
+            history: history.cloned().map(Box::new),
         }))
     }
 
@@ -206,7 +220,7 @@ impl DecisionMaker {
             return None;
         }
         if let Some(history) = self.evidence_history.get(&slot)
-            && history.sample.sequence == sequence
+            && history.latest_sample().sequence == sequence
             && self.evidence_assignment_current(slot, history.sample.assignment_revision)
         {
             return Some((
@@ -217,18 +231,12 @@ impl DecisionMaker {
             ));
         }
         let (sample, time) = self.periodic_evidence.get(&slot)?;
-        (sample.sequence == sequence
-            && self.evidence_assignment_current(slot, sample.assignment_revision))
-        .then(|| {
-            (
-                self.evidence
-                    .get(&slot)
-                    .expect("periodic sample has admission"),
-                sample,
-                *time,
-                false,
-            )
-        })
+        if sample.sequence != sequence
+            || !self.evidence_assignment_current(slot, sample.assignment_revision)
+        {
+            return None;
+        }
+        Some((self.evidence.get(&slot)?, sample, *time, false))
     }
 
     pub(in crate::consensus) fn periodic_evidence_notice(
@@ -240,15 +248,23 @@ impl DecisionMaker {
             self.reported_evidence(slot, sequence)?;
         Some(PeriodicEvidencePair {
             admission: rally_point_proto::control::SlotEvidence {
+                historical: false,
+                failure_count: None,
                 slot,
                 observation: admission.clone(),
             },
             sample: rally_point_proto::control::SlotEvidence {
+                historical: false,
+                failure_count: None,
                 slot,
                 observation: sample.clone(),
             },
             observed_at_ms,
-            historical,
+            history: historical
+                .then(|| self.evidence_history.get(&slot))
+                .flatten()
+                .cloned()
+                .map(Box::new),
         })
     }
 
@@ -273,6 +289,8 @@ impl DecisionMaker {
             })
             .map(
                 |(&slot, (observation, _))| rally_point_proto::control::SlotEvidence {
+                    historical: false,
+                    failure_count: None,
                     slot,
                     observation: observation.clone(),
                 },
@@ -319,6 +337,7 @@ impl DecisionMaker {
         };
         observation.sequence = sequence;
         observation.verdict = rally_point_proto::control::EvidenceVerdict::Missing;
+        observation.interruption = None;
         observation.key_id = None;
         observation.body.clear();
         self.evidence_pending.insert(slot, (epoch, observation));
@@ -329,6 +348,7 @@ impl DecisionMaker {
         &mut self,
         slot: SlotId,
         expected: Option<(u64, u64)>,
+        reason: EvidenceInterruption,
     ) -> bool {
         let Some((epoch, pending)) = self.evidence_pending.get(&slot) else {
             return false;
@@ -336,10 +356,17 @@ impl DecisionMaker {
         if expected.is_some_and(|(e, id)| e != *epoch || id != pending.sample_id) {
             return false;
         }
-        let (_, sample) = self
+        let (_, mut sample) = self
             .evidence_pending
             .remove(&slot)
             .expect("pending entry checked");
+        if matches!(
+            reason,
+            EvidenceInterruption::Revoked | EvidenceInterruption::SessionRetired
+        ) {
+            return false;
+        }
+        sample.interruption = Some(reason);
         if !self.evidence_assignment_current(slot, sample.assignment_revision) {
             return false;
         }
@@ -362,23 +389,43 @@ impl DecisionMaker {
         sample: &rally_point_proto::control::EvidenceObservation,
         time: u64,
     ) {
-        if sample.verdict == rally_point_proto::control::EvidenceVerdict::Valid
-            || self.evidence_history.contains_key(&slot)
-            || self.evidence_history.len()
-                >= rally_point_proto::control::MAX_PERIODIC_EVIDENCE_SLOTS
-        {
+        use rally_point_proto::control::{EvidenceFailure, EvidenceHistory};
+        if sample.verdict == rally_point_proto::control::EvidenceVerdict::Valid {
             return;
         }
         let Some(admission) = self.evidence.get(&slot) else {
             return;
         };
-        let history = rally_point_proto::control::EvidenceHistory {
-            admission: admission.clone(),
-            sample: sample.clone(),
-            observed_at_ms: time,
+        let history = if let Some(history) = self.evidence_history.get_mut(&slot) {
+            if sample.sequence <= history.latest_sample().sequence {
+                return;
+            }
+            history.failures = history.failures.saturating_add(1);
+            history.latest = Some(Box::new(EvidenceFailure {
+                admission: admission.clone(),
+                sample: sample.clone(),
+                observed_at_ms: time,
+            }));
+            history
+        } else {
+            if self.evidence_history.len()
+                >= rally_point_proto::control::MAX_PERIODIC_EVIDENCE_SLOTS
+            {
+                return;
+            }
+            self.evidence_history
+                .entry(slot)
+                .or_insert_with(|| EvidenceHistory {
+                    failures: 1,
+                    latest: None,
+                    admission: admission.clone(),
+                    sample: sample.clone(),
+                    observed_at_ms: time,
+                })
         };
-        // Capture exactly at the first-history transition, not from snapshots:
-        // receipts and expiry must not cause the same history to be enqueued again.
+        // Only a newly settled failure refreshes delivery. Snapshots cannot
+        // resurrect acknowledged or expired reports; a later failure carries
+        // the complete cumulative summary even if its earlier delivery was lost.
         if let Some(outbox) = &self.evidence_outbox {
             outbox.insert(
                 rally_point_proto::control::EvidenceReport {
@@ -390,7 +437,6 @@ impl DecisionMaker {
                 Instant::now(),
             );
         }
-        self.evidence_history.insert(slot, history);
     }
 
     pub(in crate::consensus) fn evidence_history_snapshot(
@@ -428,14 +474,14 @@ impl DecisionMaker {
             })
             .collect();
         for slot in revoked {
-            self.abandon_periodic_evidence(slot, None);
+            self.abandon_periodic_evidence(slot, None, EvidenceInterruption::Revoked);
         }
     }
 
     pub(in crate::consensus) fn settle_pending_evidence(&mut self) {
         let slots: Vec<_> = self.evidence_pending.keys().copied().collect();
         for slot in slots {
-            self.abandon_periodic_evidence(slot, None);
+            self.abandon_periodic_evidence(slot, None, EvidenceInterruption::SessionRetired);
         }
     }
 }

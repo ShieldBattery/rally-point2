@@ -123,3 +123,144 @@ impl SessionSetup {
 #[cfg(test)]
 #[path = "tests/retired_evidence_limits.rs"]
 mod tests;
+
+/// Closed-session receipts only authorize dropping reports; this process-local
+/// cache never restores a session or promises to retain observations.
+#[derive(Default)]
+pub(super) struct ClosedEvidenceAssignments {
+    entries: std::collections::VecDeque<ClosedEvidenceAssignment>,
+    assignments: usize,
+}
+
+struct ClosedEvidenceAssignment {
+    tenant: TenantId,
+    session: SessionId,
+    assignments: Vec<RetiredAssignment>,
+    expires: std::time::Instant,
+}
+
+impl ClosedEvidenceAssignments {
+    pub(super) fn retain_session(
+        &mut self,
+        tenant: &TenantId,
+        session: SessionId,
+        refs: &SessionRefs,
+    ) {
+        if !refs.periodic_evidence {
+            return;
+        }
+        let now = unix_secs_fail_closed();
+        let instant = std::time::Instant::now();
+        self.expire(instant);
+        let mut assignments: Vec<_> = refs
+            .retired_evidence_assignments
+            .iter()
+            .filter(|entry| {
+                entry.expires_at > now
+                    && entry.expires_at <= now.saturating_add(RETIREMENT_GRACE_SECS)
+            })
+            .cloned()
+            .collect();
+        for (&slot, &relay) in &refs.homes {
+            if let (Some(&boot_id), Some(&revision)) = (
+                refs.evidence_home_boots.get(&slot),
+                refs.evidence_assignments.get(&slot),
+            ) {
+                assignments.push(RetiredAssignment {
+                    slot,
+                    relay,
+                    boot_id,
+                    revision,
+                    expires_at: now.saturating_add(RETIREMENT_GRACE_SECS),
+                });
+            }
+        }
+        assignments.truncate(80);
+        if assignments.is_empty() {
+            return;
+        }
+        while self.entries.len() >= 4096
+            || self.assignments.saturating_add(assignments.len()) > 65536
+        {
+            let Some(oldest) = self.entries.pop_front() else {
+                break;
+            };
+            self.assignments -= oldest.assignments.len();
+        }
+        self.assignments += assignments.len();
+        self.entries.push_back(ClosedEvidenceAssignment {
+            tenant: tenant.clone(),
+            session,
+            assignments,
+            expires: instant + std::time::Duration::from_secs(RETIREMENT_GRACE_SECS),
+        });
+    }
+
+    fn expire(&mut self, now: std::time::Instant) {
+        while self
+            .entries
+            .front()
+            .is_some_and(|entry| entry.expires <= now)
+        {
+            if let Some(entry) = self.entries.pop_front() {
+                self.assignments -= entry.assignments.len();
+            }
+        }
+    }
+}
+
+impl SessionSetup {
+    pub(crate) fn closed_evidence_history_assignment(
+        &self,
+        relay: RelayId,
+        boot_id: u64,
+        tenant: &TenantId,
+        session: SessionId,
+        slot: SlotId,
+        revision: u64,
+    ) -> bool {
+        let mut closed = self.closed_evidence_assignments.lock();
+        closed.expire(std::time::Instant::now());
+        let now = unix_secs_fail_closed();
+        closed.entries.iter().any(|entry| {
+            &entry.tenant == tenant
+                && entry.session == session
+                && entry.assignments.iter().any(|assignment| {
+                    assignment.slot == slot
+                        && assignment.relay == relay
+                        && assignment.boot_id == boot_id
+                        && assignment.revision == revision
+                        && assignment.expires_at > now
+                })
+        })
+    }
+}
+
+impl SessionSetup {
+    /// Counter eviction follows removal of authority records, not a momentary
+    /// wall-clock check that could become true again after a clock correction.
+    pub(crate) fn retained_evidence_history_assignment(
+        &self,
+        relay: RelayId,
+        boot_id: u64,
+        tenant: &TenantId,
+        session: SessionId,
+        slot: SlotId,
+        revision: u64,
+    ) -> bool {
+        self.session_refs
+            .lock()
+            .get(&(tenant.clone(), session))
+            .is_some_and(|refs| {
+                (refs.homes.get(&slot) == Some(&relay)
+                    && refs.evidence_home_boots.get(&slot) == Some(&boot_id)
+                    && refs.evidence_assignments.get(&slot) == Some(&revision))
+                    || refs.retired_evidence_assignments.iter().any(|entry| {
+                        entry.slot == slot
+                            && entry.relay == relay
+                            && entry.boot_id == boot_id
+                            && entry.revision == revision
+                    })
+            })
+    }
+}

@@ -36,6 +36,8 @@ async fn cached_evidence_projects_retained_observations_without_asking_relays() 
             resumed: false,
             connected_at_ms: 1,
             evidence: Some(EvidenceObservation {
+                interruption: None,
+
                 sample_id: 0,
                 connection_id: [9; 32],
                 sequence: 1,
@@ -61,6 +63,7 @@ async fn cached_evidence_projects_retained_observations_without_asking_relays() 
         response["evidence"],
         serde_json::json!([{
             "slot": 0,
+            "historical": false,
             "observation": {
                 "connectionId": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
                 "sequence": 1,
@@ -245,6 +248,8 @@ async fn cached_and_load_state_reads_include_admission_and_latest_periodic_sampl
         Default::default(),
     );
     let admission = EvidenceObservation {
+        interruption: None,
+
         sample_id: 0,
         connection_id: [9; 32],
         sequence: 1,
@@ -258,6 +263,9 @@ async fn cached_and_load_state_reads_include_admission_and_latest_periodic_sampl
         generation,
         &[rally_point_proto::control::SessionPresence {
             evidence: vec![SlotEvidence {
+                historical: false,
+                failure_count: None,
+
                 slot: SlotId(0),
                 observation: admission.clone(),
             }],

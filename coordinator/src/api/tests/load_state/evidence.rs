@@ -36,6 +36,8 @@ async fn load_state_projects_nonempty_evidence_to_the_tenant_contract() {
             resumed: false,
             connected_at_ms: 1,
             evidence: Some(EvidenceObservation {
+                interruption: None,
+
                 sample_id: 0,
                 connection_id: [9; 32],
                 sequence: 1,
@@ -52,6 +54,7 @@ async fn load_state_projects_nonempty_evidence_to_the_tenant_contract() {
         response["evidence"],
         serde_json::json!([{
             "slot": 0,
+            "historical": false,
             "observation": {
                 "connectionId": "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk=",
                 "sequence": 1,

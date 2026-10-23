@@ -165,8 +165,8 @@ impl DecisionMakers {
                     let maker = existing.get_mut();
                     maker.set_observers(observers);
                     maker.set_expected_slots(expected_slots);
-                    // Settle outstanding checks while their original ownership
-                    // and admission still exist, before either set is replaced.
+                    // Cancel outstanding checks before a server-side ownership
+                    // or policy change can look like a client interruption.
                     maker.settle_revoked_evidence(&evidence, &homed_slots);
                     maker.rehome_homed_slots(homed_slots);
                     maker.reconcile_finalized_drops(finalized_drops);

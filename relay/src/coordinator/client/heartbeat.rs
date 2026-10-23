@@ -12,8 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rally_point_proto::control::{
-    EvidenceHistory, MAX_PERIODIC_EVIDENCE_SLOTS, RegionRttReport, SessionPresence,
-    SlotEvidenceHistory,
+    MAX_PERIODIC_EVIDENCE_SLOTS, RegionRttReport, SessionPresence, SlotEvidenceHistory,
 };
 use rally_point_proto::ids::SlotId;
 use tokio::sync::mpsc::Sender;
@@ -170,14 +169,10 @@ pub(super) fn attach_heartbeat_evidence(
         }
         match pair(key, *slot, *sequence, &mut remaining) {
             Ok(Some(pair)) => {
-                if pair.historical {
+                if let Some(history) = pair.history {
                     roster[session].evidence_history.push(SlotEvidenceHistory {
                         slot: pair.sample.slot,
-                        history: EvidenceHistory {
-                            admission: pair.admission.observation,
-                            sample: pair.sample.observation,
-                            observed_at_ms: pair.observed_at_ms,
-                        },
+                        history: *history,
                     });
                 } else {
                     roster[session].evidence.push(pair.admission);

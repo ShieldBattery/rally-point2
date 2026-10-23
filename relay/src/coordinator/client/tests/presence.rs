@@ -391,6 +391,7 @@ fn heartbeat_roster_stays_compact_while_requested_snapshots_retain_full_observat
                 slot,
                 false,
                 Some(EvidenceObservation {
+                    interruption: None,
                     sample_id: 0,
                     connection_id: [255; 32],
                     sequence: 1,
@@ -451,8 +452,11 @@ fn periodic_heartbeat_attachment_budget_rotates_without_truncating_the_roster() 
         .map(|session| {
             let evidence: Vec<_> = (0..2)
                 .map(|slot| SlotEvidence {
+                    historical: false,
+                    failure_count: None,
                     slot: SlotId(slot),
                     observation: EvidenceObservation {
+                        interruption: None,
                         sample_id: 0,
                         connection_id: [255; 32],
                         sequence: 1,
@@ -526,7 +530,7 @@ fn periodic_heartbeat_attachment_budget_rotates_without_truncating_the_roster() 
                 Ok(Some(crate::consensus::PeriodicEvidencePair {
                     admission: admission.clone(),
                     sample: periodic.clone(),
-                    historical: false,
+                    history: None,
                     observed_at_ms: 1,
                 }))
             },
@@ -589,8 +593,11 @@ fn near_full_roster_reserves_frame_space_before_cloning_observations() {
         })
         .collect();
     let sample = SlotEvidence {
+        historical: false,
+        failure_count: None,
         slot: SlotId(0),
         observation: EvidenceObservation {
+            interruption: None,
             sample_id: 1,
             connection_id: [255; 32],
             sequence: 2,
@@ -620,7 +627,7 @@ fn near_full_roster_reserves_frame_space_before_cloning_observations() {
             Ok(Some(crate::consensus::PeriodicEvidencePair {
                 admission,
                 sample: periodic,
-                historical: false,
+                history: None,
                 observed_at_ms: 1,
             }))
         },

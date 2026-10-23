@@ -58,6 +58,9 @@ impl Lifecycle {
         }
         let historical = notice.historical_admission.as_ref().map(|admission| {
             rally_point_proto::control::EvidenceHistory {
+                failures: 1,
+                latest: None,
+
                 admission: admission.clone(),
                 sample: notice.evidence.clone(),
                 observed_at_ms: notice.observed_at_ms,
@@ -68,6 +71,7 @@ impl Lifecycle {
         {
             let sample = &notice.evidence;
             if admission.sample_id != 0
+                || admission.interruption.is_some()
                 || admission.sequence == 0
                 || sample.sample_id == 0
                 || sample.sequence <= admission.sequence
@@ -118,7 +122,10 @@ impl Lifecycle {
         if notice.evidence.verdict != EvidenceVerdict::Valid {
             notice.evidence.body.clear();
         }
-        notify::handle_slot_evidence(setup, notice);
+        let failure_count = historical
+            .as_ref()
+            .and_then(|_| self.history_failure_count(&notice.tenant, notice.session, notice.slot));
+        notify::handle_slot_evidence_summary(setup, notice, historical.is_some(), failure_count);
     }
 
     // The caller holds assignment and control-epoch locks through the mutation.
@@ -134,6 +141,15 @@ impl Lifecycle {
         let (relay, boot_id) = source;
         let setup = &self.inner.setup;
         if observation.sample_id == 0
+            || (observation.interruption.is_some()
+                && observation.verdict != EvidenceVerdict::Missing)
+            || matches!(
+                observation.interruption,
+                Some(
+                    rally_point_proto::control::EvidenceInterruption::Revoked
+                        | rally_point_proto::control::EvidenceInterruption::SessionRetired
+                )
+            )
             || observation.sequence == 0
             || observation.body.len() > rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
             || setup.evidence_assignment(relay, tenant, session, slot)

@@ -7,6 +7,7 @@ fn observation() -> EvidenceObservation {
         sequence: 8,
         assignment_revision: 2,
         verdict: EvidenceVerdict::Valid,
+        interruption: None,
         key_id: Some(7),
         body: vec![0, 255, 42],
     }
@@ -99,6 +100,9 @@ fn notice_and_presence_defaults_and_observations_round_trip() {
             .is_none()
     );
     presence.evidence = vec![SlotEvidence {
+        historical: false,
+        failure_count: None,
+
         slot: SlotId(0),
         observation: observation(),
     }];
@@ -266,6 +270,9 @@ fn periodic_policy_notice_and_presence_round_trip_independently() {
         serde_json::from_value(serde_json::json!({"tenant":"test", "session":1, "slots":[]}))
             .unwrap();
     presence.periodic_evidence = vec![SlotEvidence {
+        historical: false,
+        failure_count: None,
+
         slot: SlotId(2),
         observation: sample,
     }];
@@ -284,6 +291,9 @@ fn periodic_presence_bounds_sample_count_on_both_wire_directions() {
             .unwrap();
     presence.periodic_evidence = (0..16)
         .map(|slot| SlotEvidence {
+            historical: false,
+            failure_count: None,
+
             slot: SlotId(slot),
             observation: EvidenceObservation {
                 sample_id: 1,
@@ -322,10 +332,14 @@ fn history_is_optional_for_older_notices_and_bounded_for_recovery() {
             .is_none()
     );
     let history = EvidenceHistory {
+        failures: 1,
+        latest: None,
+
         admission: observation(),
         sample: EvidenceObservation {
             sample_id: 1,
             verdict: EvidenceVerdict::Missing,
+            interruption: None,
             body: Vec::new(),
             ..observation()
         },
@@ -411,10 +425,14 @@ fn historical_report_and_memory_receipt_round_trip_without_capability_negotiatio
         session: SessionId(4),
         slot: SlotId(2),
         history: EvidenceHistory {
+            failures: 1,
+            latest: None,
+
             sample: EvidenceObservation {
                 sample_id: 3,
                 sequence: admission.sequence + 1,
                 verdict: EvidenceVerdict::Missing,
+                interruption: None,
                 body: vec![],
                 ..admission.clone()
             },

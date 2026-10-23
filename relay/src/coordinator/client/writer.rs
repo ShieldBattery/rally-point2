@@ -444,7 +444,7 @@ pub(super) async fn write_control_frames(
                     session.periodic_evidence.iter()
                         .map(|entry| (entry.slot, entry.observation.sequence))
                         .chain(session.evidence_history.iter()
-                            .map(|entry| (entry.slot, entry.history.sample.sequence)))
+                            .map(|entry| (entry.slot, entry.history.latest_sample().sequence)))
                         .map(move |(slot, sequence)| (key.clone(), slot, sequence))
                 }).collect();
                 let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {

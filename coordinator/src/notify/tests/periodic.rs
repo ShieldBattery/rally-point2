@@ -35,6 +35,8 @@ async fn a_blocked_periodic_webhook_does_not_block_same_session_result_delivery(
             external_ref: None,
             observed_at_ms: 123,
             evidence: EvidenceObservation {
+                interruption: None,
+
                 sample_id: 1,
                 connection_id: [1; 32],
                 sequence: 2,
