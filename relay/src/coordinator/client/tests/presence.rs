@@ -71,6 +71,7 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
         RelayToCoordinator::Heartbeat {
             roster_complete: true,
             sessions: vec![SessionPresence {
+                evidence_history: Vec::new(),
                 periodic_evidence: Vec::new(),
                 tenant: TenantId(TENANT.to_owned()),
                 session: SessionId(7),
@@ -126,6 +127,7 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
     assert_eq!(
         heartbeat_presence(&sources),
         vec![SessionPresence {
+            evidence_history: Vec::new(),
             periodic_evidence: Vec::new(),
             tenant: TenantId(TENANT.to_owned()),
             session: SessionId(7),
@@ -239,6 +241,7 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
         RelayToCoordinator::LoadStateSnapshot {
             request_id: 99,
             state: SessionPresence {
+                evidence_history: Vec::new(),
                 periodic_evidence: Vec::new(),
                 tenant: TenantId(TENANT.to_owned()),
                 session: SessionId(7),
@@ -315,6 +318,7 @@ fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
     assert_eq!(
         session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)).0,
         SessionPresence {
+            evidence_history: Vec::new(),
             periodic_evidence: Vec::new(),
             tenant: TenantId(TENANT.to_owned()),
             session: SessionId(7),
@@ -462,6 +466,7 @@ fn periodic_heartbeat_attachment_budget_rotates_without_truncating_the_roster() 
             rally_point_proto::control::SessionPresence {
                 tenant: TenantId(TENANT.to_owned()),
                 session: SessionId(session),
+                evidence_history: vec![],
                 periodic_evidence: evidence
                     .iter()
                     .cloned()
@@ -495,6 +500,7 @@ fn periodic_heartbeat_attachment_budget_rotates_without_truncating_the_roster() 
                             session: session.session,
                         },
                         entry.slot,
+                        entry.observation.sequence,
                     )
                 })
             })
@@ -508,16 +514,21 @@ fn periodic_heartbeat_attachment_budget_rotates_without_truncating_the_roster() 
             &mut cursor,
             &[],
             candidates,
-            |key, slot, remaining| {
+            |key, slot, _, remaining| {
                 let session = &base[key.session.0 as usize];
                 let admission = &session.evidence[slot.0 as usize];
                 let periodic = &session.periodic_evidence[slot.0 as usize];
                 let cost = serde_json::to_vec(&(admission, periodic)).unwrap().len() + 256;
                 if cost > *remaining {
-                    return None;
+                    return Err(());
                 }
                 *remaining -= cost;
-                Some((admission.clone(), periodic.clone()))
+                Ok(Some(crate::consensus::PeriodicEvidencePair {
+                    admission: admission.clone(),
+                    sample: periodic.clone(),
+                    historical: false,
+                    observed_at_ms: 1,
+                }))
             },
         );
         assert_eq!(roster.len(), 256);
@@ -557,6 +568,7 @@ fn near_full_roster_reserves_frame_space_before_cloning_observations() {
             forwarded: slots.clone(),
             lobby_violations: vec![],
             evidence: vec![],
+            evidence_history: vec![],
             periodic_evidence: vec![],
             started_at_ms: Some(1792700000000),
         })
@@ -571,6 +583,7 @@ fn near_full_roster_reserves_frame_space_before_cloning_observations() {
                         session: session.session,
                     },
                     *slot,
+                    2,
                 )
             })
         })
@@ -594,9 +607,9 @@ fn near_full_roster_reserves_frame_space_before_cloning_observations() {
         &mut 0,
         &[],
         candidates,
-        |_, slot, remaining| {
+        |_, slot, _, remaining| {
             if cost > *remaining {
-                return None;
+                return Err(());
             }
             *remaining -= cost;
             copied += 1;
@@ -604,7 +617,12 @@ fn near_full_roster_reserves_frame_space_before_cloning_observations() {
             periodic.slot = slot;
             let mut admission = periodic.clone();
             admission.observation.sample_id = 0;
-            Some((admission, periodic))
+            Ok(Some(crate::consensus::PeriodicEvidencePair {
+                admission,
+                sample: periodic,
+                historical: false,
+                observed_at_ms: 1,
+            }))
         },
     );
     assert!(
@@ -632,12 +650,13 @@ fn oversized_first_pair_does_not_pin_heartbeat_rotation() {
         forwarded: vec![],
         lobby_violations: vec![],
         evidence: vec![],
+        evidence_history: vec![],
         periodic_evidence: vec![],
         started_at_ms: None,
     }];
     let candidates = vec![
-        (key(7), rally_point_proto::ids::SlotId(0)),
-        (key(7), rally_point_proto::ids::SlotId(1)),
+        (key(7), rally_point_proto::ids::SlotId(0), 1),
+        (key(7), rally_point_proto::ids::SlotId(1), 1),
     ];
     let mut cursor = 0;
     let mut attempts = Vec::new();
@@ -647,9 +666,9 @@ fn oversized_first_pair_does_not_pin_heartbeat_rotation() {
             &mut cursor,
             &[],
             candidates.clone(),
-            |_, slot, _| {
+            |_, slot, _, _| {
                 attempts.push(slot);
-                None
+                Err(())
             },
         );
     }

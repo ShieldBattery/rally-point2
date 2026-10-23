@@ -26,7 +26,7 @@ mod sync_coverage;
 
 pub use authority::{FrameRegression, MakerSync};
 pub use evidence::EvidenceConfig;
-pub(crate) use evidence::next_evidence_sequence;
+pub(crate) use evidence::{PeriodicEvidencePair, next_evidence_sequence};
 pub use leave::normalize_observed_leave;
 pub use lobby_policy::LobbyCommandVerdict;
 
@@ -127,6 +127,7 @@ pub enum RelayNotice {
 pub struct DecisionMakers {
     pub(in crate::consensus) makers: parking_lot::Mutex<MakerMap>,
     pub(in crate::consensus) descriptors_changed: tokio::sync::Notify,
+    pub(in crate::consensus) evidence_changes: OnceLock<tokio::sync::watch::Sender<u64>>,
     pub(in crate::consensus) require_descriptors: std::sync::atomic::AtomicBool,
     /// Set once at startup, drains into the coordinator control connection.
     /// Absent for a standalone relay. Unbounded so queueing a notice while the
@@ -402,6 +403,10 @@ impl DecisionMakers {
     ) -> SlotConnectedNotice {
         let (external_id, external_ref) = self.session_refs(key).stamps(slot);
         SlotConnectedNotice {
+            predecessor: self
+                .lock()
+                .get(key)
+                .and_then(|maker| maker.evidence_predecessor(slot)),
             tenant: key.tenant.clone(),
             session: key.session,
             slot,
@@ -509,6 +514,7 @@ pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> 
     DecisionMakers {
         makers: parking_lot::Mutex::new(HashMap::new()),
         descriptors_changed: tokio::sync::Notify::new(),
+        evidence_changes: OnceLock::new(),
         require_descriptors: std::sync::atomic::AtomicBool::new(false),
         notices: OnceLock::new(),
         refs: parking_lot::Mutex::new(HashMap::new()),
@@ -540,6 +546,7 @@ pub struct RetainedLoadState {
     /// The latest evidence observation for each home slot, ascending by slot.
     pub evidence: Vec<rally_point_proto::control::SlotEvidence>,
     pub periodic_evidence: Vec<rally_point_proto::control::SlotEvidence>,
+    pub evidence_history: Vec<rally_point_proto::control::SlotEvidenceHistory>,
     /// Relay wall-clock (unix epoch milliseconds) for the session's start, as
     /// this relay knows it. `None` on a relay that has not seen the session
     /// start at all.

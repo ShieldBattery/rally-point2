@@ -137,3 +137,59 @@ pub(super) mod periodic_samples {
         deserializer.deserialize_seq(Samples)
     }
 }
+
+/// One retained failed or interrupted sample, paired with its original admission.
+/// This never establishes the currently active connection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceHistory {
+    pub admission: EvidenceObservation,
+    pub sample: EvidenceObservation,
+    pub observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotEvidenceHistory {
+    pub slot: SlotId,
+    pub history: EvidenceHistory,
+}
+pub(super) mod history_samples {
+    use super::{MAX_PERIODIC_EVIDENCE_SLOTS, SlotEvidenceHistory};
+    use serde::de::{Error, IgnoredAny, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(
+        values: &[SlotEvidenceHistory],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if values.len() > MAX_PERIODIC_EVIDENCE_SLOTS {
+            return Err(serde::ser::Error::custom("too many periodic observations"));
+        }
+        values.serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<SlotEvidenceHistory>, D::Error> {
+        struct Samples;
+        impl<'de> Visitor<'de> for Samples {
+            type Value = Vec<SlotEvidenceHistory>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("at most 16 periodic observations")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while values.len() < MAX_PERIODIC_EVIDENCE_SLOTS {
+                    let Some(value) = seq.next_element()? else {
+                        return Ok(values);
+                    };
+                    values.push(value);
+                }
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom("too many periodic observations"));
+                }
+                Ok(values)
+            }
+        }
+        deserializer.deserialize_seq(Samples)
+    }
+}

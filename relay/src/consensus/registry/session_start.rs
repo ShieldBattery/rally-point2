@@ -48,6 +48,7 @@ impl DecisionMakers {
                 return false;
             }
         }
+        self.notify_evidence_changed();
         self.emit_notice(RelayNotice::SlotConnected(
             self.slot_connected_notice(key, slot, resumed, evidence),
         ));

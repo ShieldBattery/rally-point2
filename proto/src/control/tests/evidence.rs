@@ -241,6 +241,8 @@ fn periodic_policy_notice_and_presence_round_trip_independently() {
         ..observation()
     };
     let notice = RelayToCoordinator::SlotEvidence(SlotEvidenceNotice {
+        admission: None,
+        historical_admission: None,
         tenant: TenantId("test".into()),
         session: SessionId(1),
         slot: SlotId(2),
@@ -304,4 +306,99 @@ fn periodic_presence_bounds_sample_count_on_both_wire_directions() {
         .unwrap()
         .push(extra);
     assert!(serde_json::from_value::<SessionPresence>(value).is_err());
+}
+
+#[test]
+fn history_is_optional_for_older_notices_and_bounded_for_recovery() {
+    let mut presence: SessionPresence = serde_json::from_value(serde_json::json!({
+        "tenant": "test", "session": 1, "slots": []
+    }))
+    .unwrap();
+    assert!(presence.evidence_history.is_empty());
+    assert!(
+        serde_json::to_value(&presence)
+            .unwrap()
+            .get("evidence_history")
+            .is_none()
+    );
+    let history = EvidenceHistory {
+        admission: observation(),
+        sample: EvidenceObservation {
+            sample_id: 1,
+            verdict: EvidenceVerdict::Missing,
+            body: Vec::new(),
+            ..observation()
+        },
+        observed_at_ms: 42,
+    };
+    presence.evidence_history = (0..16)
+        .map(|slot| SlotEvidenceHistory {
+            slot: SlotId(slot),
+            history: history.clone(),
+        })
+        .collect();
+    let mut encoded = serde_json::to_value(&presence).unwrap();
+    assert_eq!(
+        serde_json::from_value::<SessionPresence>(encoded.clone()).unwrap(),
+        presence
+    );
+    presence
+        .evidence_history
+        .push(presence.evidence_history[0].clone());
+    assert!(serde_json::to_value(&presence).is_err());
+    let extra = encoded["evidence_history"][0].clone();
+    encoded["evidence_history"]
+        .as_array_mut()
+        .unwrap()
+        .push(extra);
+    assert!(serde_json::from_value::<SessionPresence>(encoded).is_err());
+
+    let mut notice = SlotEvidenceNotice {
+        admission: None,
+        historical_admission: None,
+        tenant: TenantId("test".into()),
+        session: SessionId(1),
+        slot: SlotId(0),
+        external_id: None,
+        external_ref: None,
+        observed_at_ms: 42,
+        evidence: history.sample.clone(),
+    };
+    let old = serde_json::to_value(&notice).unwrap();
+    assert!(old.get("admission").is_none());
+    assert!(old.get("historical_admission").is_none());
+    assert_eq!(
+        serde_json::from_value::<SlotEvidenceNotice>(old).unwrap(),
+        notice
+    );
+    notice.historical_admission = Some(history.admission.clone());
+    assert_eq!(
+        serde_json::from_value::<SlotEvidenceNotice>(serde_json::to_value(&notice).unwrap())
+            .unwrap(),
+        notice
+    );
+
+    let mut connected = SlotConnectedNotice {
+        predecessor: None,
+        evidence: Some(observation()),
+        tenant: TenantId("test".into()),
+        session: SessionId(1),
+        slot: SlotId(0),
+        external_id: None,
+        external_ref: None,
+        resumed: true,
+        connected_at_ms: 43,
+    };
+    let old = serde_json::to_value(&connected).unwrap();
+    assert!(old.get("predecessor").is_none());
+    assert_eq!(
+        serde_json::from_value::<SlotConnectedNotice>(old).unwrap(),
+        connected
+    );
+    connected.predecessor = Some(Box::new(history));
+    assert_eq!(
+        serde_json::from_value::<SlotConnectedNotice>(serde_json::to_value(&connected).unwrap())
+            .unwrap(),
+        connected
+    );
 }

@@ -83,10 +83,11 @@ fn periodic_samples_preserve_admission_and_coalesce_without_lifecycle_notices() 
     let before = makers.retained_load_state(&context.key).evidence;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     makers.set_notice_notifier(tx);
-    assert!(!context.record(0, checked()));
-    assert!(context.record(1, checked()));
-    assert!(!context.record(1, checked()));
-    assert!(context.record(
+    assert!(!record(&context, 0, checked()));
+    assert!(record(&context, 1, checked()));
+    assert!(!record(&context, 1, checked()));
+    assert!(record(
+        &context,
         2,
         crate::auth::CheckedEvidence {
             verdict: EvidenceVerdict::Invalid,
@@ -106,7 +107,7 @@ fn periodic_samples_preserve_admission_and_coalesce_without_lifecycle_notices() 
 #[test]
 fn old_registration_cannot_win_after_same_relay_reconnect() {
     let context = fixture();
-    assert!(context.record(1, checked()));
+    assert!(record(&context, 1, checked()));
     super::super::registry::deregister(&context.sessions, &context.key, context.slot);
     let (mut guard, _) =
         super::super::registry::register(&context.sessions, &context.key, context.slot, 2).unwrap();
@@ -118,7 +119,7 @@ fn old_registration_cannot_win_after_same_relay_reconnect() {
         .decision_makers
         .retained_load_state(&context.key);
     assert!(before.periodic_evidence.is_empty());
-    assert!(!context.record(99, checked()));
+    assert!(!record(&context, 99, checked()));
     assert!(context.current().is_none());
     assert_eq!(
         context
@@ -134,7 +135,7 @@ fn old_registration_cannot_win_after_same_relay_reconnect() {
 fn assignment_retirement_and_policy_changes_discard_late_results() {
     for change in 0..3 {
         let context = fixture();
-        assert!(context.record(1, checked()));
+        assert!(record(&context, 1, checked()));
         match change {
             0 => install(&context, true, 2),
             1 => install(&context, false, 1),
@@ -142,7 +143,7 @@ fn assignment_retirement_and_policy_changes_discard_late_results() {
                 context.mesh.session.gates.retire(&context.key);
             }
         }
-        assert!(!context.record(2, checked()));
+        assert!(!record(&context, 2, checked()));
         assert!(context.current().is_none());
         if change != 2 {
             assert!(
@@ -175,7 +176,7 @@ fn requests_wait_for_session_and_slot_start_and_jitter_is_bounded() {
     assert!(context.current().unwrap().1);
     for _ in 0..100 {
         assert!(
-            (Duration::from_secs(30)..=Duration::from_secs(60)).contains(&jitter(true).unwrap())
+            (Duration::from_secs(35)..=Duration::from_secs(65)).contains(&jitter(true).unwrap())
         );
         assert!(
             (Duration::from_secs(60)..=Duration::from_secs(90)).contains(&jitter(false).unwrap())
@@ -301,7 +302,7 @@ async fn worker_waits_for_game_start_and_keeps_empty_responses_off_gameplay_life
     );
     makers.mark_started(&key);
     makers.note_slot_started(&key, SlotId(0));
-    tokio::time::timeout(Duration::from_secs(62), client_read.read_exact(&mut frame))
+    tokio::time::timeout(Duration::from_secs(67), client_read.read_exact(&mut frame))
         .await
         .unwrap()
         .unwrap();
@@ -347,7 +348,7 @@ async fn stalled_worker_stops_only_evidence_and_policy_off_sends_nothing() {
         let task = tokio::spawn(run_with(context, write, read, request));
         if policy {
             let mut frame = [0; handshake::PERIODIC_CHALLENGE_LEN];
-            tokio::time::timeout(Duration::from_secs(62), client.read_exact(&mut frame))
+            tokio::time::timeout(Duration::from_secs(67), client.read_exact(&mut frame))
                 .await
                 .unwrap()
                 .unwrap();
@@ -366,4 +367,201 @@ async fn stalled_worker_stops_only_evidence_and_policy_off_sends_nothing() {
         let state = makers.retained_load_state(&key);
         assert_eq!(state.periodic_evidence.len(), usize::from(policy));
     }
+}
+
+fn record(context: &Context, sample: u64, checked: crate::auth::CheckedEvidence) -> bool {
+    let makers = &context.mesh.session.decision_makers;
+    if !makers.begin_periodic_evidence(
+        &context.key,
+        context.slot,
+        context.epoch,
+        EvidenceObservation {
+            sample_id: sample,
+            sequence: 0,
+            connection_id: context.connection_id,
+            assignment_revision: context.revision,
+            verdict: EvidenceVerdict::Missing,
+            key_id: None,
+            body: Vec::new(),
+        },
+    ) {
+        return false;
+    }
+    context.record(sample, checked)
+}
+
+#[test]
+fn forwarded_turn_starts_sampling_without_a_client_started_claim() {
+    let context = fixture();
+    let makers = &context.mesh.session.decision_makers;
+    makers.note_unframed_home_turn(&context.key, context.slot);
+    assert!(!context.current().unwrap().1);
+    makers.mark_started(&context.key);
+    assert!(context.current().unwrap().1);
+}
+
+#[test]
+fn optional_missing_admission_is_ineligible_but_required_missing_is_eligible() {
+    for required in [false, true] {
+        let context = fixture();
+        let makers = &context.mesh.session.decision_makers;
+        // Required policy is latched when the descriptor is first installed.
+        let mut config = makers.evidence_config(&context.key).unwrap();
+        if required {
+            config.required_slots.insert(context.slot);
+        }
+        let other_key = crate::test_support::session_key(if required { 45 } else { 44 });
+        let _ = makers.sync_maker(
+            &other_key,
+            MakerSync {
+                evidence: config,
+                expected_slots: [context.slot].into_iter().collect(),
+                homed_slots: [context.slot].into_iter().collect(),
+                ..MakerSync::new(crate::test_support::wide_bounds(), Authority::SelfRelay)
+            },
+        );
+        assert!(makers.activate_connection_epoch(&other_key, context.slot, context.epoch));
+        let observation = EvidenceObservation {
+            sample_id: 0,
+            sequence: crate::consensus::next_evidence_sequence().unwrap(),
+            connection_id: context.connection_id,
+            assignment_revision: 1,
+            verdict: EvidenceVerdict::Missing,
+            key_id: None,
+            body: Vec::new(),
+        };
+        assert!(makers.note_slot_connected(&other_key, context.slot, false, Some(observation)));
+        assert_eq!(
+            makers
+                .periodic_evidence_config(
+                    &other_key,
+                    context.slot,
+                    context.epoch,
+                    &context.connection_id,
+                    1
+                )
+                .is_some(),
+            required
+        );
+    }
+}
+
+fn begin(context: &Context, sample: u64) -> bool {
+    context
+        .mesh
+        .session
+        .decision_makers
+        .begin_periodic_evidence(
+            &context.key,
+            context.slot,
+            context.epoch,
+            EvidenceObservation {
+                sample_id: sample,
+                sequence: 0,
+                connection_id: context.connection_id,
+                assignment_revision: context.revision,
+                verdict: EvidenceVerdict::Valid,
+                key_id: Some(99),
+                body: vec![99],
+            },
+        )
+}
+
+#[test]
+fn unanswered_challenge_survives_two_replacements_before_task_drop() {
+    let mut context = fixture();
+    let makers = context.mesh.session.decision_makers.clone();
+    let admission = makers.retained_load_state(&context.key).evidence[0]
+        .observation
+        .clone();
+    assert!(begin(&context, 1));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    makers.set_notice_notifier(tx);
+    // Neither task destruction nor a control heartbeat runs before replacement.
+    admit(&context, [2; 32], 2);
+    admit(&context, [3; 32], 3);
+    let state = makers.retained_load_state(&context.key);
+    assert!(state.periodic_evidence.is_empty());
+    let history = &state.evidence_history[0].history;
+    assert_eq!(history.admission, admission);
+    assert_eq!(history.sample.verdict, EvidenceVerdict::Missing);
+    assert!(history.sample.body.is_empty());
+    assert_eq!(history.sample.key_id, None);
+    assert!(history.sample.sequence < state.evidence[0].observation.sequence);
+    for _ in 0..2 {
+        let crate::consensus::RelayNotice::SlotConnected(notice) = rx.try_recv().unwrap() else {
+            panic!("wrong notice");
+        };
+        assert_eq!(notice.predecessor.as_deref(), Some(history));
+    }
+    // Old callback completion and old task destruction cannot mutate the history.
+    assert!(!context.record(1, checked()));
+    makers.abandon_periodic_evidence(&context.key, context.slot, 1, 1);
+    assert_eq!(makers.retained_load_state(&context.key), state);
+    context.epoch = 3;
+    context.connection_id = [3; 32];
+    assert!(begin(&context, 1));
+    makers.abandon_periodic_evidence(&context.key, context.slot, 3, 1);
+    assert_eq!(
+        makers.retained_load_state(&context.key).evidence_history,
+        state.evidence_history
+    );
+}
+
+#[test]
+fn completed_failure_and_later_valid_result_cannot_replace_first_failure() {
+    let context = fixture();
+    let makers = &context.mesh.session.decision_makers;
+    assert!(record(
+        &context,
+        1,
+        crate::auth::CheckedEvidence {
+            verdict: EvidenceVerdict::Invalid,
+            ..checked()
+        }
+    ));
+    let failed = makers.retained_load_state(&context.key).evidence_history;
+    assert!(record(&context, 2, checked()));
+    assert_eq!(
+        makers.retained_load_state(&context.key).evidence_history,
+        failed
+    );
+    admit(&context, [2; 32], 2);
+    assert_eq!(
+        makers.retained_load_state(&context.key).evidence_history,
+        failed
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn abort_after_challenge_bytes_retains_missing_without_a_heartbeat() {
+    let context = fixture();
+    let req = request(&context);
+    let makers = context.mesh.session.decision_makers.clone();
+    let key = context.key.clone();
+    makers.mark_started(&key);
+    makers.note_unframed_home_turn(&key, context.slot);
+    let (relay, mut client) = tokio::io::duplex(8192);
+    let (read, write) = tokio::io::split(relay);
+    let task = tokio::spawn(run_with(context, write, read, req));
+    let mut frame = [0; handshake::PERIODIC_CHALLENGE_LEN];
+    tokio::time::timeout(Duration::from_secs(67), client.read_exact(&mut frame))
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let history = makers.retained_load_state(&key).evidence_history;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].history.sample.verdict, EvidenceVerdict::Missing);
+    assert_eq!(history[0].history.sample.sample_id, 1);
+}
+
+#[test]
+fn cancelled_obligation_cannot_complete_after_policy_reenabled() {
+    let context = fixture();
+    assert!(begin(&context, 1));
+    install(&context, false, 1);
+    install(&context, true, 1);
+    assert!(!context.record(1, checked()));
 }

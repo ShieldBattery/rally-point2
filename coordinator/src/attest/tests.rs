@@ -6,6 +6,7 @@ use crate::test_support::tid;
 fn snapshot(session: SessionId, ever_connected: &[u8]) -> AttestedSnapshot {
     AttestedSnapshot {
         state: SessionPresence {
+            evidence_history: Vec::new(),
             periodic_evidence: Vec::new(),
             evidence: Vec::new(),
             tenant: tid(),

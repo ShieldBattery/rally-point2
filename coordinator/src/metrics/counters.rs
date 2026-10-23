@@ -39,6 +39,8 @@ pub(super) static SESSIONS_CLOSED: LabeledCounter<String> = LabeledCounter::new(
 pub(super) static SESSION_REAPS: LabeledCounter<(String, String)> = LabeledCounter::new();
 pub(super) static DESYNCS: LabeledCounter<String> = LabeledCounter::new();
 pub(super) static WEBHOOK_DELIVERIES: LabeledCounter<(String, String)> = LabeledCounter::new();
+pub(super) static PERIODIC_WEBHOOK_OUTCOMES: LabeledCounter<(String, String)> =
+    LabeledCounter::new();
 pub(super) static WEBHOOK_ATTEMPT_FAILURES: LabeledCounter<String> = LabeledCounter::new();
 pub(super) static FLIGHT_RECORDINGS: LabeledCounter<String> = LabeledCounter::new();
 pub(super) static FLIGHT_RECORDINGS_PINNED: AtomicU64 = AtomicU64::new(0);
@@ -121,6 +123,13 @@ pub(crate) fn webhook_delivered(tenant: &TenantId, result: &str) {
 /// followed by a `gave_up` delivery outcome).
 pub(crate) fn webhook_attempt_failed(tenant: &TenantId) {
     WEBHOOK_ATTEMPT_FAILURES.incr(tenant.as_ref().to_owned());
+}
+
+/// Records best-effort periodic delivery separately from lifecycle delivery.
+/// `result` is `ok` or `failed` for an HTTP attempt, or `global_busy`,
+/// `tenant_busy`, `serialize_failed`, or `request_failed` for a pre-attempt drop.
+pub(crate) fn periodic_webhook_outcome(tenant: &TenantId, result: &str) {
+    PERIODIC_WEBHOOK_OUTCOMES.incr((tenant.as_ref().to_owned(), result.to_owned()));
 }
 
 /// Records a flight recording stored successfully.

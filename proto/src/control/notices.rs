@@ -258,6 +258,8 @@ pub struct ResultNotice {
 /// self-describing across a coordinator restart.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotConnectedNotice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<Box<super::EvidenceHistory>>,
     /// The evidence observation associated with this connection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<EvidenceObservation>,
@@ -389,6 +391,12 @@ pub struct LobbyViolationNotice {
 /// connection supplies the slot; the descriptor supplies the external ids.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotEvidenceNotice {
+    /// Current admission paired with a current sample, for independent reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<EvidenceObservation>,
+    /// A historical sample is paired with its original admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub historical_admission: Option<EvidenceObservation>,
     pub tenant: TenantId,
     pub session: SessionId,
     pub slot: SlotId,

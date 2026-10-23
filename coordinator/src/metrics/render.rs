@@ -12,9 +12,9 @@ use super::census::CoordinatorCensus;
 use super::counters::{
     CONTROL_CONNECTION_ENDS, CONTROL_SEND_DURATION, DESCRIPTOR_DELTA_ENTRIES_SENT,
     DESCRIPTOR_DELTAS_SENT, DESCRIPTOR_FULL_SETS_SENT, DESYNCS, FLIGHT_RECORDINGS,
-    FLIGHT_RECORDINGS_PINNED, PROVISION_LAST_TICK, REAP_DIRECTIVES_SENT, REAP_NUDGES_COALESCED,
-    RELAY_COLD_START, RELAY_DRAINS, RELAY_ENROLLS, RELAY_LAUNCH_FAILURES, RELAY_LAUNCHES,
-    RELAY_REAPED, SESSION_HOLDS, SESSION_REAPS, SESSIONS_CLOSED, SESSIONS_CREATED,
+    FLIGHT_RECORDINGS_PINNED, PERIODIC_WEBHOOK_OUTCOMES, PROVISION_LAST_TICK, REAP_DIRECTIVES_SENT,
+    REAP_NUDGES_COALESCED, RELAY_COLD_START, RELAY_DRAINS, RELAY_ENROLLS, RELAY_LAUNCH_FAILURES,
+    RELAY_LAUNCHES, RELAY_REAPED, SESSION_HOLDS, SESSION_REAPS, SESSIONS_CLOSED, SESSIONS_CREATED,
     WEBHOOK_ATTEMPT_FAILURES, WEBHOOK_DELIVERIES,
 };
 use super::instruments::LabeledCounter;
@@ -160,6 +160,15 @@ pub(super) fn exposition(census: &CoordinatorCensus) -> String {
         "Individual webhook delivery attempts that failed, by tenant.",
         &WEBHOOK_ATTEMPT_FAILURES,
         "tenant",
+    );
+
+    render_counter_2(
+        &mut out,
+        "rp2_periodic_webhook_outcomes_total",
+        "Periodic webhook attempts and pre-attempt drops, by tenant and result.",
+        &PERIODIC_WEBHOOK_OUTCOMES,
+        "tenant",
+        "result",
     );
 
     write_meta(

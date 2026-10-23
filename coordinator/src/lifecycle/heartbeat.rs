@@ -166,6 +166,13 @@ impl RegionRttIngest<'_> {
 /// accumulated sets. Truncated rather than rejected: the legitimate entries that
 /// precede the excess are still worth folding in.
 pub(crate) fn bound_session_slot_lists(relay_id: RelayId, session: &mut SessionPresence) {
+    session
+        .evidence_history
+        .truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+    let mut history_slots = std::collections::HashSet::new();
+    session
+        .evidence_history
+        .retain(|entry| history_slots.insert(entry.slot));
     session.evidence.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
     let mut evidence_slots = std::collections::HashSet::new();
     session.evidence.retain(|entry| {

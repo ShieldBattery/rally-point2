@@ -50,6 +50,7 @@ fn result_notice() -> ResultNotice {
 
 fn slot_connected_notice() -> SlotConnectedNotice {
     SlotConnectedNotice {
+        predecessor: None,
         evidence: None,
         tenant: TenantId(TENANT.to_owned()),
         session: SessionId(42),

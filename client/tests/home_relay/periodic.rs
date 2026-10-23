@@ -20,7 +20,7 @@ use super::helpers::{
 };
 
 #[tokio::test]
-async fn signed_periodic_evidence_crosses_the_real_auth_stream_during_turn_traffic() {
+async fn signed_periodic_evidence_samples_turn_traffic_without_a_game_started_report() {
     tokio::time::timeout(Duration::from_secs(75), roundtrip())
         .await
         .expect("periodic evidence did not complete within its first sampling interval");
@@ -105,12 +105,12 @@ async fn roundtrip() {
         .observation;
     assert_eq!(admission0.verdict, EvidenceVerdict::Valid);
     assert_eq!(admission0.body, vec![1]);
-    channels0.game_started.send(()).await.unwrap();
+    // Slot zero deliberately withholds GameStarted; forwarded turns must still arm collection.
     channels1.game_started.send(()).await.unwrap();
 
     let mut turns = 0;
     let periodic = loop {
-        // Keep both directions active throughout the real 30-60 second jitter,
+        // Keep both directions active throughout the real 35-65 second jitter,
         // so silence/drop handling cannot mask the auxiliary stream's behavior.
         let turn = Payload {
             commands: vec![0x0C, 1, 2, 3, 4, 5, 6, 7].into(),
@@ -140,6 +140,15 @@ async fn roundtrip() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
     assert!(turns > 1);
+    let state = makers.retained_load_state(&key);
+    assert!(!state.started.contains(&SlotId(0)));
+    assert!(state.forwarded.contains(&SlotId(0)));
+    assert!(
+        state
+            .periodic_evidence
+            .iter()
+            .all(|entry| entry.slot != SlotId(1))
+    );
     let request = requests.recv().await.unwrap();
     let context = request.periodic.as_ref().unwrap();
     assert_eq!(context.challenge_id, 1);

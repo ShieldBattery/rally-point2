@@ -305,6 +305,7 @@ pub(crate) fn presence_entry(
     connected: &[u8],
 ) -> SessionPresence {
     SessionPresence {
+        evidence_history: Vec::new(),
         periodic_evidence: Vec::new(),
         evidence: Vec::new(),
         tenant: tenant.clone(),

@@ -1503,8 +1503,8 @@ emptiness, so restating a finished session's record can never keep that session 
 The coordinator holds the global picture of a game's end and drives three things off it. **Ordered
 dispatch:** lifecycle webhooks for one `(tenant, session)` drain from a single FIFO queue, one at a time, so a
 delivered `sessionClosed` implies every earlier lifecycle notice was delivered or exhausted. Periodic
-evidence uses a separate process-wide four-request concurrency gate, with one bounded attempt per sample
-and no pending queue or retries. Busy delivery sheds samples; retained-cache recovery can retrieve the
+evidence uses a separate process-wide four-request concurrency gate, capped at two active requests per
+tenant, with one bounded attempt per sample and no pending queue or retries. Busy delivery sheds samples; retained-cache recovery can retrieve the
 latest value. Samples may arrive after `sessionClosed` and have no lifecycle effects.
 **`sessionClosed`:** the coordinator assigned each session's serving-relay set, and when every one of them
 has reported `SessionClosed` (its last local slot deregistered), the final `sessionClosed` webhook fires
@@ -1553,8 +1553,10 @@ reaps do not re-arm, and the liveness probe force-reconciles it.
 
 `POST /session/evidence` reads the coordinator's retained latest per-slot observations for a signed
 `{ tenant, session }` request and returns `{ evidence: [...] }`, empty when the session is unknown.
-The latest admission and latest periodic observation per slot are available, at most 32 observations
-for 16 slots; this is not an archival log. Intermediate periodic samples that were never received or
+The latest admission, latest periodic observation, and first retained failed or unanswered sample per
+slot are available, at most 48 observations for 16 slots; duplicate samples are returned only once.
+The first failure is an accumulated session fact and survives a subsequent admission or rehome once
+the coordinator accepts it. This is not an archival log. Intermediate periodic samples that were never received or
 were overwritten cannot be recovered here. Session retirement, including
 normal close, discards observations immediately; there is no post-close recovery grace period.
 It makes no completeness claim, performs no relay exchange or lobby settlement, and uses a separate
@@ -1864,19 +1866,34 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
 - **Periodic evidence is opt-in and cannot gate gameplay.** Client-edge `rp2/3` retains the initial
   handshake stream for bounded challenge/response frames, with `rp2/2` and `rp2/1` fallbacks. A tenant
   requests periodic collection explicitly; descriptors enable it only on relays advertising support.
-  Relays wait for game and slot start, then jitter the first request by 30-60 seconds and subsequent
-  requests by 60-90 seconds. A fixed full-image check uses a fresh nonce and nonzero challenge ID,
-  signed with the connection, session, slot, and assignment revision. Exchanges have a three-second
-  deadline and share 32 relay-wide permits; a busy relay skips work. Clients share a 30-second
-  cooldown and one blocking-provider permit across reconnects. Timed-out running providers retain
-  their permit until they return. Failure ends only the evidence stream or produces a missing sample,
-  never a gameplay close or enforcement decision. Samples are fenced against current registration,
-  assignment, control connection, relay process, and admission identity. Separate latest-periodic
-  state cannot overwrite admission or trigger load-progress callbacks. Heartbeats rotate through at
-  most 512 KiB of paired admission/periodic attachments while always reporting the complete roster;
-  matching `slotEvidence` notices use the same bounded selection. Latest-value recovery does not
-  guarantee delivery of every intermediate sample. Actual client performance must be qualified
-  before enabling the tenant policy.
+  Relays wait for session start and either a slot's start report or its relay-observed forwarded turns,
+  then jitter the first request by 35-65 seconds and subsequent requests by 60-90 seconds. An optional
+  slot whose admission supplied no evidence is not sampled; its missing admission remains visible.
+  A fixed full-image check uses a fresh nonce and nonzero challenge ID, signed with the connection,
+  session, slot, and assignment revision. Exchanges have a three-second deadline and share 32
+  relay-wide permits; a busy relay skips work. Clients share a 30-second cooldown and one blocking-
+  provider permit across reconnects. Timed-out running providers retain their permit until they return,
+  so reconnect admission can temporarily produce retryable missing evidence while a slow callback runs.
+  Qualify both frame impact and reconnect latency on slow supported clients before enabling collection.
+
+  The relay registers an exact outstanding obligation before sending a challenge. Disconnect or
+  replacement settles an unanswered obligation as missing; a late completion cannot overwrite it.
+  Each slot retains its first failure with the original admission identity independently of current
+  evidence. A historical pair never establishes current ownership: newly learned history must still
+  pass the current assignment, relay process, and control-generation fences. Already accepted history
+  survives rehome and coordinator persistence. An old home's unsent history cannot be recovered after
+  its assignment is revoked, and relay process loss can lose facts not yet reported. Interrupted
+  challenges also occur on ordinary network failure; they are not themselves proof of cheating.
+
+  Collection never closes or fences gameplay. Current samples retain the registration, assignment,
+  control connection, relay process, and admission fences and cannot trigger load-progress callbacks.
+  Changed observations wake a coalesced writer; paired notices run below lifecycle and load-state work.
+  Each control connection sends each retained sample once as a notice and once in bounded heartbeat
+  recovery attachments. Heartbeats always carry the complete roster and rotate through at most 512 KiB
+  of attachments. A new control connection restates retained pairs; unchanged bodies are omitted from
+  subsequent beats. Webhook delivery has independent tenant/global budgets and outcome counters.
+  The global descriptor-change notification still wakes live samplers; per-session notification is a
+  scaling optimization, not a collection prerequisite.
 - **Empty sessions cannot pin the relay fleet indefinitely.** After observing any local or peer player
   live, a relay uses its authoritative local roster plus explicit zero reports from every peer, so even an
   assigned relay whose own slot never connected runs the ordinary close once the session transitions to

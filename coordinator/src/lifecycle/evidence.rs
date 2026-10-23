@@ -150,6 +150,35 @@ impl Lifecycle {
         if let Some(boot_id) = registry::boot_id(setup.registry(), relay)
             && has_assignment
         {
+            if let Some(history) = &notice.predecessor
+                && history.sample.sequence < observation.sequence
+                && self.record_evidence_history(
+                    (relay, boot_id),
+                    &notice.tenant,
+                    notice.session,
+                    notice.slot,
+                    history,
+                    true,
+                )
+            {
+                notify::handle_slot_evidence(
+                    setup,
+                    rally_point_proto::control::SlotEvidenceNotice {
+                        admission: None,
+                        historical_admission: None,
+                        tenant: notice.tenant.clone(),
+                        session: notice.session,
+                        slot: notice.slot,
+                        external_id: notice.external_id.clone(),
+                        external_ref: notice.external_ref.clone(),
+                        observed_at_ms: history.observed_at_ms,
+                        evidence: rally_point_proto::control::EvidenceObservation {
+                            body: Vec::new(),
+                            ..history.sample.clone()
+                        },
+                    },
+                );
+            }
             if !self.record_connection_evidence(
                 (relay, boot_id),
                 &notice.tenant,
@@ -205,6 +234,23 @@ impl Lifecycle {
                 );
             }
             let mut seen = std::collections::HashSet::new();
+            for entry in session
+                .evidence_history
+                .iter()
+                .take(rally_point_proto::control::MAX_PERIODIC_EVIDENCE_SLOTS)
+            {
+                if seen.insert(entry.slot) {
+                    self.record_evidence_history(
+                        (relay, boot_id),
+                        &session.tenant,
+                        session.session,
+                        entry.slot,
+                        &entry.history,
+                        false,
+                    );
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
             for entry in &session.periodic_evidence {
                 if seen.insert(entry.slot) {
                     self.record_periodic_evidence(
@@ -221,7 +267,7 @@ impl Lifecycle {
     }
 
     // The caller holds assignment and relay-epoch locks through this mutation.
-    fn record_connection_evidence(
+    pub(super) fn record_connection_evidence(
         &self,
         source: (RelayId, u64),
         tenant: &TenantId,
@@ -318,8 +364,12 @@ pub(super) fn current_evidence(
                 .periodic_evidence
                 .iter()
                 .filter(|(slot, stored)| {
-                    assignments.get(slot)
-                        == Some(&(stored.relay, stored.observation.assignment_revision))
+                    !state
+                        .evidence_history
+                        .get(slot)
+                        .is_some_and(|history| history.history.sample == stored.observation)
+                        && assignments.get(slot)
+                            == Some(&(stored.relay, stored.observation.assignment_revision))
                         && state
                             .evidence
                             .get(slot)
@@ -330,5 +380,11 @@ pub(super) fn current_evidence(
                     observation: stored.observation.clone(),
                 }),
         )
+        .chain(state.evidence_history.iter().map(|(&slot, stored)| {
+            rally_point_proto::control::SlotEvidence {
+                slot,
+                observation: stored.history.sample.clone(),
+            }
+        }))
         .collect()
 }

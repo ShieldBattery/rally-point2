@@ -74,6 +74,8 @@ fn sample(connection: u64, sample_id: u64, sequence: u64) -> EvidenceObservation
 }
 fn notice(session: SessionId, evidence: EvidenceObservation) -> SessionNotice {
     SessionNotice::SlotEvidence(SlotEvidenceNotice {
+        admission: None,
+        historical_admission: None,
         tenant: tid(),
         session,
         slot: SlotId(0),
@@ -178,6 +180,7 @@ async fn snapshots_merge_admission_first_and_late_arrival_does_not_drop_periodic
         RelayId(1),
         generation,
         SessionNotice::SlotConnected(SlotConnectedNotice {
+            predecessor: None,
             tenant: tid(),
             session,
             slot: SlotId(0),
@@ -329,4 +332,198 @@ async fn periodic_policy_capability_and_sample_shape_gate_both_ingest_paths() {
     );
     lc.ingest_notice(RelayId(1), generation, notice(session, sample(1, 1, 2)));
     assert_eq!(lc.connection_evidence(&tid(), session).len(), 1);
+}
+
+fn history_notice(session: SessionId, connection: u64, sequence: u64) -> SessionNotice {
+    let SessionNotice::SlotEvidence(mut notice) = notice(session, sample(connection, 1, sequence))
+    else {
+        unreachable!()
+    };
+    notice.evidence.verdict = EvidenceVerdict::Missing;
+    notice.evidence.body.clear();
+    notice.historical_admission = Some(admission(connection));
+    SessionNotice::SlotEvidence(notice)
+}
+
+#[tokio::test]
+async fn historical_failure_survives_new_admission_before_notice_and_two_reconnects() {
+    let (lc, session, generation) = setup(true);
+    let (url, mut receiver) = WebhookReceiver::default().spawn().await;
+    crate::tenant::set_notify(
+        lc.inner.setup.tenants(),
+        &tid(),
+        Some(crate::tenant::NotifyConfig { url }),
+    );
+    lc.merge_connection_evidence(
+        RelayId(1),
+        generation,
+        &[snapshot(session, Some(admission(5)), None)],
+    );
+    lc.ingest_notice(RelayId(1), generation, history_notice(session, 1, 2));
+    lc.ingest_notice(RelayId(1), generation, history_notice(session, 1, 2));
+    let webhook = timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(webhook.body["evidence"]["verdict"], "missing");
+    assert_eq!(lc.drain_webhooks(Duration::from_secs(2)).await, 0);
+    assert!(receiver.try_recv().is_err());
+    lc.merge_connection_evidence(
+        RelayId(1),
+        generation,
+        &[snapshot(session, Some(admission(8)), None)],
+    );
+    lc.ingest_notice(RelayId(1), generation, notice(session, sample(8, 1, 9)));
+    let retained = lc.connection_evidence(&tid(), session);
+    assert_eq!(retained.len(), 3);
+    assert_eq!(retained[0].observation, admission(8));
+    assert_eq!(
+        retained[2].observation.connection_id,
+        admission(1).connection_id
+    );
+    assert_eq!(retained[2].observation.verdict, EvidenceVerdict::Missing);
+    let facts = lc.export_facts().remove(&(tid(), session)).unwrap();
+    let facts = serde_json::from_slice(&serde_json::to_vec(&facts).unwrap()).unwrap();
+    let restored = Lifecycle::new(lc.inner.setup.clone());
+    restored.restore_session(
+        tid(),
+        session,
+        vec![RelayId(1)],
+        HashSet::from([SlotId(0), SlotId(1)]),
+        HashSet::new(),
+        facts,
+    );
+    assert_eq!(restored.connection_evidence(&tid(), session), retained);
+    restored.on_rehome(&tid(), session, RelayId(1), RelayId(1));
+    let retained = restored.connection_evidence(&tid(), session);
+    assert!(
+        retained.iter().any(
+            |entry| entry.observation == lc.connection_evidence(&tid(), session)[2].observation
+        )
+    );
+    let generation = enroll(&restored, 8, true);
+    assert_eq!(restored.connection_evidence(&tid(), session).len(), 1);
+    restored.ingest_notice(RelayId(1), generation, history_notice(session, 1, 2));
+    assert_eq!(restored.connection_evidence(&tid(), session).len(), 1);
+}
+
+#[tokio::test]
+async fn historical_pairs_reject_stale_control_wrong_assignment_and_bad_order() {
+    let (lc, session, old_generation) = setup(true);
+    lc.merge_connection_evidence(
+        RelayId(1),
+        old_generation,
+        &[snapshot(session, Some(admission(5)), None)],
+    );
+    let generation = enroll(&lc, 7, true);
+    lc.ingest_notice(RelayId(1), old_generation, history_notice(session, 1, 2));
+    assert_eq!(lc.connection_evidence(&tid(), session).len(), 1);
+    for mode in 0..6 {
+        let SessionNotice::SlotEvidence(mut invalid) = history_notice(session, 1, 2) else {
+            unreachable!()
+        };
+        match mode {
+            0 => invalid.evidence.assignment_revision = 2,
+            1 => invalid.evidence.sequence = 6,
+            2 => invalid.evidence.connection_id = [9; 32],
+            3 => invalid.historical_admission.as_mut().unwrap().sequence = 2,
+            4 => invalid.admission = Some(admission(1)),
+            _ => invalid.evidence.verdict = EvidenceVerdict::Valid,
+        }
+        lc.ingest_notice(RelayId(1), generation, SessionNotice::SlotEvidence(invalid));
+        assert_eq!(lc.connection_evidence(&tid(), session).len(), 1);
+    }
+    lc.ingest_notice(RelayId(1), generation, history_notice(session, 1, 2));
+    assert_eq!(lc.connection_evidence(&tid(), session).len(), 2);
+    lc.ingest_notice(RelayId(1), generation, history_notice(session, 3, 4));
+    assert_eq!(
+        lc.connection_evidence(&tid(), session)[1]
+            .observation
+            .connection_id,
+        [1; 32]
+    );
+}
+
+#[tokio::test]
+async fn malformed_current_pair_cannot_advance_admission() {
+    let (lc, session, generation) = setup(true);
+    lc.merge_connection_evidence(
+        RelayId(1),
+        generation,
+        &[snapshot(session, Some(admission(1)), None)],
+    );
+    for mode in 0..5 {
+        let SessionNotice::SlotEvidence(mut invalid) = notice(session, sample(5, 1, 6)) else {
+            unreachable!()
+        };
+        invalid.admission = Some(admission(5));
+        match mode {
+            0 => invalid.evidence.sample_id = 0,
+            1 => invalid.evidence.connection_id = [9; 32],
+            2 => invalid.evidence.assignment_revision = 2,
+            3 => invalid.evidence.sequence = 4,
+            _ => invalid
+                .evidence
+                .body
+                .resize(rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN + 1, 0),
+        }
+        lc.ingest_notice(RelayId(1), generation, SessionNotice::SlotEvidence(invalid));
+        assert_eq!(
+            lc.connection_evidence(&tid(), session)[0].observation,
+            admission(1)
+        );
+    }
+    let SessionNotice::SlotEvidence(mut valid) = notice(session, sample(5, 1, 6)) else {
+        unreachable!()
+    };
+    valid.admission = Some(admission(5));
+    lc.ingest_notice(RelayId(1), generation, SessionNotice::SlotEvidence(valid));
+    assert_eq!(
+        lc.connection_evidence(&tid(), session)[0].observation,
+        admission(5)
+    );
+    assert_eq!(lc.connection_evidence(&tid(), session).len(), 2);
+}
+
+#[tokio::test]
+async fn next_admission_and_snapshot_preserve_predecessor_without_current_sample() {
+    let (lc, session, generation) = setup(true);
+    let history = rally_point_proto::control::EvidenceHistory {
+        admission: admission(1),
+        sample: EvidenceObservation {
+            verdict: EvidenceVerdict::Missing,
+            body: Vec::new(),
+            ..sample(1, 1, 2)
+        },
+        observed_at_ms: 42,
+    };
+    lc.ingest_notice(
+        RelayId(1),
+        generation,
+        SessionNotice::SlotConnected(SlotConnectedNotice {
+            predecessor: Some(Box::new(history.clone())),
+            evidence: Some(admission(5)),
+            tenant: tid(),
+            session,
+            slot: SlotId(0),
+            external_id: None,
+            external_ref: None,
+            resumed: true,
+            connected_at_ms: 50,
+        }),
+    );
+    assert_eq!(lc.connection_evidence(&tid(), session).len(), 2);
+    let (other, other_session, other_generation) = setup(true);
+    let mut snapshot = snapshot(other_session, Some(admission(5)), None);
+    snapshot
+        .evidence_history
+        .push(rally_point_proto::control::SlotEvidenceHistory {
+            slot: SlotId(0),
+            history,
+        });
+    other.merge_connection_evidence(RelayId(1), other_generation, &[snapshot]);
+    assert_eq!(
+        other.connection_evidence(&tid(), other_session),
+        lc.connection_evidence(&tid(), session)
+    );
 }

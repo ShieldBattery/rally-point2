@@ -50,6 +50,7 @@ fn observation(sequence: u64, assignment_revision: u64) -> EvidenceObservation {
 
 fn notice(session: SessionId, observation: EvidenceObservation) -> SessionNotice {
     SessionNotice::SlotConnected(SlotConnectedNotice {
+        predecessor: None,
         tenant: tid(),
         session,
         slot: SlotId(0),

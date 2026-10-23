@@ -632,6 +632,12 @@ pub enum RelayToCoordinator {
 /// added claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPresence {
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "super::evidence::history_samples"
+    )]
+    pub evidence_history: Vec<super::SlotEvidenceHistory>,
     /// Latest periodic sample per slot, separate from admission observations.
     #[serde(
         default,

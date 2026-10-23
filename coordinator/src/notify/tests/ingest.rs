@@ -71,6 +71,7 @@ fn every_kind(session: SessionId) -> Vec<(&'static str, SessionNotice)> {
         (
             "slotConnected",
             SessionNotice::SlotConnected(SlotConnectedNotice {
+                predecessor: None,
                 evidence: None,
                 tenant: tenant.clone(),
                 session,

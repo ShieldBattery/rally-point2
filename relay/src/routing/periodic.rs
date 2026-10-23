@@ -138,7 +138,7 @@ fn jitter(first: bool) -> Option<Duration> {
     let mut bytes = [0; 8];
     SystemRandom::new().fill(&mut bytes).ok()?;
     Some(Duration::from_millis(
-        if first { 30_000 } else { 60_000 } + u64::from_le_bytes(bytes) % 30_001,
+        if first { 35_000 } else { 60_000 } + u64::from_le_bytes(bytes) % 30_001,
     ))
 }
 
@@ -189,6 +189,42 @@ async fn run_with(
             assignment_revision: context.revision,
             check: EvidenceCheck::FullImage,
         };
+        let pending = EvidenceObservation {
+            sample_id,
+            connection_id: context.connection_id,
+            assignment_revision: context.revision,
+            sequence: 0,
+            verdict: rally_point_proto::control::EvidenceVerdict::Missing,
+            key_id: None,
+            body: Vec::new(),
+        };
+        let armed = context
+            .mesh
+            .session
+            .gates
+            .with_ingress(&context.key, || {
+                let roster = context.sessions.lock();
+                if !roster
+                    .get(&context.key)
+                    .and_then(|slots| slots.get(&context.slot))
+                    .is_some_and(|entry| entry.connection_epoch == context.epoch)
+                {
+                    return false;
+                }
+                context
+                    .mesh
+                    .session
+                    .decision_makers
+                    .begin_periodic_evidence(&context.key, context.slot, context.epoch, pending)
+            })
+            .unwrap_or(false);
+        if !armed {
+            return;
+        }
+        let _obligation = Obligation {
+            context: &context,
+            sample: sample_id,
+        };
         let response = tokio::select! {
             _ = context.invalidated() => return,
             response = tokio::time::timeout(EXCHANGE_TIMEOUT, exchange(&mut send, &mut recv, &challenge)) => response.ok().flatten(),
@@ -235,3 +271,24 @@ async fn exchange(
 
 #[cfg(test)]
 mod tests;
+
+// An exact registered obligation may be settled after roster teardown, but cannot
+// mutate a replacement's challenge. A reconnect also settles it before admission.
+struct Obligation<'a> {
+    context: &'a Context,
+    sample: u64,
+}
+impl Drop for Obligation<'_> {
+    fn drop(&mut self) {
+        self.context
+            .mesh
+            .session
+            .decision_makers
+            .abandon_periodic_evidence(
+                &self.context.key,
+                self.context.slot,
+                self.context.epoch,
+                self.sample,
+            );
+    }
+}

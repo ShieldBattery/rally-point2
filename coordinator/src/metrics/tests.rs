@@ -291,3 +291,48 @@ fn the_gauge_census_reads_each_subsystem_that_owns_a_value() {
         "the tenant census reports an empty store as zeros: {text}",
     );
 }
+
+#[test]
+fn periodic_outcomes_do_not_increment_lifecycle_delivery_metrics() {
+    let tenant = TenantId("metrics-periodic-only".to_owned());
+    let state = test_state();
+    for result in [
+        "ok",
+        "failed",
+        "global_busy",
+        "tenant_busy",
+        "serialize_failed",
+        "request_failed",
+    ] {
+        periodic_webhook_outcome(&tenant, result);
+    }
+    let text = render(&state);
+    for result in [
+        "ok",
+        "failed",
+        "global_busy",
+        "tenant_busy",
+        "serialize_failed",
+        "request_failed",
+    ] {
+        assert!(text.contains(&format!(
+            "rp2_periodic_webhook_outcomes_total{{tenant=\"metrics-periodic-only\",result=\"{result}\"}} 1"
+        )), "{text}");
+    }
+    assert_eq!(
+        series_value(
+            &text,
+            "rp2_webhook_deliveries_total",
+            "metrics-periodic-only"
+        ),
+        None
+    );
+    assert_eq!(
+        series_value(
+            &text,
+            "rp2_webhook_attempt_failures_total",
+            "metrics-periodic-only"
+        ),
+        None
+    );
+}

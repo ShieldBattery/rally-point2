@@ -23,6 +23,7 @@ use super::*;
 pub(crate) struct LifecycleFacts {
     evidence: Vec<(SlotId, evidence::StoredEvidence)>,
     periodic_evidence: Vec<(SlotId, periodic::StoredPeriodic)>,
+    evidence_history: Vec<(SlotId, periodic::StoredHistory)>,
     /// Whether a client was ever observed for the session.
     started: bool,
     /// The relay-reported session start instant (unix epoch ms).
@@ -87,6 +88,11 @@ impl Lifecycle {
                         .iter()
                         .map(|(&slot, value)| (slot, value.clone()))
                         .collect(),
+                    evidence_history: state
+                        .evidence_history
+                        .iter()
+                        .map(|(&slot, value)| (slot, value.clone()))
+                        .collect(),
                     started: state.started,
                     started_at_ms: state.started_at_ms,
                     attestable: state.attestable,
@@ -132,6 +138,7 @@ impl Lifecycle {
         state.connected_slots.extend(facts.connected_slots);
         state.evidence.extend(facts.evidence);
         state.periodic_evidence.extend(facts.periodic_evidence);
+        state.evidence_history.extend(facts.evidence_history);
         state.started_slots.extend(facts.started_slots);
         state.forwarded_slots.extend(facts.forwarded_slots);
         state

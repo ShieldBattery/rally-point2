@@ -274,6 +274,7 @@ use crate::observability::events::{
 use clock::*;
 use law::*;
 use lead::*;
+pub(crate) use registry::PeriodicEvidencePair;
 use registry::*;
 use slot::*;
 use sync::*;

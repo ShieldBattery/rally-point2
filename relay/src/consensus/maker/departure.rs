@@ -598,6 +598,7 @@ impl DecisionMaker {
     /// leave) is kept -- those outlive the connection so a promotion can still
     /// re-derive the leave.
     pub fn remove_slot(&mut self, slot: SlotId) {
+        self.abandon_periodic_evidence(slot, None);
         self.slots.remove(&slot);
         self.delivery.forget_slot(slot);
         // The phase estimate describes the torn-down connection; the commanded

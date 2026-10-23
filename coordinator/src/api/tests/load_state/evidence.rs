@@ -27,6 +27,7 @@ async fn load_state_projects_nonempty_evidence_to_the_tenant_contract() {
         relay,
         generation,
         crate::lifecycle::SessionNotice::SlotConnected(SlotConnectedNotice {
+            predecessor: None,
             tenant: tenant_id(),
             session,
             slot: SlotId(0),

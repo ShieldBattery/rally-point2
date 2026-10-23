@@ -263,6 +263,7 @@ impl DecisionMaker {
             Some(ConnectionState::Down(current)) if current == epoch => return false,
             _ => {}
         }
+        self.abandon_periodic_evidence(slot, None);
         if let Some(superseded) = self.connection_states.get(&slot).copied() {
             self.retired_connection_epochs
                 .entry(slot)

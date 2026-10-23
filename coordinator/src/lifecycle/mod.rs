@@ -249,6 +249,7 @@ struct DepartureSeed {
 struct SessionState {
     evidence: std::collections::BTreeMap<SlotId, evidence::StoredEvidence>,
     periodic_evidence: std::collections::BTreeMap<SlotId, periodic::StoredPeriodic>,
+    evidence_history: std::collections::BTreeMap<SlotId, periodic::StoredHistory>,
     /// The relays the coordinator assigned to serve the session — the distinct
     /// home relays of its slots — or empty for a webhook-only state lazily created
     /// for a session this coordinator lifetime never created (restart amnesia). The

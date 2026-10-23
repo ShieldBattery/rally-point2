@@ -27,6 +27,7 @@ async fn cached_evidence_projects_retained_observations_without_asking_relays() 
         relay,
         generation,
         crate::lifecycle::SessionNotice::SlotConnected(SlotConnectedNotice {
+            predecessor: None,
             tenant: tenant_id(),
             session,
             slot: SlotId(0),
@@ -267,6 +268,8 @@ async fn cached_and_load_state_reads_include_admission_and_latest_periodic_sampl
         relay,
         generation,
         crate::lifecycle::SessionNotice::SlotEvidence(SlotEvidenceNotice {
+            admission: None,
+            historical_admission: None,
             tenant: tenant_id(),
             session,
             slot: SlotId(0),

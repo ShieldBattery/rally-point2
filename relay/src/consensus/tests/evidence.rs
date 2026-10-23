@@ -64,3 +64,76 @@ fn stale_assignment_cannot_activate_or_replace_retained_evidence() {
     registry.deregister_maker(&key);
     assert!(!registry.note_slot_connected(&key, SlotId(0), true, Some(next)));
 }
+
+#[test]
+fn pending_obligations_and_failure_history_are_bounded_even_with_an_oversized_descriptor() {
+    let registry = new_decision_makers();
+    let key = SessionKey {
+        tenant: TenantId("bounded".into()),
+        session: SessionId(1),
+    };
+    let slots: HashSet<_> = (0..18).map(SlotId).collect();
+    let _ = registry.sync_maker(
+        &key,
+        MakerSync {
+            evidence: EvidenceConfig {
+                periodic: true,
+                keys: vec![rally_point_proto::control::EvidenceKey {
+                    key_id: 7,
+                    public_key: rally_point_proto::token::ClientPublicKey([7; 32]),
+                }],
+                assignments: slots.iter().map(|&slot| (slot, 1)).collect(),
+                ..Default::default()
+            },
+            homed_slots: slots.clone(),
+            expected_slots: slots,
+            ..MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::SelfRelay)
+        },
+    );
+    for slot in 0..18 {
+        assert!(registry.activate_connection_epoch(&key, SlotId(slot), 1));
+        let admission = EvidenceObservation {
+            sample_id: 0,
+            sequence: next_evidence_sequence().unwrap(),
+            connection_id: [slot; 32],
+            assignment_revision: 1,
+            verdict: EvidenceVerdict::Valid,
+            key_id: Some(7),
+            body: vec![8],
+        };
+        assert!(registry.note_slot_connected(&key, SlotId(slot), false, Some(admission.clone())));
+        let sample = EvidenceObservation {
+            sample_id: 1,
+            ..admission
+        };
+        assert_eq!(
+            registry.begin_periodic_evidence(&key, SlotId(slot), 1, sample.clone()),
+            slot < 17
+        );
+        if slot == 0 {
+            // One completed sample coexists with sixteen other pending slots.
+            assert!(registry.record_periodic_evidence(&key, SlotId(slot), 1, sample));
+        }
+    }
+    for slot in 1..17 {
+        registry.abandon_periodic_evidence(&key, SlotId(slot), 1, 1);
+    }
+    let state = registry.retained_load_state(&key);
+    assert_eq!(state.evidence_history.len(), 16);
+    assert_eq!(state.periodic_evidence.len(), 16);
+    let mut presence: rally_point_proto::control::SessionPresence =
+        serde_json::from_value(serde_json::json!({"tenant":"bounded", "session":1, "slots":[]}))
+            .unwrap();
+    presence.periodic_evidence = state.periodic_evidence.clone();
+    presence.evidence_history = state.evidence_history.clone();
+    assert!(serde_json::to_vec(&presence).is_ok());
+    assert!(
+        state
+            .evidence_history
+            .iter()
+            .all(
+                |entry| entry.history.sample.verdict == EvidenceVerdict::Missing
+                    && entry.history.sample.body.is_empty()
+            )
+    );
+}

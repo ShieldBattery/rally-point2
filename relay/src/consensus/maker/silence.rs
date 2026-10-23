@@ -363,6 +363,7 @@ impl DecisionMaker {
         RetainedLoadState {
             evidence: self.evidence_snapshot(),
             periodic_evidence: self.periodic_evidence_snapshot(),
+            evidence_history: self.evidence_history_snapshot(),
             ..self.heartbeat_load_state()
         }
     }
@@ -376,6 +377,7 @@ impl DecisionMaker {
             lobby_violations: self.lobby_violations(),
             evidence: Vec::new(),
             periodic_evidence: Vec::new(),
+            evidence_history: Vec::new(),
             started_at_ms: self.started_at_ms,
         }
     }

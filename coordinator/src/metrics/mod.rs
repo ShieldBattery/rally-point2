@@ -51,9 +51,10 @@ pub(crate) use counters::{
     control_connection_ended, descriptor_delta_sent, descriptor_full_set_sent, desync,
     flight_recording_lost, flight_recording_pinned, flight_recording_refused,
     flight_recording_stored, observe_control_send, observe_relay_cold_start,
-    provision_tick_completed, reap_directives_sent, reap_nudges_coalesced, relay_drained,
-    relay_enrolled, relay_launch_failed, relay_launched, relay_reaped, session_closed,
-    session_created, session_held, session_reaped, webhook_attempt_failed, webhook_delivered,
+    periodic_webhook_outcome, provision_tick_completed, reap_directives_sent,
+    reap_nudges_coalesced, relay_drained, relay_enrolled, relay_launch_failed, relay_launched,
+    relay_reaped, session_closed, session_created, session_held, session_reaped,
+    webhook_attempt_failed, webhook_delivered,
 };
 
 /// The content type a Prometheus scrape expects for the version 0.0.4 text

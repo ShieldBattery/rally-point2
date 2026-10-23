@@ -6,6 +6,8 @@
 //! arm sends through and the in-flight shipment bookkeeping that survives a
 //! reconnect.
 
+use std::collections::{HashSet, VecDeque};
+
 use futures_util::SinkExt;
 use rally_point_proto::control::RelayToCoordinator;
 use rally_point_proto::ids::RelayId;
@@ -22,7 +24,7 @@ use crate::observability::flight_upload::{self, PutOutcome};
 use super::connect::{ControlDisconnect, answer_identity_challenge};
 use super::heartbeat::{
     LoadStateAnswer, LoadStateAsk, heartbeat_presence_with_evidence, heartbeat_region_rtts,
-    start_load_state_answer,
+    start_load_state_answer, unsent_periodic_candidates,
 };
 use super::{
     ControlError, HeartbeatConfig, LOAD_STATE_ASK_CAPACITY, MAX_INFLIGHT_FLIGHT_UPLOADS,
@@ -163,9 +165,16 @@ pub(super) async fn write_control_frames(
 
     // The Hello already proved liveness at t=0, so skip the immediate first tick
     // and send the first heartbeat one interval later.
-    let mut periodic_sent = std::collections::HashMap::new();
+    let mut periodic_sent = HashSet::new();
+    let mut heartbeat_sent = HashSet::new();
+    let mut periodic_changes = heartbeat
+        .sources
+        .decision_makers
+        .periodic_evidence_changes();
+    let mut periodic_changes_open = true;
+    let mut periodic_refresh = true;
     let mut periodic_cursor = 0;
-    let mut periodic_pending = std::collections::VecDeque::new();
+    let mut periodic_pending = VecDeque::new();
     let mut heartbeat_tick = tokio::time::interval(heartbeat.interval);
     heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat_tick.tick().await;
@@ -411,37 +420,34 @@ pub(super) async fn write_control_frames(
                 // one), bounded by the relay's live slots. A delta scheme is a
                 // scale option, not needed at these payload sizes.
                 let region_rtts = heartbeat_region_rtts(&heartbeat.sources.region_rtt_cache);
-                let sessions = heartbeat_presence_with_evidence(&heartbeat.sources, &mut periodic_cursor, &region_rtts);
-                let current: std::collections::HashSet<_> = heartbeat.sources.decision_makers.periodic_evidence_candidates().into_iter().collect();
-                periodic_sent.retain(|key, _| current.contains(key));
-                // Replace unsent work with the newest bounded selection. Heartbeat
-                // admissions are sent first, and individual samples yield to every
-                // higher-priority control arm between writes.
-                periodic_pending.clear();
-                for session in &sessions {
-                    for sample in &session.periodic_evidence {
-                        let key = crate::key::SessionKey { tenant: session.tenant.clone(), session: session.session };
-                        let sequence = sample.observation.sequence;
-                        if periodic_sent.get(&(key.clone(), sample.slot)) != Some(&sequence) {
-                            periodic_pending.push_back((key, sample.slot, sequence));
-                        }
-                    }
-                }
+                let sessions = heartbeat_presence_with_evidence(
+                    &heartbeat.sources,
+                    &mut periodic_cursor,
+                    &region_rtts,
+                    &mut heartbeat_sent,
+                );
+                // Refresh the notice selection as a recovery fallback even when
+                // no change wakeup arrived. Sent state is local to this connection.
+                periodic_refresh = true;
+                // Keep recovery independent of notice delivery: an older
+                // coordinator may ignore a notice's additive admission context.
+                let attached: Vec<_> = sessions.iter().flat_map(|session| {
+                    let key = crate::key::SessionKey {
+                        tenant: session.tenant.clone(),
+                        session: session.session,
+                    };
+                    session.periodic_evidence.iter()
+                        .map(|entry| (entry.slot, entry.observation.sequence))
+                        .chain(session.evidence_history.iter()
+                            .map(|entry| (entry.slot, entry.history.sample.sequence)))
+                        .map(move |(slot, sequence)| (key.clone(), slot, sequence))
+                }).collect();
                 let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {
                     roster_complete: true, sessions, region_rtts,
                 }).expect("a heartbeat always serializes");
                 sink.send(Message::Text(frame.into())).await?;
+                heartbeat_sent.extend(attached);
 
-            }
-
-            _ = std::future::ready(()), if !periodic_pending.is_empty() => {
-                let (key, slot, sequence) = periodic_pending.pop_front().expect("guarded by nonempty");
-                if let Some(notice) = heartbeat.sources.decision_makers.periodic_evidence_notice(&key, slot, sequence) {
-                    let frame = serde_json::to_string(&RelayToCoordinator::SlotEvidence(notice))
-                        .expect("a periodic evidence notice serializes");
-                    sink.send(Message::Text(frame.into())).await?;
-                    periodic_sent.insert((key, slot), sequence);
-                }
             }
 
             // A fence task finished: send its answer. Ranked with the ask arm
@@ -489,6 +495,42 @@ pub(super) async fn write_control_frames(
                 match ask {
                     Some(ask) => start_load_state_answer(&heartbeat.sources, ask, &answers_tx),
                     None => load_state_open = false,
+                }
+            }
+
+            // A watch coalesces collector changes instead of queueing sample
+            // bodies. Reading it and sending samples both yield to load-state work.
+            changed = periodic_changes.changed(), if periodic_changes_open => {
+                match changed {
+                    Ok(()) => periodic_refresh = true,
+                    Err(_) => periodic_changes_open = false,
+                }
+            }
+
+            // Samples carry their matching admission, so immediate delivery does
+            // not need a heartbeat and never changes presence or reap timers.
+            _ = std::future::ready(()), if periodic_refresh || !periodic_pending.is_empty() => {
+                if periodic_pending.is_empty() {
+                    let mut candidates = unsent_periodic_candidates(
+                        &heartbeat.sources,
+                        &mut periodic_sent,
+                    );
+                    candidates.sort_by(|(a, sa, qa), (b, sb, qb)| {
+                        (&a.tenant.0, a.session, sa, qa).cmp(&(&b.tenant.0, b.session, sb, qb))
+                    });
+                    const BATCH_SIZE: usize = 128;
+                    periodic_refresh = candidates.len() > BATCH_SIZE;
+                    periodic_pending.extend(candidates.into_iter().take(BATCH_SIZE));
+                }
+                if let Some((key, slot, sequence)) = periodic_pending.pop_front()
+                    && !periodic_sent.contains(&(key.clone(), slot, sequence))
+                    && let Some(notice) = heartbeat.sources.decision_makers
+                        .periodic_evidence_notice(&key, slot, sequence)
+                {
+                    let frame = serde_json::to_string(&RelayToCoordinator::SlotEvidence(notice))
+                        .expect("a periodic evidence notice serializes");
+                    sink.send(Message::Text(frame.into())).await?;
+                    periodic_sent.insert((key, slot, sequence));
                 }
             }
 

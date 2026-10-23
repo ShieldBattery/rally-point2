@@ -109,7 +109,7 @@ impl DecisionMakers {
         }
         Some((
             maker.evidence_config.clone(),
-            maker.is_started() && maker.has_started(slot),
+            maker.periodic_evidence_ready(slot),
         ))
     }
 
@@ -121,37 +121,42 @@ impl DecisionMakers {
         epoch: u64,
         observation: rally_point_proto::control::EvidenceObservation,
     ) -> bool {
-        self.lock()
+        let recorded = self
+            .lock()
             .get_mut(key)
-            .is_some_and(|maker| maker.record_periodic_evidence(slot, epoch, observation))
+            .is_some_and(|maker| maker.record_periodic_evidence(slot, epoch, observation));
+        if recorded {
+            self.notify_evidence_changed();
+        }
+        recorded
     }
 
     /// Metadata only: no opaque bodies are copied before the heartbeat budget is known.
-    pub(crate) fn periodic_evidence_candidates(&self) -> Vec<(SessionKey, SlotId)> {
+    pub(crate) fn periodic_evidence_candidates(&self) -> Vec<(SessionKey, SlotId, u64)> {
         self.lock()
             .iter()
             .flat_map(|(key, maker)| {
                 maker
                     .periodic_evidence_slots()
                     .into_iter()
-                    .map(|slot| (key.clone(), slot))
+                    .map(|(slot, sequence)| (key.clone(), slot, sequence))
             })
             .collect()
     }
 
-    /// Copies at most one pair that fits the caller's remaining serialized-byte budget.
+    /// Copies only an exact retained observation that fits the byte budget.
     pub(crate) fn periodic_evidence_pair(
         &self,
         key: &SessionKey,
         slot: SlotId,
+        sequence: u64,
         remaining: &mut usize,
-    ) -> Option<(
-        rally_point_proto::control::SlotEvidence,
-        rally_point_proto::control::SlotEvidence,
-    )> {
-        self.lock()
-            .get(key)?
-            .periodic_evidence_pair(slot, remaining)
+    ) -> Result<Option<PeriodicEvidencePair>, ()> {
+        let makers = self.lock();
+        let Some(maker) = makers.get(key) else {
+            return Ok(None);
+        };
+        maker.periodic_evidence_pair(slot, sequence, remaining)
     }
 
     /// Rechecks one selected sample before the writer sends it; stale selections vanish.
@@ -161,12 +166,21 @@ impl DecisionMakers {
         slot: SlotId,
         sequence: u64,
     ) -> Option<rally_point_proto::control::SlotEvidenceNotice> {
-        let (evidence, observed_at_ms) = self
+        let pair = self
             .lock()
             .get(key)?
             .periodic_evidence_notice(slot, sequence)?;
         let (external_id, external_ref) = self.session_refs(key).stamps(slot);
+        let observed_at_ms = pair.observed_at_ms;
+        let evidence = pair.sample.observation;
+        let (admission, predecessor) = if pair.historical {
+            (None, Some(pair.admission.observation))
+        } else {
+            (Some(pair.admission.observation), None)
+        };
         Some(rally_point_proto::control::SlotEvidenceNotice {
+            admission,
+            historical_admission: predecessor,
             tenant: key.tenant.clone(),
             session: key.session,
             slot,
@@ -175,5 +189,54 @@ impl DecisionMakers {
             observed_at_ms,
             evidence,
         })
+    }
+}
+
+/// A byte-budgeted current sample or immutable historical failure with its admission.
+pub(crate) struct PeriodicEvidencePair {
+    pub admission: rally_point_proto::control::SlotEvidence,
+    pub sample: rally_point_proto::control::SlotEvidence,
+    pub historical: bool,
+    pub observed_at_ms: u64,
+}
+
+impl DecisionMakers {
+    pub(crate) fn periodic_evidence_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.evidence_changes
+            .get_or_init(|| tokio::sync::watch::channel(0).0)
+            .subscribe()
+    }
+
+    pub(in crate::consensus) fn notify_evidence_changed(&self) {
+        if let Some(changes) = self.evidence_changes.get() {
+            changes.send_modify(|revision| *revision = revision.wrapping_add(1));
+        }
+    }
+
+    pub(crate) fn begin_periodic_evidence(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        epoch: u64,
+        observation: rally_point_proto::control::EvidenceObservation,
+    ) -> bool {
+        self.lock()
+            .get_mut(key)
+            .is_some_and(|maker| maker.begin_periodic_evidence(slot, epoch, observation))
+    }
+
+    pub(crate) fn abandon_periodic_evidence(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        epoch: u64,
+        sample: u64,
+    ) {
+        let _ = self
+            .lock()
+            .get_mut(key)
+            .is_some_and(|maker| maker.abandon_periodic_evidence(slot, Some((epoch, sample))));
+        // Epoch replacement may already have settled this obligation synchronously.
+        self.notify_evidence_changed();
     }
 }
