@@ -6,8 +6,8 @@ use super::*;
 impl DecisionMakers {
     /// Every session this relay holds a decision-maker for, paired with the load
     /// progress facts that maker has retained — the heartbeat builder's session universe.
-    /// Opaque connection observations travel in notices and requested single-session
-    /// snapshots, keeping periodic roster size independent of their bodies.
+    /// Opaque observations are attached separately after the heartbeat byte budget
+    /// selects a rotating subset; requested single-session snapshots retain them all.
     ///
     /// A maker lives from the descriptor apply that created it until the session
     /// retires, which outlasts every local link: a session whose slots have all

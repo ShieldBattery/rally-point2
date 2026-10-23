@@ -22,6 +22,7 @@ use super::*;
 #[serde(default)]
 pub(crate) struct LifecycleFacts {
     evidence: Vec<(SlotId, evidence::StoredEvidence)>,
+    periodic_evidence: Vec<(SlotId, periodic::StoredPeriodic)>,
     /// Whether a client was ever observed for the session.
     started: bool,
     /// The relay-reported session start instant (unix epoch ms).
@@ -81,6 +82,11 @@ impl Lifecycle {
                         .iter()
                         .map(|(&slot, value)| (slot, value.clone()))
                         .collect(),
+                    periodic_evidence: state
+                        .periodic_evidence
+                        .iter()
+                        .map(|(&slot, value)| (slot, value.clone()))
+                        .collect(),
                     started: state.started,
                     started_at_ms: state.started_at_ms,
                     attestable: state.attestable,
@@ -125,6 +131,7 @@ impl Lifecycle {
         state.accounted.extend(facts.accounted);
         state.connected_slots.extend(facts.connected_slots);
         state.evidence.extend(facts.evidence);
+        state.periodic_evidence.extend(facts.periodic_evidence);
         state.started_slots.extend(facts.started_slots);
         state.forwarded_slots.extend(facts.forwarded_slots);
         state

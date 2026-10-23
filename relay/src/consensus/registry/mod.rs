@@ -26,6 +26,7 @@ mod sync_coverage;
 
 pub use authority::{FrameRegression, MakerSync};
 pub use evidence::EvidenceConfig;
+pub(crate) use evidence::next_evidence_sequence;
 pub use leave::normalize_observed_leave;
 pub use lobby_policy::LobbyCommandVerdict;
 
@@ -524,8 +525,8 @@ pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> 
 /// order.
 ///
 /// Heartbeats restate progress facts after a lost notice or coordinator restart.
-/// Opaque connection observations remain available in requested single-session
-/// snapshots instead of multiplying the periodic roster's size by their bodies.
+/// Requested single-session snapshots retain all observations. Heartbeats select
+/// a byte-bounded rotating subset of periodic observations and their admissions.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetainedLoadState {
     /// Slots whose links ever activated on this relay, ascending.
@@ -538,6 +539,7 @@ pub struct RetainedLoadState {
     pub lobby_violations: Vec<SlotId>,
     /// The latest evidence observation for each home slot, ascending by slot.
     pub evidence: Vec<rally_point_proto::control::SlotEvidence>,
+    pub periodic_evidence: Vec<rally_point_proto::control::SlotEvidence>,
     /// Relay wall-clock (unix epoch milliseconds) for the session's start, as
     /// this relay knows it. `None` on a relay that has not seen the session
     /// start at all.

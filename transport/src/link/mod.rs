@@ -52,6 +52,7 @@ pub const RECEIVE_WINDOW: u64 = 4096;
 
 /// A single transport link over one QUIC connection.
 pub struct Link {
+    connection_task: Option<ConnectionTask>,
     connection: noq::Connection,
     acks: AckManager,
     dedup: Dedup,
@@ -61,6 +62,14 @@ pub struct Link {
     /// slot is an untrusted client claim (see
     /// [`with_ingress_slot`](Link::with_ingress_slot)).
     ingress_slot: Option<SlotId>,
+}
+
+struct ConnectionTask(tokio::task::JoinHandle<()>);
+
+impl Drop for ConnectionTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// A send or receive on a link failed.
@@ -123,6 +132,7 @@ impl Link {
     pub fn new(connection: noq::Connection) -> Self {
         Self {
             connection,
+            connection_task: None,
             acks: AckManager::new(),
             dedup: Dedup::new(),
             ingress_slot: None,
@@ -155,10 +165,25 @@ impl Link {
     pub fn with_ingress_slot(connection: noq::Connection, slot: SlotId) -> Self {
         Self {
             connection,
+            connection_task: None,
             acks: AckManager::new(),
             dedup: Dedup::new(),
             ingress_slot: Some(slot),
         }
+    }
+
+    /// Associates one auxiliary task with this connection. Dropping or rebinding
+    /// the link aborts the task, even if it owns another connection handle.
+    pub fn with_connection_task(mut self, task: tokio::task::JoinHandle<()>) -> Self {
+        self.connection_task = Some(ConnectionTask(task));
+        self
+    }
+
+    /// Rebinds while transferring the fresh link's auxiliary connection task.
+    /// Ack and receive history follow the same rules as [`Self::rebind`].
+    pub fn rebind_from(&mut self, mut fresh: Self) {
+        self.rebind(fresh.connection.clone());
+        self.connection_task = fresh.connection_task.take();
     }
 
     /// The underlying QUIC connection.
@@ -186,6 +211,7 @@ impl Link {
     /// ([`verify_datagram_budget`](crate::quic::verify_datagram_budget)), and
     /// every preserved payload was admitted against that same floor.
     pub fn rebind(&mut self, connection: noq::Connection) {
+        self.connection_task = None;
         self.connection = connection;
         self.acks.reset_connection();
         // dedup preserved: it is what makes the reconnect a resume, not a restart.

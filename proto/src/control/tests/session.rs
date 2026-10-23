@@ -85,6 +85,7 @@ fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
     // An absent estimate stays off the wire (byte-identical to the pre-field
     // form), while a present one round-trips.
     let request = SessionRequest {
+        periodic_evidence: false,
         evidence_keys: vec![],
         lobby_policy: None,
         rollback: false,
@@ -115,6 +116,7 @@ fn session_request_latency_estimate_defaults_absent_and_omits_from_the_wire() {
 #[test]
 fn session_descriptor_roundtrips_json() {
     let desc = SessionDescriptor {
+        periodic_evidence: false,
         evidence_keys: vec![],
         required_evidence_slots: vec![],
         evidence_assignments: vec![],
@@ -246,6 +248,7 @@ fn session_descriptor_omits_absent_correlation_ids_on_the_wire() {
     // `authority_order`'s plain `#[serde(default)]`), so an empty Vec still
     // serializes as `[]`, not omitted.
     let desc = SessionDescriptor {
+        periodic_evidence: false,
         evidence_keys: vec![],
         required_evidence_slots: vec![],
         evidence_assignments: vec![],
@@ -437,6 +440,7 @@ fn session_request_omits_absent_correlation_ids_on_the_wire() {
     // `skip_serializing_if` keeps an unset id off the wire, so a new
     // encoder talking to an old decoder emits exactly the old shape.
     let req = SessionRequest {
+        periodic_evidence: false,
         evidence_keys: vec![],
         lobby_policy: None,
         rollback: false,
@@ -484,6 +488,7 @@ fn lobby_policy_defaults_absent_and_admits_only_exact_slot_payload_records() {
     assert!(!policy.admits(SlotId(2), &[0x09]));
 
     let request = SessionRequest {
+        periodic_evidence: false,
         evidence_keys: vec![],
         lobby_policy: Some(policy.clone()),
         rollback: false,

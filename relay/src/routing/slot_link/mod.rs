@@ -133,6 +133,7 @@ pub async fn run_slot_link(
     mesh: crate::mesh::MeshState,
 ) {
     let SlotInbox {
+        evidence_stream,
         mut forward_rx,
         mut leave_push_rx,
         mut start_push_rx,
@@ -213,6 +214,16 @@ pub async fn run_slot_link(
         );
         return;
     }
+    let _evidence_task = evidence_stream.map(|stream| {
+        super::periodic::spawn(
+            stream,
+            key.clone(),
+            slot,
+            connection_epoch,
+            sessions.clone(),
+            mesh_for_teardown.clone(),
+        )
+    });
     // The ack-beacon side-channel, mirroring the client driver. The relay opens
     // its outbound uni-stream (open_uni completes locally); the client's stream
     // is accepted lazily inside the reader task so a one-way-traffic client that

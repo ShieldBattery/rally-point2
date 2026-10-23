@@ -241,7 +241,7 @@ impl ClientEndpoint {
                 if refused_with(&connection, close_codes::EVIDENCE_REJECTED) {
                     Err(DialError::EvidenceRejected)
                 } else {
-                    result.map(|()| Link::new(connection))
+                    result
                 }
             }
             Err(_elapsed) => {
@@ -287,7 +287,7 @@ impl ClientEndpoint {
         rally_point_transport::quic::verify_datagram_budget(&connection)?;
 
         match timeout_at(deadline, authorize(&connection, identity, cursors)).await {
-            Ok(Ok(())) => Ok(Link::new(connection)),
+            Ok(Ok(link)) => Ok(link),
             Ok(Err(error)) => {
                 // A read/write failure during the handshake may be the relay closing
                 // the connection to refuse the re-dial. Prefer its application close
@@ -340,7 +340,7 @@ async fn authorize(
     connection: &noq::Connection,
     identity: &Identity,
     cursors: &[(SlotId, u64)],
-) -> Result<(), DialError> {
+) -> Result<Link, DialError> {
     let (mut send, mut recv) = connection.open_bi().await?;
 
     // Present the token: a length-prefixed frame the relay reads in two reads.
@@ -370,17 +370,17 @@ async fn authorize(
     let cursor_frame = handshake::encode_resume_cursors(cursors)?;
     send.write_all(&cursor_frame).await?;
 
+    let request = handshake::EvidenceRequest {
+        periodic: None,
+        challenge,
+        channel_binding,
+        tenant: identity.token.claims.tenant.clone(),
+        session: identity.token.claims.session,
+        slot: identity.token.claims.slot,
+        client_pubkey: identity.token.claims.client_pubkey,
+    };
     if quic::supports_evidence(connection) {
-        let evidence = identity
-            .collect_evidence(handshake::EvidenceRequest {
-                challenge,
-                channel_binding,
-                tenant: identity.token.claims.tenant.clone(),
-                session: identity.token.claims.session,
-                slot: identity.token.claims.slot,
-                client_pubkey: identity.token.claims.client_pubkey,
-            })
-            .await;
+        let evidence = identity.collect_evidence(request.clone()).await;
         let frame = handshake::encode_evidence_frame(evidence.as_ref())?;
         send.write_all(&frame).await?;
     }
@@ -392,9 +392,14 @@ async fn authorize(
         return Err(DialError::UnexpectedAck);
     }
 
-    // Turns ride datagrams from here; the handshake stream has nothing more to say.
-    let _ = send.finish();
-    Ok(())
+    let link = Link::new(connection.clone());
+    if quic::supports_periodic_evidence(connection) {
+        let task = identity.start_periodic(connection.clone(), send, recv, request);
+        Ok(link.with_connection_task(task))
+    } else {
+        let _ = send.finish();
+        Ok(link)
+    }
 }
 
 /// Rewrites an IPv4 relay address to its IPv4-mapped IPv6 form when dialing

@@ -14,8 +14,8 @@ use crate::ids::{SessionId, SlotId};
 use super::{
     DepartureNotice, DescriptorKey, DesyncNotice, LobbyViolationNotice, MeshPeerIdentity,
     RegionBeaconTarget, RegionRttReport, RelayHello, ResultNotice, SessionDescriptor,
-    SessionStartedNotice, SlotConnectedNotice, SlotEvidence, SlotStartedNotice, TenantId,
-    TenantVerifyingKey,
+    SessionStartedNotice, SlotConnectedNotice, SlotEvidence, SlotEvidenceNotice, SlotStartedNotice,
+    TenantId, TenantVerifyingKey,
 };
 
 /// `serde(skip_serializing_if)` helper: keep a field off the wire when it is
@@ -441,6 +441,9 @@ pub enum RelayToCoordinator {
     /// dedups the webhook by `(tenant, session, slot)`, so a reconnect updates its
     /// state without re-firing a notification.
     SlotConnected(SlotConnectedNotice),
+    /// A periodic sample, not a slot activation or liveness announcement.
+    /// Sent only when the coordinator descriptor enables periodic evidence.
+    SlotEvidence(SlotEvidenceNotice),
     /// The session started: the authority relay's coverage latch fired, every
     /// expected slot being present somewhere in the mesh. Only the authority
     /// reports it — a peer adopting the directive off the mesh does not — so
@@ -629,6 +632,13 @@ pub enum RelayToCoordinator {
 /// added claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionPresence {
+    /// Latest periodic sample per slot, separate from admission observations.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        with = "super::evidence::periodic_samples"
+    )]
+    pub periodic_evidence: Vec<SlotEvidence>,
     /// Latest connection evidence observations retained by this relay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<SlotEvidence>,

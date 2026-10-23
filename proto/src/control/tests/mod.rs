@@ -24,6 +24,7 @@ mod session;
 /// different shape build on it with struct-update syntax.
 fn a_descriptor() -> SessionDescriptor {
     SessionDescriptor {
+        periodic_evidence: false,
         evidence_keys: vec![],
         required_evidence_slots: vec![],
         evidence_assignments: vec![],

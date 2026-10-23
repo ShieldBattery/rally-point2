@@ -32,6 +32,7 @@ fn create_session(served: &ServedCoordinator) -> SessionId {
     let created = session::create_session(
         &served.setup,
         SessionRequest {
+            periodic_evidence: false,
             evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,

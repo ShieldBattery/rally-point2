@@ -25,9 +25,12 @@ pub enum EvidenceVerdict {
     Valid,
 }
 
-/// A relay's observation of one connection attempt.
+/// A relay's observation of one admission or periodic sample.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceObservation {
+    /// Zero for admission; otherwise the connection-local periodic challenge id.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub sample_id: u64,
     pub connection_id: [u8; 32],
     pub sequence: u64,
     pub assignment_revision: u64,
@@ -84,4 +87,53 @@ pub struct SlotEvidence {
 pub struct SlotEvidenceAssignment {
     pub slot: SlotId,
     pub revision: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Maximum periodic observations in one session presence snapshot.
+pub const MAX_PERIODIC_EVIDENCE_SLOTS: usize = 16;
+
+pub(super) mod periodic_samples {
+    use super::{MAX_PERIODIC_EVIDENCE_SLOTS, SlotEvidence};
+    use serde::de::{Error, IgnoredAny, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(
+        values: &[SlotEvidence],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        if values.len() > MAX_PERIODIC_EVIDENCE_SLOTS {
+            return Err(serde::ser::Error::custom("too many periodic observations"));
+        }
+        values.serialize(serializer)
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<SlotEvidence>, D::Error> {
+        struct Samples;
+        impl<'de> Visitor<'de> for Samples {
+            type Value = Vec<SlotEvidence>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("at most 16 periodic observations")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while values.len() < MAX_PERIODIC_EVIDENCE_SLOTS {
+                    let Some(value) = seq.next_element()? else {
+                        return Ok(values);
+                    };
+                    values.push(value);
+                }
+                if seq.next_element::<IgnoredAny>()?.is_some() {
+                    return Err(A::Error::custom("too many periodic observations"));
+                }
+                Ok(values)
+            }
+        }
+        deserializer.deserialize_seq(Samples)
+    }
 }

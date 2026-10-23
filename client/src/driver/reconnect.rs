@@ -378,7 +378,7 @@ pub(super) async fn reconnect_link(
                 // — mirroring the re-home path's own rebind-then-reinject
                 // order — though an oversize turn is definitionally oversize
                 // on any realistic path.
-                link.rebind(fresh.connection().clone());
+                link.rebind_from(fresh);
                 redivert_oversize_retention_on_same_relay_resume(link, state);
                 backoff.reset();
                 tracing::info!(relay = %addr, "re-dialed the home relay");
@@ -512,7 +512,7 @@ pub(super) async fn reconnect_link(
                                             // on a *successful* dial — does the driver adopt
                                             // the new relay id, so a failed dial never leaves
                                             // it naming a relay it isn't homed on.
-                                            link.rebind(fresh.connection().clone());
+                                            link.rebind_from(fresh);
                                             reinject_retention(link, state);
                                             let new_addr = new_target.current_addr();
                                             rc.target = new_target;

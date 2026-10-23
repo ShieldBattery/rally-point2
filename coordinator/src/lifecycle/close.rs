@@ -326,6 +326,7 @@ impl Lifecycle {
             accounted: HashSet::new(),
             connected_slots: HashSet::new(),
             evidence: Default::default(),
+            periodic_evidence: Default::default(),
             started_slots: HashSet::new(),
             forwarded_slots: HashSet::new(),
             lobby_violation_slots: HashSet::new(),

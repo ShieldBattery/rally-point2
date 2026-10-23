@@ -260,6 +260,8 @@ pub(crate) fn session_closed_dispatch(
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EvidencePayload {
+    #[serde(skip_serializing_if = "sample_is_zero")]
+    sample_id: u64,
     connection_id: String,
     sequence: u64,
     assignment_revision: u64,
@@ -272,6 +274,7 @@ pub(crate) struct EvidencePayload {
 impl From<rally_point_proto::control::EvidenceObservation> for EvidencePayload {
     fn from(value: rally_point_proto::control::EvidenceObservation) -> Self {
         Self {
+            sample_id: value.sample_id,
             connection_id: BASE64_STANDARD.encode(value.connection_id),
             sequence: value.sequence,
             assignment_revision: value.assignment_revision,
@@ -295,4 +298,23 @@ impl From<rally_point_proto::control::SlotEvidence> for SlotEvidencePayload {
             observation: value.observation.into(),
         }
     }
+}
+
+fn sample_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SlotEvidenceWebhook {
+    pub(super) event: &'static str,
+    pub(super) tenant: String,
+    pub(super) session: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) external_id: Option<String>,
+    pub(super) slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) external_ref: Option<String>,
+    pub(super) observed_at_ms: u64,
+    pub(super) evidence: EvidencePayload,
 }

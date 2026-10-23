@@ -275,6 +275,7 @@ fn create_fixture_session(
     session::create_session(
         setup,
         SessionRequest {
+            periodic_evidence: false,
             evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,
@@ -304,6 +305,7 @@ pub(crate) fn presence_entry(
     connected: &[u8],
 ) -> SessionPresence {
     SessionPresence {
+        periodic_evidence: Vec::new(),
         evidence: Vec::new(),
         tenant: tenant.clone(),
         session,

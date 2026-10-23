@@ -31,6 +31,7 @@ fn stale_assignment_cannot_activate_or_replace_retained_evidence() {
     registry.require_descriptors();
     install(&registry, &key, config(1));
     let observation = EvidenceObservation {
+        sample_id: 0,
         connection_id: [1; 32],
         sequence: 1,
         assignment_revision: 1,

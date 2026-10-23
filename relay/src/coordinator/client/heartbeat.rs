@@ -2,9 +2,9 @@
 //! heartbeat's roster and the answer to a one-session load-state question.
 //!
 //! Both use the live routing roster and per-session decision-makers. Heartbeats
-//! restate every session's roster and progress facts; requested snapshots also
-//! carry retained connection observations. Opaque bodies stay out of periodic
-//! rosters so their size does not multiply by every session on the relay. The
+//! restate every session's roster and progress facts, plus a rotating byte-bounded
+//! subset of paired observations. Requested snapshots carry all observations for
+//! one session. Selection happens before opaque bodies are cloned. The
 //! load-state side adds the fence: probe every slot that could still be holding
 //! a report back, wait for the acks, and only then snapshot.
 
@@ -57,9 +57,19 @@ pub(super) struct LoadStateAsk {
 /// entry, with the load fields empty.
 ///
 /// The roster and progress sets are complete every time, so a lost beat is
-/// corrected by the next one. Connection observations are recovered by requesting
-/// the affected session's load state instead of repeating bodies in every roster.
+/// corrected by the next one. A byte-bounded rotating subset of periodic samples
+/// carries its matching admission for recovery without growing the complete roster
+/// beyond the control-message limit. Requested load state retains every observation.
+#[cfg(test)]
 pub(super) fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPresence> {
+    heartbeat_presence_with_evidence(sources, &mut 0, &[])
+}
+
+pub(super) fn heartbeat_presence_with_evidence(
+    sources: &HeartbeatSources,
+    cursor: &mut usize,
+    region_rtts: &[RegionRttReport],
+) -> Vec<SessionPresence> {
     let mut live: HashMap<SessionKey, _> = crate::routing::live_slots(&sources.sessions)
         .into_iter()
         .collect();
@@ -76,7 +86,88 @@ pub(super) fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPrese
         live.into_iter()
             .map(|(key, slots)| presence_entry(key, slots, RetainedLoadState::default())),
     );
+    let candidates = sources.decision_makers.periodic_evidence_candidates();
+    attach_heartbeat_evidence(
+        &mut roster,
+        cursor,
+        region_rtts,
+        candidates,
+        |key, slot, remaining| {
+            sources
+                .decision_makers
+                .periodic_evidence_pair(key, slot, remaining)
+        },
+    );
     roster
+}
+
+const HEARTBEAT_EVIDENCE_BYTES: usize = 512 * 1024;
+
+/// A complete roster with a rotating bounded subset of paired observations.
+/// Candidate enumeration holds only keys; the callback clones only pairs that fit.
+pub(super) fn attach_heartbeat_evidence(
+    roster: &mut [SessionPresence],
+    cursor: &mut usize,
+    region_rtts: &[RegionRttReport],
+    mut candidates: Vec<(SessionKey, SlotId)>,
+    mut pair: impl FnMut(
+        &SessionKey,
+        SlotId,
+        &mut usize,
+    ) -> Option<(
+        rally_point_proto::control::SlotEvidence,
+        rally_point_proto::control::SlotEvidence,
+    )>,
+) {
+    roster.sort_by(|a, b| (&a.tenant.0, a.session).cmp(&(&b.tenant.0, b.session)));
+    candidates.sort_by(|(a, sa), (b, sb)| {
+        (&a.tenant.0, a.session, sa).cmp(&(&b.tenant.0, b.session, sb))
+    });
+    if candidates.is_empty() {
+        *cursor = 0;
+        return;
+    }
+    // The complete base roster and RTTs count against the coordinator's 2 MiB
+    // frame cap too. Leave extra framing headroom rather than assuming the roster
+    // is small because the opaque attachment budget is bounded.
+    let base = serde_json::to_vec(&rally_point_proto::control::RelayToCoordinator::Heartbeat {
+        roster_complete: true,
+        sessions: roster.to_vec(),
+        region_rtts: region_rtts.to_vec(),
+    })
+    .expect("a heartbeat serializes")
+    .len();
+    let mut remaining =
+        HEARTBEAT_EVIDENCE_BYTES.min((2usize * 1024 * 1024).saturating_sub(base + 1024));
+    let start = *cursor % candidates.len();
+    for offset in 0..candidates.len() {
+        let index = (start + offset) % candidates.len();
+        let (key, slot) = &candidates[index];
+        let Ok(session) = roster.binary_search_by(|entry| {
+            (&entry.tenant.0, entry.session).cmp(&(&key.tenant.0, key.session))
+        }) else {
+            continue;
+        };
+        let before = remaining;
+        if let Some((admission, periodic)) = pair(key, *slot, &mut remaining) {
+            roster[session].evidence.push(admission);
+            roster[session].periodic_evidence.push(periodic);
+        } else if remaining == before {
+            // A pair that exhausted this beat's budget gets first chance next
+            // time. A pair too large even when first must not pin the rotation.
+            *cursor = if offset == 0 {
+                (index + 1) % candidates.len()
+            } else {
+                index
+            };
+            break;
+        }
+        *cursor = (index + 1) % candidates.len();
+    }
+    for session in roster {
+        session.evidence.sort_by_key(|entry| entry.slot);
+        session.periodic_evidence.sort_by_key(|entry| entry.slot);
+    }
 }
 
 /// Snapshots what this relay holds for **one** session, in the same
@@ -84,8 +175,8 @@ pub(super) fn heartbeat_presence(sources: &HeartbeatSources) -> Vec<SessionPrese
 /// [`CoordinatorToRelay::LoadStateRequest`](rally_point_proto::control::CoordinatorToRelay::LoadStateRequest).
 ///
 /// Reads the same roster and progress facts as a heartbeat, plus the session's
-/// retained connection observations. The single-session bound keeps opaque bodies
-/// out of the relay-wide periodic roster without losing requested recovery.
+/// retained connection observations, including ones outside the current heartbeat
+/// attachment budget.
 /// A session this relay holds nothing for — no maker, no live slot — snapshots to
 /// empty lists, which is this relay attesting that it knows of no arrival rather
 /// than declining to answer.
@@ -314,10 +405,11 @@ pub(super) async fn fenced_load_state_snapshot(
 }
 
 /// Assembles one [`SessionPresence`] from a session's key, its connected slots, and
-/// the retained state selected for that report. Heartbeats select progress facts;
-/// requested single-session snapshots additionally select connection observations.
+/// the retained state selected for that report. Heartbeats attach bounded paired
+/// observations after assembling progress; requested snapshots carry every observation.
 fn presence_entry(key: SessionKey, slots: Vec<SlotId>, load: RetainedLoadState) -> SessionPresence {
     SessionPresence {
+        periodic_evidence: load.periodic_evidence,
         tenant: key.tenant,
         session: key.session,
         slots,

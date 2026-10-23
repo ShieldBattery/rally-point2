@@ -559,3 +559,43 @@ fn enqueue_dispatch(
     };
     lifecycle.enqueue_webhook(tenant, session, config, body, kind);
 }
+
+/// Delivers a fenced periodic observation without recording a connection arrival.
+pub(crate) fn handle_slot_evidence(
+    setup: &SessionSetup,
+    lifecycle: &Lifecycle,
+    notice: rally_point_proto::control::SlotEvidenceNotice,
+) {
+    let Some(resolved) = resolve_or_drop(
+        setup,
+        &notice.tenant,
+        notice.session,
+        NoticeKey::Slot(notice.slot),
+        "slot-evidence",
+        notice.external_id.clone(),
+        true,
+    ) else {
+        return;
+    };
+    let external_ref = notice
+        .external_ref
+        .or_else(|| resolved.stored_slot_ref(notice.slot));
+    let payload = SlotEvidenceWebhook {
+        event: "slotEvidence",
+        tenant: notice.tenant.as_ref().to_owned(),
+        session: notice.session.0,
+        external_id: Some(resolved.external_id),
+        slot: notice.slot.0,
+        external_ref,
+        observed_at_ms: notice.observed_at_ms,
+        evidence: notice.evidence.into(),
+    };
+    enqueue_dispatch(
+        lifecycle,
+        notice.tenant,
+        notice.session,
+        resolved.config,
+        &payload,
+        "slotEvidence",
+    );
+}

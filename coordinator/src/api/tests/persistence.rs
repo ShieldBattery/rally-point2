@@ -40,6 +40,7 @@ fn restored_sessions(ledger: &Arc<RelayLedger>) -> Vec<(SessionId, Vec<RelayId>)
 async fn a_create_that_cannot_be_persisted_is_refused_and_its_retry_replays() {
     let (state, ledger) = state_with_store();
     let body = serde_json::to_vec(&SessionRequest {
+        periodic_evidence: false,
         evidence_keys: Vec::new(),
         lobby_policy: None,
         rollback: false,

@@ -13,13 +13,14 @@ use crate::{notify, registry};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct StoredEvidence {
     pub(super) relay: RelayId,
-    boot_id: u64,
+    pub(super) boot_id: u64,
     pub(super) observation: EvidenceObservation,
     notified_sequence: Option<u64>,
 }
 
 impl Lifecycle {
-    /// Latest retained observations matching each slot's current assignment, sorted by slot.
+    /// Admission then latest periodic observations matching each current assignment.
+    /// Each group is sorted by slot; earlier periodic samples are not retained.
     /// Unknown or retired sessions have no observations; this makes no completeness claim.
     pub fn connection_evidence(
         &self,
@@ -117,7 +118,8 @@ impl Lifecycle {
         let Some(observation) = &mut notice.evidence else {
             return;
         };
-        if observation.sequence == 0
+        if observation.sample_id != 0
+            || observation.sequence == 0
             || observation.body.len() > rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
             || !setup.relay_serves_session(relay, &notice.tenant, notice.session)
         {
@@ -202,6 +204,19 @@ impl Lifecycle {
                     false,
                 );
             }
+            let mut seen = std::collections::HashSet::new();
+            for entry in &session.periodic_evidence {
+                if seen.insert(entry.slot) {
+                    self.record_periodic_evidence(
+                        (relay, boot_id),
+                        &session.tenant,
+                        session.session,
+                        entry.slot,
+                        &entry.observation,
+                        false,
+                    );
+                }
+            }
         }
     }
 
@@ -216,7 +231,8 @@ impl Lifecycle {
         notify: bool,
     ) -> bool {
         let (relay, boot_id) = source;
-        if observation.sequence == 0
+        if observation.sample_id != 0
+            || observation.sequence == 0
             || observation.body.len() > rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
             || self
                 .inner
@@ -262,6 +278,13 @@ impl Lifecycle {
         {
             return false;
         }
+        if state
+            .periodic_evidence
+            .get(&slot)
+            .is_some_and(|periodic| !periodic.matches_admission(stored))
+        {
+            state.periodic_evidence.remove(&slot);
+        }
         if notify {
             if stored
                 .notified_sequence
@@ -290,5 +313,22 @@ pub(super) fn current_evidence(
             slot,
             observation: stored.observation.clone(),
         })
+        .chain(
+            state
+                .periodic_evidence
+                .iter()
+                .filter(|(slot, stored)| {
+                    assignments.get(slot)
+                        == Some(&(stored.relay, stored.observation.assignment_revision))
+                        && state
+                            .evidence
+                            .get(slot)
+                            .is_some_and(|admission| stored.matches_admission(admission))
+                })
+                .map(|(&slot, stored)| rally_point_proto::control::SlotEvidence {
+                    slot,
+                    observation: stored.observation.clone(),
+                }),
+        )
         .collect()
 }

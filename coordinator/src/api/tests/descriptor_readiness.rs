@@ -14,6 +14,7 @@ mod rehome;
 
 fn create_body(players: Vec<PlayerHandoff>) -> Vec<u8> {
     serde_json::to_vec(&SessionRequest {
+        periodic_evidence: false,
         evidence_keys: Vec::new(),
         lobby_policy: None,
         rollback: false,

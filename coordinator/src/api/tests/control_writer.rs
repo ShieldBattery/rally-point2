@@ -10,6 +10,7 @@ use super::*;
 /// fixture for the descriptor-diff unit tests.
 fn diff_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        periodic_evidence: false,
         evidence_keys: Vec::new(),
         required_evidence_slots: Vec::new(),
         evidence_assignments: Vec::new(),

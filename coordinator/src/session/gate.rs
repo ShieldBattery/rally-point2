@@ -65,6 +65,8 @@ pub(super) struct CreateFingerprint {
     players: Vec<FingerprintPlayer>,
     #[serde(default)]
     evidence_keys: Vec<rally_point_proto::control::EvidenceKey>,
+    #[serde(default)]
+    periodic_evidence: bool,
     /// The request's worst-pairwise one-way path-latency estimate.
     latency_estimate_ms: Option<u32>,
     /// The request's lobby command allow-list.
@@ -109,6 +111,7 @@ impl CreateFingerprint {
         Self {
             players,
             evidence_keys,
+            periodic_evidence: request.periodic_evidence,
             latency_estimate_ms: request.latency_estimate_ms,
             lobby_policy: request.lobby_policy.clone(),
         }

@@ -112,6 +112,9 @@ impl Lifecycle {
         let Some(state) = sessions.get_mut(&(tenant.clone(), session)) else {
             return;
         };
+        state
+            .periodic_evidence
+            .retain(|_, evidence| evidence.relay != dead);
         if dead == r_new {
             // Membership is unchanged, but the resumed descriptor is still a new
             // assignment boundary. Clear any close/empty evidence that landed
@@ -416,6 +419,9 @@ impl Lifecycle {
                 state.attestable = false;
             }
             state.evidence.retain(|_, evidence| evidence.relay != relay);
+            state
+                .periodic_evidence
+                .retain(|_, evidence| evidence.relay != relay);
         }
     }
 

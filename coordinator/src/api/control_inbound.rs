@@ -227,6 +227,10 @@ pub(super) fn note_inbound(
             lifecycle.ingest_notice(relay_id, generation, SessionNotice::Result(notice));
             InboundAction::None
         }
+        Ok(RelayToCoordinator::SlotEvidence(notice)) => {
+            lifecycle.ingest_notice(relay_id, generation, SessionNotice::SlotEvidence(notice));
+            InboundAction::None
+        }
         Ok(RelayToCoordinator::SlotConnected(notice)) => {
             lifecycle.ingest_notice(relay_id, generation, SessionNotice::SlotConnected(notice));
             InboundAction::None

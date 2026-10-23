@@ -183,6 +183,9 @@ pub struct PlayerHandoff {
 /// at game launch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRequest {
+    /// Enables optional periodic evidence on capable client connections.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub periodic_evidence: bool,
     /// Session-scoped keys accepted for connection evidence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_keys: Vec<EvidenceKey>,
@@ -377,6 +380,9 @@ pub struct SlotExternalRef {
 /// themselves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionDescriptor {
+    /// Enables optional periodic evidence on capable client connections.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub periodic_evidence: bool,
     /// Session-scoped keys accepted for connection evidence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence_keys: Vec<EvidenceKey>,

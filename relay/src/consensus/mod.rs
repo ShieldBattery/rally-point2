@@ -284,6 +284,7 @@ pub use maker::{
     FinalizeOutcome, RecordedDeparture, SilentSlot,
 };
 pub use registry::LobbyCommandVerdict;
+pub(crate) use registry::next_evidence_sequence;
 
 pub use registry::{
     DecisionMakers, EvidenceConfig, FrameRegression, MakerSync, RelayNotice, RetainedLoadState,

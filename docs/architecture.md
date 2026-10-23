@@ -1550,8 +1550,9 @@ reaps do not re-arm, and the liveness probe force-reconciles it.
 
 `POST /session/evidence` reads the coordinator's retained latest per-slot observations for a signed
 `{ tenant, session }` request and returns `{ evidence: [...] }`, empty when the session is unknown.
-Only the latest retained observation per slot is available; this is not an archival log. Observations
-that were never received or were overwritten cannot be recovered here. Session retirement, including
+The latest admission and latest periodic observation per slot are available, at most 32 observations
+for 16 slots; this is not an archival log. Intermediate periodic samples that were never received or
+were overwritten cannot be recovered here. Session retirement, including
 normal close, discards observations immediately; there is no post-close recovery grace period.
 It makes no completeness claim, performs no relay exchange or lobby settlement, and uses a separate
 per-tenant budget (burst 200, one token per 100 ms). Background recovery uses this cached read so it
@@ -1857,6 +1858,22 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   is retryable because a provider can be temporarily unavailable; a supplied signature that fails
   verification is terminal. Only valid evidence retains its body. A capability downgrade moves affected
   sessions to a capable relay or retires them if no replacement exists, leaving unrelated sessions served.
+- **Periodic evidence is opt-in and cannot gate gameplay.** Client-edge `rp2/3` retains the initial
+  handshake stream for bounded challenge/response frames, with `rp2/2` and `rp2/1` fallbacks. A tenant
+  requests periodic collection explicitly; descriptors enable it only on relays advertising support.
+  Relays wait for game and slot start, then jitter the first request by 30-60 seconds and subsequent
+  requests by 60-90 seconds. A fixed full-image check uses a fresh nonce and nonzero challenge ID,
+  signed with the connection, session, slot, and assignment revision. Exchanges have a three-second
+  deadline and share 32 relay-wide permits; a busy relay skips work. Clients share a 30-second
+  cooldown and one blocking-provider permit across reconnects. Timed-out running providers retain
+  their permit until they return. Failure ends only the evidence stream or produces a missing sample,
+  never a gameplay close or enforcement decision. Samples are fenced against current registration,
+  assignment, control connection, relay process, and admission identity. Separate latest-periodic
+  state cannot overwrite admission or trigger load-progress callbacks. Heartbeats rotate through at
+  most 512 KiB of paired admission/periodic attachments while always reporting the complete roster;
+  matching `slotEvidence` notices use the same bounded selection. Latest-value recovery does not
+  guarantee delivery of every intermediate sample. Actual client performance must be qualified
+  before enabling the tenant policy.
 - **Empty sessions cannot pin the relay fleet indefinitely.** After observing any local or peer player
   live, a relay uses its authoritative local roster plus explicit zero reports from every peer, so even an
   assigned relay whose own slot never connected runs the ordinary close once the session transitions to

@@ -73,6 +73,7 @@ mod fan_out;
 mod forward;
 mod lifecycle;
 mod lobby;
+mod periodic;
 mod registry;
 mod silence;
 mod slot_link;
@@ -374,6 +375,7 @@ pub struct SlotEntry {
 /// The receiving end of a registered slot, handed to its link task: the queue of
 /// turns to deliver to the client, and the signal to shut the link down.
 pub struct SlotInbox {
+    evidence_stream: Option<periodic::EvidenceStream>,
     forward_rx: ForwardRx,
     /// Leaves to push down this client's control stream (see [`SlotEntry::leave_push`]).
     leave_push_rx: mpsc::Receiver<LeaveDirective>,
@@ -403,6 +405,19 @@ pub struct SlotInbox {
 }
 
 impl SlotInbox {
+    pub(crate) fn set_evidence_stream(
+        &mut self,
+        send: rally_point_transport::noq::SendStream,
+        recv: rally_point_transport::noq::RecvStream,
+        request: rally_point_proto::handshake::EvidenceRequest,
+    ) {
+        self.evidence_stream = Some(periodic::EvidenceStream {
+            send,
+            recv,
+            request,
+        });
+    }
+
     /// Non-blockingly pulls the next turn forwarded to this slot, for
     /// cross-module tests of the local-delivery boundary. `None` when nothing
     /// is queued.

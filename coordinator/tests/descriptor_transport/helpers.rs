@@ -186,6 +186,7 @@ pub(crate) async fn coordinator_with_session(
     let resp = session::create_session(
         &served.setup,
         SessionRequest {
+            periodic_evidence: false,
             evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,
@@ -253,6 +254,7 @@ pub(crate) async fn serve_coordinator_returning_setup(
 /// the descriptor outbox directly.
 pub(crate) fn a_descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        periodic_evidence: false,
         evidence_keys: Vec::new(),
         required_evidence_slots: Vec::new(),
         evidence_assignments: Vec::new(),
@@ -399,6 +401,7 @@ pub(crate) fn try_create_one_slot_session(
     session::create_session(
         setup,
         SessionRequest {
+            periodic_evidence: false,
             evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,

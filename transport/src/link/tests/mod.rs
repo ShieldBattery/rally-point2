@@ -13,6 +13,7 @@ mod dedup;
 mod delivery;
 mod ingress;
 mod resume;
+mod task;
 
 /// Brings up a client-edge loopback QUIC connection and wraps each end in a
 /// plain [`Link`]. The endpoints are returned so the caller keeps them alive

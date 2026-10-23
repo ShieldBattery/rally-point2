@@ -360,6 +360,7 @@ fn create_body(
     // them — the notification is then self-describing (the coordinator keeps no
     // other session→game map, and the tenant needs none either).
     let refs = SessionRefs {
+        periodic_evidence: request.periodic_evidence,
         evidence_keys: request.evidence_keys.clone(),
         required_evidence_slots: request
             .players
@@ -499,7 +500,8 @@ fn validate_request(request: &SessionRequest) -> Result<(), SessionSetupError> {
         .evidence_keys
         .iter()
         .any(|key| !key_ids.insert(key.key_id))
-        || (request.evidence_keys.is_empty() && request.players.iter().any(|p| p.require_evidence))
+        || (request.evidence_keys.is_empty()
+            && (request.periodic_evidence || request.players.iter().any(|p| p.require_evidence)))
     {
         return Err(SessionSetupError::InvalidEvidenceKeys);
     }

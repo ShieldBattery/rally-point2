@@ -362,11 +362,12 @@ impl DecisionMaker {
     pub fn load_state(&self) -> RetainedLoadState {
         RetainedLoadState {
             evidence: self.evidence_snapshot(),
+            periodic_evidence: self.periodic_evidence_snapshot(),
             ..self.heartbeat_load_state()
         }
     }
 
-    /// Progress facts restated periodically without copying opaque observations.
+    /// Progress facts only; bounded observations are selected separately before cloning.
     pub fn heartbeat_load_state(&self) -> RetainedLoadState {
         RetainedLoadState {
             ever_connected: sorted_slots(&self.connected_slots),
@@ -374,6 +375,7 @@ impl DecisionMaker {
             forwarded: sorted_slots(&self.forwarded_slots),
             lobby_violations: self.lobby_violations(),
             evidence: Vec::new(),
+            periodic_evidence: Vec::new(),
             started_at_ms: self.started_at_ms,
         }
     }

@@ -12,8 +12,6 @@ pub(super) struct Activation {
     pub evidence: crate::auth::CheckedEvidence,
 }
 
-static EVIDENCE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActivationRefusal {
     Retired,
@@ -52,8 +50,10 @@ fn with_activation(
         .with_ingress(key, || {
             let evidence = activation.evidence;
             let observation = rally_point_proto::control::EvidenceObservation {
+                sample_id: 0,
                 connection_id: evidence.connection_id,
-                sequence: EVIDENCE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                sequence: crate::consensus::next_evidence_sequence()
+                    .ok_or(ActivationRefusal::AssignmentChanged)?,
                 assignment_revision: evidence.assignment_revision,
                 verdict: evidence.verdict,
                 key_id: evidence.key_id,

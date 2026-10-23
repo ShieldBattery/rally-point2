@@ -71,6 +71,7 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
         RelayToCoordinator::Heartbeat {
             roster_complete: true,
             sessions: vec![SessionPresence {
+                periodic_evidence: Vec::new(),
                 tenant: TenantId(TENANT.to_owned()),
                 session: SessionId(7),
                 slots: vec![rally_point_proto::ids::SlotId(3)],
@@ -125,6 +126,7 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
     assert_eq!(
         heartbeat_presence(&sources),
         vec![SessionPresence {
+            periodic_evidence: Vec::new(),
             tenant: TenantId(TENANT.to_owned()),
             session: SessionId(7),
             slots: vec![],
@@ -237,6 +239,7 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
         RelayToCoordinator::LoadStateSnapshot {
             request_id: 99,
             state: SessionPresence {
+                periodic_evidence: Vec::new(),
                 tenant: TenantId(TENANT.to_owned()),
                 session: SessionId(7),
                 slots: vec![rally_point_proto::ids::SlotId(3)],
@@ -312,6 +315,7 @@ fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
     assert_eq!(
         session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)).0,
         SessionPresence {
+            periodic_evidence: Vec::new(),
             tenant: TenantId(TENANT.to_owned()),
             session: SessionId(7),
             slots: vec![],
@@ -383,6 +387,7 @@ fn heartbeat_roster_stays_compact_while_requested_snapshots_retain_full_observat
                 slot,
                 false,
                 Some(EvidenceObservation {
+                    sample_id: 0,
                     connection_id: [255; 32],
                     sequence: 1,
                     assignment_revision: 0,
@@ -431,5 +436,228 @@ fn heartbeat_roster_stays_compact_while_requested_snapshots_retain_full_observat
     assert!(
         snapshot_bytes.len() * 256 > 2 * 1024 * 1024,
         "repeating these bodies in the roster would exceed the control cap"
+    );
+}
+
+#[test]
+fn periodic_heartbeat_attachment_budget_rotates_without_truncating_the_roster() {
+    use rally_point_proto::control::{EvidenceObservation, EvidenceVerdict, SlotEvidence};
+    use rally_point_proto::ids::SlotId;
+    let base: Vec<_> = (0..256)
+        .map(|session| {
+            let evidence: Vec<_> = (0..2)
+                .map(|slot| SlotEvidence {
+                    slot: SlotId(slot),
+                    observation: EvidenceObservation {
+                        sample_id: 0,
+                        connection_id: [255; 32],
+                        sequence: 1,
+                        assignment_revision: 1,
+                        verdict: EvidenceVerdict::Valid,
+                        key_id: Some(7),
+                        body: vec![255; rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN],
+                    },
+                })
+                .collect();
+            rally_point_proto::control::SessionPresence {
+                tenant: TenantId(TENANT.to_owned()),
+                session: SessionId(session),
+                periodic_evidence: evidence
+                    .iter()
+                    .cloned()
+                    .map(|mut entry| {
+                        entry.observation.sample_id = 1;
+                        entry.observation.sequence = 2;
+                        entry
+                    })
+                    .collect(),
+                evidence,
+                slots: vec![],
+                ever_connected: vec![],
+                started: vec![],
+                forwarded: vec![],
+                lobby_violations: vec![],
+                started_at_ms: None,
+            }
+        })
+        .collect();
+    let mut cursor = 0;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..40 {
+        let mut roster = base.clone();
+        let candidates: Vec<_> = roster
+            .iter()
+            .flat_map(|session| {
+                session.periodic_evidence.iter().map(|entry| {
+                    (
+                        SessionKey {
+                            tenant: session.tenant.clone(),
+                            session: session.session,
+                        },
+                        entry.slot,
+                    )
+                })
+            })
+            .collect();
+        for session in &mut roster {
+            session.evidence.clear();
+            session.periodic_evidence.clear();
+        }
+        super::super::heartbeat::attach_heartbeat_evidence(
+            &mut roster,
+            &mut cursor,
+            &[],
+            candidates,
+            |key, slot, remaining| {
+                let session = &base[key.session.0 as usize];
+                let admission = &session.evidence[slot.0 as usize];
+                let periodic = &session.periodic_evidence[slot.0 as usize];
+                let cost = serde_json::to_vec(&(admission, periodic)).unwrap().len() + 256;
+                if cost > *remaining {
+                    return None;
+                }
+                *remaining -= cost;
+                Some((admission.clone(), periodic.clone()))
+            },
+        );
+        assert_eq!(roster.len(), 256);
+        let mut attachments = 0;
+        for session in &roster {
+            assert_eq!(session.evidence.len(), session.periodic_evidence.len());
+            for (admission, periodic) in session.evidence.iter().zip(&session.periodic_evidence) {
+                assert_eq!(admission.slot, periodic.slot);
+                attachments += serde_json::to_vec(&(admission, periodic)).unwrap().len() + 128;
+                seen.insert((session.session, periodic.slot));
+            }
+        }
+        assert!(attachments <= 512 * 1024);
+        let bytes = serde_json::to_vec(&RelayToCoordinator::Heartbeat {
+            roster_complete: true,
+            sessions: roster,
+            region_rtts: vec![],
+        })
+        .unwrap();
+        assert!(bytes.len() < 2 * 1024 * 1024);
+    }
+    assert_eq!(seen.len(), 512);
+}
+
+#[test]
+fn near_full_roster_reserves_frame_space_before_cloning_observations() {
+    use rally_point_proto::control::{EvidenceObservation, EvidenceVerdict, SlotEvidence};
+    use rally_point_proto::ids::SlotId;
+    let slots: Vec<_> = (0..16).map(SlotId).collect();
+    let mut roster: Vec<_> = (0..4096)
+        .map(|session| rally_point_proto::control::SessionPresence {
+            tenant: TenantId("t".repeat(160)),
+            session: SessionId(session),
+            slots: slots.clone(),
+            ever_connected: slots.clone(),
+            started: slots.clone(),
+            forwarded: slots.clone(),
+            lobby_violations: vec![],
+            evidence: vec![],
+            periodic_evidence: vec![],
+            started_at_ms: Some(1792700000000),
+        })
+        .collect();
+    let candidates = roster
+        .iter()
+        .flat_map(|session| {
+            slots.iter().map(|slot| {
+                (
+                    SessionKey {
+                        tenant: session.tenant.clone(),
+                        session: session.session,
+                    },
+                    *slot,
+                )
+            })
+        })
+        .collect();
+    let sample = SlotEvidence {
+        slot: SlotId(0),
+        observation: EvidenceObservation {
+            sample_id: 1,
+            connection_id: [255; 32],
+            sequence: 2,
+            assignment_revision: 1,
+            verdict: EvidenceVerdict::Valid,
+            key_id: Some(7),
+            body: vec![255; rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN],
+        },
+    };
+    let cost = serde_json::to_vec(&(&sample, &sample)).unwrap().len() + 256;
+    let mut copied = 0;
+    super::super::heartbeat::attach_heartbeat_evidence(
+        &mut roster,
+        &mut 0,
+        &[],
+        candidates,
+        |_, slot, remaining| {
+            if cost > *remaining {
+                return None;
+            }
+            *remaining -= cost;
+            copied += 1;
+            let mut periodic = sample.clone();
+            periodic.slot = slot;
+            let mut admission = periodic.clone();
+            admission.observation.sample_id = 0;
+            Some((admission, periodic))
+        },
+    );
+    assert!(
+        copied > 0 && copied < 40,
+        "only fitting pairs get cloned: {copied}"
+    );
+    assert_eq!(roster.len(), 4096);
+    let bytes = serde_json::to_vec(&RelayToCoordinator::Heartbeat {
+        roster_complete: true,
+        sessions: roster,
+        region_rtts: vec![],
+    })
+    .unwrap();
+    assert!(bytes.len() < 2 * 1024 * 1024, "{}", bytes.len());
+}
+
+#[test]
+fn oversized_first_pair_does_not_pin_heartbeat_rotation() {
+    let mut roster = vec![SessionPresence {
+        tenant: key(7).tenant,
+        session: SessionId(7),
+        slots: vec![],
+        ever_connected: vec![],
+        started: vec![],
+        forwarded: vec![],
+        lobby_violations: vec![],
+        evidence: vec![],
+        periodic_evidence: vec![],
+        started_at_ms: None,
+    }];
+    let candidates = vec![
+        (key(7), rally_point_proto::ids::SlotId(0)),
+        (key(7), rally_point_proto::ids::SlotId(1)),
+    ];
+    let mut cursor = 0;
+    let mut attempts = Vec::new();
+    for _ in 0..2 {
+        super::super::heartbeat::attach_heartbeat_evidence(
+            &mut roster,
+            &mut cursor,
+            &[],
+            candidates.clone(),
+            |_, slot, _| {
+                attempts.push(slot);
+                None
+            },
+        );
+    }
+    assert_eq!(
+        attempts,
+        vec![
+            rally_point_proto::ids::SlotId(0),
+            rally_point_proto::ids::SlotId(1)
+        ]
     );
 }

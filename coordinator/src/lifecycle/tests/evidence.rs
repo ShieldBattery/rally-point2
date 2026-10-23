@@ -38,6 +38,7 @@ fn setup_evidence() -> (Lifecycle, SessionId, u64) {
 
 fn observation(sequence: u64, assignment_revision: u64) -> EvidenceObservation {
     EvidenceObservation {
+        sample_id: 0,
         connection_id: [sequence as u8; 32],
         sequence,
         assignment_revision,

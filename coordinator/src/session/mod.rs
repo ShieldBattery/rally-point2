@@ -81,6 +81,8 @@ type SessionRefsStore =
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SessionRefs {
+    /// Request periodic samples on relays that advertise support.
+    pub periodic_evidence: bool,
     /// Verification keys retained across descriptor rebuilds.
     pub evidence_keys: Vec<rally_point_proto::control::EvidenceKey>,
     /// Slots whose connections require valid evidence.

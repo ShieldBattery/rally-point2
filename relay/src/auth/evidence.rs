@@ -11,6 +11,7 @@ pub struct Authenticated {
     pub resume_cursors: HashMap<SlotId, u64>,
     pub connection_epoch: u64,
     pub send: noq::SendStream,
+    pub recv: noq::RecvStream,
     pub evidence: Option<Evidence>,
     pub evidence_request: EvidenceRequest,
 }

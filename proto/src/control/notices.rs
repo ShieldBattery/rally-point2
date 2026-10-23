@@ -383,3 +383,21 @@ pub struct LobbyViolationNotice {
     /// Relay wall-clock when the violation was detected, unix epoch milliseconds.
     pub arrival_ms: u64,
 }
+
+/// A home relay's periodic sample, independent of connection activation.
+/// Sent only while the descriptor enables periodic evidence. The authenticated
+/// connection supplies the slot; the descriptor supplies the external ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlotEvidenceNotice {
+    pub tenant: TenantId,
+    pub session: SessionId,
+    pub slot: SlotId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_ref: Option<String>,
+    /// Relay receipt time in unix epoch milliseconds; not a freshness deadline.
+    pub observed_at_ms: u64,
+    /// A periodic observation has a nonzero sample id.
+    pub evidence: EvidenceObservation,
+}

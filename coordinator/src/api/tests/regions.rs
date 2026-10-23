@@ -133,6 +133,7 @@ fn provisioning_state(region_ids: &[&str], provisioning: bool) -> CoordinatorSta
 /// `external_id`.
 fn region_create_body(region: &str, external_id: &str) -> Vec<u8> {
     let req = SessionRequest {
+        periodic_evidence: false,
         evidence_keys: Vec::new(),
         lobby_policy: None,
         rollback: false,

@@ -26,6 +26,12 @@ impl DecisionMakers {
         resumed: bool,
         evidence: Option<rally_point_proto::control::EvidenceObservation>,
     ) -> bool {
+        if evidence
+            .as_ref()
+            .is_some_and(|observation| observation.sample_id != 0)
+        {
+            return false;
+        }
         {
             let mut makers = self.lock();
             if let Some(maker) = makers.get_mut(key) {

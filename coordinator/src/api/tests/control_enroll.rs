@@ -476,3 +476,48 @@ async fn check_evidence_downgrade(replacement: bool, restarted: bool) {
         assert_eq!(webhook.body["session"], required.0);
     }
 }
+
+#[test]
+fn reenrollment_refreshes_periodic_policy_without_rehoming_the_session() {
+    use rally_point_proto::control::{CAPABILITY_PERIODIC_EVIDENCE_V1, EvidenceKey};
+    let setup = relayless_setup();
+    let lifecycle = Lifecycle::new(setup.clone());
+    let regions = RegionsConfig::default();
+    let context = EnrollContext::new(&setup, &lifecycle, &regions, None, None);
+    let relay = RelayIdentity::generate();
+    let enroll = |capable| {
+        let mut hello = relay.hello(1).with_boot_id(7);
+        if capable {
+            hello = hello.with_capabilities(vec![CAPABILITY_PERIODIC_EVIDENCE_V1.into()]);
+        }
+        let mut handshake = EnrollHandshake::start(&context, &Arc::new(Semaphore::new(1))).unwrap();
+        let nonce = challenge_nonce(handshake.offer(Some(RelayToCoordinator::Hello(hello))));
+        assert!(matches!(
+            handshake.offer(Some(relay.proof(&nonce))),
+            EnrollStep::Enrolled(_)
+        ));
+    };
+    enroll(false);
+    let mut request = crate::test_support::request(vec![crate::test_support::player(0)]);
+    request.periodic_evidence = true;
+    request.evidence_keys = vec![EvidenceKey {
+        key_id: 1,
+        public_key: ClientPublicKey([3; 32]),
+    }];
+    let session = session::create_session(&setup, request, ExpiresAt(u64::MAX))
+        .unwrap()
+        .response
+        .session;
+    assert!(!setup.descriptors().current_for(RelayId(1))[0].periodic_evidence);
+    for capable in [true, false, true] {
+        enroll(capable);
+        assert_eq!(
+            setup.descriptors().current_for(RelayId(1))[0].periodic_evidence,
+            capable
+        );
+        assert_eq!(
+            setup.serving_relays(&tenant_id(), session),
+            vec![RelayId(1)]
+        );
+    }
+}

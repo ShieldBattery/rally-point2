@@ -202,3 +202,66 @@ fn exhausted_assignment_revision_rejects_before_any_membership_mutation() {
     assert!(setup.descriptors().current_for(RelayId(2)).is_empty());
     assert!(recorded_rehome(&setup, &tid(), session, RelayId(1)).is_none());
 }
+
+#[test]
+fn periodic_policy_is_persisted_fingerprinted_and_capability_gated_without_placement_requirement() {
+    use rally_point_proto::control::CAPABILITY_PERIODIC_EVIDENCE_V1;
+    let setup = region_b_fleet();
+    registry::enroll(
+        setup.registry(),
+        hello(1, 14900).with_capabilities(vec![CAPABILITY_PERIODIC_EVIDENCE_V1.into()]),
+    );
+    let mut req = evidence_request();
+    req.players[0].require_evidence = false;
+    req.players[1].region = Some(rally_point_proto::control::RegionId("region-b".into()));
+    req.periodic_evidence = true;
+    let first = create_session(&setup, req.clone(), ExpiresAt(u64::MAX)).unwrap();
+    assert!(
+        descriptor_for(&setup, &tid(), first.response.session, RelayId(1))
+            .unwrap()
+            .periodic_evidence
+    );
+    assert!(
+        !descriptor_for(&setup, &tid(), first.response.session, RelayId(2))
+            .unwrap()
+            .periodic_evidence
+    );
+    let records = {
+        let guard = setup.lock_assignment();
+        setup.export_records(&guard)
+    };
+    let restored = region_b_fleet();
+    restored.restore_records(
+        records
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key,
+                    serde_json::from_slice(&serde_json::to_vec(&value).unwrap()).unwrap(),
+                )
+            })
+            .collect(),
+    );
+    assert!(
+        session_refs(&restored, &tid(), first.response.session)
+            .unwrap()
+            .periodic_evidence
+    );
+    assert!(
+        create_session(&restored, req.clone(), ExpiresAt(u64::MAX))
+            .unwrap()
+            .replayed
+    );
+    req.periodic_evidence = false;
+    assert!(matches!(
+        create_session(&restored, req.clone(), ExpiresAt(u64::MAX)),
+        Err(SessionSetupError::IdempotentCreateMismatch)
+    ));
+    req.periodic_evidence = true;
+    req.evidence_keys.clear();
+    req.external_id = None;
+    assert!(matches!(
+        create_session(&restored, req, ExpiresAt(u64::MAX)),
+        Err(SessionSetupError::InvalidEvidenceKeys)
+    ));
+}

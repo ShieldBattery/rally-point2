@@ -96,6 +96,7 @@ fn stage_assignments(setup: &SessionSetup, session: SessionId, relays: &[RelayId
         setup.descriptors().record(
             relay,
             SessionDescriptor {
+                periodic_evidence: false,
                 evidence_keys: Vec::new(),
                 required_evidence_slots: Vec::new(),
                 evidence_assignments: Vec::new(),
@@ -145,6 +146,7 @@ mod empty_reap;
 mod evidence;
 mod heartbeat;
 mod notices;
+mod periodic;
 mod reaps;
 mod rehome;
 mod sessions;

@@ -37,8 +37,12 @@ fn identity() -> Identity {
 }
 
 fn endpoints(legacy: bool) -> (noq::Endpoint, ClientEndpoint) {
+    endpoints_with_alpn(legacy.then_some(quic::LEGACY_ALPN))
+}
+
+fn endpoints_with_alpn(alpn: Option<&[u8]>) -> (noq::Endpoint, ClientEndpoint) {
     let (chain, key, ca) = self_signed();
-    let config = if legacy {
+    let config = if let Some(alpn) = alpn {
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -47,8 +51,8 @@ fn endpoints(legacy: bool) -> (noq::Endpoint, ClientEndpoint) {
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .unwrap();
-        // This peer knows only the original client-edge protocol.
-        tls.alpn_protocols = vec![b"rp2/1".to_vec()];
+        // This peer offers exactly the selected older protocol.
+        tls.alpn_protocols = vec![alpn.to_vec()];
         let crypto = noq::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
         noq::ServerConfig::with_crypto(Arc::new(crypto))
     } else {
@@ -101,6 +105,7 @@ async fn read_original_handshake(
         assert_eq!(&entry[1..], &cursor.to_le_bytes());
     }
     let request = EvidenceRequest {
+        periodic: None,
         challenge,
         channel_binding: binding,
         tenant: token.claims.tenant,
@@ -252,7 +257,12 @@ async fn accept_current(
         .unwrap();
     send.write_all(&[0x01]).await.unwrap();
     send.finish().unwrap();
-    assert!(recv.read_to_end(0).await.unwrap().is_empty());
+    if quic::supports_periodic_evidence(&connection) {
+        // This fixture ends the optional exchange without closing gameplay.
+        assert!(recv.read_to_end(0).await.is_err());
+    } else {
+        assert!(recv.read_to_end(0).await.unwrap().is_empty());
+    }
     connection
 }
 
@@ -384,4 +394,29 @@ async fn rehome_stops_on_rejected_evidence_without_trying_fallback_addresses() {
     })
     .await
     .expect("rehome evidence rejection must be terminal");
+}
+
+#[tokio::test]
+async fn admission_only_peer_finishes_the_handshake_stream() {
+    let (server, client) = endpoints_with_alpn(Some(quic::EVIDENCE_ALPN));
+    let address = server.local_addr().unwrap();
+    let identity = identity();
+    let dial = client.connect(address, "localhost", &identity);
+    let peer = async {
+        let (connection, mut send, mut recv, _) = read_original_handshake(&server, None).await;
+        let mut length = [0; 2];
+        recv.read_exact(&mut length).await.unwrap();
+        assert_eq!(length, [0; 2]);
+        send.write_all(&[handshake::HANDSHAKE_OK]).await.unwrap();
+        assert_eq!(recv.read(&mut [0]).await.unwrap(), None);
+        assert!(!quic::supports_periodic_evidence(&connection));
+        connection
+    };
+    let (link, peer) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(dial, peer) })
+            .await
+            .unwrap();
+    let link = link.unwrap();
+    assert!(!quic::supports_periodic_evidence(link.connection()));
+    assert!(peer.close_reason().is_none());
 }

@@ -354,6 +354,7 @@ fn enroll_second_relay(state: &CoordinatorState, region: Option<&'static str>) {
 /// existence and its `(tenant, session)` ownership matter.
 fn create_rehome_session(state: &CoordinatorState) -> SessionId {
     let req = SessionRequest {
+        periodic_evidence: false,
         evidence_keys: Vec::new(),
         lobby_policy: None,
         rollback: false,
@@ -408,6 +409,7 @@ fn create_session_with_user(state: &CoordinatorState, user: &str) -> SessionId {
     crate::session::create_session(
         &state.setup,
         SessionRequest {
+            periodic_evidence: false,
             evidence_keys: Vec::new(),
             lobby_policy: None,
             rollback: false,

@@ -13,12 +13,15 @@
 //! this type's public surface: an `Identity` can sign a challenge but never hands
 //! the key material back out.
 
+use std::sync::Arc;
+
 use ring::signature::Ed25519KeyPair;
 
 use rally_point_proto::handshake::{Evidence, EvidenceRequest};
 use rally_point_proto::token::SignedToken;
 
 mod evidence;
+mod periodic;
 
 /// A client's per-session connection credentials: its signed authorization token
 /// and the Ed25519 signing key that proves possession of the public key the token
@@ -26,7 +29,8 @@ mod evidence;
 pub struct Identity {
     pub(crate) token: SignedToken,
     pub(crate) signing_key: Ed25519KeyPair,
-    evidence: Option<evidence::Provider>,
+    evidence: Option<Arc<evidence::Provider>>,
+    periodic_budget: Arc<periodic::Budget>,
 }
 
 /// Why a client's signing key could not be loaded.
@@ -52,6 +56,7 @@ impl Identity {
             token,
             signing_key,
             evidence: None,
+            periodic_budget: Arc::new(periodic::Budget::new()),
         })
     }
 
@@ -63,12 +68,29 @@ impl Identity {
     where
         F: Fn(EvidenceRequest) -> Option<Evidence> + Send + Sync + 'static,
     {
-        self.evidence = Some(evidence::Provider::new(provider));
+        self.evidence = Some(Arc::new(evidence::Provider::new(provider)));
         self
     }
 
     pub(crate) async fn collect_evidence(&self, request: EvidenceRequest) -> Option<Evidence> {
         self.evidence.as_ref()?.collect(request).await
+    }
+
+    pub(crate) fn start_periodic(
+        &self,
+        connection: rally_point_transport::noq::Connection,
+        send: rally_point_transport::noq::SendStream,
+        recv: rally_point_transport::noq::RecvStream,
+        request: EvidenceRequest,
+    ) -> tokio::task::JoinHandle<()> {
+        periodic::start(
+            connection,
+            send,
+            recv,
+            request,
+            self.evidence.clone(),
+            self.periodic_budget.clone(),
+        )
     }
 
     /// The authorization token this identity presents.

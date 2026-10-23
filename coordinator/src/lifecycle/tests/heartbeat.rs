@@ -304,6 +304,7 @@ async fn heartbeat_rejects_only_the_session_a_relay_does_not_serve() {
         session::create_session(
             &setup,
             SessionRequest {
+                periodic_evidence: false,
                 evidence_keys: Vec::new(),
                 lobby_policy: None,
                 rollback: false,

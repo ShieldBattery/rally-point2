@@ -35,6 +35,7 @@ async fn cached_evidence_projects_retained_observations_without_asking_relays() 
             resumed: false,
             connected_at_ms: 1,
             evidence: Some(EvidenceObservation {
+                sample_id: 0,
                 connection_id: [9; 32],
                 sequence: 1,
                 assignment_revision: 1,
@@ -197,5 +198,101 @@ fn evidence_budget_sustains_recovery_pages_with_headroom() {
         for _ in 0..150 {
             assert!(limiter.check_at(&tenant_id(), start + Duration::from_secs(30 * page)));
         }
+    }
+}
+
+#[tokio::test]
+async fn cached_and_load_state_reads_include_admission_and_latest_periodic_sample() {
+    use rally_point_proto::control::{
+        CAPABILITY_PERIODIC_EVIDENCE_V1, EvidenceKey, SlotEvidence, SlotEvidenceNotice,
+    };
+    let setup = SessionFixture::default().setup_only();
+    let mut request = crate::test_support::request(crate::test_support::two_players());
+    request.periodic_evidence = true;
+    request.evidence_keys = vec![EvidenceKey {
+        key_id: 7,
+        public_key: rally_point_proto::token::ClientPublicKey([4; 32]),
+    }];
+    let session = crate::session::create_session(
+        &setup,
+        request,
+        rally_point_proto::token::ExpiresAt(u64::MAX),
+    )
+    .unwrap()
+    .response
+    .session;
+    let mut state = state_over(setup);
+    state.attest_timeout = Duration::from_millis(1);
+    let relay = RelayId(1);
+    let generation = state
+        .lifecycle
+        .enroll_relay_epoch(relay, || {
+            Ok::<_, ()>(registry::enroll(
+                state.setup.registry(),
+                crate::test_support::hello(1, 14901)
+                    .with_boot_id(7)
+                    .with_capabilities(vec![CAPABILITY_PERIODIC_EVIDENCE_V1.into()]),
+            ))
+        })
+        .unwrap();
+    registry::note_boot_id(state.setup.registry(), relay, Some(7));
+    state.lifecycle.register_session(
+        tenant_id(),
+        session,
+        vec![relay],
+        std::collections::HashSet::from([SlotId(0)]),
+        Default::default(),
+    );
+    let admission = EvidenceObservation {
+        sample_id: 0,
+        connection_id: [9; 32],
+        sequence: 1,
+        assignment_revision: 1,
+        verdict: EvidenceVerdict::Valid,
+        key_id: Some(7),
+        body: vec![1],
+    };
+    state.lifecycle.merge_connection_evidence(
+        relay,
+        generation,
+        &[rally_point_proto::control::SessionPresence {
+            evidence: vec![SlotEvidence {
+                slot: SlotId(0),
+                observation: admission.clone(),
+            }],
+            ..crate::test_support::presence_entry(&tenant_id(), session, &[])
+        }],
+    );
+    state.lifecycle.ingest_notice(
+        relay,
+        generation,
+        crate::lifecycle::SessionNotice::SlotEvidence(SlotEvidenceNotice {
+            tenant: tenant_id(),
+            session,
+            slot: SlotId(0),
+            external_id: None,
+            external_ref: None,
+            observed_at_ms: 1,
+            evidence: EvidenceObservation {
+                sample_id: 1,
+                sequence: 2,
+                ..admission
+            },
+        }),
+    );
+    for path in ["/session/evidence", "/session/load-state"] {
+        let response = signed_post(
+            router(state.clone()),
+            path,
+            &evidence_body(session.0),
+            &TEST_CLIENT_SEED,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["evidence"].as_array().unwrap().len(), 2);
+        assert!(json["evidence"][0]["observation"].get("sampleId").is_none());
+        assert_eq!(json["evidence"][1]["observation"]["sampleId"], 1);
+        assert_eq!(json["evidence"][1]["observation"]["sequence"], 2);
     }
 }

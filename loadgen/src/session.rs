@@ -88,6 +88,7 @@ pub async fn run_session(config: SessionConfig) -> SessionReport {
     }
 
     let request = SessionRequest {
+        periodic_evidence: false,
         lobby_policy: None,
         evidence_keys: Vec::new(),
         rollback: false,

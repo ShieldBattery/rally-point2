@@ -125,6 +125,7 @@ async fn a_restart_keeps_accounting_departures_and_load_state() {
     first
         .lifecycle
         .merge_load_state(&[rally_point_proto::control::SessionPresence {
+            periodic_evidence: Vec::new(),
             evidence: Vec::new(),
             tenant: tid(),
             session,

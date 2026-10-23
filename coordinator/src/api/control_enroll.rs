@@ -518,6 +518,20 @@ impl<'a> EnrollHandshake<'a> {
             {
                 lifecycle.on_relay_lineage_break(relay_id);
             }
+            if result.is_ok() {
+                // Restaged policy must follow capability upgrades and downgrades before resync.
+                let capable = registry::entry(registry, relay_id).is_some_and(|entry| {
+                    entry.capabilities.iter().any(|capability| {
+                        capability == rally_point_proto::control::CAPABILITY_PERIODIC_EVIDENCE_V1
+                    })
+                });
+                for mut descriptor in setup.descriptors().current_for(relay_id) {
+                    descriptor.periodic_evidence = capable
+                        && session::session_refs(setup, &descriptor.tenant, descriptor.session)
+                            .is_some_and(|refs| refs.periodic_evidence);
+                    setup.descriptors().record(relay_id, descriptor);
+                }
+            }
             let evict = match &result {
                 Ok(generation) => {
                     // Sessions whose recorded build-class cohort no longer

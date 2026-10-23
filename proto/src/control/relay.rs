@@ -39,6 +39,9 @@ pub const CAPABILITY_ROLLBACK_V1: &str = "rollback_v1";
 /// The relay supports session evidence configuration and observations.
 pub const CAPABILITY_EVIDENCE_V1: &str = "evidence_v1";
 
+/// Periodic evidence policy and reporting on negotiated client connections.
+pub const CAPABILITY_PERIODIC_EVIDENCE_V1: &str = "periodic_evidence_v1";
+
 /// The relay acknowledges explicitly requested descriptor installation barriers.
 /// Coordinators omit barriers for relays without this capability during rollout.
 pub const CAPABILITY_DESCRIPTOR_ACK_V1: &str = "descriptor_ack_v1";

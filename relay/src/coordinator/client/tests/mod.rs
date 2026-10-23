@@ -40,6 +40,7 @@ mod enroll;
 mod fence;
 mod flight;
 mod notices;
+mod periodic_reporting;
 mod presence;
 mod reconnect;
 mod stores;
@@ -174,6 +175,7 @@ fn key(session: u64) -> SessionKey {
 
 fn descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        periodic_evidence: false,
         evidence_keys: vec![],
         required_evidence_slots: vec![],
         evidence_assignments: vec![],

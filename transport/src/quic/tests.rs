@@ -242,29 +242,39 @@ async fn every_side_of_every_link_runs_the_floored_controller() {
 
 #[tokio::test]
 async fn client_edge_negotiates_current_or_legacy_in_both_rollout_orders() {
-    for (old_server, old_client) in [(false, false), (true, false), (false, true), (true, true)] {
+    for (server_version, client_version) in
+        (1..=3).flat_map(|server| (1..=3).map(move |client| (server, client)))
+    {
         let (chain, key, ca) = self_signed();
-        let server_cfg = if old_server {
+        let server_cfg = if server_version < 3 {
             let mut tls = rustls::ServerConfig::builder_with_provider(ring_provider())
                 .with_protocol_versions(&[&rustls::version::TLS13])
                 .unwrap()
                 .with_no_client_auth()
                 .with_single_cert(chain, key)
                 .unwrap();
-            tls.alpn_protocols = vec![LEGACY_ALPN.to_vec()];
+            tls.alpn_protocols = if server_version == 2 {
+                vec![EVIDENCE_ALPN.to_vec(), LEGACY_ALPN.to_vec()]
+            } else {
+                vec![LEGACY_ALPN.to_vec()]
+            };
             noq::ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(tls).unwrap()))
         } else {
             server_config(chain, key).unwrap()
         };
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca).unwrap();
-        let client_cfg = if old_client {
+        let client_cfg = if client_version < 3 {
             let mut tls = rustls::ClientConfig::builder_with_provider(ring_provider())
                 .with_protocol_versions(&[&rustls::version::TLS13])
                 .unwrap()
                 .with_root_certificates(roots)
                 .with_no_client_auth();
-            tls.alpn_protocols = vec![LEGACY_ALPN.to_vec()];
+            tls.alpn_protocols = if client_version == 2 {
+                vec![EVIDENCE_ALPN.to_vec(), LEGACY_ALPN.to_vec()]
+            } else {
+                vec![LEGACY_ALPN.to_vec()]
+            };
             noq::ClientConfig::new(Arc::new(QuicClientConfig::try_from(tls).unwrap()))
         } else {
             client_config(roots).unwrap()
@@ -281,9 +291,12 @@ async fn client_edge_negotiates_current_or_legacy_in_both_rollout_orders() {
         })
         .await
         .unwrap();
-        let expected = !old_server && !old_client;
+        let expected = server_version >= 2 && client_version >= 2;
         assert_eq!(supports_evidence(&accepted), expected);
         assert_eq!(supports_evidence(&dialed), expected);
+        let periodic = server_version == 3 && client_version == 3;
+        assert_eq!(supports_periodic_evidence(&accepted), periodic);
+        assert_eq!(supports_periodic_evidence(&dialed), periodic);
         dialed.close(noq::VarInt::from_u32(0), b"done");
     }
 }

@@ -2,6 +2,7 @@ use super::*;
 
 fn observation() -> EvidenceObservation {
     EvidenceObservation {
+        sample_id: 0,
         connection_id: [3; 32],
         sequence: 8,
         assignment_revision: 2,
@@ -177,4 +178,130 @@ fn other_control_byte_fields_keep_their_array_encoding() {
         serde_json::to_value(command).unwrap()["payload"],
         serde_json::json!([0, 255, 42])
     );
+}
+
+#[test]
+fn periodic_fields_default_and_are_omitted_for_older_peers() {
+    let old = serde_json::to_value(observation()).unwrap();
+    assert!(old.get("sample_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<EvidenceObservation>(old)
+            .unwrap()
+            .sample_id,
+        0
+    );
+    let request: SessionRequest =
+        serde_json::from_value(serde_json::json!({"tenant":"test", "players":[]})).unwrap();
+    assert!(!request.periodic_evidence);
+    assert!(
+        serde_json::to_value(request)
+            .unwrap()
+            .get("periodic_evidence")
+            .is_none()
+    );
+    let descriptor = serde_json::to_value(a_descriptor()).unwrap();
+    assert!(descriptor.get("periodic_evidence").is_none());
+    assert!(
+        !serde_json::from_value::<SessionDescriptor>(descriptor)
+            .unwrap()
+            .periodic_evidence
+    );
+    let presence: SessionPresence =
+        serde_json::from_value(serde_json::json!({"tenant":"test", "session":1, "slots":[]}))
+            .unwrap();
+    assert!(presence.periodic_evidence.is_empty());
+    assert!(
+        serde_json::to_value(presence)
+            .unwrap()
+            .get("periodic_evidence")
+            .is_none()
+    );
+}
+
+#[test]
+fn periodic_policy_notice_and_presence_round_trip_independently() {
+    let descriptor = SessionDescriptor {
+        periodic_evidence: true,
+        ..a_descriptor()
+    };
+    assert_eq!(
+        serde_json::from_value::<SessionDescriptor>(serde_json::to_value(&descriptor).unwrap())
+            .unwrap(),
+        descriptor
+    );
+    let mut request: SessionRequest =
+        serde_json::from_value(serde_json::json!({"tenant":"test", "players":[]})).unwrap();
+    request.periodic_evidence = true;
+    assert_eq!(
+        serde_json::from_value::<SessionRequest>(serde_json::to_value(&request).unwrap()).unwrap(),
+        request
+    );
+    let sample = EvidenceObservation {
+        sample_id: 13,
+        ..observation()
+    };
+    let notice = RelayToCoordinator::SlotEvidence(SlotEvidenceNotice {
+        tenant: TenantId("test".into()),
+        session: SessionId(1),
+        slot: SlotId(2),
+        external_id: None,
+        external_ref: None,
+        observed_at_ms: 42,
+        evidence: sample.clone(),
+    });
+    let encoded = serde_json::to_value(&notice).unwrap();
+    assert_eq!(encoded["type"], "slot_evidence");
+    assert_eq!(encoded["evidence"]["sample_id"], 13);
+    assert!(encoded.get("external_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<RelayToCoordinator>(encoded.clone()).unwrap(),
+        notice
+    );
+    let mut missing = encoded;
+    missing.as_object_mut().unwrap().remove("evidence");
+    assert!(serde_json::from_value::<RelayToCoordinator>(missing).is_err());
+    let mut presence: SessionPresence =
+        serde_json::from_value(serde_json::json!({"tenant":"test", "session":1, "slots":[]}))
+            .unwrap();
+    presence.periodic_evidence = vec![SlotEvidence {
+        slot: SlotId(2),
+        observation: sample,
+    }];
+    let value = serde_json::to_value(&presence).unwrap();
+    assert!(value.get("evidence").is_none());
+    assert_eq!(
+        serde_json::from_value::<SessionPresence>(value).unwrap(),
+        presence
+    );
+}
+
+#[test]
+fn periodic_presence_bounds_sample_count_on_both_wire_directions() {
+    let mut presence: SessionPresence =
+        serde_json::from_value(serde_json::json!({"tenant":"test", "session":1, "slots":[]}))
+            .unwrap();
+    presence.periodic_evidence = (0..16)
+        .map(|slot| SlotEvidence {
+            slot: SlotId(slot),
+            observation: EvidenceObservation {
+                sample_id: 1,
+                ..observation()
+            },
+        })
+        .collect();
+    let mut value = serde_json::to_value(&presence).unwrap();
+    assert_eq!(
+        serde_json::from_value::<SessionPresence>(value.clone()).unwrap(),
+        presence
+    );
+    presence
+        .periodic_evidence
+        .push(presence.periodic_evidence[0].clone());
+    assert!(serde_json::to_value(&presence).is_err());
+    let extra = value["periodic_evidence"][0].clone();
+    value["periodic_evidence"]
+        .as_array_mut()
+        .unwrap()
+        .push(extra);
+    assert!(serde_json::from_value::<SessionPresence>(value).is_err());
 }

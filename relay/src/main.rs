@@ -422,6 +422,7 @@ async fn main() -> Result<()> {
             // only of sessions every assigned relay supports.
             .with_capabilities(vec![
                 rally_point_proto::control::CAPABILITY_EVIDENCE_V1.to_owned(),
+                rally_point_proto::control::CAPABILITY_PERIODIC_EVIDENCE_V1.to_owned(),
                 rally_point_proto::control::CAPABILITY_DESCRIPTOR_ACK_V1.to_owned(),
                 rally_point_proto::control::CAPABILITY_FINALIZED_DROP_V1.to_owned(),
                 rally_point_proto::control::CAPABILITY_ROLLBACK_V1.to_owned(),

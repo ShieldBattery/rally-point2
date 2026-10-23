@@ -125,6 +125,7 @@ pub fn register(
         armed: true,
     };
     let inbox = SlotInbox {
+        evidence_stream: None,
         forward_rx: ForwardRx {
             rx,
             resident_bytes: forward_resident,

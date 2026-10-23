@@ -33,6 +33,8 @@ use crate::token::{SignedToken, TokenError};
 
 mod evidence;
 pub use evidence::*;
+mod periodic;
+pub use periodic::*;
 
 /// Width of the little-endian length prefix that precedes the presented token, in
 /// bytes. The prefix is a `u16`, so the relay reads exactly this many bytes before

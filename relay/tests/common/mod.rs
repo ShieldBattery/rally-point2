@@ -264,6 +264,7 @@ pub fn build_turn(slot: u8, seq: u64, frame: Option<u32>) -> Payload {
 /// field costs one line here instead of one per test.
 pub fn descriptor(tenant: &str, session: SessionId) -> SessionDescriptor {
     SessionDescriptor {
+        periodic_evidence: false,
         evidence_keys: vec![],
         required_evidence_slots: vec![],
         evidence_assignments: vec![],

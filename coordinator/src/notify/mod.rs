@@ -76,7 +76,7 @@ mod payloads;
 pub(crate) use dispatch::dispatch;
 pub(crate) use handlers::{
     handle_departure, handle_desync, handle_lobby_violation, handle_result, handle_session_started,
-    handle_slot_connected, handle_slot_started,
+    handle_slot_connected, handle_slot_evidence, handle_slot_started,
 };
 pub(crate) use payloads::session_closed_dispatch;
 
@@ -89,7 +89,8 @@ pub(crate) use payloads::EvidencePayload;
 pub(crate) use payloads::SlotEvidencePayload;
 use payloads::{
     DepartureWebhook, DesyncWebhook, DivergedSlotWebhook, LobbyViolationWebhook, ResultEchoWebhook,
-    ResultWebhook, SessionStartedWebhook, SlotConnectedWebhook, SlotStartedWebhook,
+    ResultWebhook, SessionStartedWebhook, SlotConnectedWebhook, SlotEvidenceWebhook,
+    SlotStartedWebhook,
 };
 // Test-only: not needed by `handlers`/`dispatch` themselves (each already has
 // direct access to its own module's items), only by `notify::tests`' `use

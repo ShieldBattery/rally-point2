@@ -461,6 +461,7 @@ async fn serve_connection(
         resume_cursors,
         connection_epoch,
         send: mut handshake_send,
+        recv: handshake_recv,
         evidence,
         evidence_request,
     } = match tokio::time::timeout_at(auth_deadline, handshake).await {
@@ -518,6 +519,7 @@ async fn serve_connection(
     // relay state behind. The guard takes custody: it closes the connection,
     // frees the roster seat once there is one, and runs the rollback each
     // refusal owes.
+    let supports_periodic = rally_point_transport::quic::supports_periodic_evidence(&connection);
     let mut admission = Admission::new(connection, key.clone(), authorized.slot, &sessions, &mesh);
 
     // GATES: home-relay binding, then the decided-departure fast-fail, then
@@ -553,7 +555,7 @@ async fn serve_connection(
     let Some(registered) = registered else {
         return Err(admission.refuse(SESSION_RETIRED));
     };
-    let Some((registration, inbox)) = registered else {
+    let Some((registration, mut inbox)) = registered else {
         return Err(admission.refuse(SLOT_TAKEN));
     };
     admission.hold_seat(registration);
@@ -608,7 +610,11 @@ async fn serve_connection(
     if let Err(error) = handshake_send.write_all(&[HANDSHAKE_OK]).await {
         return Err(admission.refuse_unannounced(AuthError::from(error).into()));
     }
-    let _ = handshake_send.finish();
+    if supports_periodic {
+        inbox.set_evidence_stream(handshake_send, handshake_recv, evidence_request);
+    } else {
+        let _ = handshake_send.finish();
+    }
 
     // GATE: the admission itself. Resolve this slot against CURRENT hold,
     // departure, final-leave, and epoch state. The holds lock stays stable

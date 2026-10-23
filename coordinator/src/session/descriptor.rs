@@ -80,6 +80,12 @@ pub fn build_descriptor(
     let refs = session_refs(setup, tenant, session).unwrap_or_default();
 
     Some(SessionDescriptor {
+        periodic_evidence: refs.periodic_evidence
+            && registry::entry(setup.registry(), relay_id).is_some_and(|entry| {
+                entry.capabilities.iter().any(|capability| {
+                    capability == rally_point_proto::control::CAPABILITY_PERIODIC_EVIDENCE_V1
+                })
+            }),
         evidence_keys: refs.evidence_keys.clone(),
         required_evidence_slots: refs.required_evidence_slots.clone(),
         evidence_assignments: refs

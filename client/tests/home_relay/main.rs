@@ -23,6 +23,7 @@ mod address_fallback;
 mod connect_and_turns;
 mod directives;
 mod lobby_retention;
+mod periodic;
 mod reconnect_and_leaves;
 mod rehome;
 mod stale_mapping;

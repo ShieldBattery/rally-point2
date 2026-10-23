@@ -30,8 +30,8 @@ mod congestion;
 
 pub use congestion::MIN_CONGESTION_WINDOW;
 
-/// Preferred client-edge protocol, including the optional evidence frame after resume cursors.
-/// Both endpoints also offer [`LEGACY_ALPN`]; only the negotiated protocol selects the framing.
+/// Preferred client-edge protocol, retaining the authenticated stream for periodic evidence.
+/// Both endpoints also offer [`EVIDENCE_ALPN`] and [`LEGACY_ALPN`].
 /// Mesh connections use the independent [`MESH_ALPN`] namespace.
 ///
 /// Bump the trailing version when the handshake, datagram framing, or stream shape
@@ -41,13 +41,25 @@ pub use congestion::MIN_CONGESTION_WINDOW;
 /// the preferred version permits either rollout order; each negotiated version
 /// must retain its own framing. Mesh versions evolve independently because their
 /// connections carry different packets and streams.
-pub const ALPN: &[u8] = b"rp2/2";
+pub const ALPN: &[u8] = b"rp2/3";
+
+/// Client-edge protocol with admission evidence only.
+pub const EVIDENCE_ALPN: &[u8] = b"rp2/2";
 
 /// Client-edge protocol without the optional evidence frame.
 pub const LEGACY_ALPN: &[u8] = b"rp2/1";
 
 /// Whether the negotiated client-edge protocol includes the evidence frame.
 pub fn supports_evidence(connection: &noq::Connection) -> bool {
+    connection.handshake_data().is_some_and(|data| {
+        data.downcast_ref::<noq::crypto::rustls::HandshakeData>()
+            .and_then(|data| data.protocol.as_deref())
+            .is_some_and(|protocol| protocol == ALPN || protocol == EVIDENCE_ALPN)
+    })
+}
+
+/// Whether the authenticated stream supports periodic evidence exchanges.
+pub fn supports_periodic_evidence(connection: &noq::Connection) -> bool {
     connection.handshake_data().is_some_and(|data| {
         data.downcast_ref::<noq::crypto::rustls::HandshakeData>()
             .and_then(|data| data.protocol.as_deref())
@@ -328,7 +340,12 @@ pub fn server_config(
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(cert_chain, key)?;
-    tls.alpn_protocols = vec![ALPN.to_vec(), LEGACY_ALPN.to_vec(), MESH_ALPN.to_vec()];
+    tls.alpn_protocols = vec![
+        ALPN.to_vec(),
+        EVIDENCE_ALPN.to_vec(),
+        LEGACY_ALPN.to_vec(),
+        MESH_ALPN.to_vec(),
+    ];
 
     let server = QuicServerConfig::try_from(tls)?;
     let mut config = noq::ServerConfig::with_crypto(Arc::new(server));
@@ -346,7 +363,7 @@ pub fn client_config(roots: rustls::RootCertStore) -> Result<noq::ClientConfig, 
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    tls.alpn_protocols = vec![ALPN.to_vec(), LEGACY_ALPN.to_vec()];
+    tls.alpn_protocols = vec![ALPN.to_vec(), EVIDENCE_ALPN.to_vec(), LEGACY_ALPN.to_vec()];
     // The relay's identity is the pinned leaf certificate, so the server name is
     // only a local label the verifier checks that cert against; it carries no
     // security weight. Leaving it off the wire matters because a QUIC Initial is

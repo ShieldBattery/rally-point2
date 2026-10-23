@@ -35,6 +35,7 @@ fn relay_peer(id: u64) -> RelayPeer {
 
 fn descriptor(session: u64, peers: &[u64]) -> SessionDescriptor {
     SessionDescriptor {
+        periodic_evidence: false,
         evidence_keys: vec![],
         required_evidence_slots: vec![],
         evidence_assignments: vec![],

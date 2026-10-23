@@ -21,7 +21,7 @@
 
 use rally_point_proto::control::{
     DepartureNotice, DesyncNotice, LobbyViolationNotice, ResultNotice, SessionStartedNotice,
-    SlotConnectedNotice, SlotStartedNotice, TenantId,
+    SlotConnectedNotice, SlotEvidenceNotice, SlotStartedNotice, TenantId,
 };
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 
@@ -43,6 +43,8 @@ pub enum SessionNotice {
     Result(ResultNotice),
     /// A slot's link activated on the reporting relay.
     SlotConnected(SlotConnectedNotice),
+    /// A periodic sample; does not describe connection activation.
+    SlotEvidence(SlotEvidenceNotice),
     /// The authority relay's coverage latch fired: the session started.
     SessionStarted(SessionStartedNotice),
     /// A client reported that its game loop began running.
@@ -75,6 +77,7 @@ impl SessionNotice {
             Self::Desync(n) => &n.tenant,
             Self::Result(n) => &n.tenant,
             Self::SlotConnected(n) => &n.tenant,
+            Self::SlotEvidence(n) => &n.tenant,
             Self::SessionStarted(n) => &n.tenant,
             Self::SlotStarted(n) => &n.tenant,
             Self::LobbyViolation(n) => &n.tenant,
@@ -88,6 +91,7 @@ impl SessionNotice {
             Self::Desync(n) => n.session,
             Self::Result(n) => n.session,
             Self::SlotConnected(n) => n.session,
+            Self::SlotEvidence(n) => n.session,
             Self::SessionStarted(n) => n.session,
             Self::SlotStarted(n) => n.session,
             Self::LobbyViolation(n) => n.session,
@@ -101,6 +105,7 @@ impl SessionNotice {
             Self::Desync(n) => NoticeKey::SyncOrdinal(n.sync_ordinal),
             Self::Result(n) => NoticeKey::Slot(n.slot),
             Self::SlotConnected(n) => NoticeKey::Slot(n.slot),
+            Self::SlotEvidence(n) => NoticeKey::Slot(n.slot),
             Self::SessionStarted(_) => NoticeKey::Session,
             Self::SlotStarted(n) => NoticeKey::Slot(n.slot),
             Self::LobbyViolation(n) => NoticeKey::Slot(n.slot),
@@ -114,6 +119,7 @@ impl SessionNotice {
             Self::Desync(_) => "desync",
             Self::Result(_) => "result",
             Self::SlotConnected(_) => "slot-connected",
+            Self::SlotEvidence(_) => "slot-evidence",
             Self::SessionStarted(_) => "session-started",
             Self::SlotStarted(_) => "slot-started",
             Self::LobbyViolation(_) => "lobby-violation",
@@ -190,6 +196,10 @@ impl Lifecycle {
     /// below; there is no second path that could quietly bypass the check.
     pub fn ingest_notice(&self, relay: RelayId, generation: u64, notice: SessionNotice) {
         let notice = match notice {
+            SessionNotice::SlotEvidence(sample) => {
+                self.ingest_periodic_notice(relay, generation, sample);
+                return;
+            }
             SessionNotice::SlotConnected(connected) if connected.evidence.is_some() => {
                 self.ingest_evidence_notice(relay, generation, connected);
                 return;
@@ -231,6 +241,9 @@ impl Lifecycle {
         let setup = &self.inner.setup;
         let dedup = &self.inner.notices;
         match notice {
+            SessionNotice::SlotEvidence(_) => {
+                unreachable!("periodic samples use their connection fence")
+            }
             SessionNotice::Departure(notice) => {
                 self.on_departure(
                     notice.tenant.clone(),

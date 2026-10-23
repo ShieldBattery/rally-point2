@@ -9,6 +9,7 @@ use super::*;
 
 fn request() -> EvidenceRequest {
     EvidenceRequest {
+        periodic: None,
         challenge: [1; 32],
         channel_binding: [2; 32],
         tenant: TenantId("test".into()),
@@ -122,5 +123,47 @@ async fn timeout_or_cancellation_does_not_allow_another_blocking_callback() {
         assert!(second.is_none());
         assert_eq!(count, 1);
         assert!(provider.collect(request()).await.is_some());
+    }
+}
+
+#[test]
+fn queued_callback_is_cancelled_before_it_can_start() {
+    for cancel in [false, true] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (occupied, started) = tokio::sync::oneshot::channel();
+            let (release, wait) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                occupied.send(()).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(5));
+            });
+            started.await.unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let callback_calls = calls.clone();
+            let provider = Arc::new(Provider::new(move |_| {
+                callback_calls.fetch_add(1, Ordering::Relaxed);
+                None
+            }));
+            let task_provider = provider.clone();
+            let task = tokio::spawn(async move { task_provider.collect(request()).await });
+            while provider.available.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                assert!(task.await.unwrap().is_none());
+            }
+            release.send(()).unwrap();
+            blocker.await.unwrap();
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(provider.available.available_permits(), 1);
+        });
     }
 }

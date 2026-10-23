@@ -60,6 +60,7 @@ async fn signed_create_waits_for_real_relay_installation_and_replays_the_handoff
     assert!(applied.is_empty(), "enrollment has no session to install");
 
     let body = serde_json::to_vec(&SessionRequest {
+        periodic_evidence: false,
         tenant,
         players: (0..2)
             .map(|slot| PlayerHandoff {

@@ -387,7 +387,7 @@ pub fn verify_challenge(
 
 /// Runs the full authorization handshake on `connection` and returns the
 /// authenticated identity, resume cursors, connection context, optional evidence,
-/// and the still-open send stream.
+/// and both still-open handshake stream halves.
 ///
 /// The caller writes [`HANDSHAKE_OK`] on the returned stream once it has wired the
 /// client into routing, so a client only learns it's accepted after its slot can
@@ -462,6 +462,7 @@ pub async fn authenticate(
         None
     };
     let evidence_request = handshake::EvidenceRequest {
+        periodic: None,
         challenge: nonce,
         channel_binding,
         tenant: authorized.tenant.clone(),
@@ -474,6 +475,7 @@ pub async fn authenticate(
         resume_cursors,
         connection_epoch,
         send,
+        recv,
         evidence,
         evidence_request,
     })

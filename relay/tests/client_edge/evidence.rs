@@ -73,6 +73,7 @@ async fn present(
         .unwrap();
     if rally_point_transport::quic::supports_evidence(connection) {
         send.write_all(&frame(EvidenceRequest {
+            periodic: None,
             challenge,
             channel_binding,
             tenant: token.claims.tenant,

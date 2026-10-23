@@ -172,6 +172,15 @@ pub(crate) fn bound_session_slot_lists(relay_id: RelayId, session: &mut SessionP
         entry.observation.body.len() <= rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
             && evidence_slots.insert(entry.slot)
     });
+    session
+        .periodic_evidence
+        .truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+    let mut periodic_slots = std::collections::HashSet::new();
+    session.periodic_evidence.retain(|entry| {
+        entry.observation.sample_id > 0
+            && entry.observation.body.len() <= rally_point_proto::handshake::MAX_EVIDENCE_BODY_LEN
+            && periodic_slots.insert(entry.slot)
+    });
     for (label, slots) in [
         ("connected", &mut session.slots),
         ("ever-connected", &mut session.ever_connected),

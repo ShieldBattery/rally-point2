@@ -7,6 +7,7 @@ fn roster(session: u64, slots: &[u8]) -> Vec<SessionPresence> {
 
 fn roster_for(tenant: TenantId, session: u64, slots: &[u8]) -> Vec<SessionPresence> {
     vec![SessionPresence {
+        periodic_evidence: Vec::new(),
         evidence: Vec::new(),
         tenant,
         session: SessionId(session),

@@ -3,6 +3,7 @@ use crate::token::CHALLENGE_DOMAIN_TAG;
 
 fn request() -> EvidenceRequest {
     EvidenceRequest {
+        periodic: None,
         challenge: [0x11; 32],
         channel_binding: [0x22; 32],
         tenant: TenantId("ténant".into()),

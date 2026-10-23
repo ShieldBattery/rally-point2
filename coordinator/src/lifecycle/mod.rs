@@ -155,7 +155,7 @@ type SessionRef = (TenantId, SessionId);
 /// makes no claim about a connection's evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionLoadState {
-    /// Latest retained connection observations, in slot order.
+    /// Admission then latest periodic observations, each group in slot order.
     pub evidence: Vec<rally_point_proto::control::SlotEvidence>,
     /// Whether `register_session` created this state: the session was set up
     /// against *this* coordinator process, so the sets start at the session's
@@ -246,6 +246,7 @@ struct DepartureSeed {
 /// One session's lifecycle state.
 struct SessionState {
     evidence: std::collections::BTreeMap<SlotId, evidence::StoredEvidence>,
+    periodic_evidence: std::collections::BTreeMap<SlotId, periodic::StoredPeriodic>,
     /// The relays the coordinator assigned to serve the session — the distinct
     /// home relays of its slots — or empty for a webhook-only state lazily created
     /// for a session this coordinator lifetime never created (restart amnesia). The
@@ -563,6 +564,7 @@ mod close;
 mod evidence;
 mod heartbeat;
 mod notices;
+mod periodic;
 mod persist;
 mod reaps;
 mod relays;

@@ -6,6 +6,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 fn fixture() -> (EvidenceRequest, Evidence, EvidenceConfig) {
     let pair = Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
     let request = EvidenceRequest {
+        periodic: None,
         challenge: [1; 32],
         channel_binding: [2; 32],
         tenant: TenantId("tenant".into()),
@@ -25,6 +26,7 @@ fn fixture() -> (EvidenceRequest, Evidence, EvidenceConfig) {
         body,
     };
     let config = EvidenceConfig {
+        periodic: false,
         keys: vec![EvidenceKey {
             key_id: 7,
             public_key: ClientPublicKey(pair.public_key().as_ref().try_into().unwrap()),
@@ -85,4 +87,39 @@ fn every_connection_field_and_the_body_are_signed() {
         verify_evidence(&request, Some(changed), &config).verdict,
         EvidenceVerdict::Invalid
     );
+}
+
+#[test]
+fn periodic_signatures_bind_fresh_nonce_sample_and_assignment() {
+    use rally_point_proto::handshake::{EvidenceCheck, PeriodicEvidenceContext};
+    let (mut request, mut evidence, config) = fixture();
+    request.periodic = Some(PeriodicEvidenceContext {
+        challenge_id: 1,
+        nonce: [6; 32],
+        assignment_revision: 11,
+        check: EvidenceCheck::FullImage,
+    });
+    let pair = Ed25519KeyPair::from_seed_unchecked(&[9; 32]).unwrap();
+    evidence.signature = Signature(
+        pair.sign(&request.signed_message(7, &evidence.body))
+            .as_ref()
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(
+        verify_evidence(&request, Some(evidence.clone()), &config).verdict,
+        EvidenceVerdict::Valid
+    );
+    for field in 0..4 {
+        let mut changed = request.clone();
+        match field {
+            0 => changed.periodic.as_mut().unwrap().nonce[0] ^= 1,
+            1 => changed.periodic.as_mut().unwrap().challenge_id += 1,
+            2 => changed.periodic.as_mut().unwrap().assignment_revision += 1,
+            _ => changed.periodic = None,
+        }
+        let checked = verify_evidence(&changed, Some(evidence.clone()), &config);
+        assert_eq!(checked.verdict, EvidenceVerdict::Invalid);
+        assert!(checked.body.is_empty());
+    }
 }

@@ -14,10 +14,13 @@ const EVIDENCE_HEADER_LEN: usize = 4 + SIGNATURE_LEN;
 /// Maximum length of the opaque evidence body.
 pub const MAX_EVIDENCE_BODY_LEN: usize = MAX_EVIDENCE_LEN - EVIDENCE_HEADER_LEN;
 const EVIDENCE_DOMAIN_TAG: u8 = 0x02;
+const PERIODIC_EVIDENCE_DOMAIN_TAG: u8 = 0x03;
 
 /// The connection context supplied to an evidence provider.
 #[derive(Clone, Debug)]
 pub struct EvidenceRequest {
+    /// Additional context for a periodic sample; absent for admission evidence.
+    pub periodic: Option<super::PeriodicEvidenceContext>,
     pub challenge: [u8; 32],
     pub channel_binding: [u8; 32],
     pub tenant: TenantId,
@@ -31,11 +34,18 @@ impl EvidenceRequest {
     ///
     /// A distinct domain tag precedes the challenge, channel binding, u64-LE
     /// tenant byte length and UTF-8 bytes, u64-LE session, slot, client key,
-    /// u32-LE evidence key id, and the opaque body.
+    /// u32-LE evidence key id, and the opaque body. Periodic samples use a distinct
+    /// domain and insert their challenge id, nonce, assignment revision, and check
+    /// after the client key and before the evidence key id. Numeric context fields
+    /// use little endian; the check is one byte.
     pub fn signed_message(&self, key_id: u32, body: &[u8]) -> Vec<u8> {
         let tenant = self.tenant.0.as_bytes();
         let mut message = Vec::new();
-        message.push(EVIDENCE_DOMAIN_TAG);
+        message.push(if self.periodic.is_some() {
+            PERIODIC_EVIDENCE_DOMAIN_TAG
+        } else {
+            EVIDENCE_DOMAIN_TAG
+        });
         message.extend_from_slice(&self.challenge);
         message.extend_from_slice(&self.channel_binding);
         message.extend_from_slice(&(tenant.len() as u64).to_le_bytes());
@@ -43,6 +53,12 @@ impl EvidenceRequest {
         message.extend_from_slice(&self.session.0.to_le_bytes());
         message.push(self.slot.0);
         message.extend_from_slice(&self.client_pubkey.0);
+        if let Some(context) = &self.periodic {
+            message.extend_from_slice(&context.challenge_id.to_le_bytes());
+            message.extend_from_slice(&context.nonce);
+            message.extend_from_slice(&context.assignment_revision.to_le_bytes());
+            message.push(context.check as u8);
+        }
         message.extend_from_slice(&key_id.to_le_bytes());
         message.extend_from_slice(body);
         message
