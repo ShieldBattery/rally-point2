@@ -57,13 +57,14 @@ impl DecisionMaker {
     }
 
     /// The slot whose turns stopped reaching this relay's local clients before
-    /// any other slot's did — the one holding lockstep up, and whose link this
-    /// relay should therefore close. A live QUIC link says nothing about whether
-    /// the game behind it is still stepping: keepalives keep flowing from a hung
-    /// game thread or a suspended process, and every other player is stalled
-    /// behind it with no way out. Reported so the caller can close the link,
-    /// after which the ordinary link-death path (departure record, drop hold,
-    /// survivors' countdown) resolves the slot like any other lost client.
+    /// any other slot's did — the one holding lockstep up. A live QUIC link says
+    /// nothing about whether the game behind it is still stepping: keepalives
+    /// keep flowing from a hung game thread or a suspended process, and every
+    /// other player is stalled behind it with no way out. Reported so the caller
+    /// can judge from the link whether the client is still there and, if it is,
+    /// close the link, after which the ordinary link-death path (departure
+    /// record, drop hold, survivors' countdown) resolves the slot like any other
+    /// lost client.
     ///
     /// **The verdict rests on complete knowledge of the session.** Naming a
     /// culprit is a claim about *every* participant lockstep still waits on, so

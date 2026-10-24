@@ -120,19 +120,72 @@ pub(crate) fn close_slots_for_overflow(sessions: &Sessions, key: &SessionKey, sl
     );
 }
 
-/// Closes the links of `slots` in the `key` routing group because their clients
-/// stopped producing turns while the session advanced past them (see
-/// [`crate::routing::run_silence_watch`]). Identical to [`close_slots`] but for
-/// the reason it stamps, which is what makes the closed connection carry
-/// [`close_codes::SILENT_SLOT`] instead of the generic close: a client whose game thread
-/// hung has a perfectly healthy link, and its log should say so.
-pub fn close_slots_for_silence(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
-    signal_close(
+/// Evicts `slot`'s link in the `key` routing group, if it is still the
+/// `connection_epoch` generation, because its client stopped producing turns
+/// while the session advanced past it and its link kept receiving frames (see
+/// [`crate::routing::run_silence_watch`]). The stamped reason makes the link task
+/// mark the eviction — refusing every later dial — and close with
+/// [`close_codes::SILENT_SLOT`]: a client whose game thread hung has a perfectly
+/// healthy link, and its log should say so. The task marks it only if this
+/// signal is what ends its link, so a link already ending as a disconnect stays
+/// one.
+pub fn close_silent_slot_link(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    connection_epoch: u64,
+) {
+    signal_close_generation(
         sessions,
         key,
-        slots,
+        slot,
+        connection_epoch,
         SlotCloseReason::SilentSlot,
         "closing slot link after silent-slot eviction",
+    );
+}
+
+/// Ends `slot`'s link in the `key` routing group, if it is still the
+/// `connection_epoch` generation, as an ordinary lost connection: its turns
+/// stopped and it has received nothing past the transport's idle timeout, which
+/// has not closed it yet (see [`crate::routing::run_silence_watch`]). Nothing is
+/// marked, so the client may resume from the drop hold its disconnect leaves.
+pub fn close_quiet_slot_link(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    connection_epoch: u64,
+) {
+    signal_close_generation(
+        sessions,
+        key,
+        slot,
+        connection_epoch,
+        SlotCloseReason::QuietLink,
+        "closing silent slot link that outlasted the transport idle timeout",
+    );
+}
+
+/// [`signal_close`] for one slot, and only while its seat still belongs to
+/// `connection_epoch`: a verdict read off one connection must never end the
+/// connection that replaced it. The generation is checked under the same
+/// roster lock the signal is fired under, so no replacement can take the seat
+/// in between.
+fn signal_close_generation(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    connection_epoch: u64,
+    reason: SlotCloseReason,
+    message: &'static str,
+) {
+    signal_close_matching(
+        sessions,
+        key,
+        &[slot],
+        Some(connection_epoch),
+        reason,
+        message,
     );
 }
 
@@ -175,12 +228,28 @@ fn signal_close(
     reason: SlotCloseReason,
     message: &'static str,
 ) {
+    signal_close_matching(sessions, key, slots, None, reason, message);
+}
+
+/// [`signal_close`], skipping any seat whose connection is not
+/// `connection_epoch` when one is given.
+fn signal_close_matching(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slots: &[SlotId],
+    connection_epoch: Option<u64>,
+    reason: SlotCloseReason,
+    message: &'static str,
+) {
     let roster = sessions.lock();
     let Some(group) = roster.get(key) else {
         return;
     };
     for slot in slots {
-        if let Some(entry) = group.get(slot) {
+        let entry = group
+            .get(slot)
+            .filter(|entry| connection_epoch.is_none_or(|epoch| entry.connection_epoch == epoch));
+        if let Some(entry) = entry {
             tracing::info!(
                 tenant = key.tenant.as_ref(),
                 session = key.session.0,

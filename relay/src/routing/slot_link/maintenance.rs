@@ -74,17 +74,71 @@ pub(super) fn handle_shutdown(link: &mut Link, ctx: &SlotLinkCtx, close_reason: 
         ctx.leave_announced.then_some(SlotCloseReason::SlotDeparted),
     );
     match SlotCloseReason::from_raw(close_reason.load(Ordering::Acquire)) {
+        // The eviction is committed here, by the task that owns this connection and
+        // before teardown frees the slot's seat, so no re-dial is admitted ahead of
+        // it. The decision is whether the connection was still open when this task
+        // closed it: one already closed ended on its own, and ends as the ordinary
+        // disconnect that makes it, resumable. The transport offers no atomic
+        // check-and-close, so the check runs immediately before the close and
+        // everything else after it. A close the transport makes in between —
+        // the client's own close as it gives up a failed link to re-dial, or an
+        // idle close after a stall of seconds in this task or the watch — still
+        // evicts, and that client's re-dial is refused. That is accepted as the
+        // rare cost of an eviction that needs the transport's evidence at all.
         SlotCloseReason::SilentSlot => {
-            tracing::info!(
-                tenant = ctx.key.tenant.as_ref(),
-                session = ctx.key.session.0,
-                slot = ctx.slot.0,
-                "slot stopped producing turns; closing connection",
-            );
-            link.connection().close(
-                VarInt::from_u32(close_codes::SILENT_SLOT),
-                b"slot stopped producing turns",
-            );
+            let open = link.connection().close_reason().is_none();
+            if open {
+                link.connection().close(
+                    VarInt::from_u32(close_codes::SILENT_SLOT),
+                    b"slot stopped producing turns",
+                );
+                ctx.decision_makers.mark_silence_evicted(&ctx.key, ctx.slot);
+                ctx.decision_makers.flight_recorder().record(
+                    &ctx.key,
+                    crate::observability::flight_recorder::FlightEvent::SlotEvictedSilent {
+                        slot: ctx.slot.0,
+                    },
+                );
+                tracing::info!(
+                    tenant = ctx.key.tenant.as_ref(),
+                    session = ctx.key.session.0,
+                    slot = ctx.slot.0,
+                    "slot stopped producing turns; evicted and closed its connection",
+                );
+            } else {
+                tracing::info!(
+                    tenant = ctx.key.tenant.as_ref(),
+                    session = ctx.key.session.0,
+                    slot = ctx.slot.0,
+                    "silent slot's connection had already closed; ending it as a disconnect",
+                );
+            }
+        }
+        // Marks nothing, so only the recording depends on the open check: a
+        // connection the transport already closed is not reported as the watch's.
+        SlotCloseReason::QuietLink => {
+            if link.connection().close_reason().is_none() {
+                ctx.decision_makers.flight_recorder().record(
+                    &ctx.key,
+                    crate::observability::flight_recorder::FlightEvent::SlotQuietLinkClosed {
+                        slot: ctx.slot.0,
+                    },
+                );
+                tracing::info!(
+                    tenant = ctx.key.tenant.as_ref(),
+                    session = ctx.key.session.0,
+                    slot = ctx.slot.0,
+                    "silent slot's link received nothing past the transport idle timeout; \
+                     closing it as a lost connection",
+                );
+            } else {
+                tracing::info!(
+                    tenant = ctx.key.tenant.as_ref(),
+                    session = ctx.key.session.0,
+                    slot = ctx.slot.0,
+                    "quiet silent slot's connection had already closed; ending it as a disconnect",
+                );
+            }
         }
         SlotCloseReason::DesyncEvicted => {
             tracing::info!(

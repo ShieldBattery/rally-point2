@@ -31,7 +31,9 @@ pub trait FlightEvents {
 
     /// Records one event **only when a recording for `key` already exists**;
     /// with none, the event is dropped and no recording begins. For an event
-    /// that only marks the end of an observation, such as a session close.
+    /// that must not begin a recording on its own: one that only marks the end
+    /// of an observation, such as a session close, or one any dialer can cause,
+    /// such as a refused dial.
     fn record_existing(&self, key: &SessionKey, event: FlightEvent);
 }
 
@@ -47,22 +49,56 @@ pub enum FlightEvent {
     SlotConnected { slot: u8, resumed: bool },
     /// A client's link ended (any exit: clean leave, drop, isolation).
     SlotDisconnected { slot: u8 },
-    /// The relay closed a slot's link because its turns stopped reaching the
-    /// session's other players while everyone else's kept arriving — a hung game
-    /// thread or a suspended process behind a link that kept answering
-    /// keepalives. Lockstep cannot advance past such a slot, and the survivors'
-    /// drop machinery only fires for a slot the relay saw disconnect, so the
-    /// relay manufactures the disconnect here; the
-    /// [`SlotDisconnected`](Self::SlotDisconnected) and
-    /// [`DropHeld`](Self::DropHeld) that follow are the ordinary link-death path
-    /// doing the rest. `silent_ms` is how long ago this slot's forwarded turns
-    /// stopped; `lead_ms` how much earlier that was than the next-earliest slot
-    /// the session still needed — the entire margin the eviction rested on.
-    SlotEvictedSilent {
+    /// A dial for this slot was refused before it began serving: the slot is
+    /// homed elsewhere, already departed or evicted, already connected, or the
+    /// session was retired. Recorded only for a session already being recorded,
+    /// so a stray dial never starts a recording. `close_code` and `reason` are
+    /// exactly what the client was told (see `rally_point_proto::close_codes`).
+    SlotDialRefused {
+        slot: u8,
+        close_code: u32,
+        reason: String,
+    },
+    /// The silence watch found this slot's turns stopped reaching the
+    /// session's other players while everyone else's kept arriving, and began
+    /// watching its link for proof that the client is still sending anything.
+    /// A link that keeps carrying frames is a hung game thread or a suspended
+    /// game behind a live network stack, and is evicted
+    /// ([`SlotEvictedSilent`](Self::SlotEvictedSilent)). A link that carries
+    /// nothing is a dead network path, left to the transport's idle timeout to
+    /// close as an ordinary disconnect the client may come back from, so the
+    /// [`SlotDisconnected`](Self::SlotDisconnected) follows with no eviction.
+    /// The measures are [`SlotEvictedSilent`](Self::SlotEvictedSilent)'s, at
+    /// the moment the slot was first named.
+    SlotSilent {
         slot: u8,
         silent_ms: u64,
         lead_ms: u64,
     },
+    /// The relay evicted a slot because its turns stopped reaching the session's
+    /// other players while everyone else's kept arriving, and its link kept
+    /// receiving frames after it was named — a hung game thread or a suspended
+    /// game whose network stack still answers. Lockstep cannot advance past such
+    /// a slot, and the survivors' drop machinery only fires for a slot the relay
+    /// saw disconnect, so the relay manufactures the disconnect here, and refuses
+    /// the slot's later dials; the [`SlotDisconnected`](Self::SlotDisconnected)
+    /// and [`DropHeld`](Self::DropHeld) that follow are the ordinary link-death
+    /// path doing the rest. Recorded by the slot's own link task as it commits
+    /// the eviction; a link that had already closed on its own when its task
+    /// answered is not evicted, and records nothing here. How long the slot had
+    /// been stopped, and its margin over the next-earliest, are on the
+    /// [`SlotSilent`](Self::SlotSilent) that named it.
+    SlotEvictedSilent { slot: u8 },
+    /// The silence watch asked a named silent slot's link to end as an ordinary
+    /// lost connection, and the link's task found it still open: it had
+    /// received nothing since being named, yet outlasted the transport's idle
+    /// timeout and slack without the transport closing it. Nothing is marked,
+    /// so the drop is held and the client may resume like any whose path was
+    /// lost. Recorded by the slot's own link task when it checked the
+    /// connection open on that signal; the transport can still close it in the
+    /// same instant, so this says the watch asked and found the link up, not
+    /// that its close won.
+    SlotQuietLinkClosed { slot: u8 },
     /// The relay closed a slot's link, as its home, because the rollback
     /// session's state hash comparison named it: its hash disagreed with the
     /// majority's, or it kept sending turns without reporting one. Rollback

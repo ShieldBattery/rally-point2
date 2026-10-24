@@ -520,6 +520,7 @@ async fn serve_connection(
     // frees the roster seat once there is one, and runs the rollback each
     // refusal owes.
     let supports_periodic = rally_point_transport::quic::supports_periodic_evidence(&connection);
+    let transport = connection.weak_handle();
     let mut admission = Admission::new(connection, key.clone(), authorized.slot, &sessions, &mesh);
 
     // GATES: home-relay binding, then the decided-departure fast-fail, then
@@ -550,7 +551,13 @@ async fn serve_connection(
     // session with no lifecycle left) nor land between the check and the
     // register.
     let registered = mesh.session.gates.with_ingress(&key, || {
-        routing::register(&sessions, &key, authorized.slot, connection_epoch)
+        routing::register_with_transport(
+            &sessions,
+            &key,
+            authorized.slot,
+            connection_epoch,
+            Some(transport),
+        )
     });
     let Some(registered) = registered else {
         return Err(admission.refuse(SESSION_RETIRED));

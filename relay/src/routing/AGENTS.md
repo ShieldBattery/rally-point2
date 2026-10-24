@@ -19,10 +19,11 @@
 - `departure.rs`, `drops.rs`, `close.rs` — who left, who decides it, and what
   this relay tears down once its last local slot is gone.
 - `silence.rs` — the relay-wide silent-slot watch: a timer that takes each
-  session's verdict from the decision-makers (`claim_silent_slots`) and closes
-  the named slot's link. The verdict is consensus's and stays there; the
-  actuation is here, behind a `SilenceCloser` the roster implements, so the
-  loop is testable with a fake closer.
+  session's verdict from the decision-makers (`silent_slots`), reads the named
+  slot's link, and orders it evicted only once that link has received frames
+  since it was named. The verdict is consensus's and stays there; the link
+  reading and the closes are here, behind `SilenceLinks`, which the roster
+  implements, so the loop is testable with a fake.
 - `state_hash.rs` — the rollback comparator's sweep, and the same split for its
   evictions: `claim_desync_evictions` hands over the named slots, and a
   `DesyncEvictor` (`MeshEvictor` in production) closes the ones this relay homes
@@ -50,11 +51,20 @@
 - A *drop* is only ever held; an honored `RequestDrop` (or the abandon timer)
   decides it, and in finalized-drop sessions only the slot's home may seal the
   count. A *clean leave* decides immediately, at the home.
-- A slot the silence watch named is already marked evicted by the claim that
-  named it, so the close is owed exactly once — don't re-derive the verdict
-  here, and don't let a failed close silently un-name it. A desync-evicted slot
-  is marked the same way before its close, for the same reason: the mark is
-  what refuses the re-dial that would otherwise reinstate it.
+- Naming a silent slot is not evicting it. An eviction refuses every later
+  dial, so it waits for the relay's own evidence that reconnecting cannot help:
+  the named link's count of authenticated QUIC frames moving (keepalives keep
+  arriving from a hung game). A link that receives nothing is a dead path, left
+  to QUIC's idle timeout so it ends as an ordinary held disconnect its client
+  can resume from; one that outlasts `TRANSPORT_QUIET_GRACE` is ended by the
+  watch as that same ordinary disconnect (`QuietLink`), never evicted. Both
+  closes target the connection generation the watch read, checked under the
+  roster lock the signal fires under. The silence eviction is *marked by the
+  link task* answering the `SilentSlot` signal, before teardown frees the seat
+  and only if its connection had not already closed — never by the watch, which
+  would race a link already tearing down as a disconnect. A desync-evicted slot
+  is marked before its close instead: a diverged game is final however its
+  link ends.
 - A descriptor lobby-policy check runs at authenticated ingress before lobby
   delivery, replay, or mesh fan-out. A pre-start mismatch marks and closes only
   that home slot; a mismatch after that slot reported started is discarded.

@@ -55,8 +55,10 @@
   stamps and fails closed without a cursor.
 - **Silence eviction** names the slot that stopped *strictly* earliest, and blocks
   entirely while any required slot is unaccounted for. Only the *verdict* is here
-  (`claim_silent_slots`, which also marks what it names); the watch that closes the
-  named link is `routing::run_silence_watch`.
+  (`silent_slots` and `still_silent`, which mark nothing); the eviction mark,
+  `mark_silence_evicted`, is called by the slot's own link task as it ends the link,
+  and the watch that decides from the link whether a named slot is evicted is
+  `routing::run_silence_watch`.
 - **Desync eviction** is the rollback comparator's verdict turned into a queue:
   `judge_state_hashes` queues every slot a majority verdict names (a no-majority
   verdict names nobody at fault but queues every player, since nothing can reconcile

@@ -110,7 +110,7 @@ async fn close_slots_signals_a_held_slot_with_a_reason_and_skips_an_absent_one()
     // A fresh slot's silence eviction stamps its own reason before signaling.
     let inbox1 = registered(&sessions, &k, SlotId(1));
     let shutdown1 = inbox1.shutdown_handle();
-    close_slots_for_silence(&sessions, &k, &[SlotId(1)]);
+    close_silent_slot_link(&sessions, &k, SlotId(1), 1);
     shutdown1.notified().await;
     assert_eq!(inbox1.close_reason(), SlotCloseReason::SilentSlot);
 
@@ -118,6 +118,34 @@ async fn close_slots_signals_a_held_slot_with_a_reason_and_skips_an_absent_one()
     close_slots_for_desync(&sessions, &k, &[SlotId(1)]);
     shutdown1.notified().await;
     assert_eq!(inbox1.close_reason(), SlotCloseReason::DesyncEvicted);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_silence_close_reaches_only_the_connection_it_was_read_from() {
+    let sessions: Sessions = Arc::default();
+    let k = key();
+    let inbox = registered(&sessions, &k, SlotId(1));
+    let shutdown = inbox.shutdown_handle();
+
+    // The seat holds generation 1; a verdict read off another generation must
+    // not end it. With the clock paused, the timeout costs no real time.
+    close_silent_slot_link(&sessions, &k, SlotId(1), 2);
+    close_quiet_slot_link(&sessions, &k, SlotId(1), 2);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(60), shutdown.notified())
+            .await
+            .is_err(),
+        "a close for another connection generation signals nothing",
+    );
+    assert_eq!(inbox.close_reason(), SlotCloseReason::Unspecified);
+
+    close_quiet_slot_link(&sessions, &k, SlotId(1), 1);
+    shutdown.notified().await;
+    assert_eq!(
+        inbox.close_reason(),
+        SlotCloseReason::QuietLink,
+        "a quiet link is ended with its own cause, which marks no eviction",
+    );
 }
 
 #[tokio::test(start_paused = true)]

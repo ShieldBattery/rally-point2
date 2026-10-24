@@ -40,6 +40,7 @@ use rally_point_proto::ids::SlotId;
 use rally_point_transport::noq::{self, VarInt};
 
 use crate::key::SessionKey;
+use crate::observability::events::FlightEvent;
 use crate::routing::{self, Sessions, SlotRegistration};
 use crate::session::SessionState;
 
@@ -371,9 +372,25 @@ impl<'a> Admission<'a> {
     /// This is the only way a refusal reaches the client, which is what makes
     /// the rollback rule (see the module docs) enforceable rather than
     /// repeated: a gate names its cause, and the rollback follows from it.
+    ///
+    /// A refusal for a session already being recorded lands in its flight
+    /// recording, so a refused re-dial is visible next to the departure it
+    /// was refused for.
     pub(super) fn refuse(mut self, refusal: Refusal) -> ConnError {
         self.connection
             .close(VarInt::from_u32(refusal.code), refusal.reason);
+        self.mesh
+            .session
+            .decision_makers
+            .flight_recorder()
+            .record_existing(
+                &self.key,
+                FlightEvent::SlotDialRefused {
+                    slot: self.slot.0,
+                    close_code: refusal.code,
+                    reason: String::from_utf8_lossy(refusal.reason).into_owned(),
+                },
+            );
         self.roll_back(refusal.rollback);
         refusal.kind.into_error(self.key, self.slot)
     }

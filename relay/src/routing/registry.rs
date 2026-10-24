@@ -54,11 +54,28 @@ impl Drop for SlotRegistration {
 /// makes for the same slot. Pass the same value the slot's [`run_slot_link`] is
 /// given: the entry and its link task are one generation, and anything that
 /// resolves an answer from that link matches the pair.
+///
+/// The seat holds no transport handle, so the silence watch has no evidence
+/// that its link still carries packets and never evicts it. A production
+/// admission registers through [`register_with_transport`].
 pub fn register(
     sessions: &Sessions,
     key: &SessionKey,
     slot: SlotId,
     connection_epoch: u64,
+) -> Option<(SlotRegistration, SlotInbox)> {
+    register_with_transport(sessions, key, slot, connection_epoch, None)
+}
+
+/// [`register`], recording the dialing connection's weak handle on the seat so
+/// the silence watch can read whether that link still carries packets (see
+/// [`link_receipts`]).
+pub fn register_with_transport(
+    sessions: &Sessions,
+    key: &SessionKey,
+    slot: SlotId,
+    connection_epoch: u64,
+    transport: Option<WeakConnectionHandle>,
 ) -> Option<(SlotRegistration, SlotInbox)> {
     let (tx, rx) = mpsc::channel(FORWARD_CAPACITY);
     // The forward queue's aggregate resident bytes, shared between the fan-out
@@ -112,6 +129,7 @@ pub fn register(
                 lead_push: lead_tx,
                 probe_push: probe_tx,
                 connection_epoch,
+                transport,
                 shutdown: Arc::clone(&shutdown),
                 close_reason: Arc::clone(&close_reason),
                 provisional_reap: Arc::clone(&provisional_reap),
@@ -226,4 +244,40 @@ pub fn live_session_slot_epochs(sessions: &Sessions, key: &SessionKey) -> Vec<(S
         .collect();
     links.sort_by_key(|(slot, _)| slot.0);
     links
+}
+
+/// How many authenticated frames a registered slot's QUIC connection has
+/// received from its client, and which link generation that count belongs to.
+///
+/// The count includes QUIC's own traffic — keepalive PINGs, ACKs — that never
+/// surfaces as a turn or a control frame, so it is the only measure of whether
+/// the client is still sending anything at all. Only frames that decrypted
+/// under the connection's keys count: a datagram merely addressed to the
+/// connection proves nothing about the client, since anyone who has seen its
+/// connection ID can send one. A close frame is left out too, as it is the
+/// client leaving, not the client still being there. Counts from two different
+/// `connection_epoch`s are different connections and never comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkReceipts {
+    pub connection_epoch: u64,
+    pub frames: u64,
+}
+
+/// The [`LinkReceipts`] of `slot`'s registered link in `key`'s session, or
+/// `None` when there is nothing to read: no seat, a seat registered without a
+/// transport handle, or a connection already gone.
+///
+/// The roster lock is released before the connection's stats are read, so the
+/// transport's own lock never nests inside it.
+pub fn link_receipts(sessions: &Sessions, key: &SessionKey, slot: SlotId) -> Option<LinkReceipts> {
+    let (connection_epoch, transport) = {
+        let roster = sessions.lock();
+        let entry = roster.get(key)?.get(&slot)?;
+        (entry.connection_epoch, entry.transport.clone()?)
+    };
+    let received = transport.upgrade()?.stats().frame_rx;
+    Some(LinkReceipts {
+        connection_epoch,
+        frames: received.ping + received.acks + received.datagram + received.stream,
+    })
 }

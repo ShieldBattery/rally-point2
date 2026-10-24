@@ -122,11 +122,13 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// at 5s, so a live connection never approaches this timeout).
 ///
 /// Applied to every dial side ([`keepalive_transport_config`]): the mesh edge and
-/// the client edge. QUIC negotiates the idle timeout as the minimum of both
-/// endpoints' advertised values, so the dial side's value governs without touching
-/// `server_config`, and one side's keepalive keeps both ends alive (its PINGs
-/// elicit ACKs, resetting both idle timers), so the accept side needs no change.
-const MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// the client edge, and one side's keepalive keeps both ends alive (its PINGs
+/// elicit ACKs, resetting both idle timers). QUIC negotiates the idle timeout as
+/// the minimum of both endpoints' advertised values, and a dialer that advertises
+/// none leaves only the other side's, so the accept side ([`server_config`])
+/// advertises it too: the relay's own bound on a dead client link must not be a
+/// value the client chose.
+pub const MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Builds a `TransportConfig` running the floored congestion controller (see
 /// [`floored_transport_config`]), with keepalive (to prevent idle disconnects during
@@ -137,9 +139,9 @@ const MAX_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10)
 /// keepalive their own connections would idle-time-out and the relay would wrongly
 /// drop them too; the PINGs keep a stalled-but-alive client connected until the
 /// relay pushes it the leave that unstalls it, and only the genuinely dead client
-/// (no PINGs) times out — a clean drop detector. QUIC negotiates the idle timeout
-/// as the minimum of both ends, so setting it on the dial side governs without
-/// touching `server_config`, and one side's keepalive keeps both idle timers reset.
+/// (no PINGs) times out — a clean drop detector. One side's keepalive keeps both
+/// idle timers reset, so the accept side sends none; it does advertise the same
+/// idle timeout ([`server_config`]), so a dialer cannot lengthen it.
 fn keepalive_transport_config() -> noq::TransportConfig {
     let mut config = floored_transport_config();
     config.keep_alive_interval(Some(KEEPALIVE_INTERVAL));
@@ -349,9 +351,13 @@ pub fn server_config(
 
     let server = QuicServerConfig::try_from(tls)?;
     let mut config = noq::ServerConfig::with_crypto(Arc::new(server));
-    // Only the congestion controller differs from the defaults here: keepalive and
-    // the idle timeout are the dialer's to set (see `keepalive_transport_config`).
-    config.transport_config(Arc::new(floored_transport_config()));
+    // Keepalive is the dialer's to send (see `keepalive_transport_config`); the idle
+    // timeout is advertised here as well, so no dialer can lengthen it.
+    let mut transport = floored_transport_config();
+    transport.max_idle_timeout(Some(
+        noq::IdleTimeout::try_from(MAX_IDLE_TIMEOUT).expect("10s fits in a VarInt"),
+    ));
+    config.transport_config(Arc::new(transport));
     Ok(config)
 }
 

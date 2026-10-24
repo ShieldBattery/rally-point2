@@ -1,5 +1,15 @@
 use super::*;
 
+/// The silence watch's eviction close, in the slot-list shape of the closes it
+/// is compared with here: it targets each seat's current connection generation.
+fn close_for_silence(sessions: &Sessions, key: &SessionKey, slots: &[SlotId]) {
+    for (slot, epoch) in crate::routing::live_session_slot_epochs(sessions, key) {
+        if slots.contains(&slot) {
+            close_silent_slot_link(sessions, key, slot, epoch);
+        }
+    }
+}
+
 #[test]
 fn requested_shutdown_cause_wins_over_sampler_and_task_cleanup() {
     for (close, expected) in [
@@ -7,7 +17,7 @@ fn requested_shutdown_cause_wins_over_sampler_and_task_cleanup() {
             close_slots as fn(&Sessions, &SessionKey, &[SlotId]),
             EvidenceInterruption::Revoked,
         ),
-        (close_slots_for_silence, EvidenceInterruption::SilentSlot),
+        (close_for_silence, EvidenceInterruption::SilentSlot),
         (close_slots_for_overflow, EvidenceInterruption::LaggingSlot),
         (close_slots_for_desync, EvidenceInterruption::DesyncEvicted),
         (
@@ -140,7 +150,7 @@ fn link_teardown_uses_stamped_cause_and_clean_leave_never_retains_failure() {
         assert!(begin(&context, 1));
         match mode {
             1 => close_slots(&context.sessions, &context.key, &[context.slot]),
-            2 => close_slots_for_silence(&context.sessions, &context.key, &[context.slot]),
+            2 => close_for_silence(&context.sessions, &context.key, &[context.slot]),
             _ => {}
         }
         super::super::slot_link::end_slot_link(
@@ -219,7 +229,7 @@ async fn reset_evidence_stream_does_not_claim_the_gameplay_connection_closed() {
 fn administrative_and_departure_signals_cannot_become_client_failures() {
     for departed in [false, true] {
         for close in [
-            close_slots_for_silence,
+            close_for_silence,
             close_slots_for_desync,
             close_slots_for_lobby_violation,
         ] {
@@ -270,7 +280,7 @@ fn administrative_and_departure_signals_cannot_become_client_failures() {
 fn administrative_signal_can_cancel_a_technical_close_before_settlement() {
     let context = fixture();
     assert!(begin(&context, 1));
-    close_slots_for_silence(&context.sessions, &context.key, &[context.slot]);
+    close_for_silence(&context.sessions, &context.key, &[context.slot]);
     close_slots(&context.sessions, &context.key, &[context.slot]);
     drop(Obligation {
         context: &context,

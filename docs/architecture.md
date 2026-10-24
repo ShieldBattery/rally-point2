@@ -966,7 +966,7 @@ A drop needs a link death to start from, and a client can stop stepping without 
 or a suspended process keeps answering keepalives, so its link stays up while lockstep holds every other
 player still behind it, and a drop request against a connected slot is ignored. The relay closes that gap
 with **silent-slot eviction**: a per-relay watch (every 2s) closes the link of the slot it homes that
-stopped feeding the session first.
+stopped feeding the session first, once that link shows the client behind it is still sending.
 
 Naming *which* slot is the whole problem, because every per-slot quantity a client supplies — how many
 turns it sent, what frame they stamp, how far ahead their seqs run — is padding the hostile client
@@ -1073,13 +1073,58 @@ A session where anyone is still loading therefore names nobody at all — not by
 because an unreported participant has no clock, and the app server's load timeout owns a session that
 never finishes loading.
 
-The close is manufactured link death and nothing more — the departure record, drop hold, survivors'
-countdown, and honored request are the ordinary path — but a slot evicted this way is refused readmission
-for the rest of the session, since reconnecting cannot restart a dead simulation and admitting it would
-clear the hold and restart the survivors' countdown on every redial. The close carries its own QUIC code
-(`SILENT_SLOT_CLOSE`) and a `slot_evicted_silent` flight event recording how long the slot had been
-stopped and by how much it led the next-earliest, so a client log and a recording both say the link was
-healthy and the game was not.
+**Naming a slot is not evicting it.** A slot whose whole network path died stops its turns exactly like
+one whose game hung, and the forwarded-prefix clocks cannot tell the two apart. They differ in what a
+reconnect can do: a client whose path comes back has a running simulation that resumes the game, while a
+hung one would only clear the survivors' hold and restart their countdown on every redial. So the watch
+reads the named slot's link — the relay's own count of frames received on that connection that decrypted
+under its keys, which takes in the transport's keepalive PINGs and ACKs as well as turns — and evicts
+only once that count moves after the naming: frames arriving while turns do not is a live client behind
+a stopped game. A datagram merely addressed to the connection does not count, since anyone who has seen
+its connection ID can send one. A link that receives nothing is left to QUIC's idle timeout, which
+closes it as an ordinary disconnect within seconds (by the time a slot is named, the window has outlasted
+most of the idle timeout), and its client may resume from the drop hold like any lost client. The relay
+advertises that timeout on its accept side too, so a dialer cannot lengthen the advertised value, though
+QUIC's own floor of three probe timeouts can still outlast it on a long or erratic round trip, or for a
+peer that advertises a long ACK delay. A link that outlasts the idle timeout plus slack
+(`TRANSPORT_QUIET_GRACE`) with nothing arriving is ended by the watch itself, as the ordinary lost
+connection it is: no session is ever held on a link nothing will close, and nothing is marked, so the
+client may still resume.
+
+The watch never marks an eviction itself. It signals the exact connection generation it read, and that
+link's own task marks the eviction as it ends the link on the signal — before it frees the slot's roster
+seat, so no re-dial is admitted ahead of the mark, and only if the connection was still open when the
+task closed it. A link that was already tearing down as a disconnect when the verdict landed therefore
+stays an ordinary, resumable one. QUIC offers no atomic check-and-close, so the task checks immediately
+before closing, and the watch acts only on frames that arrived since its previous tick, keeping the
+evidence close to the eviction. A close of the link's own that lands in the gap between the check and the
+close still evicts, and its client's re-dial is refused: a client closing a failed link to re-dial at that
+instant, or an idle close after a stall of seconds in the watch or the task. So, very rarely, a client
+that could have resumed is permanently evicted. That is accepted as the cost of reading the transport's
+evidence at all.
+
+The count is relay-measured and can only push a client toward the disconnect it already gets by going
+quiet, so it gives a hostile client nothing new: a fully suspended game (network stack included) gets the
+ordinary disconnect and resume, the same as pulling its network cable. If its game is still stopped once
+it is back and it keeps that link up, it is named again behind a live link and evicted then. A client
+that instead lets every reconnected link die again before the reconnect window has passed is never
+named; that cycling is possible with any lost-client resume and is bounded only by the survivors' drop
+countdown. Two cases still read as a live client and are evicted, as every silent slot was before this
+evidence was read: a path degraded enough to pass QUIC's small frames but not turns, and a path that
+comes back in the second or two between naming and the idle close, if its first frames land before its
+re-carried turns move the prefix. A hung game is evicted up to a keepalive interval plus a tick later
+than a bare verdict would; the survivors' 30s drop floor dominates that anyway.
+
+An evicted slot's close is manufactured link death and nothing more — the departure record, drop hold,
+survivors' countdown, and honored request are the ordinary path — but it is refused readmission for the
+rest of the session. The close carries its own QUIC code (`SILENT_SLOT_CLOSE`). The flight recording has a
+`slot_silent` event when a slot is first named, carrying how long it had been stopped and by how much it
+led the next-earliest, and the link task records `slot_evicted_silent` only when it commits an eviction,
+or `slot_quiet_link_closed` when it answers the watch's quiet-close request past the grace and finds the
+link still open (QUIC may still close it in the same instant). A named slot followed by neither is
+a dead path the transport ended, or a link that had closed on its own before its task answered. Every
+refused dial for a recorded session lands as `slot_dial_refused` with the close code the client was
+given.
 
 The apply frame is the subtle part. A departing client's own `game_frame_count` cannot be trusted to set
 it — a malicious client could name an unreachable future frame and stall every honest survivor forever — so
@@ -1765,8 +1810,10 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   alerting until production baselines exist.
 - **No auto-drop of disconnected players.** Holds are decided only by a survivor's `RequestDrop`
   (30s relay floor) or the 45s abandoned-session force-decide. Silent-slot eviction does not change
-  this: it manufactures the *disconnect* for a connected slot that stopped producing turns, and the
-  hold it leaves behind is decided exactly as any other. The slot it names is chosen from
+  this: it manufactures the *disconnect* for a connected slot that stopped producing turns while its
+  link kept carrying packets, and the hold it leaves behind is decided exactly as any other. A slot
+  whose link carries nothing is not evicted at all; the transport's idle timeout disconnects it and
+  its client may resume. The slot it names is chosen from
   relay-authored evidence alone — the order in which slots' forwarded prefixes stopped advancing. No
   client-supplied count, frame stamp, or seq may pick a victim: each is padding the hostile client
   chooses (see "silent-slot eviction").

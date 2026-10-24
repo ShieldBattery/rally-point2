@@ -29,5 +29,6 @@ mod restart_resume;
 mod results;
 mod rollback_stats;
 mod session_start;
+mod silence;
 mod turns;
 mod turns_complete;

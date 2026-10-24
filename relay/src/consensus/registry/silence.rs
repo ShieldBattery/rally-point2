@@ -66,32 +66,55 @@ impl DecisionMakers {
         Some(update)
     }
 
-    /// Every session whose decision-maker names a slot that has gone silent, with
-    /// that verdict marked so the same slot is not named again on a later tick.
+    /// Every session whose decision-maker names a slot that has gone silent,
+    /// marking nothing.
     ///
     /// The verdict itself is [`DecisionMaker::silent_slot`]: complete knowledge of
     /// the session or no verdict at all, and only ever the slot that stopped
-    /// strictly earliest. What a caller does with a named slot — closing its link,
-    /// so the ordinary link-death path resolves it — belongs to the layer that
-    /// owns the links, which is why this hands the names back rather than acting
-    /// on them.
+    /// strictly earliest. Naming a slot is not yet evicting it. A slot whose
+    /// turns stopped because its whole link went dead is the transport's to
+    /// close, as an ordinary disconnect its client may come back from; only a
+    /// link that still carries frames while its turns have stopped is a
+    /// simulation that will not restart. Telling the two apart takes the link
+    /// itself, which this layer does not hold, so the caller judges that,
+    /// re-checks the verdict with [`still_silent`](Self::still_silent), and has
+    /// the link's own task record the eviction with
+    /// [`mark_silence_evicted`](Self::mark_silence_evicted).
+    pub fn silent_slots(&self, now: Instant, window: Duration) -> Vec<(SessionKey, SilentSlot)> {
+        self.lock()
+            .iter_mut()
+            .filter_map(|(key, maker)| Some((key.clone(), maker.silent_slot(now, window)?)))
+            .collect()
+    }
+
+    /// `key`'s session's verdict, rendered again, if it still names `slot`.
     ///
-    /// The whole sweep runs under one acquisition of the registry lock, and the
-    /// mark is taken inside it: acting on a name takes other locks, and a slot
-    /// already marked is out of the comparison regardless of how long the acting
-    /// takes.
-    pub fn claim_silent_slots(
+    /// An earlier [`silent_slots`](Self::silent_slots) is not trusted across
+    /// the link reads in between: the slot may have forwarded a turn,
+    /// disconnected, or reconnected since.
+    pub fn still_silent(
         &self,
+        key: &SessionKey,
+        slot: SlotId,
         now: Instant,
         window: Duration,
-    ) -> Vec<(SessionKey, SilentSlot)> {
-        let mut claimed = Vec::new();
-        for (key, maker) in self.lock().iter_mut() {
-            if let Some(found) = maker.silent_slot(now, window) {
-                maker.mark_evicted(found.slot, EvictionCause::Silent);
-                claimed.push((key.clone(), found));
-            }
+    ) -> Option<SilentSlot> {
+        self.lock()
+            .get_mut(key)?
+            .silent_slot(now, window)
+            .filter(|found| found.slot == slot)
+    }
+
+    /// Records that `slot` was evicted for silence, so it is out of every later
+    /// comparison and its re-dials are refused.
+    ///
+    /// Called by the slot's own link task as the silence close ends its link,
+    /// before the task gives up the slot's roster seat: no re-dial can be
+    /// admitted ahead of the mark, and a link that was already ending for any
+    /// other reason never gets one.
+    pub fn mark_silence_evicted(&self, key: &SessionKey, slot: SlotId) {
+        if let Some(maker) = self.lock().get_mut(key) {
+            maker.mark_evicted(slot, EvictionCause::Silent);
         }
-        claimed
     }
 }

@@ -61,6 +61,7 @@ use rally_point_proto::ids::SlotId;
 use rally_point_proto::messages::{
     LeadReport, LeaveDirective, Payload, PhaseDirective, RegionLabel,
 };
+use rally_point_transport::noq::WeakConnectionHandle;
 use tokio::sync::{Notify, mpsc};
 
 use crate::key::SessionKey;
@@ -84,15 +85,15 @@ mod tests;
 
 pub(crate) use lifecycle::close_slots_for_overflow;
 pub use lifecycle::{
-    after_authority_change, announce_slot_present, close_slots, close_slots_for_desync,
-    close_slots_for_lobby_violation, close_slots_for_silence,
+    after_authority_change, announce_slot_present, close_quiet_slot_link, close_silent_slot_link,
+    close_slots, close_slots_for_desync, close_slots_for_lobby_violation,
 };
 pub(crate) use lobby::{deliver_lobby_command, report_game_started};
 pub use registry::{
-    SlotRegistration, holds_any_slots, live_session_slot_epochs, live_slots, register,
-    session_count,
+    LinkReceipts, SlotRegistration, holds_any_slots, link_receipts, live_session_slot_epochs,
+    live_slots, register, register_with_transport, session_count,
 };
-pub use silence::{SILENCE_CHECK_INTERVAL, SilenceCloser, run_silence_watch};
+pub use silence::{SILENCE_CHECK_INTERVAL, SilenceLinks, run_silence_watch};
 pub use slot_link::run_slot_link;
 pub use state_hash::{DesyncEvictor, MeshEvictor, STATE_HASH_CHECK_INTERVAL, run_state_hash_watch};
 
@@ -253,6 +254,10 @@ enum SlotCloseReason {
     LaggingSlot = 5,
     /// The client announced a normal departure.
     SlotDeparted = 6,
+    /// The slot's turns stopped and its link has received nothing for longer
+    /// than the transport's idle timeout should allow: a lost connection the
+    /// transport has not yet closed, ended here as the ordinary disconnect it is.
+    QuietLink = 7,
 }
 
 impl SlotCloseReason {
@@ -266,6 +271,7 @@ impl SlotCloseReason {
             Self::Revoked => EvidenceInterruption::Revoked,
             Self::LaggingSlot => EvidenceInterruption::LaggingSlot,
             Self::SlotDeparted => EvidenceInterruption::SlotDeparted,
+            Self::QuietLink => EvidenceInterruption::ConnectionClosed,
         }
     }
 
@@ -277,6 +283,7 @@ impl SlotCloseReason {
             raw if raw == Self::Revoked as u8 => Self::Revoked,
             raw if raw == Self::LaggingSlot as u8 => Self::LaggingSlot,
             raw if raw == Self::SlotDeparted as u8 => Self::SlotDeparted,
+            raw if raw == Self::QuietLink as u8 => Self::QuietLink,
             _ => Self::Unspecified,
         }
     }
@@ -380,6 +387,12 @@ pub struct SlotEntry {
     /// names one link generation where `slot` alone names only a seat that a
     /// different connection may have taken over in the meantime.
     connection_epoch: u64,
+    /// The QUIC connection this entry's link runs over, held weakly so the
+    /// roster never keeps a connection alive past its link task. Read for the
+    /// one thing only the transport knows: whether the client is still sending
+    /// packets at all (see [`link_receipts`](registry::link_receipts)). `None`
+    /// for a seat registered without one, which reads as no evidence.
+    transport: Option<WeakConnectionHandle>,
     shutdown: Arc<Notify>,
     /// The [`SlotCloseReason`] behind the pending `shutdown` signal, stored here
     /// before the signal is fired. Shared with the link task, which reads it when
