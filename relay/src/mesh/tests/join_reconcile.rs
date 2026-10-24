@@ -114,7 +114,7 @@ fn join_reconcile_re_sends_the_authoritys_session_clock() {
     assert!(control_rx.try_recv().is_err(), "no clock before the anchor");
 
     let start = rally_point_proto::rollback::LOCKSTEP_START_STEPS;
-    let _ = makers.note_forward_advance(&key, SlotId(0), start);
+    let _ = makers.note_forwarded_turn(&key, SlotId(0), start - 1, Some(start));
     reconcile_session_clock_on_join(&makers, &control_tx, &key);
     reconcile_session_clock_on_join(&makers, &control_tx, &key);
     let clocks: Vec<_> = std::iter::from_fn(|| control_rx.try_recv().ok())

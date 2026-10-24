@@ -38,6 +38,70 @@ fn micros(duration: Duration) -> u64 {
 }
 
 impl DecisionMaker {
+    /// Enables clock recovery only when this maker is created for an already running
+    /// session. A surviving maker retains its complete-prefix clock progression.
+    pub(in crate::consensus) fn recover_clock(&mut self) {
+        if self.rollback_enabled {
+            self.clock_progress = Some(ClockProgress::default());
+        }
+    }
+
+    /// Folds one actually forwarded turn into the session's progress. Only a proven
+    /// complete prefix advances silence and state-hash bookkeeping. Clock recovery
+    /// separately follows a contiguous suffix above a peer-confirmed baseline.
+    pub fn note_forwarded_turn(
+        &mut self,
+        slot: SlotId,
+        seq: u64,
+        forwarded: Option<u64>,
+        now: Instant,
+    ) -> Option<ClockUpdate> {
+        let update = forwarded.and_then(|count| {
+            self.note_forward_advance(slot, now);
+            self.note_forwarded_turns(slot, count, now)
+        });
+        if !self.expected_slots.contains(&slot) {
+            return update;
+        }
+        let Some(progress) = &mut self.clock_progress else {
+            return update;
+        };
+        if progress.note(slot, seq) {
+            tracing::warn!(
+                tenant = self.key.tenant.as_ref(),
+                session = self.key.session.0,
+                slot = slot.0,
+                seq,
+                next_needed = progress.count(slot),
+                "clock recovery pending-turn limit exceeded; timing progress may stall",
+            );
+        }
+        let (before, after) = self.recovered_clock_progress();
+        self.advance_clock(before, after, now)
+    }
+
+    /// Consumes the minimum clock count of the remaining players. Keeping the previous
+    /// minimum also accounts for departures without skipping a stop at the old limit.
+    fn recovered_clock_progress(&mut self) -> (u64, u64) {
+        let before = self.clock_confirmed;
+        let after = self
+            .clock_progress
+            .as_ref()
+            .and_then(|progress| {
+                self.expected_slots
+                    .iter()
+                    .filter(|slot| {
+                        !self.observers.contains(slot) && !self.departures.contains_key(slot)
+                    })
+                    .map(|&slot| progress.count(slot))
+                    .min()
+            })
+            .unwrap_or(before)
+            .max(before);
+        self.clock_confirmed = after;
+        (before, after)
+    }
+
     /// Measures `slot`'s turn with seq `seq`, which first arrived on this relay's client edge at
     /// `received_at`, and returns the slot's lead report when one is due. A turn whose deadline
     /// isn't final yet is measured once the clock moves far enough on: on the authority as more
@@ -146,7 +210,31 @@ impl DecisionMaker {
             return Vec::new();
         }
         let pause_before = self.clock.pause();
-        if !self.clock.merge(frame, received_at, mesh_rtt_us) {
+        let changed = self.clock.merge(frame, received_at, mesh_rtt_us);
+        if self.clock.anchor_step() != Some(frame.anchor_step) {
+            return Vec::new();
+        }
+        self.lead.anchor_rehomes(frame.final_through);
+        if let Some(progress) = &mut self.clock_progress {
+            // A clock limit includes slack beyond the turns the former authority
+            // confirmed. Only that confirmed prefix can seed the suffix, never the
+            // slack itself or a client's resume cursor. Use the received frame so a
+            // copy of our own clock cannot manufacture progress on each heartbeat.
+            if let Some(count) = frame
+                .final_through
+                .checked_sub(STALL_SLACK_STEPS)
+                .and_then(|seq| seq.checked_add(1))
+            {
+                progress.seed(count);
+                let (before, after) = self.recovered_clock_progress();
+                if after > before && self.is_authority() {
+                    // A replay may precede its clock copy. Consume that retained suffix
+                    // now; the regular heartbeat distributes any stop this records.
+                    self.clock
+                        .note_confirmable(before.checked_sub(1), after - 1, received_at);
+                }
+            }
+        } else if !changed {
             return Vec::new();
         }
         let stopped = self.clock.pause() > pause_before;
@@ -195,6 +283,9 @@ impl DecisionMaker {
             // session this is when the slowest player's start arrived, and nobody is asked to be
             // earlier than the session has shown it can be.
             self.clock.anchor(after - 1, now);
+            if let Some(final_through) = self.clock.final_through() {
+                self.lead.anchor_rehomes(final_through);
+            }
             return Some(ClockUpdate {
                 frame: self.clock.to_frame(now),
                 reports: Vec::new(),

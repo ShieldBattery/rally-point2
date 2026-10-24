@@ -6,6 +6,8 @@
 mod copies;
 mod handoff;
 mod measuring;
+mod recovery;
+mod rehome_measuring;
 mod stopping;
 
 use super::*;

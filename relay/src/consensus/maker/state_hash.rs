@@ -53,7 +53,11 @@ impl DecisionMaker {
             .min()
             .unwrap_or(0);
         self.turns_complete.store(complete, Ordering::Release);
-        self.advance_clock(before, self.hashes.confirmable_until(), now)
+        if self.clock_progress.is_some() {
+            None
+        } else {
+            self.advance_clock(before, self.hashes.confirmable_until(), now)
+        }
     }
 
     /// How many of `slot`'s turns this relay has forwarded without a gap, as far as

@@ -874,6 +874,24 @@ targets.
   Copies only ever gain stopped time, so all of this is order-free and repeatable: frames arriving
   late, twice, or from two relays both deciding the clock leave every relay on the same deadlines
   ahead.
+- **Fresh replacements.** A relay created for a resumed session may only receive retained
+  midgame turns, so its complete forwarding prefix can remain at zero. Its clock uses separate,
+  bounded per-player suffix tracking. An accepted peer clock supplies a confirmed baseline:
+  `final_through - STALL_SLACK_STEPS`, excluding the clock's slack. Actual received turns must
+  fill every gap above that baseline. A later peer copy can raise it, and suffixes received
+  before the copy are preserved. The minimum across remaining players moves the clock; observer
+  turns do not hold it back. These counts never certify complete delivery, silence-watch progress,
+  or state-hash completeness. Surviving makers retain their complete-prefix path. Recovery needs
+  a surviving clock copy (or actual from-zero history); arbitrary client sequences cannot
+  reconstruct a clock if every copy and the initial history were lost.
+- **Rehome measurements.** A newly activated home link skips lead measurements for deadlines
+  already final at activation: retained turns replayed after an outage do not describe live
+  arrival timing. If the clock is not yet anchored, measurements wait for the first accepted
+  copy and use its limit before replay advances it. This per-link cutoff stays fixed as the
+  clock moves. The measurement window resets, but dedup and cumulative telemetry survive;
+  zero-sample reports still carry stopped time to release the client's schedule hold. Retained
+  turns above the cutoff can still be measured against their subsequently finalized deadlines.
+  Clock-recovery pending-turn overflow warns once per slot rather than silently losing progress.
 - **Authority changes.** Only the authority makes stops, from what it can confirm, but it merges
   copies like every other relay. So a new authority decides at once from its own copy, and
   learns any stop it missed (one a former authority made that reached another relay) from the

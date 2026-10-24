@@ -276,6 +276,12 @@ impl DecisionMaker {
         }
         self.connection_states
             .insert(slot, ConnectionState::Up(epoch));
+        if self.rollback_enabled
+            && self.homed_slots.contains(&slot)
+            && self.rehomed_homes.contains(&slot)
+        {
+            self.lead.begin_rehome(slot, self.clock.final_through());
+        }
         if let Some(state) = self.slots.get_mut(&slot) {
             state.reset_link_conditions();
             state.connection_up_at = Some(now);

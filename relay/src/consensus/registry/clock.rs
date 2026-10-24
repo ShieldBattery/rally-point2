@@ -4,6 +4,28 @@
 use super::*;
 
 impl DecisionMakers {
+    /// Records a fresh forwarded turn. Only `forwarded` certifies an advance of the
+    /// complete prefix; a resumed relay also tracks the actual sequence for its clock.
+    #[must_use]
+    pub fn note_forwarded_turn(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        seq: u64,
+        forwarded: Option<u64>,
+    ) -> Option<ClockUpdate> {
+        let now = Instant::now();
+        let (update, events) = {
+            let mut makers = self.lock();
+            let maker = makers.get_mut(key)?;
+            let mark = maker.clock_mark();
+            let update = maker.note_forwarded_turn(slot, seq, forwarded, now);
+            (update, maker.clock_events(mark, false))
+        };
+        self.record_clock_events(key, events);
+        update
+    }
+
     /// Measures `slot`'s turn with seq `seq` against `key`'s session clock and returns the slot's
     /// lead report when one is due (see [`DecisionMaker::note_lead_arrival`]). `received_at` is the
     /// instant the caller pulled the packet off the socket, stamped there so validation and this

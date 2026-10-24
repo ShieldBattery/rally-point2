@@ -208,6 +208,7 @@ impl DecisionMakers {
                     }
                     if resumed_departed.is_some() {
                         maker.mark_homes_rehomed();
+                        maker.recover_clock();
                     }
                     let seeded = resumed_departed
                         .map(|d| maker.seed_resumed(d))

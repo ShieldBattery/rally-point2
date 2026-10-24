@@ -202,24 +202,19 @@ pub(super) fn deliver_turn_to_locals(
         decision_makers.flight_recorder().note_dedup_drop(key, slot);
         return None;
     }
-    if forwarded.prefix_advanced {
-        // The relay's own record that this slot's simulation is still feeding
-        // local lockstep, in order. Progress is taken here rather than from the
-        // turn itself because a client picks what it sends and when, so any
-        // count or stamp it supplies can be padded; only the turns it actually
-        // produced move this prefix.
-        // On the authority of a rollback session, the same advance moves the
-        // session clock on: anchoring it once the lockstep start is in, moving
-        // its limit, and keeping any stop it made while the session waited.
-        // Every other relay adopts an anchor or a stop at once, and this relay's
-        // own players get the reports a stop or their newly measured turns call
-        // for.
-        if let Some(update) = decision_makers.note_forward_advance(key, slot, forwarded.forwarded) {
-            if let Some(frame) = update.frame {
-                super::fan_out::fan_out_session_clock(&mesh.links, key, frame);
-            }
-            routing::fan_out_lead_reports(sessions, key, &update.reports);
+    // Only a complete prefix proves silence/hash progress. A fresh resumed relay
+    // also needs each actual turn to advance its clock suffix above the baseline
+    // learned from a peer clock, without claiming it forwarded the missing history.
+    if let Some(update) = decision_makers.note_forwarded_turn(
+        key,
+        slot,
+        payload.seq,
+        forwarded.prefix_advanced.then_some(forwarded.forwarded),
+    ) {
+        if let Some(frame) = update.frame {
+            super::fan_out::fan_out_session_clock(&mesh.links, key, frame);
         }
+        routing::fan_out_lead_reports(sessions, key, &update.reports);
     }
     // The frame observation's one and only feed point, right after the
     // `mark_seen` dedup, for the same reason as the desync comparator just

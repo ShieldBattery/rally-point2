@@ -19,5 +19,6 @@ mod lobby;
 mod lobby_resend;
 mod presence;
 mod rehome;
+mod rehome_clock;
 mod replay_fairness;
 mod sessions;

@@ -219,9 +219,36 @@ impl SlotLead {
 #[derive(Debug, Default)]
 pub(in crate::consensus) struct LeadTracker {
     slots: HashMap<SlotId, SlotLead>,
+    /// A rehomed link excludes deadlines already final when it connected. None
+    /// waits for the first clock copy; an established cutoff never follows the clock.
+    rehome_floors: HashMap<SlotId, Option<u64>>,
 }
 
 impl LeadTracker {
+    /// Starts a rehomed link's measurement window without replaying its old samples.
+    /// Keep dedup and cumulative telemetry, but clear queued arrivals from the old
+    /// link. An empty window still carries stopped time in connect/stop reports.
+    pub(in crate::consensus) fn begin_rehome(&mut self, slot: SlotId, final_through: Option<u64>) {
+        self.rehome_floors.insert(slot, final_through);
+        let lead = self.slots.entry(slot).or_insert_with(SlotLead::new);
+        lead.waiting.clear();
+        lead.len = 0;
+        lead.next = 0;
+        lead.measured_through = 0;
+        lead.report_at = 0;
+        lead.last_report = None;
+    }
+
+    /// Resolves links that came up before the clock. Call before recovered turns
+    /// advance its limit, so the cutoff excludes inherited history, not live traffic.
+    pub(in crate::consensus) fn anchor_rehomes(&mut self, final_through: u64) {
+        for floor in self.rehome_floors.values_mut() {
+            if floor.is_none() {
+                *floor = Some(final_through);
+            }
+        }
+    }
+
     /// Takes in `slot`'s turn with seq `seq`, which first arrived at `arrived`, against `clock`,
     /// and returns the slot's report when one is due. The turn is measured now if its deadline is
     /// final, waits if the clock may still stop before its step, and is skipped if it has no
@@ -233,6 +260,12 @@ impl LeadTracker {
         arrived: Instant,
         clock: &SessionClock,
     ) -> Option<LeadReport> {
+        if let Some(floor) = self.rehome_floors.get(&slot) {
+            let floor = (*floor)?;
+            if seq <= floor {
+                return None;
+            }
+        }
         let final_through = clock.final_through()?;
         let lateness_us = if seq <= final_through {
             Some(clock.lateness_us(seq, arrived)?)

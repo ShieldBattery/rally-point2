@@ -38,34 +38,6 @@ impl DecisionMakers {
             .unwrap_or_default()
     }
 
-    /// Records that `slot`'s gap-free forwarded prefix advanced for `key`'s
-    /// session to `forwarded` turns, stamping the slot's stop clock (see
-    /// [`DecisionMaker::note_forward_advance`]) and, in a rollback session, starting the report
-    /// deadlines of the steps that became confirmable and moving the authority's session clock
-    /// on (see [`DecisionMaker::note_forwarded_turns`]). Returns what moving the clock calls for: a
-    /// frame for the caller to send the other relays, and reports to push down this relay's home
-    /// slots. The clock's anchoring or stop is recorded in the flight recording. Called from the
-    /// forward gate's fan-out choke point, once per turn that genuinely extends the prefix.
-    #[must_use]
-    pub fn note_forward_advance(
-        &self,
-        key: &SessionKey,
-        slot: SlotId,
-        forwarded: u64,
-    ) -> Option<ClockUpdate> {
-        let now = Instant::now();
-        let (update, events) = {
-            let mut makers = self.lock();
-            let maker = makers.get_mut(key)?;
-            maker.note_forward_advance(slot, now);
-            let mark = maker.clock_mark();
-            let update = maker.note_forwarded_turns(slot, forwarded, now)?;
-            (update, maker.clock_events(mark, false))
-        };
-        self.record_clock_events(key, events);
-        Some(update)
-    }
-
     /// Every session whose decision-maker names a slot that has gone silent,
     /// marking nothing.
     ///

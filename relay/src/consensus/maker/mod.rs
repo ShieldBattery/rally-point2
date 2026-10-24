@@ -381,6 +381,10 @@ pub struct DecisionMaker {
     /// [`SessionClock`]). The authority anchors and stops it; every relay merges
     /// the other relays' copies into its own.
     pub(in crate::consensus) clock: SessionClock,
+    /// Clock-only suffix tracking on a relay created by a resumed descriptor. It never
+    /// certifies complete forwarding history for delivery, silence, or state hashes.
+    pub(in crate::consensus) clock_progress: Option<ClockProgress>,
+    pub(in crate::consensus) clock_confirmed: u64,
     /// How late this relay's home slots' turns have been arriving against
     /// [`clock`](Self::clock), and the reports made from it.
     pub(in crate::consensus) lead: LeadTracker,
@@ -563,6 +567,8 @@ impl DecisionMaker {
             finalized_drops_enabled: false,
             rollback_enabled: false,
             clock: SessionClock::default(),
+            clock_progress: None,
+            clock_confirmed: 0,
             lead: LeadTracker::default(),
             clock_stop_events: 0,
             started_session_as_authority: false,

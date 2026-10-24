@@ -231,6 +231,7 @@ pub mod phase;
 mod buffer_law_sim;
 
 mod clock;
+mod clock_progress;
 mod evidence_outbox;
 mod law;
 mod lead;
@@ -273,6 +274,7 @@ use crate::observability::events::{
 // through these globs: each file's own `use super::*` picks them up, so an item
 // keeps resolving by its bare name wherever it was written.
 use clock::*;
+use clock_progress::ClockProgress;
 use law::*;
 use lead::*;
 pub(crate) use registry::PeriodicEvidencePair;
