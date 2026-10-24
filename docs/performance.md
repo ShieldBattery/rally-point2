@@ -63,6 +63,21 @@ and background-load conditions for both sides. Treat changes whose confidence
 intervals overlap as inconclusive and repeat them before keeping extra
 complexity.
 
+On a hybrid CPU (performance + efficiency cores), the OS can move the
+single-threaded benchmark between core types mid-run; on an i7-14700KF that
+alone swung individual cases by ±50–100% between two runs of identical
+binaries. Pin both sides to one performance core. Child processes inherit
+affinity, so pin the shell before running `cargo bench`:
+
+```sh
+taskset -c 4 cargo bench ...                                    # Linux
+(Get-Process -Id $PID).ProcessorAffinity = 0x10; cargo bench ...  # PowerShell, logical CPU 4
+```
+
+Even pinned, rerunning the unchanged baseline on that machine drifted ~5%
+geomean and up to ~15% on individual allocation-heavy cases, so run the
+baseline twice and treat that spread as the noise floor.
+
 The current cases cover:
 
 - redundancy packing when the unacked window fits and when the datagram budget

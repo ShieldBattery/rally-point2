@@ -268,3 +268,8 @@ debug = 1
 # Release builds can afford slower compilation in exchange for giving LLVM the
 # whole crate at once, improving its opportunities to optimize and deduplicate.
 codegen-units = 1
+# Cross-crate LTO (thin and fat) was measured on the relay in 2026-10 and left
+# off: hot-path microbenchmarks moved within noise, end-to-end relay CPU per
+# delivered turn did not improve (~40% of it is kernel time in the UDP path,
+# which LTO cannot touch), and builds took ~4x longer — worse still for the
+# coordinator's AWS SDK dependency. Re-measure before turning it on.
