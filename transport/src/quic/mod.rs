@@ -121,7 +121,7 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5
 /// decided within ~10s), while staying clear of brief silences (keepalive fires
 /// at 5s, so a live connection never approaches this timeout).
 ///
-/// Applied to every dial side ([`keepalive_transport_config`]): the mesh edge and
+/// Applied to every dial side (`keepalive_transport_config`): the mesh edge and
 /// the client edge, and one side's keepalive keeps both ends alive (its PINGs
 /// elicit ACKs, resetting both idle timers). QUIC negotiates the idle timeout as
 /// the minimum of both endpoints' advertised values, and a dialer that advertises

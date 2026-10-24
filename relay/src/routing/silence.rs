@@ -88,7 +88,7 @@ impl SilenceLinks for Sessions {
 /// same way, but it is not evicted: its client's simulation is fine, and if
 /// its path comes back while the survivors still hold its drop, its re-dial
 /// can resume the game. The transport's idle timeout closes such a link as an
-/// ordinary disconnect, and the watch only waits for that (see [`SilenceWatch`]).
+/// ordinary disconnect, and the watch only waits for that (see `SilenceWatch`).
 ///
 /// A verdict needs complete knowledge of the session, so most ticks produce
 /// none — see `DecisionMakers::silent_slots` for everything that blocks one.
