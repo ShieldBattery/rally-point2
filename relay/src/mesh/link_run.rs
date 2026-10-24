@@ -320,6 +320,7 @@ pub async fn run_mesh_link(
         peer_presence_seen,
         ack_cursors_sent,
         joined,
+        replays: super::link_replay::ReplayQueue::default(),
         idle_since,
         maintenance,
         mesh_rtt,
@@ -360,6 +361,10 @@ pub async fn run_mesh_link(
         {
             break exit;
         }
+        if let ControlFlow::Break(exit) = driver.dispatch_replays().await {
+            break exit;
+        }
+        let replay_ready = driver.replay_ready();
         // The idle-teardown deadline. Only armed once the link has served at
         // least one session and is now empty (`idle_since` is Some); otherwise
         // the fallback (a day out) keeps the branch dormant. Cancel-safe like
@@ -408,7 +413,7 @@ pub async fn run_mesh_link(
             // datagram path could not carry. The reader task assembled the
             // complete frame off a cancel-safe path; `recv` is cancel-safe.
             received = peer_control_rx.recv() => {
-                if let ControlFlow::Break(exit) = driver.handle_peer_control(received).await {
+                if let ControlFlow::Break(exit) = driver.handle_peer_control(received) {
                     break exit;
                 }
             }
@@ -452,6 +457,10 @@ pub async fn run_mesh_link(
                     break exit;
                 }
             }
+            // Recovery must revisit the normal I/O loop between bounded batches.
+            // If every replay is window-blocked, wait for real I/O or maintenance
+            // instead of waking ourselves until an acknowledgement arrives.
+            _ = tokio::task::yield_now(), if replay_ready => {}
         }
     };
 

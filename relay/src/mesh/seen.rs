@@ -395,16 +395,9 @@ pub fn slot_receipts(registries: &SeenRegistries, key: &SessionKey, slot: SlotId
     }
 }
 
-/// Whether `key` has ANY forward-gate history at all — an entry in the same
-/// registry [`resume_cursor_snapshot`] reads, regardless of whether any slot
-/// in it has formed a contiguous prefix yet. This is the `resuming` a
-/// resume-cursor ask carries: `true` means "I have genuinely exchanged mesh
-/// traffic for this session before" (even if every slot in the accompanying
-/// snapshot is gapped or absent), which is what licenses a resume reply to
-/// treat an absent slot as "everything from the start" rather than "nothing
-/// asked for" — see the wire frame's own doc. `false` — no entry at all — is
-/// indistinguishable from a first Join, so the conservative first-join
-/// reading (nothing) is exactly what a session with no history should get.
+/// Whether `key` has any forward-gate history, even if every slot is gapped.
+/// Mesh recovery also considers the coordinator's resumed assignment: a fresh
+/// replacement can owe its clients history before this registry has any entry.
 pub fn has_resumable_state(registries: &SeenRegistries, key: &SessionKey) -> bool {
     registries.lock().contains_key(key)
 }

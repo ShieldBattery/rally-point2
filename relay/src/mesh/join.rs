@@ -146,6 +146,17 @@ pub(super) fn reconcile_session_clock_on_join(
     }
 }
 
+/// A replacement assigned an already-running session needs history even before
+/// its first local turn creates a forward-gate entry. Ordinary first joins have
+/// neither resumed assignment nor forwarding history, and ask for no old turns.
+pub(super) fn needs_resume_replay(
+    seen: &SeenRegistries,
+    makers: &crate::consensus::DecisionMakers,
+    key: &SessionKey,
+) -> bool {
+    makers.is_resumed(key) || has_resumable_state(seen, key)
+}
+
 /// Sends this relay's resume cursors for `key` down a freshly registered
 /// link's control channel — the mesh counterpart of
 /// [`reconcile_leaves_on_join`], closing the gap a redialed link's fresh
@@ -153,26 +164,17 @@ pub(super) fn reconcile_session_clock_on_join(
 /// the old link died are gone from that link's own state, but this session's
 /// forward-gate cursors survive it (see [`resume_cursor_snapshot`]), so the
 /// fresh link can still ask for exactly what's missing. Every Join sends one,
-/// and a Join that resumed existing history sends another on the peer's first
-/// presence report: a peer that had not joined the session yet drops the
-/// first ask unanswered.
-///
-/// The frame's `resuming` flag ([`has_resumable_state`]) is what keeps a
-/// first join and a real mid-game recovery from being confused with each
-/// other even though both can produce the exact same (empty) cursor list: a
-/// first join has no forward-gate entry at all, so `resuming` is `false` and
-/// the empty cursors ask for nothing; a session recovering from a death whose
-/// every slot happens to be gapped or never-seen also has an empty cursor
-/// list, but its forward-gate entry exists (`resuming` true), so the SAME
-/// empty list instead asks the peer to replay every slot it can, from the
-/// start.
+/// and a Join that resumes history or an assigned running session sends another
+/// on the peer's first presence report: a peer that had not joined the session
+/// yet drops the first ask unanswered.
 pub(super) fn reconcile_resume_cursors_on_join(
     seen: &SeenRegistries,
+    makers: &crate::consensus::DecisionMakers,
     control_tx: &MeshControlTx,
     key: &SessionKey,
 ) {
     let cursors = resume_cursor_snapshot(seen, key);
-    let resuming = has_resumable_state(seen, key);
+    let resuming = needs_resume_replay(seen, makers, key);
     let _ = control_tx.send(resume_cursors_frame(key.session, cursors, resuming));
 }
 

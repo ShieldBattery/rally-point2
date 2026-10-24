@@ -41,6 +41,7 @@ mod frames;
 mod join;
 mod link_arms;
 mod link_commands;
+mod link_replay;
 mod link_run;
 mod links;
 mod seen;

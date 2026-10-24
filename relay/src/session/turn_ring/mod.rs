@@ -126,7 +126,7 @@ const TURN_RING_MIN_BYTES: usize = 1024 * 1024;
 
 /// The byte ceiling for a session of `slots` slots — [`TURN_RING_FULL_BYTES`]
 /// scaled linearly by the slot count, floored at [`TURN_RING_MIN_BYTES`].
-const fn max_bytes(slots: usize) -> usize {
+pub(crate) const fn max_bytes(slots: usize) -> usize {
     let scaled = TURN_RING_FULL_BYTES * effective_slots(slots) / MAX_GAME_SLOTS;
     if scaled < TURN_RING_MIN_BYTES {
         TURN_RING_MIN_BYTES
@@ -328,16 +328,12 @@ impl TurnRing {
     /// mesh. That is what keeps a resume reply from becoming an echo: a mesh
     /// peer's cursors are answered only with what genuinely originated here.
     ///
-    /// `resuming` decides what a slot absent from `cursors` means. An asker with
-    /// genuine prior history for the session (`resuming` true) needs an absent
-    /// slot answered from the very start — its own dedup absorbs whatever sparse
-    /// overlap it already has — exactly as [`replay`](Self::replay) answers one.
-    /// An asker with no history at all (`resuming` false: a relay holding no
-    /// forward-gate entry for the session, so it has never delivered one of its
-    /// turns and cannot have missed any) gets nothing for an absent slot, and
-    /// answering it would push the whole ring across the mesh on every first
-    /// Join. A client asker has no such distinction to make: it always has a
-    /// slot in the session it is dialing for.
+    /// `resuming` decides what a slot absent from `cursors` means. A recovering
+    /// mesh link or a relay assigned an already-running session needs every
+    /// retained local-origin turn for that slot; the asker's dedup absorbs
+    /// overlap. An ordinary first Join asks for no old turns. The resumed
+    /// assignment matters even before the replacement's forward gate has history:
+    /// its client can already be waiting for turns held only by a surviving peer.
     pub fn replay_local(
         &self,
         key: &SessionKey,

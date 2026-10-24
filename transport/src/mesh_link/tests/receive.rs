@@ -311,3 +311,50 @@ async fn deliver_external_folds_a_stream_delivered_seq_into_the_session_dedup() 
         other => panic!("expected UnknownSession, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn advancing_live_turns_leave_the_replayed_tail_deliverable() {
+    let (sender, mut receiver, _client_ep, _server_ep) = connected_mesh_links().await;
+    let session = SessionId(1);
+    receiver.open_session(session);
+
+    // Separate packets exercise a newest replay, a live turn, then older recovery
+    // data. In-packet sorting must not be what keeps the recovery data deliverable.
+    for (packet_seq, (seqs, expected)) in [
+        (vec![9_999], vec![9_999]),
+        (vec![10_000], vec![10_000]),
+        (vec![9_997, 9_998], vec![9_997, 9_998]),
+        (vec![9_997, 9_998, 9_999, 10_000], vec![]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let packet = MeshPacket {
+            session: session.0,
+            packet: Some(Packet {
+                seq: packet_seq as u32,
+                ack: None,
+                ack_bits: 0,
+                payloads: seqs.into_iter().map(|seq| turn(0, seq, 0)).collect(),
+                turns_complete: None,
+            }),
+            conditions: None,
+            tenant: None,
+        };
+        sender
+            .connection()
+            .send_datagram(packet.encode_to_vec().into())
+            .unwrap();
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(
+            received
+                .delivery
+                .fresh
+                .iter()
+                .map(|payload| payload.seq)
+                .collect::<Vec<_>>(),
+            expected,
+        );
+    }
+    assert_eq!(receiver.delivered_through(session, SlotId(0)), Some(5_904));
+}

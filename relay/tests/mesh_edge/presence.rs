@@ -256,6 +256,8 @@ async fn first_peer_presence_repeats_a_resuming_joins_resume_ask() -> Result<(),
     let sessions: Sessions = Arc::default();
     let mesh_state = mesh::MeshState::default();
     let seen = mesh_state.seen.clone();
+    let descriptor_control =
+        mesh::control::MeshControl::new(RelayId(8), &mesh_state, Arc::clone(&sessions));
     // History from before the link died: slot 1's seq 0 already reached this
     // relay's locals, so a Join of `resumed` asks for slot 1 from seq 1.
     mesh::mark_seen(&seen, &resumed, SlotId(1), 0);
@@ -343,6 +345,39 @@ async fn first_peer_presence_repeats_a_resuming_joins_resume_ask() -> Result<(),
         session, barrier.session.0,
         "the resume ask is repeated once, not on every presence report",
     );
+
+    // Descriptor recovery must not depend on the replacement having forwarded
+    // any turns. Exercise both installation before Join and an upgrade while
+    // the peer has not yet announced its own Join.
+    for (id, descriptor_before_join) in [(53, true), (54, false)] {
+        let replacement = key(id);
+        let mut assigned = descriptor(TENANT, replacement.session);
+        assigned.resumed = descriptor_before_join;
+        descriptor_control.apply_descriptor(&assigned);
+        commands_tx.send(mesh::MeshCommand::Join(replacement.clone()))?;
+        let (session, ask) = next_resume_ask(&mut outbound_control).await;
+        assert_eq!(session, id);
+        assert_eq!(ask.resuming, descriptor_before_join);
+        assert!(ask.cursors.is_empty());
+        assert!(!mesh::has_resumable_state(&seen, &replacement));
+        if !descriptor_before_join {
+            assigned.resumed = true;
+            descriptor_control.apply_descriptor(&assigned);
+        }
+        peer_presence_tx
+            .send(MeshPresence {
+                session: replacement.session,
+                live_players: 1,
+            })
+            .await?;
+        let (session, ask) = next_resume_ask(&mut outbound_control).await;
+        assert_eq!(session, id);
+        assert!(
+            ask.resuming,
+            "a replacement retries history after the peer joins"
+        );
+        assert!(ask.cursors.is_empty());
+    }
 
     drop(commands_tx);
     assert_eq!(

@@ -26,8 +26,8 @@ impl DecisionMaker {
     }
 
     /// The seq-aware sibling of [`observe_frame`](Self::observe_frame): records the
-    /// same monotone per-slot frame **and** appends `(seq, frame)` to the slot's
-    /// bounded `frame_history`, so a leave decided
+    /// same monotone per-slot frame **and** retains `(seq, frame)` in the slot's
+    /// sequence-ordered, bounded `frame_history`, so a leave decided
     /// later can clamp its apply frame to a survivor-reachable ceiling (see
     /// `reachable_frame`). **Every production
     /// frame-observation on the leave path must go through this**, not the
@@ -82,7 +82,20 @@ impl DecisionMaker {
         if state.frame.is_none_or(|current| frame > current) {
             state.frame = Some(frame);
         }
-        state.frame_history.push_back((seq, frame.0));
+        if state
+            .frame_history
+            .back()
+            .is_none_or(|(last, _)| seq > *last)
+        {
+            state.frame_history.push_back((seq, frame.0));
+        } else if let Err(index) = state
+            .frame_history
+            .binary_search_by_key(&seq, |(seq, _)| *seq)
+        {
+            // Replay and packet reordering must not displace newer observations
+            // or make the last history entry stop representing the frontier.
+            state.frame_history.insert(index, (seq, frame.0));
+        }
         while state.frame_history.len() > cap {
             state.frame_history.pop_front();
         }

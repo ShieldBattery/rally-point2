@@ -12,9 +12,12 @@
 mod common;
 mod helpers;
 
+mod ack_receipts;
 mod delivery;
 mod link_lifecycle;
 mod lobby;
 mod lobby_resend;
 mod presence;
+mod rehome;
+mod replay_fairness;
 mod sessions;

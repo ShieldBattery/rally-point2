@@ -327,6 +327,11 @@ const MAX_OVERSIZE_TURN_COMMANDS_LEN: usize = 8192;
 /// private, so the roster is built and read solely through this module.
 pub struct SlotEntry {
     forward: ForwardSink,
+    /// Per-origin next-needed cursors from this connection's handshake. Mesh recovery can
+    /// bring older turns to a replacement after the client has registered; skip those
+    /// already received by this destination before charging its bounded forward queue.
+    /// Fan-out excludes this slot as an origin, so its own-slot window anchor is never a floor.
+    peer_resume_cursors: HashMap<SlotId, u64>,
     /// Synced player-leaves to push down THIS client's reliable control stream.
     /// Fed by [`fan_out_leave`] when a *different* slot leaves; drained by this
     /// slot's link task, which writes each to its control stream. Separate from

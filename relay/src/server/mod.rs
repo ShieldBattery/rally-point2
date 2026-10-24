@@ -557,6 +557,7 @@ async fn serve_connection(
             authorized.slot,
             connection_epoch,
             Some(transport),
+            &resume_cursors,
         )
     });
     let Some(registered) = registered else {

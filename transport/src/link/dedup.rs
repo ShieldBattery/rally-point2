@@ -174,44 +174,23 @@ impl SlotDedup {
         }
     }
 
-    /// Collapses the delivered prefix forward until `seq` fits the receive
-    /// window, treating the gaps it advances over as delivered. Only ever
-    /// called from a forward-collapsing [`Dedup`] (see its `forward_collapse`
-    /// field for the trust argument), with `seq` already known to be at least
-    /// `window` past the current base.
+    /// Slides the delivered prefix just far enough for `seq` to fit, keeping
+    /// the full receive window below it open for delayed or replayed payloads.
+    /// Only a forward-collapsing [`Dedup`] calls this, with `seq` already at
+    /// least `window` past the current base, so the lower bound never rewinds.
     ///
-    /// Advances over the lowest out-of-order seqs first — each pop may absorb a
-    /// contiguous run above it — so the prefix lands on real delivery evidence
-    /// wherever any exists. When nothing out-of-order remains (a pristine slot
-    /// meeting a mid-stream session, or a prefix stalled behind a dead gap with
-    /// nothing above it), the prefix jumps so `seq` sits at the window's top
-    /// edge, keeping the full window *below* `seq` open: the sender's
-    /// still-unacked backlog rides behind its freshest seq, and landing the
-    /// base any higher would misread that backlog as already delivered and
-    /// silently drop it.
-    ///
-    /// The prefix only ever moves forward here: every `ahead` entry is strictly
-    /// below `seq` (each was accepted inside the then-current window, which sat
-    /// entirely below a seq now at least a full window past base), and the
-    /// empty-`ahead` jump target `seq - window` is at or above the base that
-    /// proved too far behind.
+    /// Received entries below that bound can be forgotten. Entries above it
+    /// remain sparse until their gaps fill: jumping to an arbitrary received
+    /// seq would discard still-needed backlog whenever live traffic advances
+    /// beyond a replay's first high seq. Absorbing a genuinely contiguous run
+    /// at the lower bound is safe because those payloads were all delivered.
     fn collapse_forward_until_fits(&mut self, seq: u64, window: u64) {
-        loop {
-            let base = self.delivered_through.map_or(0, |t| t + 1);
-            if seq - base < window {
-                return;
-            }
-            match self.ahead.pop_first() {
-                Some(lowest) => {
-                    self.delivered_through = Some(lowest);
-                    self.absorb_contiguous_run();
-                }
-                None => {
-                    self.delivered_through = Some(seq - window);
-                    return;
-                }
-            }
+        let through = seq - window;
+        self.delivered_through = Some(through);
+        while self.ahead.first().is_some_and(|seq| *seq <= through) {
+            self.ahead.pop_first();
         }
+        self.absorb_contiguous_run();
     }
 }
 

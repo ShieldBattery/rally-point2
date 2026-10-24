@@ -217,6 +217,11 @@ impl DecisionMaker {
         self.started
     }
 
+    /// Whether a coordinator descriptor assigned this relay an already-running session.
+    pub fn is_resumed(&self) -> bool {
+        self.resumed
+    }
+
     /// The slot count the session is currently shaped for, for sizing
     /// per-session state whose need scales with turn production (every live
     /// slot produces turns at the same nominal cadence — see the forwarded-turn

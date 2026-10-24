@@ -1319,29 +1319,18 @@ message MeshControlFrame {
     // An origin slot absent from `cursors` means one of two things, told
     // apart by `resuming`:
     //
-    // - `resuming` false: a session this relay has no forward-gate history
-    //   for at all (a first Join, or one that predates this link entirely) --
-    //   the absent slot asks for NO replay. A peer with nothing recorded yet
-    //   wants only new turns, not a backfill (a newly-added relay's own
-    //   clients get their backfill from their own client-side reconnect, not
-    //   from a mesh peer).
-    // - `resuming` true: this relay DOES have forward-gate history for the
-    //   session (evidence of prior mesh exchange), so an absent slot is not
-    //   "unknown" -- it is a slot this relay's own gap-tracking never formed a
-    //   contiguous prefix for (nothing arrived yet, or what did arrived with
-    //   a gap below it -- the exact shape a mesh-side death with no other
-    //   re-carrier leaves behind, unlike a client's own inbound gaps, which
-    //   its home relay's live link redundancy would otherwise catch). The
-    //   receiver replays that slot's turns from the very start; the asker's
-    //   own dedup absorbs any overlap with whatever sparse, out-of-order
-    //   turns it already has.
+    // - `resuming` false: an ordinary first Join with neither forward-gate
+    //   history nor a coordinator assignment to resume an already-running
+    //   session. An absent slot asks for no replay.
+    // - `resuming` true: the sender has forwarding history, or a resumed
+    //   assignment whose clients may need turns produced before this relay
+    //   joined. An absent slot asks for every retained local-origin turn;
+    //   the sender's dedup absorbs overlap. A fresh replacement must ask even
+    //   before its first client turn creates a forward-gate entry.
     //
-    // The one gap this does not close: a session with NO forward-gate history
-    // on EITHER side of a link death (nothing from any path ever reached this
-    // relay for it) still reads as a first join (`resuming` false) and asks
-    // for nothing, so turns produced and lost in that narrow pre-history
-    // window are not recovered. Bounded to session start and the
-    // abandoned/stall machinery's own timers, not indefinite.
+    // A resuming Join repeats its ask on the peer's first presence, because
+    // a peer that has not joined yet cannot answer. A resumed assignment
+    // learned between Join and that presence also triggers the repeat.
     MeshResumeCursors mesh_resume_cursors = 12;
 
     // The sending relay's per-slot delivered-through cursors for THIS mesh
@@ -1458,15 +1447,20 @@ message MeshResumeCursors {
   // The sender's per-origin-slot resume cursors, complete as of this frame.
   repeated MeshResumeCursor cursors = 1;
 
-  // Whether the sender has ANY forward-gate history for this session --
-  // whether its `cursors` above came from a session it has actually
-  // exchanged mesh traffic for, not a session it is joining fresh. Decides
-  // what an origin slot absent from `cursors` means: nothing (a fresh join)
-  // when false, everything-from-the-start (a real gap this relay's own
-  // gap-tracking never closed) when true. Defaults to `false` on the wire, so
-  // a peer that predates this field is read as never resuming -- the
-  // conservative, no-replay reading.
+  // Whether the sender is recovering forwarding history or has a coordinator
+  // assignment to resume an already-running session. An absent origin asks
+  // for every retained local-origin turn when true, and nothing when false.
+  // Defaults to false, so peers predating this field request no absent origins.
   bool resuming = 2;
+
+  // The sender accepts recent turns before older retained turns. Its receive
+  // window preserves the trailing RECEIVE_WINDOW sequences when live traffic
+  // advances the window during replay, so older turns within that range remain
+  // deliverable. Its consensus history also retains the latest sequences
+  // independently of arrival order. The responder may reverse a snapshot only
+  // when every origin's sequence span fits that window. Defaults to false for
+  // peers that require recording order; peers unaware of this field ignore it.
+  bool prefer_recent = 3;
 }
 
 // One origin slot's resume cursor within a `MeshResumeCursors` frame.

@@ -116,7 +116,11 @@ pub(crate) fn fan_out(sessions: &Sessions, key: &SessionKey, source: SlotId, pay
         match roster.get(key) {
             Some(slots) => slots
                 .iter()
-                .filter(|(slot, _)| **slot != source)
+                .filter(|(slot, entry)| {
+                    **slot != source
+                        && payload.seq
+                            >= entry.peer_resume_cursors.get(&source).copied().unwrap_or(0)
+                })
                 .map(|(slot, entry)| {
                     (
                         *slot,

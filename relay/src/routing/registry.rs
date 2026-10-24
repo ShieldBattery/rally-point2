@@ -64,18 +64,21 @@ pub fn register(
     slot: SlotId,
     connection_epoch: u64,
 ) -> Option<(SlotRegistration, SlotInbox)> {
-    register_with_transport(sessions, key, slot, connection_epoch, None)
+    register_with_transport(sessions, key, slot, connection_epoch, None, &HashMap::new())
 }
 
 /// [`register`], recording the dialing connection's weak handle on the seat so
 /// the silence watch can read whether that link still carries packets (see
-/// [`link_receipts`]).
+/// [`link_receipts`]). Peer resume cursors install with the seat so mesh recovery
+/// cannot queue already-delivered history between registration and link activation. Fan-out
+/// excludes the registering slot as an origin, so its own-slot window anchor is never consulted.
 pub fn register_with_transport(
     sessions: &Sessions,
     key: &SessionKey,
     slot: SlotId,
     connection_epoch: u64,
     transport: Option<WeakConnectionHandle>,
+    resume_cursors: &HashMap<SlotId, u64>,
 ) -> Option<(SlotRegistration, SlotInbox)> {
     let (tx, rx) = mpsc::channel(FORWARD_CAPACITY);
     // The forward queue's aggregate resident bytes, shared between the fan-out
@@ -117,6 +120,7 @@ pub fn register_with_transport(
         slots.insert(
             slot,
             SlotEntry {
+                peer_resume_cursors: resume_cursors.clone(),
                 forward: ForwardSink {
                     tx,
                     resident_bytes: Arc::clone(&forward_resident),

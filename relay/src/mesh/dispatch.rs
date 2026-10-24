@@ -571,9 +571,8 @@ fn dispatch_mesh_control_frame(
             }
         }
         Some(mesh_control_frame::Kind::MeshResumeCursors(_)) => {
-            // Handled before this dispatch runs, by `resume_replay_for_frame` +
-            // `send_resume_replay` in the driver's own select branch — the reply
-            // must go out over this driver's own link, not through anything this
+            // Queued before this dispatch runs by the driver's resume handler. The
+            // reply must go out over this driver's own link, not through anything this
             // function has access to. Nothing left to update here: unlike every
             // other kind, a resume ask carries no session state to fold, only a
             // reply to send.

@@ -26,8 +26,8 @@ pub(in crate::consensus) struct SlotState {
     /// turns carry no frame). The session's consensus coordinate is the
     /// *minimum* across slots, so one slot's inflated claim can't poison it.
     pub(in crate::consensus) frame: Option<GameFrameCount>,
-    /// A bounded, recent history of `(seq, game_frame_count)` for this slot's
-    /// framed turns — the turn's transport seq paired with the frame it stamped.
+    /// A bounded history of the highest-seq `(seq, game_frame_count)` pairs for
+    /// this slot's framed turns, ordered by seq regardless of arrival order.
     /// Used to prove which frames a *survivor* has executed when a leave is
     /// decided: a turn stamped at seq `s` is provably executed once the session
     /// advanced `buffer_max` turns past `s`, so the leave's apply frame can be

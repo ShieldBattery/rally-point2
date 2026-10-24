@@ -14,17 +14,17 @@ use crate::routing;
 use super::conditions::snapshot_conditions;
 use super::forward::send_turn_over_link;
 use super::join::{
-    local_presence, presence_statement, presence_updates, push_presence_updates,
-    reconcile_leaves_on_join, reconcile_lobby_on_join, reconcile_local_slots_on_join,
-    reconcile_resume_cursors_on_join, reconcile_session_clock_on_join,
-    reconcile_started_slots_on_join,
+    local_presence, needs_resume_replay, presence_statement, presence_updates,
+    push_presence_updates, reconcile_leaves_on_join, reconcile_lobby_on_join,
+    reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
+    reconcile_session_clock_on_join, reconcile_started_slots_on_join,
 };
 use super::link_arms::LinkDriver;
 use super::link_run::{MeshCommand, defer_flush_after_send};
 use super::links::{
     JoinedSession, LeaseAwait, MESH_STREAM_WRITE_TIMEOUT, MeshLinkExit, await_while_current,
 };
-use super::seen::{has_resumable_state, resume_cursor_snapshot};
+use super::seen::resume_cursor_snapshot;
 use super::{mesh_session_key, register_mesh_link};
 
 impl LinkDriver {
@@ -131,6 +131,7 @@ impl LinkDriver {
         let Self {
             link,
             joined,
+            replays,
             lease,
             presence_tx,
             presence_sent,
@@ -225,14 +226,20 @@ impl LinkDriver {
                     // counterpart of the leave re-sync just above. The peer
                     // may not have joined yet, so a resuming Join asks again
                     // on the peer's first presence.
-                    let resumed = has_resumable_state(seen_registries, &key);
-                    reconcile_resume_cursors_on_join(seen_registries, control_forward_tx, &key);
+                    let resumed = needs_resume_replay(seen_registries, decision_makers, &key);
+                    reconcile_resume_cursors_on_join(
+                        seen_registries,
+                        decision_makers,
+                        control_forward_tx,
+                        &key,
+                    );
                     let joined_at = tokio::time::Instant::now();
                     joined.insert(
                         session_id,
                         JoinedSession {
                             key,
                             flush_deadline: joined_at + routing::FLUSH_INTERVAL,
+                            acks_owed: false,
                             resumed,
                             _registration: registration,
                         },
@@ -294,6 +301,7 @@ impl LinkDriver {
                         // Dropping the removed `JoinedSession` deregisters this
                         // session's mesh forward channel (its RAII guard).
                         joined.remove(&session_id);
+                        replays.remove(&key);
                         link.close_session(mesh_session_key(&key));
                         presence_sent.remove(&session_id);
                         peer_presence_seen.remove(&session_id);

@@ -382,7 +382,7 @@ replacement.
 
 **The clients are the turn log.** Each client already holds every turn it sent (it generated them) and every
 turn it received (it executed them), so a replacement relay never needs a persisted log — it asks the
-returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
+returning clients to replay. Recovery combines that client replay with surviving relays' retained history:
 
 - **Resume cursors** (the same infrastructure a same-relay reconnect uses): on re-dial the client presents,
   per peer slot, the seq it next needs, and the relay replays from its turn ring at or past it. A peer the
@@ -439,6 +439,37 @@ returning clients to replay. Two mechanisms cover the two gaps a re-home leaves:
   stream and kept staged until its send succeeds, so a mid-drain stream failure retries it on the next
   session rather than losing it. An undecided drop-hold at relay death is deliberately lost — survivors
   re-wait the fresh 30s floor on the new relay.
+
+**Destination resume cursors are queue floors.** Each returning client's peer cursors are installed
+with its routing entry. Forwarded turns below a destination's next-needed cursor are already
+received there, so recovery skips them before charging that destination's bounded queue.
+
+**A fresh replacement also recovers survivor turns across the mesh.** The replacement's Join asks
+surviving peers for their retained local-origin turns whenever the coordinator assigned a resumed
+session, even with no forwarding history of its own. Otherwise a survivor that stalled during the
+outage has no new turns to carry the missing tail to the replacement. The first peer presence
+repeats the ask because a peer may have discarded it before joining. An ordinary fresh session
+still asks for no history; a resumed assignment learned before that presence enables the retry.
+
+A resume request can opt into newest-first recovery. The receiver advertises this only when
+its mesh receive window preserves delayed turns behind advancing live traffic and its frame
+history retains the highest sequences independently of arrival order. Missing opt-in keeps
+oldest-first delivery, so mixed relay versions remain compatible. The sender also keeps
+oldest-first delivery if any slot's retained sequence range spans a whole receive window:
+the ring's session-wide capacity does not guarantee a small range for each individual slot.
+For ordinary lockstep histories, newest-first delivers the missing tail before draining the
+older retained turns that returning clients already hold.
+
+Mesh recovery runs in bounded batches between the link's receive and control events, with
+round-robin service across recovering sessions. A per-session in-flight watermark pauses replay
+while awaiting receipts, leaving live turns on their immediate path. This prevents a retained
+history burst from growing the redundancy-selection window or occupying the shared pair loop
+until the entire replay finishes. Repeated requests coalesce while a replay is pending; the
+pending work is bounded by the full turn-ring count and byte budgets and removed on session
+Leave. A replay that makes no progress for the stream-write timeout resets the link. Receiving
+payload-bearing packets schedules a packet ACK even when the receiver has no outgoing turns
+and no contiguous receive prefix; duplicate payloads also need receipts. ACK-only packets do
+not schedule another ACK, so one-way recovery works without an acknowledgement loop.
 
 **Lobby commands across any reconnect are re-sent and deduped by origin seq.** A lobby command rides the
 control stream, and a control-stream write carries no acknowledgment: one written onto a connection whose

@@ -245,15 +245,21 @@ fn reconcile_resume_cursors_on_join_sends_an_empty_frame_for_a_first_join() {
     // marks as "replay nothing", never as "replay from the very start".
     let seen = new_seen_registries();
     let key = control_key();
+    let makers = crate::consensus::new_decision_makers();
+    test_maker(&makers, &key, crate::consensus::Authority::SelfRelay);
+    makers.mark_started(&key);
+    // Starting locally is not a resumed assignment; only the latter requires
+    // history even when this relay has no prior forwarding record.
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
-    reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
+    reconcile_resume_cursors_on_join(&seen, &makers, &control_tx, &key);
 
     let frame = control_rx.try_recv().expect("a frame was sent");
     assert_eq!(frame.session, key.session.0);
     match frame.kind {
         Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) => {
             assert!(resume.cursors.is_empty());
+            assert!(resume.prefer_recent);
             assert!(!resume.resuming, "no forward-gate history to resume from");
         }
         other => panic!("expected MeshResumeCursors, got {other:?}"),
@@ -268,7 +274,12 @@ fn reconcile_resume_cursors_on_join_sends_the_current_snapshot() {
     mark_seen(&seen, &key, SlotId(0), 1);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
+    reconcile_resume_cursors_on_join(
+        &seen,
+        &crate::consensus::new_decision_makers(),
+        &control_tx,
+        &key,
+    );
 
     let frame = control_rx.try_recv().expect("a frame was sent");
     match frame.kind {
@@ -296,7 +307,12 @@ fn a_wholly_gapped_session_still_sends_an_empty_but_resuming_frame() {
     mark_seen(&seen, &key, SlotId(0), 5); // arrived, but gapped below 5
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
+    reconcile_resume_cursors_on_join(
+        &seen,
+        &crate::consensus::new_decision_makers(),
+        &control_tx,
+        &key,
+    );
 
     let frame = control_rx.try_recv().expect("a frame was sent");
     match frame.kind {
@@ -358,6 +374,7 @@ fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
         JoinedSession {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
+            acks_owed: false,
             resumed: false,
             _registration: register_mesh_link(
                 &mesh.links,
@@ -381,13 +398,15 @@ fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
                 // `resuming` only changes the answer for a slot the
                 // cursors omit, and every recorded slot here is listed.
                 resuming: false,
+                prefer_recent: false,
             },
         )),
     };
 
-    let (got_key, payloads) =
+    let (got_key, payloads, prefer_recent) =
         resume_replay_for_frame(&frame, &joined, &mesh).expect("something to replay");
     assert_eq!(got_key, key);
+    assert!(!prefer_recent);
     assert_eq!(
         payloads.iter().map(|p| p.seq).collect::<Vec<_>>(),
         vec![0, 2],
@@ -430,6 +449,7 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
         JoinedSession {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
+            acks_owed: false,
             resumed: false,
             _registration: register_mesh_link(
                 &mesh.links,
@@ -454,6 +474,7 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
             rally_point_proto::messages::MeshResumeCursors {
                 cursors: vec![],
                 resuming: false,
+                prefer_recent: false,
             },
         )),
     };
@@ -468,11 +489,13 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
             rally_point_proto::messages::MeshResumeCursors {
                 cursors: vec![],
                 resuming: true,
+                prefer_recent: true,
             },
         )),
     };
-    let (_, payloads) = resume_replay_for_frame(&resuming_ask, &joined, &mesh)
+    let (_, payloads, prefer_recent) = resume_replay_for_frame(&resuming_ask, &joined, &mesh)
         .expect("a resuming ask replays the unlisted slot from the start");
+    assert!(prefer_recent);
     assert_eq!(
         payloads.iter().map(|p| p.seq).collect::<Vec<_>>(),
         vec![0, 1],
@@ -491,6 +514,7 @@ fn resume_replay_is_none_for_an_unjoined_session_or_an_empty_result() {
             rally_point_proto::messages::MeshResumeCursors {
                 cursors: vec![],
                 resuming: false,
+                prefer_recent: false,
             },
         )),
     };

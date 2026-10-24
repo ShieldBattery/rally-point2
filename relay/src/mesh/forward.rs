@@ -10,7 +10,6 @@ use rally_point_proto::messages::{LinkConditions, MeshControlFrame, Payload, mes
 use crate::key::SessionKey;
 use crate::routing;
 
-use super::conditions::{ConditionsRegistry, snapshot_conditions};
 use super::links::{JoinedSession, MESH_STREAM_WRITE_TIMEOUT};
 use super::seen::{Seen, mark_seen};
 use super::{MeshState, fan_out_to_mesh, mesh_session_key};
@@ -336,7 +335,8 @@ fn for_clients(payload: &Payload) -> Payload {
 
 /// Whether `frame` is a resume-cursor ask, and if so, the local-origin turns
 /// this relay's own client edge produced that the peer's cursors say it's
-/// still missing, paired with the session they belong to. `None` for any
+/// still missing, their session, and whether the peer accepts recent-first
+/// recovery. `None` for any
 /// other frame kind, a session this link hasn't joined, or a resume ask this
 /// relay has nothing to answer (an empty replay list — the ordinary case for
 /// a session with no locally-homed slots). The frame's own `resuming` flag
@@ -347,14 +347,14 @@ fn for_clients(payload: &Payload) -> Payload {
 /// Reads straight from the turn ring rather than mutating any session state,
 /// so — unlike [`dispatch_mesh_control`] — this never needs to run inside
 /// that function; [`run_mesh_link`]'s own select branch calls it separately,
-/// before the dispatch, because the reply it computes has to go out over
-/// *this* link directly (see [`send_resume_replay`]), which `dispatch_mesh_control`
-/// has no way to do.
+/// before the dispatch, because its reply is queued on this driver's own link.
+/// Recovery batches return to the I/O loop so other sessions and acknowledgements
+/// continue making progress while the snapshot drains.
 pub(super) fn resume_replay_for_frame(
     frame: &MeshControlFrame,
     joined: &HashMap<SessionId, JoinedSession>,
     mesh: &MeshState,
-) -> Option<(SessionKey, Vec<Payload>)> {
+) -> Option<(SessionKey, Vec<Payload>, bool)> {
     let Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) = &frame.kind else {
         return None;
     };
@@ -372,7 +372,7 @@ pub(super) fn resume_replay_for_frame(
         .session
         .turn_ring
         .replay_local(&key, &cursors, resume.resuming);
-    (!payloads.is_empty()).then_some((key, payloads))
+    (!payloads.is_empty()).then_some((key, payloads, resume.prefer_recent))
 }
 
 /// Sends one turn over `link`'s datagram path for `key`'s session, diverting
@@ -472,39 +472,4 @@ pub(super) async fn send_turn_over_link(
             None
         }
     }
-}
-
-/// Sends every payload in `payloads` over `link`'s datagram path for `key`, in
-/// order, stopping at the first link-fatal failure — the resume-reply analog
-/// of the live forward branch's own per-turn send, going straight out this
-/// link rather than through the shared, `try_send`-based forward queue: a
-/// large replay pumped through that bounded queue could itself fill it and
-/// trip the very full-queue reset this exists to recover from. Samples the
-/// outgoing conditions sidecar once for the whole batch — a backlog
-/// catch-up burst does not need per-turn-fresh telemetry — rather than
-/// resampling for each payload. Returns `Some(carried_redundancy)` when every
-/// payload sent (or was diverted), where the bit is true if any send in the
-/// replay re-carried an unacked turn; `None` means a link-fatal error.
-pub(super) async fn send_resume_replay(
-    link: &mut rally_point_transport::MeshLink,
-    control_send: &mut rally_point_transport::noq::SendStream,
-    conditions: &ConditionsRegistry,
-    key: &SessionKey,
-    payloads: Vec<Payload>,
-) -> Option<bool> {
-    let outgoing = snapshot_conditions(conditions, key);
-    let mut carried_redundancy = false;
-    for payload in payloads {
-        let sent_redundancy = send_turn_over_link(
-            link,
-            control_send,
-            key,
-            payload,
-            outgoing.clone(),
-            "resume replay",
-        )
-        .await?;
-        carried_redundancy |= sent_redundancy;
-    }
-    Some(carried_redundancy)
 }

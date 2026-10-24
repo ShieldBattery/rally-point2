@@ -113,16 +113,10 @@ fn anchored_window_accepts_a_resumed_high_seq_stream() {
     assert_eq!(dedup.accept(SlotId(1), 25), Delivery::New);
 }
 
-/// A forward-collapsing dedup admits a seq beyond the window by walking
-/// the prefix forward instead of rejecting: first over any out-of-order
-/// delivery evidence it holds (each pop absorbing the contiguous run above
-/// it), then — with nothing outstanding — by jumping so the far seq sits
-/// at the window's top edge, keeping the full window below it open for the
-/// sender's in-flight backlog. Seqs inside a swallowed gap thereafter read
-/// as duplicates, never fresh: the safe failure direction, exactly as the
-/// session-level forward gate argues for its own cap collapse.
+/// A forward-collapsing dedup admits a far seq while preserving a full receive
+/// window below it. Only gaps outside that window are considered delivered.
 #[test]
-fn forward_collapse_admits_a_far_seq_by_walking_the_prefix_forward() {
+fn forward_collapse_admits_a_far_seq_by_sliding_the_lower_bound() {
     let mut dedup = Dedup {
         slots: HashMap::new(),
         retired_through: HashMap::new(),
@@ -134,9 +128,8 @@ fn forward_collapse_admits_a_far_seq_by_walking_the_prefix_forward() {
     assert_eq!(dedup.accept(SlotId(0), 3), Delivery::New); // gap at 1, 2
     assert_eq!(dedup.accept(SlotId(0), 4), Delivery::New);
 
-    // Far past the window (20 - 1 >= 8): strict mode would reject; the
-    // collapse pops the out-of-order run (3, 4), finds the base still too
-    // far behind, and jumps so 20 sits at the window's top edge (base 13).
+    // Far past the window (20 - 1 >= 8): strict mode would reject. Sliding
+    // to base 13 discards received 3 and 4 below it and keeps 20 at the top.
     assert_eq!(dedup.accept(SlotId(0), 20), Delivery::New);
     assert_eq!(
         dedup.delivered_through(SlotId(0)),
@@ -167,4 +160,39 @@ fn anchor_is_a_no_op_on_zero_or_an_already_active_slot() {
     dedup.anchor(SlotId(0), 100);
     assert_eq!(dedup.accept(SlotId(0), 2), Delivery::New);
     assert_eq!(dedup.delivered_through(SlotId(0)), Some(2));
+}
+
+#[test]
+fn forward_collapse_keeps_the_backlog_when_live_turns_advance() {
+    let slot = SlotId(0);
+    let mut dedup = Dedup::with_forward_collapse();
+    assert_eq!(dedup.accept(slot, 9_999), Delivery::New);
+    assert_eq!(dedup.accept(slot, 10_000), Delivery::New);
+    assert_eq!(dedup.delivered_through(slot), Some(10_000 - RECEIVE_WINDOW));
+
+    for seq in [9_997, 9_998, 10_000 - RECEIVE_WINDOW + 1] {
+        assert_eq!(dedup.accept(slot, seq), Delivery::New);
+        assert_eq!(dedup.accept(slot, seq), Delivery::Duplicate);
+    }
+    assert_eq!(
+        dedup.accept(slot, 10_000 - RECEIVE_WINDOW),
+        Delivery::Duplicate
+    );
+    assert_eq!(dedup.accept(SlotId(1), 0), Delivery::New);
+}
+
+#[test]
+fn forward_collapse_absorbs_only_a_contiguous_run_at_the_new_lower_bound() {
+    let slot = SlotId(0);
+    let mut dedup = Dedup::with_window(8);
+    dedup.forward_collapse = true;
+    for seq in [9, 3, 4, 10] {
+        assert_eq!(dedup.accept(slot, seq), Delivery::New);
+    }
+    // Moving the lower bound to 2 joins the received 3..=4 run, but not 9..=10.
+    assert_eq!(dedup.delivered_through(slot), Some(4));
+    for seq in 5..9 {
+        assert_eq!(dedup.accept(slot, seq), Delivery::New);
+    }
+    assert_eq!(dedup.delivered_through(slot), Some(10));
 }

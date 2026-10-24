@@ -141,24 +141,6 @@ async fn live_and_replay_sends_report_when_they_carry_redundancy() {
         Some(true),
         "the next live turn reports its redundant re-carry",
     );
-
-    let replay_key = SessionKey {
-        tenant: live_key.tenant.clone(),
-        session: SessionId(2),
-    };
-    link.open_session(mesh_session_key(&replay_key));
-    assert_eq!(
-        send_resume_replay(
-            &mut link,
-            &mut control_send,
-            &new_conditions_registry(),
-            &replay_key,
-            vec![turn_payload(0, 0), turn_payload(0, 1)],
-        )
-        .await,
-        Some(true),
-        "a replay batch propagates the redundancy carried by its later send",
-    );
 }
 
 /// A minimal `JoinedSession` for `reconcile_ack_cursors`'s `joined` map --
@@ -172,6 +154,7 @@ fn bare_session_state(key: SessionKey) -> JoinedSession {
     JoinedSession {
         key,
         flush_deadline: tokio::time::Instant::now(),
+        acks_owed: false,
         resumed: false,
         _registration: registration,
     }

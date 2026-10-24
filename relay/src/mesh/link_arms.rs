@@ -21,14 +21,14 @@ use crate::routing::{self};
 use super::conditions::ConditionsRegistry;
 use super::dispatch::dispatch_mesh_control;
 use super::fan_out::{apply_ack_cursors, fold_oversize_into_link, reconcile_ack_cursors};
-use super::forward::{resume_replay_for_frame, send_resume_replay};
+use super::forward::resume_replay_for_frame;
 use super::join::{
     SentPresence, local_presence, presence_catch_up, presence_statement, presence_updates,
     push_presence_updates, reconcile_lobby_on_join, reconcile_local_slots_on_join,
     reconcile_resume_cursors_on_join, reconcile_session_clock_on_join,
     reconcile_started_slots_on_join,
 };
-use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};
+use super::link_run::MeshMaintenanceTimer;
 use super::links::{
     JoinedSession, LeaseAwait, MESH_STREAM_WRITE_TIMEOUT, MeshControlTx, MeshForwardTx,
     MeshLinkExit, MeshLinkLease, MeshLinks, MeshRttCache, await_while_current,
@@ -63,6 +63,7 @@ pub(super) struct LinkDriver {
     pub(super) ack_cursors_sent: HashMap<(SessionId, SlotId), u64>,
     /// Per-session driver state, keyed by the wire's bare session id.
     pub(super) joined: HashMap<SessionId, JoinedSession>,
+    pub(super) replays: super::link_replay::ReplayQueue,
     /// When the last session left; `None` while any is joined, and before the
     /// first Join.
     pub(super) idle_since: Option<tokio::time::Instant>,
@@ -151,11 +152,12 @@ impl LinkDriver {
                     break;
                 }
                 if state.flush_deadline <= now {
-                    if in_flight > 0
-                        && let Err(error) = link.send(key, None, None)
-                    {
-                        failed = Some(error);
-                        break;
+                    if in_flight > 0 || state.acks_owed {
+                        if let Err(error) = link.send(key, None, None) {
+                            failed = Some(error);
+                            break;
+                        }
+                        state.acks_owed = false;
                     }
                     state.flush_deadline = now + routing::FLUSH_INTERVAL;
                 }
@@ -276,13 +278,16 @@ impl LinkDriver {
         match received {
             Ok(mesh_received) => {
                 let _ = lease.with_current(|| {
-                    let Some(state) = joined.get(&mesh_received.session) else {
+                    let Some(state) = joined.get_mut(&mesh_received.session) else {
                         tracing::warn!(
                             session = mesh_received.session.0,
                             "mesh datagram for unjoined session; dropping",
                         );
                         return;
                     };
+                    // Duplicate payloads still need packet ACKs: the sender
+                    // may have lost an earlier ACK while our prefix is gapped.
+                    state.acks_owed |= mesh_received.delivery.carried_payloads;
                     let key = state.key.clone();
                     // Feed the peer relay's home-client conditions into this
                     // session's decision-maker. The mesh hop is a property of
@@ -342,17 +347,16 @@ impl LinkDriver {
     /// Handles one control frame from the peer relay: the link-local folds that
     /// need this driver's own transport state (ack cursors, a resume-cursor
     /// reply, the oversize-turn dedup fold), then the ordinary dispatch.
-    pub(super) async fn handle_peer_control(
+    pub(super) fn handle_peer_control(
         &mut self,
         received: Option<MeshControlFrame>,
     ) -> ControlFlow<MeshLinkExit> {
         let peer_id = self.peer_id;
         let Self {
             link,
-            control_send,
             joined,
+            replays,
             lease,
-            conditions,
             sessions,
             mesh_for_dispatch,
             mesh_rtt,
@@ -363,41 +367,18 @@ impl LinkDriver {
                 if !lease.is_current() {
                     return ControlFlow::Continue(());
                 }
-                // A resume-cursor ask answers with turns THIS relay
-                // originated, sent straight out this link — computed
-                // and sent before the ordinary dispatch below, which
-                // has no link to send a reply over (see
-                // `resume_replay_for_frame`'s own doc).
                 // A peer's push of its own link-level receive cursors:
                 // force-retire this link's unacked window through them
                 // before anything else touches the frame. Needs direct
                 // link access `dispatch_mesh_control` doesn't have, so
                 // it's handled here, like the resume-cursor reply below.
                 apply_ack_cursors(link, &frame, joined);
-                if let Some((key, payloads)) =
+                if let Some((key, payloads, prefer_recent)) =
                     resume_replay_for_frame(&frame, joined, mesh_for_dispatch)
+                    && replays.enqueue(key, payloads, prefer_recent).is_err()
                 {
-                    let carried_redundancy = match await_while_current(
-                        lease,
-                        send_resume_replay(link, control_send, conditions, &key, payloads),
-                    )
-                    .await
-                    {
-                        LeaseAwait::Superseded => {
-                            return ControlFlow::Break(MeshLinkExit::Superseded);
-                        }
-                        LeaseAwait::Completed(Some(carried)) => carried,
-                        LeaseAwait::Completed(None) => {
-                            return ControlFlow::Break(MeshLinkExit::ConnectionFailed);
-                        }
-                    };
-                    if let Some(state) = joined.get_mut(&key.session) {
-                        defer_flush_after_send(
-                            &mut state.flush_deadline,
-                            carried_redundancy,
-                            tokio::time::Instant::now(),
-                        );
-                    }
+                    tracing::warn!("mesh replay work exceeded its bound; resetting link");
+                    return ControlFlow::Break(MeshLinkExit::ConnectionFailed);
                 }
                 // An oversize turn's transport-dedup fold also needs
                 // direct link access, so it too runs here. A copy the
@@ -472,7 +453,7 @@ impl LinkDriver {
                     // unjoined session has no key to record under.
                     let state = joined.get(&report.session)?;
                     let key = state.key.clone();
-                    let resumed = state.resumed;
+                    let resumed = state.resumed || decision_makers.is_resumed(&key);
                     let first_peer_presence = peer_presence_seen.insert(report.session);
                     if first_peer_presence {
                         reconcile_local_slots_on_join(conditions, control_forward_tx, &key);
@@ -495,6 +476,7 @@ impl LinkDriver {
                         if resumed {
                             reconcile_resume_cursors_on_join(
                                 seen_registries,
+                                decision_makers,
                                 control_forward_tx,
                                 &key,
                             );

@@ -147,3 +147,53 @@ fn the_clamped_apply_frame_is_reproduced_by_a_peer_and_a_promoted_authority() {
         "same clamped apply frame from the same carried record",
     );
 }
+
+#[test]
+fn recovered_frame_history_keeps_the_newest_sequences_in_every_arrival_order() {
+    let mut ascending = maker_with(bounds(0, 6));
+    feed_turns(&mut ascending, 0, 0..=103);
+    assert_eq!(ascending.reachable_frame(SlotId(1)), Some(197));
+
+    let reversed: Vec<u64> = (0..=103).rev().collect();
+    let mut interleaved = Vec::new();
+    for seq in (0..=100).rev() {
+        interleaved.push(seq);
+        match seq {
+            75 => interleaved.push(101),
+            50 => interleaved.push(102),
+            25 => interleaved.push(103),
+            _ => {}
+        }
+    }
+    for arrivals in [reversed, interleaved] {
+        let mut recovered = maker_with(bounds(0, 6));
+        for seq in arrivals {
+            recovered.observe_turn_frame(SlotId(0), seq, GameFrameCount(100 + seq as u32));
+        }
+        assert_eq!(
+            recovered.slots[&SlotId(0)].frame_history,
+            ascending.slots[&SlotId(0)].frame_history,
+        );
+        assert_eq!(
+            recovered.reachable_frame(SlotId(1)),
+            ascending.reachable_frame(SlotId(1)),
+        );
+        assert_eq!(
+            recovered.slot_frame(SlotId(0)),
+            ascending.slot_frame(SlotId(0))
+        );
+    }
+}
+
+#[test]
+fn repeated_and_older_frames_do_not_displace_recent_reachability_history() {
+    let mut maker = maker_with(bounds(0, 6));
+    feed_turns(&mut maker, 0, 0..=103);
+    let history = maker.slots[&SlotId(0)].frame_history.clone();
+    let ceiling = maker.reachable_frame(SlotId(1));
+    for seq in [103, 99, 100, 0, 50, 94] {
+        maker.observe_turn_frame(SlotId(0), seq, GameFrameCount(100 + seq as u32));
+    }
+    assert_eq!(maker.slots[&SlotId(0)].frame_history, history);
+    assert_eq!(maker.reachable_frame(SlotId(1)), ceiling);
+}

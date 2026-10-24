@@ -32,6 +32,7 @@ pub(super) fn resume_cursors_frame(
                     )
                     .collect(),
                 resuming,
+                prefer_recent: true,
             },
         )),
     }

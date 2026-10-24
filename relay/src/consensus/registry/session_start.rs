@@ -224,6 +224,12 @@ impl DecisionMakers {
         self.lock().get(key).is_some_and(DecisionMaker::is_started)
     }
 
+    /// Whether a coordinator descriptor assigned this relay an already-running session.
+    /// Returns false when the session has no decision-maker.
+    pub fn is_resumed(&self, key: &SessionKey) -> bool {
+        self.lock().get(key).is_some_and(DecisionMaker::is_resumed)
+    }
+
     /// The slot count `key`'s session is shaped for, or `None` when the session has
     /// not started (or no maker exists). The started gate mirrors
     /// [`is_started`](Self::is_started) so a caller sizing started-session state gets the gate

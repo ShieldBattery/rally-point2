@@ -20,9 +20,7 @@ use crate::routing::{self};
 
 use super::dispatch::dispatch_mesh_control;
 use super::fan_out::{apply_ack_cursors, fold_oversize_into_link, reconcile_ack_cursors};
-use super::forward::{
-    deliver_turn_to_locals, resume_replay_for_frame, send_resume_replay, send_turn_over_link,
-};
+use super::forward::{deliver_turn_to_locals, resume_replay_for_frame, send_turn_over_link};
 use super::frames::*;
 use super::join::{
     SentPresence, presence_catch_up, presence_statement, reconcile_leaves_on_join,
@@ -245,6 +243,7 @@ pub(super) fn joined_state(
         JoinedSession {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
+            acks_owed: false,
             resumed: false,
             _registration: MeshLinkRegistration {
                 links: mesh_links.clone(),
