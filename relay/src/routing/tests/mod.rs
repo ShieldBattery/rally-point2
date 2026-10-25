@@ -123,6 +123,25 @@ pub(super) fn drop_hold_harness(
     departing: SlotId,
     finalized_homes: Option<&[u8]>,
 ) -> DropHarness {
+    let harness = unframed_drop_hold_harness(key, survivor, finalized_homes);
+    // Both slots have framed history: the survivor pins a session frame and the
+    // departing slot gives the leave its apply-frame basis.
+    harness
+        .makers
+        .observe_frame(key, survivor, rally_point_proto::ids::GameFrameCount(40));
+    harness
+        .makers
+        .observe_frame(key, departing, rally_point_proto::ids::GameFrameCount(50));
+    harness
+}
+
+/// [`drop_hold_harness`] before any framed turn: the session as it stands in
+/// the game's first steps, or before any game loop runs.
+pub(super) fn unframed_drop_hold_harness(
+    key: &SessionKey,
+    survivor: SlotId,
+    finalized_homes: Option<&[u8]>,
+) -> DropHarness {
     use crate::consensus::{self, Authority};
     use rally_point_proto::control::BufferBounds;
 
@@ -142,11 +161,6 @@ pub(super) fn drop_hold_harness(
             ..consensus::MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
         },
     );
-    // Both slots have framed history: the survivor pins a session frame and the
-    // departing slot gives the leave its apply-frame basis.
-    makers.observe_frame(key, survivor, rally_point_proto::ids::GameFrameCount(40));
-    makers.observe_frame(key, departing, rally_point_proto::ids::GameFrameCount(50));
-
     let (mut guard, inbox) = register(&sessions, key, survivor, 1).expect("survivor registers");
     guard.disarm();
     DropHarness {

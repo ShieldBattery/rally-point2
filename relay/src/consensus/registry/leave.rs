@@ -61,18 +61,18 @@ impl DecisionMakers {
             .is_some_and(|maker| maker.leave_decided(slot))
     }
 
-    /// Whether `slot`'s leave, if decided right now, would actually commit: a
-    /// framed scheduling basis exists (a session frame, or a last frame on the
-    /// slot's own departure record) — the same short-circuit `commit_leave`
-    /// applies. Read before releasing a drop hold whose decide must not silently
-    /// fail: a released hold with no committed leave strands the departure with
-    /// nothing left to retry against. Monotone-safe as a check-then-act — frames
-    /// only accumulate, so a `true` here never becomes `false` by decide time.
-    /// `false` with no maker (nothing to decide into).
-    pub fn leave_schedulable(&self, key: &SessionKey, slot: SlotId) -> bool {
+    /// Whether a leave for `slot` carrying an exact final turn count (a
+    /// finalized drop's) would commit if decided right now: a framed scheduling
+    /// basis exists, or some slot's game loop is running (see
+    /// `DecisionMaker::counted_leave_schedulable`). Read before releasing a
+    /// drop hold whose decide must not silently fail: a released hold with no
+    /// committed leave strands the departure with nothing left to retry
+    /// against. Monotone-safe as a check-then-act. `false` with no maker
+    /// (nothing to decide into).
+    pub fn counted_leave_schedulable(&self, key: &SessionKey, slot: SlotId) -> bool {
         self.lock()
             .get(key)
-            .is_some_and(|maker| maker.leave_schedulable(slot))
+            .is_some_and(|maker| maker.counted_leave_schedulable(slot))
     }
 
     /// Caches a synced leave a peer relay's authority authored (received off the

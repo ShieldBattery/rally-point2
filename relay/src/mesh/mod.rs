@@ -71,8 +71,9 @@ pub use links::{
     MeshLinks, claim_mesh_link, claim_verified_mesh_link, new_mesh_link_attempt, new_mesh_links,
 };
 pub use seen::{
-    Forwarded, MeshSeen, Seen, SeenRegistries, SlotReceipts, deregister_seen, forwarded_count,
-    has_resumable_state, mark_seen, new_seen_registries, resume_cursor_snapshot, slot_receipts,
+    Forwarded, MeshSeen, Seen, SeenRegistries, SlotReceipts, deregister_seen, forward_gate_reading,
+    forwarded_count, has_resumable_state, mark_seen, new_seen_registries, resume_cursor_snapshot,
+    slot_receipts,
 };
 
 use std::collections::HashMap;

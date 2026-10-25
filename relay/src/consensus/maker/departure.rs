@@ -116,6 +116,22 @@ pub enum FinalizeOutcome {
     RejectedNoCursor,
 }
 
+/// What the home relay's session-level forward gate holds for a slot whose drop
+/// is being finalized: the cursor read [`DecisionMakers::finalize_drop`] seals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardGateReading {
+    /// The slot's seqs `0..n` were forwarded without a gap.
+    Count(u64),
+    /// The gate holds no record of any turn from the slot. Whether that means
+    /// none ever entered the game, or only that this relay never saw them, is
+    /// the maker's to judge (see `DecisionMaker::home_forwarded_nothing`).
+    NeverForwarded,
+    /// Turns were recorded, but no gap-free prefix counts them: the prefix was
+    /// collapsed over a gap, or the slot's first turn is missing below the
+    /// ones recorded.
+    Unsound,
+}
+
 impl DecisionMaker {
     /// Caches a synced leave this relay observed authored by the session's
     /// authority (a peer relay's `LeaveDirective` off the mesh), so a later
@@ -376,30 +392,39 @@ impl DecisionMaker {
         if self.rehomed_homes.contains(&slot) {
             return Err(FinalizeOutcome::RejectedNoCursor);
         }
-        // Pre-frame (no framed turn observed anywhere, and none on the
-        // slot's own record): the game has not started, nothing is stalled,
-        // and the leave the count would feed has no scheduling basis yet —
-        // sealing admission here would only lock a lobby slot out of
-        // rejoining while the decide side could never complete. Refuse
-        // without sealing; the drop stays held and a later request, once
-        // frames exist, finalizes normally.
-        if !self.leave_schedulable(slot) {
+        // Before any game loop runs (no slot has reported its loop started,
+        // and no framed turn exists anywhere or on the slot's own record),
+        // nothing is stalled and the leave the count would feed has no
+        // scheduling basis — sealing admission here would only lock a lobby
+        // or loading slot out of rejoining while the decide side could never
+        // complete. Refuse without sealing; the drop stays held and a later
+        // request, once a loop runs, finalizes normally.
+        if !self.counted_leave_schedulable(slot) {
             return Err(FinalizeOutcome::RejectedNoCursor);
         }
         self.finalizing_drops.insert(slot);
         Ok(())
     }
 
-    /// Completes a sealed finalization with the count the caller's cursor read
-    /// produced: stamps it into the departure record with the finalization
-    /// proof, so the leave the authority then decides carries it (see
-    /// [`commit_leave`](Self::commit_leave)). With no count, the seal is lifted
-    /// again so a later reconnect can still resume the slot.
+    /// Completes a sealed finalization with the caller's forward-gate read:
+    /// stamps the count it yields into the departure record with the
+    /// finalization proof, so the leave the authority then decides carries it
+    /// (see [`commit_leave`](Self::commit_leave)). With no count, the seal is
+    /// lifted again so a later reconnect can still resume the slot.
+    ///
+    /// A gate with no record of the slot yields a count of zero only when
+    /// [`home_forwarded_nothing`](Self::home_forwarded_nothing) holds; anywhere
+    /// else an empty gate is ignorance, not proof, and yields no count.
     pub(in crate::consensus) fn finish_finalize(
         &mut self,
         slot: SlotId,
-        count: Option<u64>,
+        reading: ForwardGateReading,
     ) -> FinalizeOutcome {
+        let count = match reading {
+            ForwardGateReading::Count(count) => Some(count),
+            ForwardGateReading::NeverForwarded if self.home_forwarded_nothing(slot) => Some(0),
+            ForwardGateReading::NeverForwarded | ForwardGateReading::Unsound => None,
+        };
         match count {
             Some(final_turn_count) => {
                 self.note_departure(
@@ -419,6 +444,35 @@ impl DecisionMaker {
                 FinalizeOutcome::RejectedNoCursor
             }
         }
+    }
+
+    /// Whether this relay knows first-hand that none of `slot`'s turns ever
+    /// entered the game, so that a forward gate with no record of the slot
+    /// is a count of zero rather than a gap in this relay's knowledge.
+    ///
+    /// The slot's home is its single ingress: every turn it originates enters
+    /// the mesh through that home's forward gate, recorded before it is sent
+    /// on. That makes an empty gate exact only on a home that has been the
+    /// slot's single ingress for the whole session: strictly homed here since
+    /// this maker's creation, never gained by a rehome or seeded by a resumed
+    /// descriptor (`rehomed_homes`). The maker's own record of home turns
+    /// forwarded (`forwarded_slots`), which lives as long as the session's
+    /// descriptor rather than as long as the gate's per-session state, must
+    /// agree, and so must the departure record: a slot that ever produced a
+    /// framed turn forwarded it here. Any disagreement leaves the count
+    /// unknown.
+    ///
+    /// Nothing can arrive after the answer: the slot's link is down, its turns
+    /// are handled inline by that link's task, and the finalization seal
+    /// refuses any new one.
+    fn home_forwarded_nothing(&self, slot: SlotId) -> bool {
+        self.strictly_homes(slot)
+            && !self.rehomed_homes.contains(&slot)
+            && !self.forwarded_slots.contains(&slot)
+            && self
+                .departures
+                .get(&slot)
+                .is_some_and(|departure| departure.last_frame.is_none())
     }
 
     /// The slots whose leave this relay has already decided or cached for this

@@ -31,8 +31,10 @@ impl DecisionMaker {
     /// Decides a synced player-leave for `slot` and queues it for broadcast.
     /// Returns the queued [`LeaveDirective`] (for logging), or `None` when this
     /// relay is not the authority, a leave for the slot is already broadcasting,
-    /// or there is no frame basis yet (no in-game turn observed for the session
-    /// -- a lobby/pre-game drop, which the game handles natively, not here).
+    /// or there is no scheduling basis yet: no in-game turn observed for the
+    /// session and, unless the leave carries an exact count while some slot's
+    /// game loop runs, nothing stalled to unstall -- a lobby/pre-game drop,
+    /// which the game handles natively, not here.
     ///
     /// `reason` is the native `pending_leave_reason` value every client will
     /// write (`0x40000006` dropped, else left). Call this on the authority --
@@ -154,7 +156,8 @@ impl DecisionMaker {
     /// The decision-and-cache step shared by [`DecisionMakers::decide_leave`] (behind the authority
     /// gate) and [`force_decide_leave`] (a fully-abandoned session, no authority).
     /// Dedups by slot — a `None` return means the slot's leave was already decided
-    /// or cached, or no framed turn has been observed to schedule against yet.
+    /// or cached, or there is nothing to schedule it against yet (no framed
+    /// turn observed, and no count with a game loop running).
     pub(in crate::consensus) fn commit_leave(
         &mut self,
         slot: SlotId,
@@ -206,21 +209,30 @@ impl DecisionMaker {
             record.and_then(|d| d.final_turn_count)
         };
         let session = self.session_frame().map(|f| f.0);
-        // No framed turn observed anywhere yet (pre-game / lobby): nothing to
-        // schedule against, so hold — a `None` short-circuits the decision.
-        let base = leave_base_frame(slot_last, session)?;
-        // Clamp only a framed departure's base, and only when the home supplied a
-        // ceiling; the session-frame fallback has no client-inflatable basis.
-        let base = match (slot_last, reachable) {
-            (Some(_), Some(ceiling)) => base.min(ceiling),
-            _ => base,
+        let apply_at_frame = match leave_base_frame(slot_last, session) {
+            // Clamp only a framed departure's base, and only when the home
+            // supplied a ceiling; the session-frame fallback has no
+            // client-inflatable basis.
+            Some(base) => match (slot_last, reachable) {
+                (Some(_), Some(ceiling)) => base.min(ceiling),
+                _ => base,
+            }
+            .saturating_add(1),
+            // No framed turn anywhere, but a game loop is running: survivors
+            // are stalled in the game's first steps, before any turn they
+            // send carries a frame. A counted leave needs no frame — clients
+            // apply it by consumption — so it commits, at the earliest frame.
+            None if final_turn_count.is_some() && self.game_underway() => 0,
+            // No game loop running (lobby / loading), or no count to apply by:
+            // nothing to schedule against, so hold.
+            None => return None,
         };
         self.next_leave_seq += 1;
         let directive = LeaveDirective {
             finalized,
             slot: u32::from(slot.0),
             reason,
-            apply_at_frame: base.saturating_add(1),
+            apply_at_frame,
             leave_seq: self.next_leave_seq,
             final_turn_count,
         };
@@ -237,22 +249,33 @@ impl DecisionMaker {
         self.decided_leaves.contains_key(&slot)
     }
 
-    /// Whether `slot`'s leave, if decided right now, would actually commit: a
-    /// framed scheduling basis exists — a session frame, or a last frame on the
-    /// slot's own departure record — which is the same short-circuit
-    /// [`commit_leave`](Self::commit_leave) applies.
+    /// Whether a leave for `slot` that carries an exact final turn count — a
+    /// finalized drop's, the only kind the callers decide — would actually
+    /// commit if decided right now: a framed scheduling basis exists (a session
+    /// frame, or a last frame on the slot's own departure record), or the game
+    /// is underway, which are the short-circuits
+    /// [`commit_leave`](Self::commit_leave) applies to a counted leave.
     ///
     /// Read before releasing a drop hold whose decide must not silently fail: a
     /// released hold with no committed leave strands the departure with nothing
     /// left to retry against. Monotone-safe as a check-then-act — frames only
-    /// accumulate, so a `true` here never becomes `false` by decide time.
-    pub(in crate::consensus) fn leave_schedulable(&self, slot: SlotId) -> bool {
-        self.session_frame().is_some()
+    /// accumulate and a started game loop is never forgotten, so a `true` here
+    /// never becomes `false` by decide time.
+    pub(in crate::consensus) fn counted_leave_schedulable(&self, slot: SlotId) -> bool {
+        self.game_underway()
+            || self.session_frame().is_some()
             || self
                 .departures
                 .get(&slot)
                 .and_then(|d| d.last_frame)
                 .is_some()
+    }
+
+    /// Whether some slot's game loop is known to be running (see
+    /// [`has_started`](Self::has_started)): from then on a departure can stall
+    /// the session, even before any turn carries a frame.
+    pub(in crate::consensus) fn game_underway(&self) -> bool {
+        !self.started_slots.is_empty() || !self.peer_started_slots.is_empty()
     }
 
     /// The `(slot, reason)` of every recorded departure that has not yet had its

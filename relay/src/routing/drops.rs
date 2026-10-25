@@ -328,7 +328,7 @@ pub(crate) fn honor_drop_request(
 
 /// Seals the drop of `slot`, a slot this relay strictly homes, and snapshots
 /// its count: [`crate::consensus::DecisionMakers::finalize_drop`] against this
-/// relay's own gap-free forwarded prefix for the slot, the only cursor a home's
+/// relay's own forward gate for the slot, the only cursor a home's
 /// finalization may seal. `connection_epoch` is the departed generation being
 /// finalized. A refusal for want of a sealable cursor is recorded: the drop
 /// stays undecided and its survivors stalled, which is the signal worth
@@ -342,7 +342,7 @@ pub(crate) fn finalize_home_drop(
 ) -> consensus::FinalizeOutcome {
     let decision_makers = &mesh.session.decision_makers;
     let outcome = decision_makers.finalize_drop(key, slot, connection_epoch, || {
-        crate::mesh::forwarded_count(&mesh.seen, key, slot)
+        crate::mesh::forward_gate_reading(&mesh.seen, key, slot)
     });
     if outcome == consensus::FinalizeOutcome::RejectedNoCursor {
         decision_makers.flight_recorder().record(
@@ -469,21 +469,21 @@ pub(crate) fn complete_finalized_drop(
         );
         return;
     }
-    // The decide below silently short-circuits without a framed scheduling
-    // basis — and by then the hold would already be released, leaving the
-    // departure with no committed leave, no hold for a retry to claim, and
-    // (with the home's seal standing) no reconnect path either: a stranded
-    // session. Check the basis FIRST and keep the hold when it is missing;
-    // the home's answer is idempotent, so a later honored drop request
-    // completes once a framed turn exists. Safe as a check-then-act because
-    // frames only accumulate — schedulable never reverts to unschedulable.
-    if !decision_makers.leave_schedulable(key, target) {
+    // The decide below silently short-circuits without a scheduling basis —
+    // and by then the hold would already be released, leaving the departure
+    // with no committed leave, no hold for a retry to claim, and (with the
+    // home's seal standing) no reconnect path either: a stranded session.
+    // Check the basis FIRST and keep the hold when it is missing; the home's
+    // answer is idempotent, so a later honored drop request completes once a
+    // game loop runs or a framed turn exists. Safe as a check-then-act
+    // because neither is ever forgotten — schedulable never reverts.
+    if !decision_makers.counted_leave_schedulable(key, target) {
         tracing::warn!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
             target = target.0,
             final_turn_count,
-            "finalized drop has no framed scheduling basis yet; keeping the hold for a retry",
+            "finalized drop has no scheduling basis yet; keeping the hold for a retry",
         );
         decision_makers.flight_recorder().record(
             key,

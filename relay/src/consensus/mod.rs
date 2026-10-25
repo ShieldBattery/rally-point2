@@ -285,7 +285,7 @@ use sync::*;
 pub use law::ControlLaw;
 pub use maker::{
     CLOCK_ANCHOR_QUIET, ClockUpdate, DecisionMaker, DepartureStamps, DesyncEviction, EvictionCause,
-    FinalizeOutcome, RecordedDeparture, SilentSlot,
+    FinalizeOutcome, ForwardGateReading, RecordedDeparture, SilentSlot,
 };
 pub use registry::LobbyCommandVerdict;
 pub(crate) use registry::next_evidence_sequence;

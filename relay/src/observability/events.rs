@@ -262,9 +262,9 @@ pub enum FlightEvent {
     /// undecided. `no_cursor` marks the home-side fail-closed branch — no
     /// gap-free forwarded prefix to seal (a collapsed window, or a home
     /// gained mid-session whose cursor cannot cover the slot's whole
-    /// history); `false` marks the authority-side refusal to complete a
-    /// finalized answer that has no framed scheduling basis yet (a pre-frame
-    /// session). Either way survivors stay stalled until they retry or quit;
+    /// history), or no game loop running yet; `false` marks the
+    /// authority-side refusal to complete a finalized answer that has no
+    /// scheduling basis yet (no game loop running and no framed turn). Either way survivors stay stalled until they retry or quit;
     /// a session stuck repeating this event is the signal for operator
     /// intervention (or the coordinated-abort follow-up).
     DropFinalizeRejected { slot: u8, no_cursor: bool },

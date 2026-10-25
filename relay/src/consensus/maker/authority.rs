@@ -391,8 +391,8 @@ impl DecisionMaker {
                 leaves.push(directive);
                 fresh.push(directive);
             }
-            // `None` means no frame basis yet (a lobby-era departure) -- hold,
-            // exactly as a direct `decide_leave` call would.
+            // `None` means no scheduling basis yet (a lobby-era departure) --
+            // hold, exactly as a direct `decide_leave` call would.
         }
 
         (leaves, fresh)

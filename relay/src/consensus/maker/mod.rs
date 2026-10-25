@@ -29,7 +29,7 @@ mod state_hash;
 mod sync;
 
 pub use clock::{CLOCK_ANCHOR_QUIET, ClockUpdate};
-pub use departure::{DepartureStamps, FinalizeOutcome, RecordedDeparture};
+pub use departure::{DepartureStamps, FinalizeOutcome, ForwardGateReading, RecordedDeparture};
 pub use eviction::{DesyncEviction, EvictionCause};
 pub use silence::SilentSlot;
 

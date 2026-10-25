@@ -364,6 +364,15 @@ fn maker_with_labels(labels: &[(u64, &str)]) -> DecisionMaker {
 /// authority, and strictly homes the given slots, with framed history so
 /// a decide has a basis.
 fn finalized_drop_registry(k: &SessionKey, homed: &[u8]) -> DecisionMakers {
+    let registry = unframed_finalized_drop_registry(k, homed);
+    registry.observe_frame(k, SlotId(0), GameFrameCount(40));
+    registry.observe_frame(k, SlotId(1), GameFrameCount(50));
+    registry
+}
+
+/// [`finalized_drop_registry`] before any framed turn: the session in the
+/// game's first steps, or before any game loop runs.
+fn unframed_finalized_drop_registry(k: &SessionKey, homed: &[u8]) -> DecisionMakers {
     let registry = new_decision_makers();
     let _ = registry.sync_maker(
         k,
@@ -373,8 +382,6 @@ fn finalized_drop_registry(k: &SessionKey, homed: &[u8]) -> DecisionMakers {
             ..MakerSync::new(bounds(0, 20), Authority::SelfRelay)
         },
     );
-    registry.observe_frame(k, SlotId(0), GameFrameCount(40));
-    registry.observe_frame(k, SlotId(1), GameFrameCount(50));
     registry
 }
 

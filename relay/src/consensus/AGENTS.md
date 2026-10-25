@@ -24,8 +24,8 @@
 - Policy lives on the maker, not the registry: the registry sequences lock, record
   and notify, and every decision it sequences is a `DecisionMaker` method
   (`seal_for_finalize`/`finish_finalize`, `seed_resumed`, `rehome_homed_slots`,
-  `leave_schedulable`, …). A registry method reaching into `maker.<field>` is the
-  smell this split exists to remove.
+  `counted_leave_schedulable`, …). A registry method reaching into
+  `maker.<field>` is the smell this split exists to remove.
 
 ## Reads like a bug, is deliberate
 
@@ -52,7 +52,11 @@
   makes the stops. A needless stop from a new authority that was behind is the accepted cost of
   needing no handoff protocol.
 - **Finalized drops are off** unless the session enables them; finalize seals the
-  stamps and fails closed without a cursor.
+  stamps and fails closed without a cursor. An empty forward gate is a count of
+  zero, not a missing cursor, but only on a home that has been the slot's single
+  ingress all session (`home_forwarded_nothing`). Once any game loop runs, a
+  counted leave commits with no framed turn anywhere (apply frame 0): survivors
+  stalled on a slot that never sent its pipe seeds have nothing to stamp.
 - **Silence eviction** names the slot that stopped *strictly* earliest, and blocks
   entirely while any required slot is unaccounted for. Only the *verdict* is here
   (`silent_slots` and `still_silent`, which mark nothing); the eviction mark,

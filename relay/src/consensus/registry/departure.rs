@@ -232,7 +232,7 @@ impl DecisionMakers {
         key: &SessionKey,
         slot: SlotId,
         requested_epoch: Option<u64>,
-        read_cursor: impl FnOnce() -> Option<u64>,
+        read_cursor: impl FnOnce() -> ForwardGateReading,
     ) -> FinalizeOutcome {
         {
             let mut makers = self.lock();
@@ -243,10 +243,10 @@ impl DecisionMakers {
                 return outcome;
             }
         }
-        let count = read_cursor();
+        let reading = read_cursor();
         let mut makers = self.lock();
         match makers.get_mut(key) {
-            Some(maker) => maker.finish_finalize(slot, count),
+            Some(maker) => maker.finish_finalize(slot, reading),
             None => FinalizeOutcome::RejectedNoCursor,
         }
     }
