@@ -832,10 +832,16 @@ their turns take to reach everyone else is everyone else's to roll back over wit
 targets.
 
 - **Anchor.** The authority anchors the clock when the session's lockstep start (the first
-  `LOCKSTEP_START_STEPS`, which every client steps only once every turn is known) becomes
-  confirmable: the turn that completed it is due when it arrived. That is when the slowest player's
-  start reached the authority, so no player is asked to be earlier than the session has shown it can
-  be.
+  `LOCKSTEP_START_STEPS`) becomes confirmable. Its last turn is due at the latest instant any
+  player's copy of it reached that player's own relay, where the player is measured: for a player
+  homed elsewhere, its arrival at the authority less the mesh hop, taken as half the least round
+  trip the authority has sampled to that relay. A start timed by arrival at the authority would ask
+  every player to be a hop early whenever a remote player's turn completed the start. A route
+  slower one way than the other doesn't move the start the remote player sees, since its relay
+  places the anchor half a round trip before the copy arrived; and the least round trip errs toward
+  a later start, so no player is asked to be earlier than the session has shown it can be. The
+  start is never moved back more than two steps short of the slack, so the clock can't start at
+  its limit.
 - **Stopping.** The clock may not run more than `STALL_SLACK_STEPS` (6, about where a client
   stalls: its prediction limit less the couple of steps of rollback it steadily runs behind) past
   the newest turn the authority can confirm for every player. That step is the clock's *limit*:
@@ -859,11 +865,11 @@ targets.
   of), at a join, when a peer proves its join with its first presence report, and after any
   authority change; the authority also sends it when it anchors the clock and when a stop ends.
   There is one anchor: the authority that started the session, and has been the authority since,
-  anchors the clock once the lockstep start is confirmable (with its newest confirmable step due
-  then), and every other relay, a newly promoted one included, places that anchor at the first
+  anchors the clock once the lockstep start is confirmable (as above), and every other relay, a newly promoted one included, places that anchor at the first
   copy's receipt less its age and half the link's RTT, once. An authority that didn't start the
   session anchors the clock itself only after `CLOCK_ANCHOR_QUIET` (1 s) without any copy, when no
-  reachable relay has the clock (and so no stop exists either); a local count of the start is no
+  reachable relay has the clock (and so no stop exists either), with its newest confirmable step
+  due the shortest players' hop before then (zero when it homes a player); a local count of the start is no
   evidence, since a relay missing a turn of the start can complete it seconds after it completed
   elsewhere. A relay **merges** every copy it gets: the stopped time before each step
   becomes the most either copy knows of, so a step's deadline is the later of the two, except that
@@ -1218,7 +1224,8 @@ A rollback session adds what it takes to audit one afterwards. Each home slot's 
 figures** against the session clock — the interval's measured turns, reports sent and the newest one, the
 interval's highest report p90 and latest single turn, and a cumulative lateness histogram in ten fixed
 buckets (bounds -40, -20, -10, 0, 10, 20, 40, 80 and 160 ms) — and the row carries the clock's total
-stopped time. The clock's anchor (the authority's own, or a peer's adoption) is an event, and so is each
+stopped time. The clock's anchor (the authority's own, with how far before the event it placed the start
+and the player whose arrival set it, or a peer's adoption) is an event, and so is each
 growth of its stopped time, capped at 32 per session so a session that keeps stopping cannot spend the
 event ring; the rows keep tracking the stopped time past the cap. The clients also report their own
 statistics (`RollbackStats` on the control stream: rollback and input-delay histograms, mispredictions,

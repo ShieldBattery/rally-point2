@@ -117,6 +117,14 @@ fn rollback_events_round_trip_through_the_blob() {
         FlightEvent::SessionClockAnchored {
             anchor_step: 23,
             adopted: true,
+            start_backdate_us: None,
+            deciding_slot: None,
+        },
+        FlightEvent::SessionClockAnchored {
+            anchor_step: 23,
+            adopted: false,
+            start_backdate_us: Some(147_000),
+            deciding_slot: Some(0),
         },
         FlightEvent::SessionClockStopped {
             pause_us: 4_200_000,
@@ -132,8 +140,10 @@ fn rollback_events_round_trip_through_the_blob() {
 
     let blob = recorder.take_blob(&k, true).expect("a recording exists");
     let json = serde_json::to_value(&blob).unwrap();
-    assert_eq!(json["events"][2]["event"], "slot_rollback_stats");
-    assert_eq!(json["events"][2]["stats"]["through_turn"], 5_000);
+    assert!(json["events"][0].get("start_backdate_us").is_none());
+    assert_eq!(json["events"][1]["start_backdate_us"], 147_000);
+    assert_eq!(json["events"][3]["event"], "slot_rollback_stats");
+    assert_eq!(json["events"][3]["stats"]["through_turn"], 5_000);
     let back: FlightBlob = serde_json::from_value(json).unwrap();
     let recorded: Vec<FlightEvent> = back.events.into_iter().map(|r| r.event).collect();
     assert_eq!(recorded, events);

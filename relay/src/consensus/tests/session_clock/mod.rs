@@ -5,6 +5,7 @@
 
 mod copies;
 mod handoff;
+mod home_arrival;
 mod measuring;
 mod recovery;
 mod rehome_measuring;

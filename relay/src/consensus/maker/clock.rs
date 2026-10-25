@@ -3,7 +3,7 @@
 
 use super::*;
 
-use rally_point_proto::rollback::LOCKSTEP_START_STEPS;
+use rally_point_proto::rollback::{LOCKSTEP_START_STEPS, STEP_DURATION_US};
 
 /// What moving the authority's session clock on calls for: a frame to send every other relay
 /// when the clock changed in a way they should hear of at once, and reports to push down this
@@ -31,6 +31,21 @@ pub(in crate::consensus) struct ClockMark {
 /// every relay sends its copy on, so only a session where no reachable relay has the clock is
 /// anchored twice.
 pub const CLOCK_ANCHOR_QUIET: Duration = Duration::from_secs(1);
+
+/// The furthest before the instant it anchors the clock that the authority places the clock's
+/// start: two steps short of the slack. A start moved back by the full slack would leave the clock
+/// at its limit, standing still before the next step could become confirmable.
+const MAX_START_BACKDATE: Duration =
+    Duration::from_micros(STEP_DURATION_US * (STALL_SLACK_STEPS - 2));
+
+/// Where the authority placed the session clock's start when it anchored the clock itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::consensus) struct ClockStart {
+    /// How long before the anchoring instant the newest confirmable step was placed due.
+    pub(in crate::consensus) backdate: Duration,
+    /// The player whose turn reaching its own relay set the start.
+    pub(in crate::consensus) deciding_slot: SlotId,
+}
 
 /// A duration in whole microseconds, saturating.
 fn micros(duration: Duration) -> u64 {
@@ -159,9 +174,14 @@ impl DecisionMaker {
             .clock
             .anchor_step()
             .filter(|_| !mark.anchored)
-            .map(|anchor_step| FlightEvent::SessionClockAnchored {
-                anchor_step,
-                adopted,
+            .map(|anchor_step| {
+                let start = self.clock_start.filter(|_| !adopted);
+                FlightEvent::SessionClockAnchored {
+                    anchor_step,
+                    adopted,
+                    start_backdate_us: start.map(|start| micros(start.backdate)),
+                    deciding_slot: start.map(|start| start.deciding_slot.0),
+                }
             });
         let stopped =
             if self.clock.pause() > mark.pause && self.clock_stop_events < MAX_CLOCK_STOP_EVENTS {
@@ -260,11 +280,64 @@ impl DecisionMaker {
         now.saturating_duration_since(since) >= CLOCK_ANCHOR_QUIET
     }
 
+    /// Where the clock's start goes as this relay anchors it at `now`, with `count` turns of every
+    /// player confirmable: the newest of them due at the latest instant any player's turn reached
+    /// that player's own relay. `None` with no player to wait on.
+    ///
+    /// Each player's lateness is measured where its turns first arrive, at its own relay. A turn
+    /// from a player homed elsewhere reached that relay a mesh hop before it reached this one, so
+    /// a start timed by arrival here would ask every player to be a hop early whenever such a turn
+    /// completed the step. The hop is half the least round trip seen to the player's relay (zero
+    /// for a player homed here, or one never measured), so a queue on the backbone errs toward the
+    /// later start. A route slower one way than the other doesn't move the start any player
+    /// measures against: a relay holding a copy of the clock places the anchor half a round trip
+    /// before the copy arrived, which shifts it back by as much as this shifts it forward.
+    ///
+    /// Only the arrivals of the lockstep start's last turn are kept. A player whose arrival of the
+    /// newest confirmable turn isn't known is taken as arriving now, so nobody is asked to be
+    /// earlier than they have shown. The start is never more than [`MAX_START_BACKDATE`] before
+    /// `now`.
+    fn clock_start(&self, count: u64, now: Instant) -> Option<ClockStart> {
+        let arrivals_known = count == LOCKSTEP_START_STEPS;
+        self.expected_slots
+            .iter()
+            .filter(|slot| !self.observers.contains(slot) && !self.departures.contains_key(slot))
+            .map(|&slot| {
+                let arrived = arrivals_known
+                    .then(|| self.lockstep_start_arrivals.get(&slot).copied())
+                    .flatten()
+                    .unwrap_or(now);
+                (
+                    now.saturating_duration_since(arrived) + self.home_hop(slot),
+                    slot,
+                )
+            })
+            .min()
+            .map(|(backdate, deciding_slot)| ClockStart {
+                backdate: backdate.min(MAX_START_BACKDATE),
+                deciding_slot,
+            })
+    }
+
+    /// How long a turn of `slot` took across the mesh from its home relay to this one, as
+    /// [`clock_start`](Self::clock_start) counts it.
+    fn home_hop(&self, slot: SlotId) -> Duration {
+        if self.strictly_homes(slot) {
+            return Duration::ZERO;
+        }
+        let rtt_us = self
+            .slots
+            .get(&slot)
+            .and_then(|state| state.mesh_rtt_floor_us)
+            .unwrap_or(0);
+        Duration::from_micros(u64::from(rtt_us) / 2)
+    }
+
     /// Moves the authority's clock on as the newest turn it can confirm for every player advances
     /// from count `before` to count `after` at `now`: anchors it once the lockstep start is
-    /// confirmable, and afterwards moves its limit on, keeping the stop if it had stood still at
-    /// the old one, and measures the turns waiting for deadlines that are now final. Returns what
-    /// that calls for, if anything.
+    /// confirmable (see [`clock_start`](Self::clock_start)), and afterwards moves its limit on,
+    /// keeping the stop if it had stood still at the old one, and measures the turns waiting for
+    /// deadlines that are now final. Returns what that calls for, if anything.
     pub(in crate::consensus) fn advance_clock(
         &mut self,
         before: u64,
@@ -278,11 +351,15 @@ impl DecisionMaker {
             if after < LOCKSTEP_START_STEPS || !self.may_anchor_clock(now) {
                 return None;
             }
-            // The newest confirmable turn arrived just now, so it is the one due now. Every client
-            // waited for every turn of the lockstep start, so on the authority that started the
-            // session this is when the slowest player's start arrived, and nobody is asked to be
-            // earlier than the session has shown it can be.
-            self.clock.anchor(after - 1, now);
+            // The newest confirmable turn is due when the last player's copy of it reached that
+            // player's own relay, so nobody is asked to be earlier than the session has shown it
+            // can be.
+            self.clock_start = self.clock_start(after, now);
+            let backdate = self
+                .clock_start
+                .map_or(Duration::ZERO, |start| start.backdate);
+            self.clock
+                .anchor(after - 1, now.checked_sub(backdate).unwrap_or(now));
             if let Some(final_through) = self.clock.final_through() {
                 self.lead.anchor_rehomes(final_through);
             }

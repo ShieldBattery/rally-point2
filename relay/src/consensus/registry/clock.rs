@@ -121,11 +121,15 @@ impl DecisionMakers {
                 FlightEvent::SessionClockAnchored {
                     anchor_step,
                     adopted,
+                    start_backdate_us,
+                    deciding_slot,
                 } => tracing::info!(
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
                     anchor_step,
                     adopted,
+                    start_backdate_us,
+                    deciding_slot,
                     "anchored the session clock",
                 ),
                 FlightEvent::SessionClockStopped { pause_us } => tracing::info!(

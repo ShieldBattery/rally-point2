@@ -145,6 +145,11 @@ impl DecisionMaker {
             // Refresh it for every sidecar, including one whose client counters
             // are equal or backward (local ingestion supplies zero).
             state.mesh_rtt_us = mesh_rtt_us;
+            state.mesh_rtt_floor_us = Some(
+                state
+                    .mesh_rtt_floor_us
+                    .map_or(mesh_rtt_us, |floor| floor.min(mesh_rtt_us)),
+            );
         }
 
         if !self.is_authority() {

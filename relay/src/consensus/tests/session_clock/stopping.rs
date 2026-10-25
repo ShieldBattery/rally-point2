@@ -227,6 +227,8 @@ fn the_authoritys_anchor_and_stops_earn_flight_events() {
             Some(FlightEvent::SessionClockAnchored {
                 anchor_step: ANCHOR,
                 adopted: false,
+                start_backdate_us: Some(0),
+                deciding_slot: Some(0),
             }),
             None,
         ],

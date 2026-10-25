@@ -21,6 +21,11 @@ pub(in crate::consensus) struct SlotState {
     /// mesh; closing the gap means distributing relay-pair RTT observations
     /// across the mesh, which nothing does today.
     pub(in crate::consensus) mesh_rtt_us: u32,
+    /// The least `mesh_rtt_us` sampled since the slot's link conditions were
+    /// last reset, `None` before the first. A queue on the backbone only ever
+    /// adds to a sample, so half the least is the hop least likely to overstate
+    /// how long a turn took across it. One local sample (`0`) keeps it at zero.
+    pub(in crate::consensus) mesh_rtt_floor_us: Option<u32>,
     /// The newest `game_frame_count` observed on this slot's validated turns.
     /// Monotonic per slot; `None` until the slot's first framed turn (lobby
     /// turns carry no frame). The session's consensus coordinate is the
@@ -161,6 +166,7 @@ impl SlotState {
     pub(in crate::consensus) fn reset_link_conditions(&mut self) {
         self.rtt_window = RttWindow::default();
         self.mesh_rtt_us = 0;
+        self.mesh_rtt_floor_us = None;
         self.curr_lost = 0;
         self.curr_sent = 0;
         self.loss_snapshots = [LossSnapshot::default(); LOSS_SNAPSHOT_COUNT];

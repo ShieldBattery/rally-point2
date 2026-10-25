@@ -33,6 +33,7 @@ pub use departure::{DepartureStamps, FinalizeOutcome, ForwardGateReading, Record
 pub use eviction::{DesyncEviction, EvictionCause};
 pub use silence::SilentSlot;
 
+pub(in crate::consensus) use clock::ClockStart;
 pub(in crate::consensus) use departure::Departure;
 
 /// The latency-buffer decision-maker for one session.
@@ -397,6 +398,12 @@ pub struct DecisionMaker {
     /// When this relay, an authority that didn't start the session, began waiting for a copy of
     /// the clock to anchor its own.
     pub(in crate::consensus) unanchored_authority_since: Option<Instant>,
+    /// When each slot's last turn of the lockstep start was forwarded here, until the clock is
+    /// anchored: the arrivals the authority places the clock's start by.
+    pub(in crate::consensus) lockstep_start_arrivals: HashMap<SlotId, Instant>,
+    /// Where this relay placed the clock's start when it anchored the clock itself, for the
+    /// flight event recording the anchor.
+    pub(in crate::consensus) clock_start: Option<ClockStart>,
     /// The state hash comparator of a rollback session. Kept on every relay and across authority
     /// changes, so a promoted authority carries on judging where the old one stopped.
     pub(in crate::consensus) hashes: StateHashTracker,
@@ -573,6 +580,8 @@ impl DecisionMaker {
             clock_stop_events: 0,
             started_session_as_authority: false,
             unanchored_authority_since: None,
+            lockstep_start_arrivals: HashMap::new(),
+            clock_start: None,
             hashes: StateHashTracker::default(),
             turns_complete: Arc::default(),
             finalizing_drops: HashSet::new(),

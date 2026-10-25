@@ -4,6 +4,8 @@ use super::*;
 
 use std::sync::atomic::Ordering;
 
+use rally_point_proto::rollback::LOCKSTEP_START_STEPS;
+
 impl DecisionMaker {
     /// Records `slot`'s report that its state after `step` hashed to `hash`, and returns whatever
     /// verdicts the report completes. Nothing happens outside a rollback session, or for an
@@ -22,8 +24,9 @@ impl DecisionMaker {
         self.judge_state_hashes(now)
     }
 
-    /// Notes that this relay has forwarded `count` of `slot`'s turns without a gap, which starts
-    /// the report deadlines of the steps that became confirmable, updates
+    /// Notes that this relay has forwarded `count` of `slot`'s turns without a gap, which keeps
+    /// when the slot's lockstep start completed here for the clock's anchor, starts the report
+    /// deadlines of the steps that became confirmable, updates
     /// [`turns_complete`](Self::turns_complete_handle) and, on the authority, moves the session
     /// clock on, returning the frame and reports that calls for. Nothing outside a rollback
     /// session.
@@ -35,6 +38,9 @@ impl DecisionMaker {
     ) -> Option<ClockUpdate> {
         if !self.rollback_enabled {
             return None;
+        }
+        if count >= LOCKSTEP_START_STEPS && !self.clock.is_anchored() {
+            self.lockstep_start_arrivals.entry(slot).or_insert(now);
         }
         let observers = &self.observers;
         let departures = &self.departures;

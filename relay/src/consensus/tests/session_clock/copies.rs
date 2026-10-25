@@ -390,6 +390,8 @@ fn a_merged_clock_records_its_anchor_and_at_most_the_capped_number_of_stops() {
         FlightEvent::SessionClockAnchored {
             anchor_step: ANCHOR,
             adopted: true,
+            start_backdate_us: None,
+            deciding_slot: None,
         },
     );
     let recorded: Vec<u64> = events[1..]

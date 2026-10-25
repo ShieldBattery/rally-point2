@@ -320,7 +320,20 @@ pub enum FlightEvent {
     /// the session authority once the lockstep start became confirmable
     /// (`adopted` false), or from the authority's clock (`adopted` true).
     /// `anchor_step` is the step due at the anchor.
-    SessionClockAnchored { anchor_step: u64, adopted: bool },
+    SessionClockAnchored {
+        anchor_step: u64,
+        adopted: bool,
+        /// On a relay that anchored the clock itself: how long before this
+        /// event it placed the newest confirmable step due, at the latest
+        /// instant any player's turn reached that player's own relay. About a
+        /// mesh hop when a remote player's turn completed the step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_backdate_us: Option<u64>,
+        /// On a relay that anchored the clock itself: the player whose turn
+        /// reaching its own relay set the start.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        deciding_slot: Option<u8>,
+    },
     /// The rollback session clock's stopped time grew, to `pause_us` in total:
     /// the whole session waited on turns that weren't coming. Recorded on the
     /// authority when it stops the clock and elsewhere when the authority's

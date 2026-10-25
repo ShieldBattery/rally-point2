@@ -25,7 +25,8 @@
 //! both believe they are the authority) fold in wherever they land, and every relay converges on
 //! the same deadlines for the steps ahead. The authority's own record of a wait is folded in the
 //! same way, as a least stopped time, so no wait is counted twice. There is one anchor: the relay
-//! that started the session as the authority sets it, and every other relay places it once, at
+//! that started the session as the authority sets it, at the latest instant any player's last turn
+//! of the lockstep start reached that player's own relay, and every other relay places it once, at
 //! the first frame's receipt less the frame's age and half the mesh round trip it took.
 
 use super::*;
@@ -179,18 +180,18 @@ impl SessionClock {
         })
     }
 
-    /// Anchors the clock, unless it already is, so that the turn with seq `newest` is due at `now`:
+    /// Anchors the clock, unless it already is, so that the turn with seq `newest` is due at `due`:
     /// the authority seeing the lockstep start become confirmable, with `newest` its newest
-    /// confirmable step. Every relay anchors at [`ANCHOR_STEP`], so copies' stopped times line
+    /// confirmable step (see `DecisionMaker::clock_start` for when it is due). Every relay anchors at [`ANCHOR_STEP`], so copies' stopped times line
     /// up, and only one relay anchors from its own view (see `DecisionMaker::may_anchor_clock`),
     /// at the time that step corresponds to; the rest place that same anchor from its copies.
     /// Returns whether it anchored.
-    pub(in crate::consensus) fn anchor(&mut self, newest: u64, now: Instant) -> bool {
+    pub(in crate::consensus) fn anchor(&mut self, newest: u64, due: Instant) -> bool {
         if self.anchor.is_some() {
             return false;
         }
         let since = steps_duration(newest.saturating_sub(ANCHOR_STEP));
-        self.anchor = Some((ANCHOR_STEP, now.checked_sub(since).unwrap_or(now)));
+        self.anchor = Some((ANCHOR_STEP, due.checked_sub(since).unwrap_or(due)));
         self.final_through = newest.max(ANCHOR_STEP).saturating_add(STALL_SLACK_STEPS);
         true
     }
