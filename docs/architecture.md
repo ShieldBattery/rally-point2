@@ -842,9 +842,11 @@ targets.
   slower one way than the other cancels out, and a queue that has inflated either end's current
   estimate moves nothing. What's left is how far the two floors together stray from the two trips
   together: the player's start lands later by half of however much slower the trips were than the
-  floors, and earlier by half of however much one end's floor exceeds what the trips took (in
-  practice half the difference between the two ends' floors of the same link, a few ms). The least
-  round trip is each end's smallest sample of QUIC's smoothed RTT since the link came up, so a
+  floors, and earlier by half of however much one end's floor exceeds what the trips took. For a
+  copy adopted straight from the authority that is in practice half the difference between the two
+  ends' floors of the same link, a few ms; a relay that first hears of the clock through a third
+  relay places it by its own link to that relay, so the estimates of both links it crossed add to
+  the error. The least round trip is each end's smallest sample of QUIC's smoothed RTT since the link came up, so a
   replaced link starts over. The start is never moved back more than two steps short of the
   slack, so the clock can't start at its limit.
 - **Stopping.** The clock may not run more than `STALL_SLACK_STEPS` (6, about where a client
