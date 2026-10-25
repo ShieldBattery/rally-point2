@@ -17,7 +17,8 @@
 //! connection but then stalls in the handshake — rather than completing or
 //! rejecting it — surfaces a timeout instead of hanging the game-launch path.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rally_point_proto::close_codes;
@@ -144,13 +145,16 @@ impl ClientEndpoint {
     /// go beyond the port — an IPv4-only host, a shared endpoint — still builds
     /// its own socket and uses [`from_endpoint`](Self::from_endpoint).
     ///
+    /// When the host can't set up a dual-stack endpoint, this falls back to an
+    /// IPv4-only one, which reaches only the relays' IPv4 addresses. Wine on macOS
+    /// is one such host: it refuses the IPv4-level socket options noq sets on a
+    /// dual-stack socket.
+    ///
     /// Must be called from within a tokio runtime, which drives the endpoint.
     pub fn bind_on_port(roots: rustls::RootCertStore, port: u16) -> Result<Self, EndpointError> {
         let config = quic::client_config(roots)?;
-        let socket = udp_socket((Ipv6Addr::UNSPECIFIED, port).into())?;
         let runtime = noq::default_runtime().ok_or(EndpointError::NoRuntime)?;
-        let endpoint =
-            noq::Endpoint::new(noq::EndpointConfig::default(), None, socket.into(), runtime)?;
+        let endpoint = endpoint_with_fallback(port, runtime, endpoint_on)?;
         endpoint.set_default_client_config(config);
         Ok(Self { endpoint })
     }
@@ -312,15 +316,80 @@ impl ClientEndpoint {
     }
 }
 
+/// Why [`endpoint_on`] could not build an endpoint.
+enum EndpointSetupError {
+    /// Binding `local` failed, e.g. because the port is taken. Another address
+    /// family on the same port is no substitute for the requested bind.
+    Bind(std::io::Error),
+    /// Creating the socket or setting it up for noq failed.
+    Setup(std::io::Error),
+}
+
+/// Builds a dual-stack endpoint on `port` with `build`, or an IPv4-only one when
+/// the dual-stack setup (not its bind) fails. If both attempts fail, the IPv4
+/// error is returned and the earlier dual-stack error is logged.
+fn endpoint_with_fallback(
+    port: u16,
+    runtime: Arc<dyn noq::Runtime>,
+    build: impl Fn(SocketAddr, Arc<dyn noq::Runtime>) -> Result<noq::Endpoint, EndpointSetupError>,
+) -> std::io::Result<noq::Endpoint> {
+    match build((Ipv6Addr::UNSPECIFIED, port).into(), runtime.clone()) {
+        Ok(endpoint) => Ok(endpoint),
+        Err(EndpointSetupError::Bind(error)) => Err(error),
+        Err(EndpointSetupError::Setup(dual_stack_error)) => {
+            match build((Ipv4Addr::UNSPECIFIED, port).into(), runtime) {
+                Ok(endpoint) => {
+                    tracing::warn!(
+                        error = %dual_stack_error,
+                        "dual-stack client endpoint unavailable, using IPv4 only"
+                    );
+                    Ok(endpoint)
+                }
+                Err(ipv4_failure) => {
+                    let (ipv4_stage, ipv4_error) = match ipv4_failure {
+                        EndpointSetupError::Bind(error) => ("bind", error),
+                        EndpointSetupError::Setup(error) => ("setup", error),
+                    };
+                    tracing::warn!(
+                        error = %dual_stack_error,
+                        ipv4_stage,
+                        ipv4_error = %ipv4_error,
+                        "dual-stack and IPv4-only client endpoint setup failed"
+                    );
+                    Err(ipv4_error)
+                }
+            }
+        }
+    }
+}
+
+/// Builds a noq endpoint on a UDP socket bound at `local` (see [`udp_socket`]).
+fn endpoint_on(
+    local: SocketAddr,
+    runtime: Arc<dyn noq::Runtime>,
+) -> Result<noq::Endpoint, EndpointSetupError> {
+    let socket = unbound_udp_socket(local).map_err(EndpointSetupError::Setup)?;
+    socket
+        .bind(&local.into())
+        .map_err(EndpointSetupError::Bind)?;
+    noq::Endpoint::new(noq::EndpointConfig::default(), None, socket.into(), runtime)
+        .map_err(EndpointSetupError::Setup)
+}
+
 /// Binds a UDP socket at `local`. An IPv6 socket is made dual-stack: std's
 /// UdpSocket can't clear IPV6_V6ONLY (set by default on Windows), and a v6-only
 /// socket can't reach IPv4 relays, so the socket is built by hand for noq.
 fn udp_socket(local: SocketAddr) -> std::io::Result<Socket> {
+    let socket = unbound_udp_socket(local)?;
+    socket.bind(&local.into())?;
+    Ok(socket)
+}
+
+fn unbound_udp_socket(local: SocketAddr) -> std::io::Result<Socket> {
     let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
     if local.is_ipv6() {
         socket.set_only_v6(false)?;
     }
-    socket.bind(&local.into())?;
     Ok(socket)
 }
 
@@ -441,6 +510,63 @@ mod tests {
             ClientEndpoint::bind_on_port(rustls::RootCertStore::empty(), port),
             Err(EndpointError::Bind(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_dual_stack_setup_falls_back_to_ipv4() {
+        let runtime = noq::default_runtime().unwrap();
+        let endpoint = endpoint_with_fallback(0, runtime, |local, runtime| {
+            if local.is_ipv6() {
+                Err(EndpointSetupError::Setup(
+                    std::io::ErrorKind::InvalidInput.into(),
+                ))
+            } else {
+                endpoint_on(local, runtime)
+            }
+        })
+        .unwrap();
+        assert!(endpoint.local_addr().unwrap().is_ipv4());
+    }
+
+    #[tokio::test]
+    async fn failed_dual_stack_bind_does_not_fall_back() {
+        let runtime = noq::default_runtime().unwrap();
+        let result = endpoint_with_fallback(0, runtime, |local, runtime| {
+            if local.is_ipv6() {
+                Err(EndpointSetupError::Bind(
+                    std::io::ErrorKind::AddrInUse.into(),
+                ))
+            } else {
+                endpoint_on(local, runtime)
+            }
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+    }
+
+    #[tokio::test]
+    async fn failed_ipv4_fallback_reports_its_own_error() {
+        let runtime = noq::default_runtime().unwrap();
+        for ipv4_bind_fails in [true, false] {
+            let result = endpoint_with_fallback(0, runtime.clone(), |local, _| {
+                if local.is_ipv6() {
+                    Err(EndpointSetupError::Setup(
+                        std::io::Error::from_raw_os_error(10022),
+                    ))
+                } else if ipv4_bind_fails {
+                    Err(EndpointSetupError::Bind(std::io::Error::from_raw_os_error(
+                        10048,
+                    )))
+                } else {
+                    Err(EndpointSetupError::Setup(
+                        std::io::Error::from_raw_os_error(10045),
+                    ))
+                }
+            });
+            assert_eq!(
+                result.unwrap_err().raw_os_error(),
+                Some(if ipv4_bind_fails { 10048 } else { 10045 })
+            );
+        }
     }
 
     #[tokio::test]
