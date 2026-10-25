@@ -5,6 +5,27 @@
 
 use super::*;
 
+/// A mesh link's round trip as a peer relay's sidecar arrives over it: the smoothed estimate the
+/// control law sizes a remote slot's path by, and the least the link has sampled since it came up,
+/// which the session clock's start is placed by on both ends of the link.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MeshRtt {
+    /// The link's smoothed round trip, in microseconds.
+    pub rtt_us: u32,
+    /// The least smoothed round trip the link has sampled, in microseconds.
+    pub floor_us: u32,
+}
+
+impl From<u32> for MeshRtt {
+    /// A link whose round trip has held at `rtt_us`.
+    fn from(rtt_us: u32) -> Self {
+        Self {
+            rtt_us,
+            floor_us: rtt_us,
+        }
+    }
+}
+
 impl DecisionMaker {
     /// Ingests this relay's own home-client `LinkConditions` (conditions the
     /// relay observed directly on its local clients).
@@ -20,7 +41,7 @@ impl DecisionMaker {
     /// translates a returned decision into a broadcast.
     pub fn ingest_local(&mut self, conditions: &LinkConditions) -> Option<Decision> {
         self.activate_local_epochs(&conditions.slots);
-        self.ingest_slots(&conditions.slots, 0)
+        self.ingest_slots(&conditions.slots, MeshRtt::default())
     }
 
     /// Ingests one home-client conditions sample without requiring a
@@ -29,26 +50,28 @@ impl DecisionMaker {
     /// [`ingest_local`](Self::ingest_local).
     pub fn ingest_local_condition(&mut self, conditions: &SlotConditions) -> Option<Decision> {
         self.activate_local_epochs(std::slice::from_ref(conditions));
-        self.ingest_slots(std::slice::from_ref(conditions), 0)
+        self.ingest_slots(std::slice::from_ref(conditions), MeshRtt::default())
     }
 
     /// Ingests a peer relay's `LinkConditions` sidecar (conditions the peer
     /// relay observed on its own home clients, forwarded across the mesh).
     ///
-    /// `mesh_rtt_us` is the relay-pair RTT from the authority to the peer
-    /// relay -- sampled from the `MeshLink`'s QUIC connection stats. It's added
-    /// to each remote slot's effective RTT so cross-relay paths include the
-    /// mesh hop. The transport doesn't carry mesh RTT in the sidecar because
-    /// it's a property of the relay-pair, not of any individual client's link.
+    /// `mesh_rtt` is the relay-pair RTT from the authority to the peer
+    /// relay -- sampled from the `MeshLink`'s QUIC connection stats. Its
+    /// smoothed estimate is added to each remote slot's effective RTT so
+    /// cross-relay paths include the mesh hop, and its floor places the session
+    /// clock's start. The transport doesn't carry mesh RTT in the sidecar
+    /// because it's a property of the relay-pair, not of any individual
+    /// client's link.
     ///
     /// Returns a [`Decision`] if the control law fires a change, `None` if it
     /// holds.
     pub fn ingest_remote(
         &mut self,
         conditions: &LinkConditions,
-        mesh_rtt_us: u32,
+        mesh_rtt: impl Into<MeshRtt>,
     ) -> Option<Decision> {
-        self.ingest_slots(&conditions.slots, mesh_rtt_us)
+        self.ingest_slots(&conditions.slots, mesh_rtt.into())
     }
 
     /// Shared ingestion: admits current sender RTT observations, advances only
@@ -57,7 +80,7 @@ impl DecisionMaker {
     pub(in crate::consensus) fn ingest_slots(
         &mut self,
         conditions: &[SlotConditions],
-        mesh_rtt_us: u32,
+        mesh_rtt: MeshRtt,
     ) -> Option<Decision> {
         let snapshot_interval = self.law.loss_snapshot_interval();
         let run_bucket_span = self.law.blackout_run_bucket_span();
@@ -144,12 +167,8 @@ impl DecisionMaker {
             // ingestion time, so sender counter order does not make it stale.
             // Refresh it for every sidecar, including one whose client counters
             // are equal or backward (local ingestion supplies zero).
-            state.mesh_rtt_us = mesh_rtt_us;
-            state.mesh_rtt_floor_us = Some(
-                state
-                    .mesh_rtt_floor_us
-                    .map_or(mesh_rtt_us, |floor| floor.min(mesh_rtt_us)),
-            );
+            state.mesh_rtt_us = mesh_rtt.rtt_us;
+            state.mesh_rtt_floor_us = Some(mesh_rtt.floor_us);
         }
 
         if !self.is_authority() {

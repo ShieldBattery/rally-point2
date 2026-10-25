@@ -835,13 +835,18 @@ targets.
   `LOCKSTEP_START_STEPS`) becomes confirmable. Its last turn is due at the latest instant any
   player's copy of it reached that player's own relay, where the player is measured: for a player
   homed elsewhere, its arrival at the authority less the mesh hop, taken as half the least round
-  trip the authority has sampled to that relay. A start timed by arrival at the authority would ask
-  every player to be a hop early whenever a remote player's turn completed the start. A route
-  slower one way than the other doesn't move the start the remote player sees, since its relay
-  places the anchor half a round trip before the copy arrived; and the least round trip errs toward
-  a later start, so no player is asked to be earlier than the session has shown it can be. The
-  start is never moved back more than two steps short of the slack, so the clock can't start at
-  its limit.
+  trip the authority's end of the mesh link to that relay has sampled. A start timed by arrival at
+  the authority would ask every player to be a hop early whenever a remote player's turn completed
+  the start. The player's relay places its copy of the anchor by the same estimate from its own
+  end of the link (half the least round trip it has sampled, before the copy arrived), so a route
+  slower one way than the other cancels out, and a queue that has inflated either end's current
+  estimate moves nothing. What's left is how far the two floors together stray from the two trips
+  together: the player's start lands later by half of however much slower the trips were than the
+  floors, and earlier by half of however much one end's floor exceeds what the trips took (in
+  practice half the difference between the two ends' floors of the same link, a few ms). The least
+  round trip is each end's smallest sample of QUIC's smoothed RTT since the link came up, so a
+  replaced link starts over. The start is never moved back more than two steps short of the
+  slack, so the clock can't start at its limit.
 - **Stopping.** The clock may not run more than `STALL_SLACK_STEPS` (6, about where a client
   stalls: its prediction limit less the couple of steps of rollback it steadily runs behind) past
   the newest turn the authority can confirm for every player. That step is the clock's *limit*:
@@ -865,12 +870,13 @@ targets.
   of), at a join, when a peer proves its join with its first presence report, and after any
   authority change; the authority also sends it when it anchors the clock and when a stop ends.
   There is one anchor: the authority that started the session, and has been the authority since,
-  anchors the clock once the lockstep start is confirmable (as above), and every other relay, a newly promoted one included, places that anchor at the first
-  copy's receipt less its age and half the link's RTT, once. An authority that didn't start the
+  anchors the clock once the lockstep start is confirmable (as above), and every other relay, a
+  newly promoted one included, places that anchor at the first copy's receipt less its age and
+  half the least round trip the link has sampled, once. An authority that didn't start the
   session anchors the clock itself only after `CLOCK_ANCHOR_QUIET` (1 s) without any copy, when no
   reachable relay has the clock (and so no stop exists either), with its newest confirmable step
-  due the shortest players' hop before then (zero when it homes a player); a local count of the start is no
-  evidence, since a relay missing a turn of the start can complete it seconds after it completed
+  due the shortest players' hop before then (zero when it homes a player); a local count of the
+  start is no evidence, since a relay missing a turn of the start can complete it seconds after it completed
   elsewhere. A relay **merges** every copy it gets: the stopped time before each step
   becomes the most either copy knows of, so a step's deadline is the later of the two, except that
   a deadline the relay already holds as final never moves (stopped time the other copy knows of

@@ -28,23 +28,69 @@ fn mesh_rtt_cache_samples_once_and_refreshes_at_the_window_boundary() {
     };
 
     // An empty cache samples, and answers with what it sampled.
-    assert_eq!(cache.get_or_refresh_with(start, sample), 10_000);
+    assert_eq!(cache.get_or_refresh_with(start, sample).rtt_us, 10_000);
     assert_eq!(samples.get(), 1);
 
     assert_eq!(
-        cache.get_or_refresh_with(
-            start + MESH_RTT_CACHE_TTL - std::time::Duration::from_nanos(1),
-            sample,
-        ),
+        cache
+            .get_or_refresh_with(
+                start + MESH_RTT_CACHE_TTL - std::time::Duration::from_nanos(1),
+                sample,
+            )
+            .rtt_us,
         10_000,
     );
     assert_eq!(samples.get(), 1, "the within-window closure is not run");
 
     assert_eq!(
-        cache.get_or_refresh_with(start + MESH_RTT_CACHE_TTL, sample),
+        cache
+            .get_or_refresh_with(start + MESH_RTT_CACHE_TTL, sample)
+            .rtt_us,
         20_000,
     );
     assert_eq!(samples.get(), 2, "the TTL boundary itself refreshes");
+}
+
+/// The cache keeps the least RTT it sampled, for the session clock's start: a
+/// queue that inflates later samples leaves it where the route put it, a
+/// connection with no measurement (`0`) doesn't lower it, and a new cache (a
+/// replaced link) starts over.
+#[test]
+fn mesh_rtt_cache_keeps_the_least_sample_of_its_link() {
+    use crate::consensus::MeshRtt;
+
+    let start = tokio::time::Instant::now();
+    let mut cache = MeshRttCache::default();
+    let at = |windows: u32| start + MESH_RTT_CACHE_TTL * windows;
+    assert_eq!(
+        cache.get_or_refresh_with(at(0), || 0),
+        MeshRtt {
+            rtt_us: 0,
+            floor_us: 0
+        },
+    );
+    assert_eq!(
+        cache.get_or_refresh_with(at(1), || 294_000).floor_us,
+        294_000
+    );
+    assert_eq!(
+        cache.get_or_refresh_with(at(2), || 400_000),
+        MeshRtt {
+            rtt_us: 400_000,
+            floor_us: 294_000
+        },
+    );
+    assert_eq!(cache.get_or_refresh_with(at(3), || 0).floor_us, 294_000);
+    assert_eq!(
+        cache.get_or_refresh_with(at(4), || 280_000).floor_us,
+        280_000
+    );
+
+    let mut replaced = MeshRttCache::default();
+    assert_eq!(
+        replaced.get_or_refresh_with(at(5), || 350_000).floor_us,
+        350_000
+    );
 }
 
 #[test]

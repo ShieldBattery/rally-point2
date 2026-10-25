@@ -85,7 +85,7 @@ use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 pub(super) fn dispatch_mesh_control(
     frame: MeshControlFrame,
     peer_id: RelayId,
-    mesh_rtt_us: u32,
+    mesh_rtt_floor_us: u32,
     joined: &HashMap<SessionId, JoinedSession>,
     sessions: &routing::Sessions,
     mesh: &MeshState,
@@ -114,7 +114,7 @@ pub(super) fn dispatch_mesh_control(
     // which case the frame is dropped here — a frame can no longer check one
     // piece of state and then mutate another across the sweep.
     let dispatched = mesh.session.gates.with_ingress(&key, || {
-        dispatch_mesh_control_frame(frame, peer_id, mesh_rtt_us, &key, sessions, mesh)
+        dispatch_mesh_control_frame(frame, peer_id, mesh_rtt_floor_us, &key, sessions, mesh)
     });
     if dispatched.is_none() {
         tracing::debug!(
@@ -130,7 +130,7 @@ pub(super) fn dispatch_mesh_control(
 fn dispatch_mesh_control_frame(
     frame: MeshControlFrame,
     peer_id: RelayId,
-    mesh_rtt_us: u32,
+    mesh_rtt_floor_us: u32,
     key: &SessionKey,
     sessions: &routing::Sessions,
     mesh: &MeshState,
@@ -448,7 +448,7 @@ fn dispatch_mesh_control_frame(
                 &key,
                 &clock,
                 std::time::Instant::now(),
-                mesh_rtt_us,
+                mesh_rtt_floor_us,
             );
             routing::fan_out_lead_reports(sessions, &key, &reports);
         }

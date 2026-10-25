@@ -212,7 +212,8 @@ impl DecisionMaker {
     }
 
     /// Merges another relay's copy of the session clock, which arrived at `received_at` over a
-    /// mesh link with a round trip of `mesh_rtt_us` (the later deadline of the two for each step,
+    /// mesh link whose least sampled round trip is `mesh_rtt_floor_us` (see [`MeshRtt::floor_us`];
+    /// the later deadline of the two for each step,
     /// except one this relay already holds as final), measuring the turns waiting for deadlines it
     /// made final. Returns the reports to push down this relay's
     /// home slots: every measured slot's when the clock's stopped time grew, so each client moves
@@ -224,13 +225,13 @@ impl DecisionMaker {
         &mut self,
         frame: &SessionClockFrame,
         received_at: Instant,
-        mesh_rtt_us: u32,
+        mesh_rtt_floor_us: u32,
     ) -> Vec<(SlotId, LeadReport)> {
         if !self.rollback_enabled {
             return Vec::new();
         }
         let pause_before = self.clock.pause();
-        let changed = self.clock.merge(frame, received_at, mesh_rtt_us);
+        let changed = self.clock.merge(frame, received_at, mesh_rtt_floor_us);
         if self.clock.anchor_step() != Some(frame.anchor_step) {
             return Vec::new();
         }
@@ -287,11 +288,14 @@ impl DecisionMaker {
     /// Each player's lateness is measured where its turns first arrive, at its own relay. A turn
     /// from a player homed elsewhere reached that relay a mesh hop before it reached this one, so
     /// a start timed by arrival here would ask every player to be a hop early whenever such a turn
-    /// completed the step. The hop is half the least round trip seen to the player's relay (zero
-    /// for a player homed here, or one never measured), so a queue on the backbone errs toward the
-    /// later start. A route slower one way than the other doesn't move the start any player
-    /// measures against: a relay holding a copy of the clock places the anchor half a round trip
-    /// before the copy arrived, which shifts it back by as much as this shifts it forward.
+    /// completed the step. The hop is half the least round trip the mesh link to the player's relay
+    /// has sampled (zero for a player homed here, or one never measured), so a queue on the
+    /// backbone errs toward the later start. That relay places its copy of the anchor by half the
+    /// least round trip its own end of the link has sampled, before the copy arrived, so a route
+    /// slower one way than the other cancels out. The player is measured against its own arrival,
+    /// off by how far the two trips together stray from the two ends' least round trips averaged:
+    /// later when the trips took longer, earlier when they took less, as when one end never
+    /// sampled as little as the other (by half the difference).
     ///
     /// Only the arrivals of the lockstep start's last turn are kept. A player whose arrival of the
     /// newest confirmable turn isn't known is taken as arriving now, so nobody is asked to be

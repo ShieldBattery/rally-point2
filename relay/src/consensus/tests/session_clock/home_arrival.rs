@@ -84,10 +84,15 @@ fn a_session_on_one_relay_starts_when_its_last_turn_arrives() {
 }
 
 #[test]
-fn the_least_round_trip_sets_the_hop() {
+fn the_links_least_round_trip_sets_the_hop() {
     let start = Instant::now();
-    // A queue on the backbone made most samples slower than the route.
-    let mut authority = authority_homing_slot_0(&[400_000, round_trip_us(HOP), 350_000]);
+    // A queue on the backbone has the link's smoothed round trip well above the least it sampled.
+    let mut authority = authority_homing_slot_0(&[]);
+    let queued = MeshRtt {
+        rtt_us: 400_000,
+        floor_us: round_trip_us(HOP),
+    };
+    let _ = authority.ingest_remote(&conditions(1, 50_000, 0, 1), queued);
     let _ = authority.note_forwarded_turns(SlotId(0), LOCKSTEP_START_STEPS, start);
     let _ = authority
         .note_forwarded_turns(SlotId(1), LOCKSTEP_START_STEPS, start + 177 * MS)
@@ -95,43 +100,94 @@ fn the_least_round_trip_sets_the_hop() {
     assert_eq!(authority.clock.due_at(ANCHOR), Some(start + 30 * MS));
 }
 
+/// Anchors an authority homing slot 0, whose link to slot 1's relay has sampled
+/// `authority_floor` least, on slot 0's last turn of the lockstep start at `start` and slot 1's
+/// at `reached_home` on its own relay, `there` before reaching the authority. Returns slot 1's
+/// relay holding the copy that arrived `back` later, placed by the `copy_floor` its own end of
+/// the link sampled least, and the authority.
+fn anchor_across_the_link(
+    start: Instant,
+    reached_home: Instant,
+    (authority_floor, copy_floor): (Duration, Duration),
+    (there, back): (Duration, Duration),
+) -> (DecisionMaker, DecisionMaker) {
+    let mut authority = authority_homing_slot_0(&[u32::try_from(us(authority_floor)).unwrap()]);
+    let _ = authority.note_forwarded_turns(SlotId(0), LOCKSTEP_START_STEPS, start);
+    let completed = reached_home + there;
+    let frame = authority
+        .note_forwarded_turns(SlotId(1), LOCKSTEP_START_STEPS, completed)
+        .and_then(|update| update.frame)
+        .expect("anchored");
+    let mut relay = relay_homing_slot_1();
+    let _ = relay.merge_session_clock(
+        &frame,
+        completed + back,
+        u32::try_from(us(copy_floor)).unwrap(),
+    );
+    (relay, authority)
+}
+
 #[test]
-fn no_players_start_lands_before_its_turn_reached_its_own_relay() {
+fn a_players_start_is_off_only_by_how_the_floors_differ_from_the_trips() {
     let start = Instant::now();
     let reached_home = start + 30 * MS;
-    // The mesh round trip the authority sampled least, and the legs the two trips actually took:
-    // routes slower one way than the other, and trips slowed by a queue the round trip the other
-    // relay sampled as the copy arrived also includes.
+    let floor = HOP * 2;
     let cases = [
-        // (least round trip, turn's leg to the authority, copy's leg back, round trip at the copy)
-        (HOP * 2, HOP, HOP, HOP * 2),
-        (HOP * 2, 100 * MS, 194 * MS, HOP * 2),
-        (HOP * 2, 194 * MS, 100 * MS, HOP * 2),
-        (HOP * 2, 250 * MS, 44 * MS, HOP * 2),
-        (HOP * 2, 160 * MS, 160 * MS, 320 * MS),
-        (HOP * 2, 200 * MS, 120 * MS, 320 * MS),
+        // ((authority's floor, copy's floor), (turn's leg there, copy's leg back), slot 1's start)
+        ((floor, floor), (HOP, HOP), reached_home),
+        // Routes slower one way than the other cancel out.
+        ((floor, floor), (100 * MS, 194 * MS), reached_home + 17 * MS),
+        ((floor, floor), (194 * MS, 100 * MS), reached_home),
+        ((floor, floor), (250 * MS, 44 * MS), reached_home),
+        // Trips a queue slowed past the least round trip start the player later.
+        ((floor, floor), (160 * MS, 160 * MS), reached_home + 26 * MS),
+        // The player's end of the link sampled less than the authority's: later by half the
+        // difference.
+        ((floor, 280 * MS), (HOP, HOP), reached_home + 7 * MS),
+        // The player's end never sampled as little as the trips took: earlier by half the
+        // difference, the error left over.
+        ((floor, 308 * MS), (HOP, HOP), reached_home - 7 * MS),
     ];
-    for (least, there, back, at_copy) in cases {
-        let mut authority = authority_homing_slot_0(&[round_trip_us(least / 2)]);
-        let _ = authority.note_forwarded_turns(SlotId(0), LOCKSTEP_START_STEPS, start);
-        let completed = reached_home + there;
-        let frame = authority
-            .note_forwarded_turns(SlotId(1), LOCKSTEP_START_STEPS, completed)
-            .and_then(|update| update.frame)
-            .expect("anchored");
-        let mut relay = relay_homing_slot_1();
-        let _ = relay.merge_session_clock(&frame, completed + back, round_trip_us(at_copy / 2));
-
-        let case = (least, there, back, at_copy);
+    for (floors, legs, expected) in cases {
+        let (relay, authority) = anchor_across_the_link(start, reached_home, floors, legs);
         assert!(
             authority.clock.due_at(ANCHOR).unwrap() >= start,
-            "{case:?}: slot 0 is measured on the authority"
+            "{floors:?} {legs:?}: slot 0 is measured on the authority",
         );
-        assert!(
-            relay.clock.due_at(ANCHOR).unwrap() >= reached_home,
-            "{case:?}: slot 1 is measured on its own relay"
+        assert_eq!(
+            relay.clock.due_at(ANCHOR),
+            Some(expected),
+            "{floors:?} {legs:?}: slot 1 is measured on its own relay",
         );
     }
+}
+
+#[test]
+fn a_queue_inflating_the_copys_round_trip_leaves_the_player_on_time() {
+    let start = Instant::now();
+    let reached_home = start + 30 * MS;
+    // Both ends of the link sampled 294 ms least. A queue has since put the player's end's smoothed
+    // estimate at 400 ms, but the trips took 147 ms each way.
+    let (relay, _) = anchor_across_the_link(start, reached_home, (HOP * 2, HOP * 2), (HOP, HOP));
+    // The player's on-schedule turns read on time against the copy placed by the link's floor.
+    for seq in ANCHOR..=ANCHOR + STALL_SLACK_STEPS {
+        assert_eq!(
+            relay
+                .clock
+                .lateness_us(seq, reached_home + steps(seq - ANCHOR)),
+            Some(0),
+            "seq {seq}",
+        );
+    }
+    // Placed by the smoothed estimate instead, the copy's anchor would land 53 ms early, and the
+    // same turns would read 53 ms late.
+    let mut by_smoothed = relay_homing_slot_1();
+    let frame = relay.session_clock_frame(reached_home + HOP * 2).unwrap();
+    let _ = by_smoothed.merge_session_clock(&frame, reached_home + HOP * 2 + HOP, 400_000);
+    assert_eq!(
+        by_smoothed.clock.lateness_us(ANCHOR, reached_home),
+        Some(53_000)
+    );
 }
 
 /// Plays a session whose players' game loops run together, slot 0 homed on the authority and

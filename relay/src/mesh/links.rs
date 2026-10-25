@@ -13,6 +13,7 @@ use rally_point_proto::messages::{MeshControlFrame, Payload};
 use rally_point_transport::noq;
 use tokio::sync::{Notify, mpsc};
 
+use crate::consensus::MeshRtt;
 use crate::key::SessionKey;
 
 use super::{MeshCommand, MeshState};
@@ -511,9 +512,18 @@ pub(super) const MESH_RTT_CACHE_TTL: std::time::Duration = std::time::Duration::
 /// samples; an old cache refreshes immediately before the next sidecar is
 /// ingested. No timer drives it, so a dormant connection neither wakes nor
 /// returns a value retained from before the idle period.
+///
+/// It also keeps the least RTT it has sampled, which places the session
+/// clock's start. A queue on the backbone only ever adds to a sample, so the
+/// least is the estimate least likely to overstate a trip. One cache serves one
+/// link driver, so a replaced connection starts its floor over and none sticks
+/// from a route that no longer exists.
 #[derive(Debug, Default)]
 pub(super) struct MeshRttCache {
     rtt_us: u32,
+    /// The least nonzero sample, `None` before the first: `0` means the
+    /// connection had no measurement.
+    floor_us: Option<u32>,
     sampled_at: Option<tokio::time::Instant>,
 }
 
@@ -522,7 +532,7 @@ impl MeshRttCache {
         &mut self,
         connection: &rally_point_transport::noq::Connection,
         now: tokio::time::Instant,
-    ) -> u32 {
+    ) -> MeshRtt {
         self.get_or_refresh_with(now, || link_rtt_us(connection))
     }
 
@@ -532,14 +542,20 @@ impl MeshRttCache {
         &mut self,
         now: tokio::time::Instant,
         sample: impl FnOnce() -> u32,
-    ) -> u32 {
+    ) -> MeshRtt {
         if self
             .sampled_at
             .is_none_or(|sampled_at| now.duration_since(sampled_at) >= MESH_RTT_CACHE_TTL)
         {
             self.rtt_us = sample();
             self.sampled_at = Some(now);
+            if self.rtt_us > 0 {
+                self.floor_us = Some(self.floor_us.map_or(self.rtt_us, |f| f.min(self.rtt_us)));
+            }
         }
-        self.rtt_us
+        MeshRtt {
+            rtt_us: self.rtt_us,
+            floor_us: self.floor_us.unwrap_or(self.rtt_us),
+        }
     }
 }

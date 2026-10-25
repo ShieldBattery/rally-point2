@@ -86,7 +86,8 @@ impl DecisionMakers {
     }
 
     /// Merges another relay's copy of `key`'s session clock, which arrived at `received_at` over a
-    /// mesh link with a round trip of `mesh_rtt_us`, returning the lead reports to push down this
+    /// mesh link whose least sampled round trip is `mesh_rtt_floor_us`, returning the lead reports
+    /// to push down this
     /// relay's home slots (see [`DecisionMaker::merge_session_clock`]). Records the anchoring it
     /// brought and any growth of the stopped time in the flight recording.
     #[must_use]
@@ -95,12 +96,12 @@ impl DecisionMakers {
         key: &SessionKey,
         frame: &SessionClockFrame,
         received_at: Instant,
-        mesh_rtt_us: u32,
+        mesh_rtt_floor_us: u32,
     ) -> Vec<(SlotId, LeadReport)> {
         let (reports, events) = match self.lock().get_mut(key) {
             Some(maker) => {
                 let mark = maker.clock_mark();
-                let reports = maker.merge_session_clock(frame, received_at, mesh_rtt_us);
+                let reports = maker.merge_session_clock(frame, received_at, mesh_rtt_floor_us);
                 (reports, maker.clock_events(mark, true))
             }
             None => return Vec::new(),

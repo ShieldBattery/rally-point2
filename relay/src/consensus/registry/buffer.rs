@@ -15,7 +15,7 @@ impl DecisionMakers {
         key: &SessionKey,
         conditions: &LinkConditions,
     ) -> Option<Decision> {
-        self.ingest_conditions(key, &conditions.slots, 0, true)
+        self.ingest_conditions(key, &conditions.slots, MeshRtt::default(), true)
     }
 
     /// The allocation-free single-slot counterpart to [`ingest_local_conditions`](Self::ingest_local_conditions).
@@ -27,14 +27,19 @@ impl DecisionMakers {
         key: &SessionKey,
         conditions: &SlotConditions,
     ) -> Option<Decision> {
-        self.ingest_conditions(key, std::slice::from_ref(conditions), 0, true)
+        self.ingest_conditions(
+            key,
+            std::slice::from_ref(conditions),
+            MeshRtt::default(),
+            true,
+        )
     }
 
     pub(in crate::consensus) fn ingest_conditions(
         &self,
         key: &SessionKey,
         conditions: &[SlotConditions],
-        mesh_rtt_us: u32,
+        mesh_rtt: MeshRtt,
         local: bool,
     ) -> Option<Decision> {
         let (decision, directive, inputs) = {
@@ -43,7 +48,7 @@ impl DecisionMakers {
             if local {
                 maker.activate_local_epochs(conditions);
             }
-            let decision = maker.ingest_slots(conditions, mesh_rtt_us)?;
+            let decision = maker.ingest_slots(conditions, mesh_rtt)?;
             // The queued broadcast carries the decision seq the Decision lacks;
             // read it under the same lock so the recorded event matches exactly
             // what clients will be stamped with. The derivation is *taken* -- it
@@ -81,17 +86,17 @@ impl DecisionMakers {
         }
     }
 
-    /// Feeds a peer relay's `conditions` sidecar (reached over a mesh hop of
-    /// `mesh_rtt_us`) into the session's decision-maker if the relay has one,
+    /// Feeds a peer relay's `conditions` sidecar (reached over a mesh link with
+    /// the round trip `mesh_rtt`) into the session's decision-maker if the relay has one,
     /// logging any decision it fires. Returns the [`Decision`], if any. A no-op
     /// returning `None` when no maker exists for the session.
     pub fn ingest_remote_conditions(
         &self,
         key: &SessionKey,
         conditions: &LinkConditions,
-        mesh_rtt_us: u32,
+        mesh_rtt: impl Into<MeshRtt>,
     ) -> Option<Decision> {
-        self.ingest_conditions(key, &conditions.slots, mesh_rtt_us, false)
+        self.ingest_conditions(key, &conditions.slots, mesh_rtt.into(), false)
     }
 
     /// The buffer directive to stamp onto a turn forwarded for this session, if

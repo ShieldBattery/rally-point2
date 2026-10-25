@@ -27,7 +27,8 @@
 //! same way, as a least stopped time, so no wait is counted twice. There is one anchor: the relay
 //! that started the session as the authority sets it, at the latest instant any player's last turn
 //! of the lockstep start reached that player's own relay, and every other relay places it once, at
-//! the first frame's receipt less the frame's age and half the mesh round trip it took.
+//! the first frame's receipt less the frame's age and half the least round trip its mesh link has
+//! sampled.
 
 use super::*;
 
@@ -290,7 +291,8 @@ impl SessionClock {
     }
 
     /// Merges another relay's copy of the clock, `frame`, which arrived at `received_at` over a
-    /// mesh link with a round trip of `mesh_rtt_us`. Returns whether this copy changed.
+    /// mesh link whose least sampled round trip is `mesh_rtt_floor_us`. Returns whether this copy
+    /// changed.
     ///
     /// Copies only ever gain stopped time, so of two copies, the one that knows of more stopped
     /// time before a step has that step's deadline right, and the merge takes, for each step, the
@@ -302,17 +304,21 @@ impl SessionClock {
     /// the two.
     ///
     /// The anchor is placed once, from the first frame, so later frames don't move every deadline
-    /// by the jitter of their own trip. A frame anchored at another step is ignored.
+    /// by the jitter of their own trip: half a round trip before the frame arrived, by the least
+    /// round trip the link has sampled. That is the estimate the authority moved the start back
+    /// by, so a route slower one way than the other cancels out, and a round trip a queue has
+    /// inflated for now places the anchor no earlier. A frame anchored at another step is
+    /// ignored.
     pub(in crate::consensus) fn merge(
         &mut self,
         frame: &SessionClockFrame,
         received_at: Instant,
-        mesh_rtt_us: u32,
+        mesh_rtt_floor_us: u32,
     ) -> bool {
         let theirs = CopiedStops::from_frame(frame);
         let Some((anchor_step, _)) = self.anchor else {
             let age = Duration::from_micros(frame.since_anchor_us)
-                + Duration::from_micros(u64::from(mesh_rtt_us) / 2);
+                + Duration::from_micros(u64::from(mesh_rtt_floor_us) / 2);
             let at = received_at.checked_sub(age).unwrap_or(received_at);
             self.anchor = Some((frame.anchor_step, at));
             self.final_through = frame.final_through;
