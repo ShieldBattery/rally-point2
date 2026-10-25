@@ -439,25 +439,30 @@ pub(crate) fn complete_finalized_drop(
     let mesh_links = &mesh.links;
     let seen = &mesh.seen;
     // Local staleness proof, checked before anything is stamped: if this
-    // relay's own gap-free forwarded prefix for the slot already extends
-    // PAST the sealed count, turns beyond the count entered the mesh after
-    // the seal the answer describes — the slot reconnected (on a new home)
-    // and played on while this answer was in flight. The home is the slot's
-    // single ingress, so past the seal no legitimate turn can ever exceed
-    // the count; a longer prefix here is proof, not suspicion. The epoch
-    // check at the mesh arm closes most of this; this closes the interleaving
-    // where the reconnect's own connectivity update is still in flight while
-    // its turns (datagrams, a different channel) have already arrived.
-    if let Some(forwarded) = crate::mesh::forwarded_count(seen, key, target)
-        && forwarded > final_turn_count
+    // relay's forward gate holds any of the slot's turns at a seq at or past
+    // the sealed count — in its gap-free prefix or above a gap — that turn
+    // entered the mesh through an ingress the seal does not cover: the slot
+    // reconnected (on a new home) and played on while this answer was in
+    // flight, or a relay that no longer homes the slot answered. The home is
+    // the slot's single ingress, so past the seal no legitimate turn can
+    // ever reach the count; a receipt there is proof, not suspicion. A
+    // receipt above a gap counts too: a survivor that later receives the
+    // turns below it would consume past the count before applying the leave.
+    // The epoch check at the mesh arm closes most of this; this closes the
+    // interleaving where the reconnect's own connectivity update is still in
+    // flight while its turns (datagrams, a different channel) have already
+    // arrived.
+    if let Some(highest) = crate::mesh::highest_forwarded_seq(seen, key, target)
+        && highest >= final_turn_count
     {
+        let forwarded = highest.saturating_add(1);
         tracing::warn!(
             tenant = key.tenant.as_ref(),
             session = key.session.0,
             target = target.0,
             final_turn_count,
-            forwarded,
-            "finalized count is stale; this relay already forwarded past it — refusing",
+            highest_seq = highest,
+            "finalized count is stale; this relay already holds a turn past it — refusing",
         );
         decision_makers.flight_recorder().record(
             key,

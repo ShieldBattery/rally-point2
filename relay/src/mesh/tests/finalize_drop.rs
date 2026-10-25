@@ -395,6 +395,97 @@ fn the_authority_refuses_zero_once_a_turn_of_the_slot_reached_it() {
     );
 }
 
+/// A receipt of the slot above a gap is as much proof of staleness as a
+/// longer prefix. The authority holding seq 1 but not seq 0 refuses a sealed
+/// count of 0: a survivor that later receives seq 0 would consume it before
+/// applying the leave. Holding seqs 0-2 and 5, it refuses a sealed count of 3
+/// the same way, and accepts a count past every receipt.
+#[test]
+fn the_authority_refuses_a_count_below_a_receipt_above_a_gap() {
+    let fixture = finalize_fixture(crate::consensus::Authority::SelfRelay, &[0], PeerDrop::Held);
+    fixture
+        .mesh
+        .session
+        .decision_makers
+        .note_slot_started(&fixture.key, SlotId(0));
+    let (_reg, mut survivor) = fixture.survivor();
+    let _ = mark_seen(&fixture.mesh.seen, &fixture.key, SUBJECT, 1);
+
+    fixture.dispatch(finalized_result(&fixture, None, 0));
+    assert!(
+        survivor.try_recv_leave().is_none(),
+        "seq 1 without seq 0 refuses a count of 0",
+    );
+
+    for seq in [0, 2, 5] {
+        let _ = mark_seen(&fixture.mesh.seen, &fixture.key, SUBJECT, seq);
+    }
+    fixture.dispatch(finalized_result(&fixture, None, 3));
+    assert!(
+        survivor.try_recv_leave().is_none(),
+        "seqs 0-2 and 5 refuse a count of 3",
+    );
+    assert!(
+        fixture
+            .mesh
+            .session
+            .drop_holds
+            .is_pending(&fixture.key, SUBJECT),
+        "the hold survives both stale counts",
+    );
+
+    fixture.dispatch(finalized_result(&fixture, None, 6));
+    let leave = survivor
+        .try_recv_leave()
+        .expect("a count past every receipt completes");
+    assert_eq!(leave.final_turn_count, Some(6));
+}
+
+/// A home whose own gate holds one of the slot's turns above a gap refuses to
+/// seal: the authority would refuse any count below that receipt, and a seal
+/// would only lock out the reconnect whose resend could fill the gap.
+#[test]
+fn the_home_refuses_to_seal_over_its_own_sparse_receipts() {
+    let fixture = finalize_fixture(
+        crate::consensus::Authority::Peer,
+        &[FINALIZE_SUBJECT_SLOT],
+        PeerDrop::Untouched,
+    );
+    fixture
+        .mesh
+        .session
+        .decision_makers
+        .note_peer_slot_started(&fixture.key, SlotId(0));
+    fixture.mesh.session.decision_makers.record_departure(
+        &fixture.key,
+        SUBJECT,
+        crate::consensus::DepartureStamps::default(),
+        crate::consensus::LEAVE_REASON_DROPPED,
+    );
+    for seq in [0, 1, 2, 5] {
+        let _ = mark_seen(&fixture.mesh.seen, &fixture.key, SUBJECT, seq);
+    }
+    let (_echo_fwd_rx, mut ctl_rx) = register_link_channels(&fixture.mesh.links, &fixture.key);
+
+    fixture.dispatch(finalize_request(&fixture));
+    assert_eq!(
+        home_answer(&mut ctl_rx),
+        (FINALIZE_OUTCOME_REJECTED_NO_CURSOR, None),
+    );
+    assert!(
+        matches!(
+            fixture
+                .mesh
+                .session
+                .decision_makers
+                .resolve_reconnect(&fixture.key, SUBJECT, None, true, || {})
+                .admission,
+            crate::consensus::ReconnectAdmission::Admitted { .. }
+        ),
+        "no seal is left behind to refuse the slot's reconnect",
+    );
+}
+
 /// The authority's `FinalizeDrop` for the subject slot, epoch-less.
 fn finalize_request(fixture: &FinalizeFixture) -> MeshControlFrame {
     MeshControlFrame {

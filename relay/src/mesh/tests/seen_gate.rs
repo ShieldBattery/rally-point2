@@ -333,3 +333,41 @@ fn slot_receipts_report_the_prefix_and_the_sparse_ahead_even_collapsed() {
         "the sparse remainder stays bounded",
     );
 }
+
+/// The finalization reading is stricter than [`forwarded_count`]: any receipt
+/// above a gap makes it unsound, and the highest receipt, sparse or not, is
+/// what the authority's staleness check compares against.
+#[test]
+fn the_finalization_reading_refuses_sparse_receipts_and_reports_the_highest() {
+    let registries = new_seen_registries();
+    let key = control_key();
+    assert_eq!(
+        forward_gate_reading(&registries, &key, SlotId(0)),
+        crate::consensus::ForwardGateReading::NeverForwarded,
+    );
+    assert_eq!(highest_forwarded_seq(&registries, &key, SlotId(0)), None);
+
+    let _ = mark_seen(&registries, &key, SlotId(0), 1);
+    assert_eq!(
+        forward_gate_reading(&registries, &key, SlotId(0)),
+        crate::consensus::ForwardGateReading::Unsound,
+    );
+    assert_eq!(highest_forwarded_seq(&registries, &key, SlotId(0)), Some(1));
+
+    for seq in [0, 2] {
+        let _ = mark_seen(&registries, &key, SlotId(0), seq);
+    }
+    assert_eq!(
+        forward_gate_reading(&registries, &key, SlotId(0)),
+        crate::consensus::ForwardGateReading::Count(3),
+    );
+    assert_eq!(highest_forwarded_seq(&registries, &key, SlotId(0)), Some(2));
+
+    let _ = mark_seen(&registries, &key, SlotId(0), 5);
+    assert_eq!(forwarded_count(&registries, &key, SlotId(0)), Some(3));
+    assert_eq!(
+        forward_gate_reading(&registries, &key, SlotId(0)),
+        crate::consensus::ForwardGateReading::Unsound,
+    );
+    assert_eq!(highest_forwarded_seq(&registries, &key, SlotId(0)), Some(5));
+}

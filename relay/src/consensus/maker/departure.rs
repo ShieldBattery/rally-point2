@@ -126,9 +126,8 @@ pub enum ForwardGateReading {
     /// none ever entered the game, or only that this relay never saw them, is
     /// the maker's to judge (see `DecisionMaker::home_forwarded_nothing`).
     NeverForwarded,
-    /// Turns were recorded, but no gap-free prefix counts them: the prefix was
-    /// collapsed over a gap, or the slot's first turn is missing below the
-    /// ones recorded.
+    /// Turns were recorded, but they are not exactly seqs `0..n`: the prefix
+    /// was collapsed over a gap, or some recorded seq sits above a gap.
     Unsound,
 }
 

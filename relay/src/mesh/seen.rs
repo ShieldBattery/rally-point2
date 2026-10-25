@@ -310,19 +310,31 @@ pub fn deregister_seen(registries: &SeenRegistries, key: &SessionKey) {
 /// Callers fall back to frame scheduling on `None`; a fabricated or inflated
 /// exact count is strictly worse than no count.
 pub fn forwarded_count(registries: &SeenRegistries, key: &SessionKey, slot: SlotId) -> Option<u64> {
-    match forward_gate_reading(registries, key, slot) {
-        ForwardGateReading::Count(count) => Some(count),
-        ForwardGateReading::NeverForwarded | ForwardGateReading::Unsound => None,
+    let roster = registries.lock();
+    let state = roster.get(key)?.slots.get(&slot)?;
+    if state.prefix_collapsed {
+        return None;
     }
+    // A prefix top of `u64::MAX` has no representable successor; no real
+    // session approaches it, and answering `None` (frame fallback) is safe.
+    state.forwarded_through?.checked_add(1)
 }
 
-/// [`forwarded_count`] with its `None` split in two: a gate holding no record
-/// of `slot` at all ([`ForwardGateReading::NeverForwarded`] — no session state,
-/// or none for the slot) versus one holding turns no gap-free prefix counts
-/// ([`ForwardGateReading::Unsound`] — a collapsed prefix, or recorded turns
-/// above a missing first one). Read by a drop finalization, which can prove a
-/// count of zero from the former on a home with the slot's whole ingress
-/// history (see [`crate::consensus::DecisionMakers::finalize_drop`]).
+/// What a drop finalization may seal from this gate for `slot`: the count of a
+/// recorded set that is exactly seqs `0..n` ([`ForwardGateReading::Count`]), no
+/// record of the slot at all ([`ForwardGateReading::NeverForwarded`] — no
+/// session state, or none for the slot), or anything else
+/// ([`ForwardGateReading::Unsound`] — a collapsed prefix, or any recorded seq
+/// above a gap).
+///
+/// Stricter than [`forwarded_count`], which counts the prefix and ignores
+/// sparse receipts above it. A finalized count must sit above every receipt
+/// any relay holds, or the authority refuses it as stale (see
+/// [`highest_forwarded_seq`]); a home whose own gate already holds a turn past
+/// its prefix would seal a count the authority can never accept, and the seal
+/// would only refuse the reconnect whose resend could close the gap. See
+/// [`crate::consensus::DecisionMakers::finalize_drop`] for how the maker reads
+/// each answer.
 pub fn forward_gate_reading(
     registries: &SeenRegistries,
     key: &SessionKey,
@@ -332,15 +344,33 @@ pub fn forward_gate_reading(
     let Some(state) = roster.get(key).and_then(|seen| seen.slots.get(&slot)) else {
         return ForwardGateReading::NeverForwarded;
     };
-    if state.prefix_collapsed {
+    if state.prefix_collapsed || !state.ahead.is_empty() {
         return ForwardGateReading::Unsound;
     }
     // A prefix top of `u64::MAX` has no representable successor; no real
-    // session approaches it, and answering no count (frame fallback) is safe.
+    // session approaches it, and answering no count is safe.
     state
         .forwarded_through
         .and_then(|through| through.checked_add(1))
         .map_or(ForwardGateReading::Unsound, ForwardGateReading::Count)
+}
+
+/// The highest of `slot`'s seqs this gate has recorded, in its gap-free prefix
+/// or above a gap, or `None` when it has recorded none. A relay holding a
+/// receipt at or past a finalized count is proof the count is stale: the seal
+/// leaves nothing past the count able to enter the game, so a turn there
+/// entered through an ingress the seal did not cover. Sparse receipts count as
+/// much as prefix ones — a survivor that later receives the missing turns below
+/// one would consume past the count.
+pub fn highest_forwarded_seq(
+    registries: &SeenRegistries,
+    key: &SessionKey,
+    slot: SlotId,
+) -> Option<u64> {
+    let roster = registries.lock();
+    let state = roster.get(key)?.slots.get(&slot)?;
+    // Every sparse seq sits above the prefix top.
+    state.ahead.last().copied().or(state.forwarded_through)
 }
 
 /// A snapshot of `key`'s forward-gate cursors, as "next needed seq" per slot —

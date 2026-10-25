@@ -286,11 +286,12 @@ pub enum FlightEvent {
         prior_frame: u32,
     },
     /// The authority refused a home's FINALIZED answer because its own
-    /// forwarded prefix for the slot already extends past the sealed count —
-    /// local proof that turns beyond the count entered the mesh after the
-    /// seal the answer describes (a partition-delayed result from a home the
-    /// slot has since moved past). The drop stays held; a later re-request
-    /// answers from the slot's current state.
+    /// forward gate already holds one of the slot's turns at or past the
+    /// sealed count, in its gap-free prefix or above a gap — local proof that
+    /// turns beyond the count entered the mesh after the seal the answer
+    /// describes (a partition-delayed result from a home the slot has since
+    /// moved past). `forwarded` is one past the highest seq held. The drop
+    /// stays held; a later re-request answers from the slot's current state.
     DropFinalizeStaleCount {
         slot: u8,
         sealed_count: u64,

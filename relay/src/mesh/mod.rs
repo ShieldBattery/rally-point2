@@ -72,8 +72,8 @@ pub use links::{
 };
 pub use seen::{
     Forwarded, MeshSeen, Seen, SeenRegistries, SlotReceipts, deregister_seen, forward_gate_reading,
-    forwarded_count, has_resumable_state, mark_seen, new_seen_registries, resume_cursor_snapshot,
-    slot_receipts,
+    forwarded_count, has_resumable_state, highest_forwarded_seq, mark_seen, new_seen_registries,
+    resume_cursor_snapshot, slot_receipts,
 };
 
 use std::collections::HashMap;
