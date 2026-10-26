@@ -236,14 +236,14 @@ async fn disconnect_budget_snapshots_replace_and_survive_reconnect() {
     send_control_disconnect_budgets(
         &mut send,
         DisconnectBudgets {
-            budgets: vec![first.clone()],
+            budgets: vec![first],
         },
     )
     .await
     .unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
-        budgets.wait_for(|v| v == &vec![first.clone()]),
+        budgets.wait_for(|v| v == &vec![first]),
     )
     .await
     .unwrap()
@@ -265,14 +265,14 @@ async fn disconnect_budget_snapshots_replace_and_survive_reconnect() {
     send_control_disconnect_budgets(
         &mut send,
         DisconnectBudgets {
-            budgets: vec![second.clone(), invalid],
+            budgets: vec![second, invalid],
         },
     )
     .await
     .unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
-        budgets.wait_for(|v| v == &vec![second.clone()]),
+        budgets.wait_for(|v| v == &vec![second]),
     )
     .await
     .unwrap()
