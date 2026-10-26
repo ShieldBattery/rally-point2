@@ -8,6 +8,27 @@ use std::sync::atomic::Ordering;
 
 use super::inbound::{log_link_closed, sample_slot_conditions, send_packet};
 
+/// Pushes the complete disconnect-budget snapshot on its own cadence.
+pub(super) async fn push_disconnect_budgets(ctx: &mut SlotLinkCtx) -> ControlFlow<()> {
+    let budgets =
+        super::super::disconnect_budget::disconnect_budget_status(&ctx.mesh_for_teardown, &ctx.key);
+    match tokio::time::timeout(
+        Duration::from_secs(1),
+        rally_point_transport::control::send_control_disconnect_budgets(
+            &mut ctx.control_send,
+            budgets,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(())) => {
+            ctx.budget_deadline = Instant::now() + Duration::from_secs(1);
+            ControlFlow::Continue(())
+        }
+        _ => ControlFlow::Break(()),
+    }
+}
+
 /// The fixed-cadence maintenance flush.
 pub(super) fn maintenance_flush(link: &mut Link, ctx: &mut SlotLinkCtx) -> ControlFlow<()> {
     // The fixed-cadence maintenance flush. When a forwarded turn is

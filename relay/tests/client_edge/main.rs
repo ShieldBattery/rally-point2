@@ -14,6 +14,7 @@ mod helpers;
 mod auth;
 mod connectivity;
 mod desync_eviction;
+mod disconnect_budget;
 mod drop_holds;
 mod evidence;
 mod extra_ports;

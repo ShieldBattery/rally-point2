@@ -452,6 +452,9 @@ fn dispatch_mesh_control_frame(
             );
             routing::fan_out_lead_reports(sessions, &key, &reports);
         }
+        Some(mesh_control_frame::Kind::DisconnectBudgetState(state)) => {
+            super::disconnect_budget::receive_disconnect_budget(mesh, &key, peer_id, state);
+        }
         Some(mesh_control_frame::Kind::SlotConnectivity(change)) => {
             let Ok(slot) = u8::try_from(change.slot).map(SlotId) else {
                 tracing::warn!(
@@ -480,7 +483,7 @@ fn dispatch_mesh_control_frame(
             // arrived first, and fanning out true would resurrect that slot.
             let rejected = if change.connected {
                 mesh.session
-                    .admit_reconnect(&key, slot, change.connection_epoch)
+                    .observe_reconnect(&key, slot, change.connection_epoch)
                     == crate::consensus::ReconnectAdmission::Rejected
             } else {
                 !mesh.session.decision_makers.mark_connection_down(
@@ -500,6 +503,17 @@ fn dispatch_mesh_control_frame(
                     },
                 );
                 return;
+            }
+            if !change.connected
+                && mesh.session.decision_makers.is_started(&key)
+                && let Some(epoch) = change.connection_epoch
+            {
+                mesh.session.disconnect_budgets.start_remote_outage(
+                    &key,
+                    slot,
+                    epoch,
+                    std::time::Instant::now(),
+                );
             }
             routing::fan_out_connectivity(
                 sessions,

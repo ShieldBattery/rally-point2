@@ -68,6 +68,19 @@ impl MeshControl {
             .map(|p| p.relay_id)
             .filter(|id| *id != self.our_id)
             .collect();
+        self.mesh.session.disconnect_budgets.configure_session(
+            &key,
+            descriptor.resumed,
+            &descriptor.homed_slots,
+            &descriptor
+                .expected_slots
+                .iter()
+                .chain(&descriptor.observer_slots)
+                .chain(&descriptor.homed_slots)
+                .copied()
+                .collect::<Vec<_>>(),
+            &new_peers.iter().copied().collect::<Vec<_>>(),
+        );
 
         // Record this session's authority order and re-derive the verdict.
         // The order is the coordinator's ranking (home relay first); which of

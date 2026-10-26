@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeadReport, LeaveDirective, Payload, RollbackStats};
+use rally_point_proto::messages::{
+    DisconnectBudget, LeadReport, LeaveDirective, Payload, RollbackStats,
+};
 use tokio::sync::{mpsc, watch};
 
 use crate::phase::PhaseStatus;
@@ -227,6 +229,8 @@ pub struct TurnChannels {
     /// report restates the whole window, so only the newest matters. `None`
     /// until the first report arrives, and always outside a rollback session.
     pub lead_report: watch::Receiver<Option<LeadReport>>,
+    /// The latest complete relay-authored disconnect balance snapshot.
+    pub disconnect_budgets: watch::Receiver<Vec<DisconnectBudget>>,
     /// In a rollback session, the highest count the relay serving the current
     /// connection has stamped on its packets of every in-game slot's turns it holds
     /// without a gap: every turn below it has reached that relay. A game stalled

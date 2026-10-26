@@ -200,6 +200,11 @@ impl LinkDriver {
                     // link registration. This closes the race where a
                     // client's original announcement ran before the Join.
                     // The same snapshot carries active connection epochs.
+                    super::disconnect_budget::reconcile_disconnect_budget(
+                        &mesh_for_dispatch.session.disconnect_budgets,
+                        control_forward_tx,
+                        &key,
+                    );
                     reconcile_local_slots_on_join(conditions, control_forward_tx, &key);
                     // And the game-started reports its own home clients made,
                     // which reach no other relay on their own.

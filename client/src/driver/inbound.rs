@@ -397,6 +397,23 @@ pub(super) async fn on_control_frame(
         // relay against a rollback session's clock. The driver doesn't act on
         // it: the game paces its simulation from it, so it goes straight to the
         // game's watch, newest wins.
+        Some(ControlInbound::DisconnectBudgets(snapshot)) => {
+            let budgets = snapshot
+                .budgets
+                .into_iter()
+                .filter(|budget| {
+                    let valid = u8::try_from(budget.slot).is_ok();
+                    if !valid {
+                        tracing::warn!(
+                            slot = budget.slot,
+                            "disconnect budget names a slot out of range"
+                        );
+                    }
+                    valid
+                })
+                .collect();
+            seam.disconnect_budgets.send_replace(budgets);
+        }
         Some(ControlInbound::LeadReport(report)) => {
             let _ = seam.lead_report.send_replace(Some(report));
         }

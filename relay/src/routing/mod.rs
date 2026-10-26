@@ -69,6 +69,8 @@ use forward::{ForwardRx, ForwardSink};
 
 mod close;
 mod departure;
+mod disconnect_budget;
+pub use disconnect_budget::run_disconnect_budget_watch;
 mod drops;
 mod fan_out;
 mod forward;

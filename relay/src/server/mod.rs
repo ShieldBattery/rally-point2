@@ -512,6 +512,58 @@ async fn serve_connection(
             .evidence_config(&key)
             .unwrap_or_default()
     };
+    if mesh.session.decision_makers.descriptors_required() {
+        let ready = async {
+            while !mesh.session.disconnect_budgets.is_synced(&key) {
+                crate::mesh::broadcast_disconnect_budget(&mesh, &key);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        if tokio::time::timeout_at(auth_deadline, ready).await.is_err() {
+            connection.close(
+                VarInt::from_u32(close_codes::AUTH_TIMEOUT),
+                b"disconnect accounting unavailable",
+            );
+            return Err(ConnError::AuthTimeout);
+        }
+    }
+    if mesh.session.decision_makers.descriptors_required()
+        && (mesh.session.decision_makers.is_started(&key)
+            || !mesh
+                .session
+                .disconnect_budgets
+                .snapshot(&key, std::time::Instant::now())
+                .is_empty())
+    {
+        let budgets = &mesh.session.disconnect_budgets;
+        let Some(checkpoint) = budgets.begin_checkpoint(&key) else {
+            connection.close(
+                VarInt::from_u32(close_codes::AUTH_TIMEOUT),
+                b"disconnect accounting unavailable",
+            );
+            return Err(ConnError::AuthTimeout);
+        };
+        // Preserve the ongoing outage on every serving peer before admitting a
+        // reconnect. A lost completion then leaves a running debit, never a refill.
+        let committed = tokio::time::timeout_at(auth_deadline, async {
+            loop {
+                crate::mesh::checkpoint_disconnect_budget(&mesh, &key, checkpoint);
+                if budgets.is_checkpoint_complete(&key, checkpoint) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        budgets.finish_checkpoint(&key, checkpoint);
+        if committed.is_err() {
+            connection.close(
+                VarInt::from_u32(close_codes::AUTH_TIMEOUT),
+                b"disconnect checkpoint unavailable",
+            );
+            return Err(ConnError::AuthTimeout);
+        }
+    }
     let evidence = auth::verify_evidence(&evidence_request, evidence, &config);
     drop(handshake_permit);
 
@@ -667,6 +719,11 @@ async fn serve_connection(
     let reinstated = match verdict {
         consensus::ReconnectAdmission::Admitted { reinstated } => reinstated,
         consensus::ReconnectAdmission::Rejected => {
+            if mesh.session.decision_makers.descriptors_required()
+                && !mesh.session.disconnect_budgets.is_synced(&key)
+            {
+                return Err(admission.refuse(admission::BUDGET_UNAVAILABLE));
+            }
             return Err(admission.refuse(DEPARTED_AT_ADMISSION));
         }
     };

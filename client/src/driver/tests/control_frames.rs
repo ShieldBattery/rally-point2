@@ -218,3 +218,66 @@ async fn undrained_best_effort_channels_drop_instead_of_stalling_turns() {
     drop(fixture.chan.inbound);
     let _ = tokio::time::timeout(Duration::from_secs(5), fixture.task).await;
 }
+
+#[tokio::test]
+async fn disconnect_budget_snapshots_replace_and_survive_reconnect() {
+    use rally_point_proto::messages::{DisconnectBudget, DisconnectBudgets};
+    use rally_point_transport::control::send_control_disconnect_budgets;
+
+    let (sessions, chan) = ReconnectSessions::start().await;
+    let mut budgets = chan.disconnect_budgets.clone();
+    assert!(budgets.borrow().is_empty());
+    let (mut send, _recv) = sessions.peer.connection().open_bi().await.unwrap();
+    let first = DisconnectBudget {
+        slot: 1,
+        remaining_ms: 179_000,
+        running: true,
+    };
+    send_control_disconnect_budgets(
+        &mut send,
+        DisconnectBudgets {
+            budgets: vec![first.clone()],
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        budgets.wait_for(|v| v == &vec![first.clone()]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let sessions = sessions.reconnect().await;
+    assert_eq!(*budgets.borrow(), vec![first]);
+    let (mut send, _recv) = sessions.peer.connection().open_bi().await.unwrap();
+    let second = DisconnectBudget {
+        slot: 2,
+        remaining_ms: 100_000,
+        running: false,
+    };
+    let invalid = DisconnectBudget {
+        slot: 256,
+        remaining_ms: 0,
+        running: true,
+    };
+    send_control_disconnect_budgets(
+        &mut send,
+        DisconnectBudgets {
+            budgets: vec![second.clone(), invalid],
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        budgets.wait_for(|v| v == &vec![second.clone()]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(chan);
+    drop(budgets);
+    let _ = sessions.session.await;
+}

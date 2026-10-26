@@ -92,7 +92,9 @@ async fn fires_session_start_with_the_computed_depth_once_every_expected_slot_co
     let mut reader0 = spawn_control_reader(slot0.connection().clone());
     loop {
         match tokio::time::timeout(Duration::from_millis(100), reader0.recv()).await {
-            Ok(Some(ControlInbound::Connectivity(_))) => continue,
+            Ok(Some(ControlInbound::Connectivity(_) | ControlInbound::DisconnectBudgets(_))) => {
+                continue;
+            }
             Ok(Some(other)) => {
                 panic!("no session-start until every expected slot connects, got {other:?}")
             }
@@ -153,7 +155,7 @@ async fn a_slots_connect_fans_a_connectivity_up_to_the_other_slots() {
     // its own `connected = true` frame; read past it to the one naming slot 1.)
     let _slot1 = connect_slot(&endpoint, addr, &tenant, session, SlotId(1)).await;
     let mut saw_slot1_connected = false;
-    for _ in 0..4 {
+    for _ in 0..8 {
         match tokio::time::timeout(Duration::from_secs(5), reader0.recv()).await {
             Ok(Some(ControlInbound::Connectivity(change))) => {
                 if change.slot == 1 {
@@ -163,6 +165,7 @@ async fn a_slots_connect_fans_a_connectivity_up_to_the_other_slots() {
                 }
                 // Slot 0's own `connected = true` frame — keep reading.
             }
+            Ok(Some(ControlInbound::DisconnectBudgets(_))) => continue,
             Ok(Some(other)) => panic!("unexpected control frame: {other:?}"),
             Ok(None) => panic!("slot 0's control stream closed early"),
             Err(_) => panic!("timed out waiting for slot 1's connectivity frame"),

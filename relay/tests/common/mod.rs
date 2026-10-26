@@ -443,7 +443,10 @@ pub async fn recv_meaningful(reader: &mut mpsc::Receiver<ControlInbound>) -> Con
             .await
             .expect("a control frame arrives before the timeout")
             .expect("the control stream stays open");
-        if !matches!(frame, ControlInbound::Connectivity(_)) {
+        if !matches!(
+            frame,
+            ControlInbound::Connectivity(_) | ControlInbound::DisconnectBudgets(_)
+        ) {
             return frame;
         }
     }

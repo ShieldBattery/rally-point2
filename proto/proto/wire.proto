@@ -470,7 +470,21 @@ message ControlFrame {
     // frame over either limit without closing the link. A relay that predates
     // it skips the frame. See `RollbackStats`.
     RollbackStats rollback_stats = 18;
+
+    // Latest relay-authored disconnect balances for the session.
+    DisconnectBudgets disconnect_budgets = 19;
   }
+}
+
+// A complete snapshot of the session's disconnect balances.
+message DisconnectBudgets {
+  repeated DisconnectBudget budgets = 1;
+}
+
+message DisconnectBudget {
+  uint32 slot = 1;
+  uint64 remaining_ms = 2;
+  bool running = 3;
 }
 
 // A relay-authored instruction to change the latency buffer at an agreed future
@@ -1411,9 +1425,31 @@ message MeshControlFrame {
     // `SessionClock`. Tag 19 carried an earlier shape that only grew a total
     // stopped time; a relay that predates this tag skips it.
     SessionClock session_clock = 20;
+
+    // Relay-authored disconnect debit state or a request for that state.
+    DisconnectBudgetState disconnect_budget_state = 21;
   }
 
   reserved 19;
+}
+
+// Cumulative disconnect debits identified by slot and connection epoch.
+message DisconnectBudgetState {
+  repeated DisconnectDebit debits = 1;
+  bool request = 2;
+  // Nonzero challenge echoed only in a response to a baseline request.
+  fixed64 bootstrap_id = 3;
+  // A nonzero checkpoint asks the recipient to acknowledge the merged snapshot.
+  fixed64 checkpoint_id = 4;
+  // A checkpoint acknowledgement has no debit entries.
+  bool checkpoint_ack = 5;
+}
+
+message DisconnectDebit {
+  uint32 slot = 1;
+  fixed64 connection_epoch = 2;
+  uint64 elapsed_ms = 3;
+  bool complete = 4;
 }
 
 // One destination client's end-to-end delivered-through cursors: for each

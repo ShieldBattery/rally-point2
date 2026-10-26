@@ -8,6 +8,7 @@ use rally_point_proto::ids::SlotId;
 use crate::consensus::{DecisionMakers, ReconnectAdmission};
 use crate::coordinator::load_fence::LoadStateFence;
 use crate::key::SessionKey;
+use crate::session::disconnect_budget::DisconnectBudgets;
 use crate::session::drop_hold::DropHolds;
 use crate::session::gate::SessionGates;
 use crate::session::presence::PresenceRegistry;
@@ -90,11 +91,13 @@ pub struct SessionState {
     /// per-requester rate cap on the manual drop requests that resolve them. A
     /// slot that dropped (its link died) has its departure recorded and
     /// announced immediately, but the decision to remove it from lockstep is
-    /// held here indefinitely — made only when a surviving member's
-    /// `RequestDrop` is honored past the unlock floor, never on a timer; a clean
+    /// held here until a surviving member's `RequestDrop` is honored past the unlock
+    /// floor or its cumulative disconnect allowance expires; a clean
     /// leave bypasses the hold. Local and ephemeral, not replicated. See
     /// [`crate::session::drop_hold`].
     pub drop_holds: DropHolds,
+    /// Cumulative disconnect debit records, retained until descriptor retirement.
+    pub disconnect_budgets: DisconnectBudgets,
     /// Per-session bounded record of the turns this relay has forwarded, so a
     /// client that dropped and re-dialed while its drop was undecided can be
     /// replayed the turns it missed and catch its sim up. Local and ephemeral
@@ -150,6 +153,7 @@ impl SessionState {
             presence: Arc::new(crate::session::presence::new_presence_registry()),
             side_channels: SideChannels::default(),
             drop_holds: DropHolds::new(tunables.drop_unlock, tunables.abandon_timeout),
+            disconnect_budgets: DisconnectBudgets::default(),
             turn_ring: TurnRing::new(),
             provisional: ProvisionalSessions::new(tunables.provisional_window),
             gates: SessionGates::default(),
@@ -164,6 +168,23 @@ impl SessionState {
 /// The operations that span two of these stores, which is what makes them this
 /// bundle's rather than either store's.
 impl SessionState {
+    /// Applies the home relay's admitted connection as a fact. A peer's later
+    /// observation time must not veto a reconnect the home admitted before expiry.
+    pub(crate) fn observe_reconnect(
+        &self,
+        key: &SessionKey,
+        slot: SlotId,
+        epoch: Option<u64>,
+    ) -> ReconnectAdmission {
+        self.drop_holds
+            .resolve_reconnect(key, slot, |hold_pending| {
+                let transition =
+                    self.decision_makers
+                        .resolve_reconnect(key, slot, epoch, hold_pending, || {});
+                (transition.admission, transition.consume_hold)
+            })
+    }
+
     /// Atomically resolves a reliable connection-up event against both the drop
     /// hold and the decision-maker's departure/generation state.
     ///
@@ -171,7 +192,7 @@ impl SessionState {
     /// reinstatement plus activation happen under that single maker lock. Thus
     /// an old departure can linearize only wholly before this operation (and be
     /// claimed here) or wholly after the new epoch is active (and be rejected
-    /// as stale). The lock order is holds → decision-makers, everywhere.
+    /// as stale). The lock order is holds → disconnect budgets → decision-makers.
     pub(crate) fn admit_reconnect(
         &self,
         key: &SessionKey,
@@ -194,14 +215,30 @@ impl SessionState {
     ) -> ReconnectAdmission {
         self.drop_holds
             .resolve_reconnect(key, slot, |hold_pending| {
-                let transition = self.decision_makers.resolve_reconnect(
+                let outage = self.disconnect_budgets.running_epoch(key, slot);
+                let result = self.disconnect_budgets.try_reconnect(
                     key,
                     slot,
-                    epoch,
-                    hold_pending,
-                    after_reinstate,
+                    outage,
+                    std::time::Instant::now(),
+                    || {
+                        let transition = self.decision_makers.resolve_reconnect(
+                            key,
+                            slot,
+                            epoch,
+                            hold_pending,
+                            after_reinstate,
+                        );
+                        match transition.admission {
+                            ReconnectAdmission::Admitted { .. } => Ok(transition),
+                            ReconnectAdmission::Rejected => Err(()),
+                        }
+                    },
                 );
-                (transition.admission, transition.consume_hold)
+                match result {
+                    Ok(transition) => (transition.admission, transition.consume_hold),
+                    Err(_) => (ReconnectAdmission::Rejected, false),
+                }
             })
     }
 }
@@ -341,6 +378,7 @@ impl SessionState {
     /// teardown as possible.
     pub(crate) fn retire(&self, key: &SessionKey, seen: &crate::mesh::SeenRegistries) {
         self.gates.retire(key);
+        self.disconnect_budgets.retire(key);
         self.decision_makers.deregister_maker(key);
         crate::session::presence::forget(&self.presence, key);
         // Discard any turns still penned for the session — with the maker gone

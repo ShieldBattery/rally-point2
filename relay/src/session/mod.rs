@@ -8,6 +8,7 @@
 //! bookkeeping, and the bounded ring of recently forwarded turns a reconnecting
 //! client replays from.
 
+pub mod disconnect_budget;
 pub mod drop_hold;
 pub mod gate;
 pub mod presence;

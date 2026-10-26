@@ -41,6 +41,7 @@ pub(super) fn handle_control_frame(
         }
         // Connectivity frames are relay → client only; a client never
         // sends one up. Ignore a stray one, mirroring the cases above.
+        Some(ControlInbound::DisconnectBudgets(_)) => {}
         Some(ControlInbound::Connectivity(_)) => {
             tracing::warn!(
                 tenant = ctx.key.tenant.as_ref(),

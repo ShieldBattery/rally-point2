@@ -194,7 +194,14 @@ pub(crate) fn honor_drop_request(
         return;
     }
     match drop_holds.held_for(key, target) {
-        Some(elapsed) if elapsed >= drop_holds.unlock() => {
+        Some(elapsed)
+            if elapsed >= drop_holds.unlock()
+                || mesh.session.disconnect_budgets.exhausted(
+                    key,
+                    target,
+                    std::time::Instant::now(),
+                ) =>
+        {
             // In a handshake-enabled session, the drop is decided only
             // through home-side finalization: the home seals the slot's
             // generation (refusing admission and fencing its turn ingress)

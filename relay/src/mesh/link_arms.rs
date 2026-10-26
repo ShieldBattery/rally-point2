@@ -459,6 +459,11 @@ impl LinkDriver {
                     let resumed = state.resumed || decision_makers.is_resumed(&key);
                     let first_peer_presence = peer_presence_seen.insert(report.session);
                     if first_peer_presence {
+                        super::disconnect_budget::reconcile_disconnect_budget(
+                            &mesh_for_dispatch.session.disconnect_budgets,
+                            control_forward_tx,
+                            &key,
+                        );
                         reconcile_local_slots_on_join(conditions, control_forward_tx, &key);
                         reconcile_started_slots_on_join(decision_makers, control_forward_tx, &key);
                         reconcile_session_clock_on_join(decision_makers, control_forward_tx, &key);
