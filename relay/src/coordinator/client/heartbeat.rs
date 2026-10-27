@@ -233,7 +233,9 @@ pub(super) fn attach_heartbeat_evidence(
 /// activates in between shows up live but not yet ever-connected, which a fence
 /// reads as a live link it never probed — unfenced, and asked again — rather than
 /// as a departed one. A slot that leaves in between shows up as departed, which it
-/// is.
+/// is. A link that both activates and closes in between leaves no trace in either
+/// read; `last_link_epochs` is what a caller re-reads afterwards to catch that (see
+/// [`fenced_load_state_snapshot`]).
 ///
 /// `between_reads` runs after the retained state is read and before the live
 /// roster is. Every caller passes a no-op except a test landing a link change
@@ -515,20 +517,26 @@ pub(super) async fn fenced_load_state_snapshot_with(
             link_epoch: link_epoch_of(&last_link_epochs, slot),
         })
         .collect();
-    // A closed slot's epoch was read before the roster, so a link of its that
-    // activated and closed again between the two reads would leave the epoch
-    // naming the earlier closure. The roster read is the one that found the slot
-    // gone; no epoch moving between the first read and this one means no link of
-    // the slot activated across it, so the epoch read first is still the latest
-    // and names the closure the roster saw. A moved epoch is a membership change
-    // like any other across the fence, and withholds the live verdict.
-    let epochs_after = decision_makers.last_link_epochs(&key);
-    let closed_epochs_settled = closed_slots
-        .iter()
-        .all(|closed| link_epoch_of(&epochs_after, closed.slot) == closed.link_epoch);
+    // `ever_connected` and the epochs were read before the roster, so a link that
+    // activated between the two reads is invisible to the first and may be gone
+    // from the second: a slot's first link doing that lands in neither the live
+    // set nor the closed one, and a later link of an already-closed slot leaves
+    // its epoch naming the earlier closure rather than the one the roster saw.
+    // Every activation records its link's epoch in the same critical section that
+    // adds the slot to `ever_connected` — a first one adds an entry, any later one
+    // replaces it, and epochs are never reused — so the whole epoch map coming back
+    // unchanged after the roster read means no link activated across it. Then the
+    // first read's `ever_connected` was still whole when the roster was read, and
+    // each closed slot's epoch still names its latest link. Any change is a
+    // membership change like any other across the fence, and withholds the live
+    // verdict.
+    let no_link_activated_across_the_reads =
+        decision_makers.last_link_epochs(&key) == last_link_epochs;
     FencedLoadState {
         state,
-        fenced_live: every_probe_acked && every_live_link_fenced && closed_epochs_settled,
+        fenced_live: every_probe_acked
+            && every_live_link_fenced
+            && no_link_activated_across_the_reads,
         closed_slots,
     }
 }

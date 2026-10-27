@@ -478,6 +478,31 @@ async fn a_link_that_comes_and_goes_mid_snapshot_withholds_the_live_verdict() {
 }
 
 #[tokio::test]
+async fn a_first_link_that_comes_and_goes_mid_snapshot_withholds_the_live_verdict() {
+    // A slot whose first-ever link activates and closes between the reads is in
+    // neither: not yet ever-connected when the retained state was read, and
+    // already off the roster when the roster was. The answer would name no closed
+    // slot while one had in fact arrived and left, so it must not be vouched for.
+    use rally_point_proto::ids::SlotId;
+
+    let (sessions, decision_makers) = fence_fixture();
+    let fence = crate::coordinator::load_fence::LoadStateFence::new();
+    let load = fenced_load_state_snapshot_with(&sessions, &decision_makers, &fence, key(7), || {
+        let (registration, _inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
+        decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, Some(LINK_EPOCH));
+        drop(registration);
+    })
+    .await;
+    assert!(load.closed_slots.is_empty() && load.state.slots.is_empty());
+    assert!(
+        !load.fenced_live,
+        "an arrival and departure both went unseen"
+    );
+}
+
+#[tokio::test]
 async fn a_slot_that_never_connected_here_needs_no_fence() {
     // Nothing this relay serves is holding anything for a slot no client ever
     // opened a stream for, so its absence is attestable as it stands — which is
