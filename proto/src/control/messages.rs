@@ -646,10 +646,11 @@ pub enum RelayToCoordinator {
 ///
 /// `link_epoch` is the connection epoch of the slot's latest link to activate on
 /// the relay, which — since no link of the slot is live — is the link whose
-/// closure left it disconnected. Epochs are never reused within a session, so
-/// two snapshots naming the same slot closed with the same epoch saw one
-/// disconnection that lasted from the first through the second: a reconnect in
-/// between would have activated a new link and changed the epoch.
+/// closure left it disconnected. Epochs are random 64-bit values, so a later
+/// link repeating one is vanishingly unlikely: two snapshots naming the same
+/// slot closed with the same epoch saw one disconnection that lasted from the
+/// first through the second, since a reconnect in between would have activated
+/// a new link and changed the epoch.
 ///
 /// `None` when the relay recorded no epoch for the slot (a session served
 /// without epoch-aware links); such a closure cannot be told apart from a later

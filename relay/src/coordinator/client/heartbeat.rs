@@ -524,7 +524,8 @@ pub(super) async fn fenced_load_state_snapshot_with(
     // its epoch naming the earlier closure rather than the one the roster saw.
     // Every activation records its link's epoch in the same critical section that
     // adds the slot to `ever_connected` — a first one adds an entry, any later one
-    // replaces it, and epochs are never reused — so the whole epoch map coming back
+    // replaces it, and epochs are random 64-bit values that a later link repeats
+    // only with vanishing probability — so the whole epoch map coming back
     // unchanged after the roster read means no link activated across it. Then the
     // first read's `ever_connected` was still whole when the roster was read, and
     // each closed slot's epoch still names its latest link. Any change is a
