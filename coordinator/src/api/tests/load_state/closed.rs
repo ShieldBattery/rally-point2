@@ -61,7 +61,7 @@ async fn a_closed_slot_is_named_and_setup_still_finalizes() {
     let body = settle_lobby_load_state(router(state), session.0).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":true,"closedKnown":true,"setupFinal":true,"startedAtMs":1700000000000,"connectedSlots":[0,1,2,3,4,5],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[0]}"#,
+        r#"{"known":false,"turnsKnown":true,"closedKnown":true,"setupFinal":true,"startedAtMs":1700000000000,"connectedSlots":[0,1,2,3,4,5],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[0],"liveSlots":[1,2,3,4,5]}"#,
     );
 }
 
@@ -254,4 +254,64 @@ async fn a_broken_lineage_withholds_the_closed_claim() {
     assert_eq!(response["closedKnown"], false);
     assert_eq!(response["setupFinal"], false);
     assert_eq!(response["closedSlots"], serde_json::json!([0]));
+}
+
+#[tokio::test]
+async fn a_slot_that_started_and_left_is_neither_live_nor_closed() {
+    // Both players of a 1v1 are gone; one had reported its game loop running.
+    // `connectedSlots` alone would make that one look like it stayed, so the read
+    // names who is live as well: here nobody, and only the unstarted one closed.
+    let (state, session) = state_with_one_home_for_six();
+    let tenant = tenant_id();
+    let _relay = spawn_attesting_relay(
+        &state,
+        RelayId(1),
+        SessionPresence {
+            ever_connected: slots(&[0, 1]),
+            started: slots(&[0]),
+            started_at_ms: Some(1_700_000_000_000),
+            ..presence_entry(&tenant, session, &[])
+        },
+        closed_on_a_live_fence(&[1]),
+    );
+
+    let body = read_load_state(router(state), session.0).await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["closedKnown"], true);
+    assert_eq!(response["connectedSlots"], serde_json::json!([0, 1]));
+    assert_eq!(response["startedSlots"], serde_json::json!([0]));
+    assert_eq!(response["closedSlots"], serde_json::json!([1]));
+    assert_eq!(response["liveSlots"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn a_relay_cannot_vouch_that_a_slot_it_does_not_home_is_live() {
+    // A live claim keeps a leaver's peers from looking like they all left too, so
+    // one relay claiming another's slot is live could turn a mass departure into
+    // blame. Only the slot's home speaks for it.
+    let (state, session) = state_with_split_homes();
+    let tenant = tenant_id();
+    let _one = spawn_attesting_relay(
+        &state,
+        RelayId(1),
+        SessionPresence {
+            ever_connected: slots(&[0]),
+            ..presence_entry(&tenant, session, &[])
+        },
+        closed_on_a_live_fence(&[0]),
+    );
+    let _two = spawn_attesting_relay(
+        &state,
+        RelayId(2),
+        SessionPresence {
+            ever_connected: slots(&[1]),
+            ..presence_entry(&tenant, session, &[0, 1])
+        },
+        AttestOptions::default(),
+    );
+
+    let body = read_load_state(router(state), session.0).await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["closedSlots"], serde_json::json!([0]));
+    assert_eq!(response["liveSlots"], serde_json::json!([1]));
 }

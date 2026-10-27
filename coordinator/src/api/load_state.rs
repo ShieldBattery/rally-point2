@@ -106,6 +106,13 @@ struct SessionLoadStateRequest {
 /// requires `turnsKnown`. A `known` answer has no closed slot to name: its relays
 /// fenced every slot they home.
 ///
+/// `liveSlots` is the other current-state set: the slots whose link to their home
+/// relay was up when that relay snapshotted, each taken only from that home, read
+/// off the same answers as `closedSlots`. It is only meaningful beside
+/// `closedKnown`, which is what says every serving relay answered. A slot that
+/// connected is then exactly one of live, closed, or started-and-gone: a slot
+/// that reported its game loop running and then disconnected is in neither set.
+///
 /// `setupFinal: true` (only on a read that asked to settle the lobby) means
 /// `lobbyViolationSlots` is complete and stays so: every home relay cut lobby
 /// ingress before answering, and every answer fenced at least its live slots.
@@ -125,6 +132,7 @@ struct SessionLoadStateResponse {
     forwarded_slots: Vec<u8>,
     lobby_violation_slots: Vec<u8>,
     closed_slots: Vec<u8>,
+    live_slots: Vec<u8>,
 }
 
 /// Session load-progress read: which slots ever connected, which ever reported
@@ -210,6 +218,7 @@ pub(super) async fn session_load_state(
             lobby_violation_slots: Vec::new(),
             closed_known: false,
             closed_slots: Vec::new(),
+            live_slots: Vec::new(),
         })
         .into_response());
     };
@@ -239,6 +248,7 @@ pub(super) async fn session_load_state(
             lobby_violation_slots: before.lobby_violation_slots.iter().map(|s| s.0).collect(),
             closed_known: false,
             closed_slots: round.closed_slots.iter().map(|s| s.0).collect(),
+            live_slots: round.live_slots.iter().map(|s| s.0).collect(),
         })
         .into_response());
     };
@@ -306,6 +316,7 @@ pub(super) async fn session_load_state(
         lobby_violation_slots: after.lobby_violation_slots.iter().map(|s| s.0).collect(),
         closed_known,
         closed_slots: round.closed_slots.iter().map(|s| s.0).collect(),
+        live_slots: round.live_slots.iter().map(|s| s.0).collect(),
     })
     .into_response())
 }
@@ -365,6 +376,7 @@ async fn attest_serving_relays(
     let mut fenced = std::collections::HashSet::new();
     let mut fenced_live = std::collections::HashSet::new();
     let mut closed_slots = std::collections::BTreeSet::new();
+    let mut live_slots = std::collections::BTreeSet::new();
     let mut setup_settled = std::collections::HashSet::new();
     let mut reports_turns = std::collections::HashSet::new();
     for (relay, waiter) in &mut pending {
@@ -380,6 +392,7 @@ async fn attest_serving_relays(
                 fenced_live.insert(*relay);
             }
             closed_slots.extend(snapshot.closed_slots);
+            live_slots.extend(snapshot.live_slots);
             if snapshot.setup_settled {
                 setup_settled.insert(*relay);
             }
@@ -394,6 +407,7 @@ async fn attest_serving_relays(
         fenced: std::sync::Arc::new(fenced),
         fenced_live: std::sync::Arc::new(fenced_live),
         closed_slots: std::sync::Arc::new(closed_slots),
+        live_slots: std::sync::Arc::new(live_slots),
         setup_settled: std::sync::Arc::new(setup_settled),
         reports_turns: std::sync::Arc::new(reports_turns),
     }

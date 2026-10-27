@@ -21,6 +21,7 @@ fn snapshot(session: SessionId, ever_connected: &[u8]) -> AttestedSnapshot {
         fenced: true,
         fenced_live: true,
         closed_slots: vec![],
+        live_slots: vec![],
         setup_settled: false,
         reports_turns: true,
     }
@@ -183,6 +184,7 @@ async fn concurrent_reads_of_one_session_share_a_single_round() {
         fenced: Arc::new(HashSet::from([RelayId(1)])),
         fenced_live: Arc::new(HashSet::from([RelayId(1)])),
         closed_slots: Arc::new(std::collections::BTreeSet::new()),
+        live_slots: Arc::new(std::collections::BTreeSet::new()),
         setup_settled: Arc::new(HashSet::new()),
         reports_turns: Arc::new(HashSet::new()),
     });
@@ -231,6 +233,7 @@ fn round_started_at(started: Instant, relay: RelayId) -> AttestRound {
         fenced: Arc::new(HashSet::from([relay])),
         fenced_live: Arc::new(HashSet::from([relay])),
         closed_slots: Arc::new(std::collections::BTreeSet::new()),
+        live_slots: Arc::new(std::collections::BTreeSet::new()),
         setup_settled: Arc::new(HashSet::new()),
         reports_turns: Arc::new(HashSet::new()),
     }

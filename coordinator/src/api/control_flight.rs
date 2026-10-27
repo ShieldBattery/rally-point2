@@ -305,8 +305,8 @@ pub(super) fn handle_flight_upload_done(
 /// session, so one relay can never answer in another's name, and a late answer from
 /// a read that already gave up finds nothing to resolve.
 ///
-/// Every slot claim whose absence a tenant reads against a player — forwarded
-/// turns, lobby violations, closed slots — is kept only from the relay that homes
+/// Every slot claim a tenant may read against a player — forwarded turns, lobby
+/// violations, closed and live slots — is kept only from the relay that homes
 /// that slot, so another serving relay can neither vouch for nor accuse a slot it
 /// never carried.
 pub(super) fn handle_load_state_snapshot(
@@ -355,14 +355,17 @@ pub(super) fn handle_load_state_snapshot(
         .into_iter()
         .filter(|&slot| homed_here(slot, "lobby violation"))
         .collect();
-    // The closed set rides beside the snapshot rather than in it, so it gets the
-    // same per-session length cap the snapshot's own lists do.
-    answer.closed_slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
-    answer.closed_slots.sort_unstable();
-    answer.closed_slots.dedup();
-    answer
-        .closed_slots
-        .retain(|&slot| homed_here(slot, "closed slot"));
+    // The closed and live sets ride beside the snapshot rather than in it, so they
+    // get the same per-session length cap the snapshot's own lists do.
+    for (claim, slots) in [
+        ("closed slot", &mut answer.closed_slots),
+        ("live slot", &mut answer.live_slots),
+    ] {
+        slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| homed_here(slot, claim));
+    }
     answer.state.lobby_violations = lobby_violations;
     crate::lifecycle::retain_home_turn_evidence(
         inbound.setup,

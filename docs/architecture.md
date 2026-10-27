@@ -1759,7 +1759,9 @@ names the slots that connected and are now neither live nor started; `fenced` is
 empty. A departed slot then costs only the claim about itself: the coordinator answers `closedKnown` (every
 serving relay fenced its live slots, each closed slot taken only from its home, plus everything `turnsKnown`
 needs) beside `known`, so a tenant can still blame the one player who closed their game mid-setup while
-everyone else is vouched for. Turn evidence is required because a closed slot's own start report may still be
+everyone else is vouched for. It answers `liveSlots` from the same snapshots, each slot again taken only from
+its home, so a tenant can tell a player who stayed from one who reported starting and then left too — the
+latter is in neither set. Turn evidence is required because a closed slot's own start report may still be
 parked in its client, and the forwarded set — which needs no fence — is the only word on how far that slot got.
 Setup finality rests on the live half too: once every home relay settles the lobby, any lobby command a
 departed client delivers when it dials back in is dropped without a violation, so its unreachable client

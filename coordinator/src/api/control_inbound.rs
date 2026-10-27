@@ -304,6 +304,9 @@ pub(super) fn note_inbound(
                 inbound,
                 request_id,
                 crate::attest::AttestedSnapshot {
+                    // The snapshot's own live roster, narrowed to the relay's home
+                    // slots on ingest.
+                    live_slots: state.slots.clone(),
                     state,
                     fenced,
                     fenced_live,

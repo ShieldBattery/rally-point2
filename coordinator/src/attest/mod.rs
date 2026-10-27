@@ -183,6 +183,10 @@ pub struct AttestedSnapshot {
     /// neither live nor started, ascending. Already restricted to the slots the
     /// answering relay homes by the time a waiter receives it.
     pub closed_slots: Vec<SlotId>,
+    /// The slots this relay homes whose link was live when it snapshotted,
+    /// ascending: `state.slots` restricted to the answering relay's home slots by
+    /// the time a waiter receives it.
+    pub live_slots: Vec<SlotId>,
     /// Whether this request made a final setup-lobby ingress cut on the relay.
     pub setup_settled: bool,
     /// Whether the relay records its home slots' forwarded turns, so that their
@@ -213,6 +217,10 @@ pub struct AttestRound {
     /// Every slot an answering relay named closed, each taken only from the relay
     /// that homes it. A current-state fact as of this round, not a cumulative one.
     pub closed_slots: Arc<BTreeSet<SlotId>>,
+    /// Every slot an answering relay held a live link for, each taken only from the
+    /// relay that homes it. A current-state fact as of this round, read off the same
+    /// snapshots as `closed_slots`.
+    pub live_slots: Arc<BTreeSet<SlotId>>,
     /// The relays that made a final setup-lobby ingress cut — a subset of `attested`.
     pub setup_settled: Arc<HashSet<RelayId>>,
     /// The relays whose answer reported turn evidence — a subset of `attested`.
