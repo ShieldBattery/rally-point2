@@ -296,7 +296,7 @@ fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
         load_fence: crate::coordinator::load_fence::LoadStateFence::new(),
     };
     assert_eq!(
-        session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)).0,
+        session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7), || {}).0,
         heartbeat_presence(&sources)
             .into_iter()
             .find(|entry| entry.session == SessionId(7))
@@ -319,7 +319,7 @@ fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
         load_fence: crate::coordinator::load_fence::LoadStateFence::new(),
     };
     assert_eq!(
-        session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7)).0,
+        session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7), || {}).0,
         SessionPresence {
             evidence_history: Vec::new(),
             periodic_evidence: Vec::new(),
@@ -432,7 +432,7 @@ fn heartbeat_roster_stays_compact_while_requested_snapshots_retain_full_observat
         "the complete roster stays comfortably below the control-message cap"
     );
 
-    let (snapshot, _) = session_load_snapshot(&sessions, &decision_makers, key(0));
+    let (snapshot, _) = session_load_snapshot(&sessions, &decision_makers, key(0), || {});
     assert_eq!(snapshot.slots, vec![SlotId(0), SlotId(1)]);
     assert_eq!(snapshot.evidence.len(), 2);
     for entry in &snapshot.evidence {

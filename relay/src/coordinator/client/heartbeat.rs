@@ -73,12 +73,14 @@ pub(super) fn heartbeat_presence_with_evidence(
     region_rtts: &[RegionRttReport],
     sent: &mut HashSet<(SessionKey, SlotId, u64)>,
 ) -> Vec<SessionPresence> {
+    // Retained state before the live roster, for the reason `session_load_snapshot`
+    // gives: a slot is registered before it activates, so a slot ever-connected here
+    // without a live link really had gone by the time the roster was read.
+    let retained = sources.decision_makers.retained_load_states();
     let mut live: HashMap<SessionKey, _> = crate::routing::live_slots(&sources.sessions)
         .into_iter()
         .collect();
-    let mut roster: Vec<SessionPresence> = sources
-        .decision_makers
-        .retained_load_states()
+    let mut roster: Vec<SessionPresence> = retained
         .into_iter()
         .map(|(key, load)| {
             let slots = live.remove(&key).unwrap_or_default();
@@ -221,13 +223,30 @@ pub(super) fn attach_heartbeat_evidence(
 /// Takes the two handles it reads rather than the whole heartbeat sources, so the
 /// fence task — which outlives any borrow of the connection's sources — can take
 /// the same snapshot from its own clones.
+///
+/// The retained state is read **before** the live roster, and the order is what
+/// keeps a slot that is not there from being taken for one that left. The two
+/// reads take different locks, so a link can come or go between them, and a slot
+/// registers on the roster before it activates into `ever_connected`. Read in this
+/// order, a slot in `ever_connected` without a live link had activated before the
+/// first read and was off the roster by the second: it really is gone. A slot that
+/// activates in between shows up live but not yet ever-connected, which a fence
+/// reads as a live link it never probed — unfenced, and asked again — rather than
+/// as a departed one. A slot that leaves in between shows up as departed, which it
+/// is.
+///
+/// `between_reads` runs after the retained state is read and before the live
+/// roster is. Every caller passes a no-op except a test landing a link change
+/// exactly in that window.
 pub(super) fn session_load_snapshot(
     sessions: &Sessions,
     decision_makers: &crate::consensus::DecisionMakers,
     key: SessionKey,
+    between_reads: impl FnOnce(),
 ) -> (SessionPresence, Vec<(SlotId, u64)>) {
-    let links = crate::routing::live_session_slot_epochs(sessions, &key);
     let load = decision_makers.retained_load_state(&key);
+    between_reads();
+    let links = crate::routing::live_session_slot_epochs(sessions, &key);
     (
         presence_entry(key, links.iter().map(|(slot, _)| *slot).collect(), load),
         links,
@@ -401,6 +420,19 @@ pub(super) async fn fenced_load_state_snapshot(
     fence: &crate::coordinator::load_fence::LoadStateFence,
     key: SessionKey,
 ) -> FencedLoadState {
+    fenced_load_state_snapshot_with(sessions, decision_makers, fence, key, || {}).await
+}
+
+/// [`fenced_load_state_snapshot`], running `between_reads` inside its final
+/// snapshot, between the retained-state read and the live-roster read (see
+/// [`session_load_snapshot`]).
+pub(super) async fn fenced_load_state_snapshot_with(
+    sessions: &Sessions,
+    decision_makers: &crate::consensus::DecisionMakers,
+    fence: &crate::coordinator::load_fence::LoadStateFence,
+    key: SessionKey,
+    between_reads: impl FnOnce(),
+) -> FencedLoadState {
     let started: HashSet<SlotId> = decision_makers
         .retained_load_state(&key)
         .started
@@ -448,7 +480,7 @@ pub(super) async fn fenced_load_state_snapshot(
     // and that is precisely the fact the fence exists to capture. The epochs come
     // back with it, so the roster this is judged against is the one that exists
     // now, not the one the probes went out to.
-    let (state, links) = session_load_snapshot(sessions, decision_makers, key);
+    let (state, links) = session_load_snapshot(sessions, decision_makers, key, between_reads);
     let every_live_link_fenced = links
         .iter()
         .all(|(slot, epoch)| state.started.contains(slot) || acked.get(slot) == Some(epoch));

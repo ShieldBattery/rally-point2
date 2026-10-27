@@ -337,6 +337,74 @@ async fn a_slot_that_dropped_and_dialed_back_in_is_fenced_on_its_new_link() {
 }
 
 #[tokio::test]
+async fn a_slot_activating_mid_snapshot_is_never_taken_for_a_closed_one() {
+    // The snapshot's two reads take different locks. A slot that registers and
+    // activates between them must come out live and unfenced — asked again next
+    // read — and never as ever-connected-but-gone beside a live verdict, which
+    // would let a tenant blame a player who is right there.
+    use rally_point_proto::ids::SlotId;
+
+    let (sessions, decision_makers) = fence_fixture();
+    let fence = crate::coordinator::load_fence::LoadStateFence::new();
+    let mut arrival = None;
+    let load = fenced_load_state_snapshot_with(&sessions, &decision_makers, &fence, key(7), || {
+        let (mut registration, inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+                .expect("slot 0 registers");
+        registration.disarm();
+        decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+        arrival = Some(inbox);
+    })
+    .await;
+    assert!(arrival.is_some(), "the arrival landed between the reads");
+    assert!(
+        load.closed_slots.is_empty(),
+        "the arrival is live, not closed"
+    );
+    assert_eq!(load.state.slots, vec![SlotId(0)]);
+    assert!(
+        !load.fenced_live,
+        "a live link nobody probed is not vouched for"
+    );
+}
+
+#[tokio::test]
+async fn a_slot_leaving_mid_snapshot_is_reported_closed() {
+    // The other way a link can change between the reads: the slot acked, then its
+    // link ended before the roster was read. It is genuinely gone, so it is named
+    // closed, and the live verdict over everything else still stands.
+    use rally_point_proto::ids::SlotId;
+
+    let (sessions, decision_makers) = fence_fixture();
+    let fence = crate::coordinator::load_fence::LoadStateFence::new();
+    let (registration, mut inbox) =
+        crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+            .expect("slot 0 registers");
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    let mut link = Some(registration);
+
+    let ack = async {
+        loop {
+            if let Some(probe_id) = inbox.try_recv_load_state_probe() {
+                assert!(fence.resolve(probe_id, &key(7), SlotId(0), LINK_EPOCH));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let (load, ()) = tokio::join!(
+        fenced_load_state_snapshot_with(&sessions, &decision_makers, &fence, key(7), || {
+            drop(link.take());
+        }),
+        ack,
+    );
+    assert!(link.is_none(), "the link ended between the reads");
+    assert_eq!(load.closed_slots, vec![SlotId(0)]);
+    assert!(load.state.slots.is_empty());
+    assert!(load.fenced_live);
+}
+
+#[tokio::test]
 async fn a_slot_that_never_connected_here_needs_no_fence() {
     // Nothing this relay serves is holding anything for a slot no client ever
     // opened a stream for, so its absence is attestable as it stands — which is
