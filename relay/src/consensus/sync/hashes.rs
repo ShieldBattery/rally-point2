@@ -10,8 +10,10 @@
 //!
 //! A verdict is final, so a step is only decided once the reports still to come can't change it:
 //! when they agree, when one hash has more than half of every slot still taking part, or when
-//! every report is in. Reports that disagree without settling it hold the step undecided for
-//! another [`STATE_HASH_DEADLINE`], after which it is decided on the reports it has. A report that
+//! every report is in. Reports that disagree without settling it hold the step undecided until
+//! [`STATE_HASH_DEADLINE`] past the later of its deadline and its newest report, after which it is
+//! decided on the reports it has. Both are times this relay observed, so a relay promoted to
+//! authority, or a sweep that runs late, decides the step no later than it would have. A report that
 //! arrives after its step was decided is still compared with the rest while the step is among the
 //! last [`STATE_HASH_WINDOW`] judged, so a client running far behind never goes unchecked.
 //!
@@ -29,8 +31,8 @@ use crate::rate_limit::RateLimitedCounter;
 pub(in crate::consensus) const STATE_HASH_INTERVAL: u64 = 8;
 
 /// How long after a step became confirmable its reports are awaited before the slots still
-/// missing are judged, and how long reports that disagree without deciding the step are awaited
-/// after that.
+/// missing are judged, and how long after that, or after its newest report if later, reports that
+/// disagree without deciding the step are awaited.
 pub(in crate::consensus) const STATE_HASH_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How many of a slot's turns past a step this relay must have forwarded before a missing report
@@ -46,10 +48,11 @@ pub(in crate::consensus) const STATE_HASH_LIVE_TURNS: u64 = 96;
 /// turns stopped, where steps can go on being reported without ever becoming confirmable.
 pub(in crate::consensus) const STATE_HASH_WINDOW: usize = 64;
 
-/// One step's reports, and when it became confirmable.
+/// One step's reports, when the newest arrived, and when it became confirmable.
 #[derive(Debug, Default)]
 struct PendingStep {
     reports: Vec<(SlotId, u64)>,
+    newest_report_at: Option<Instant>,
     confirmable_at: Option<Instant>,
 }
 
@@ -57,10 +60,19 @@ struct PendingStep {
 #[derive(Debug)]
 struct JudgedStep {
     reports: Vec<(SlotId, u64)>,
+    /// The later of the step's deadline and its newest report. Reports that disagree without
+    /// deciding it are decided on the ones present [`STATE_HASH_DEADLINE`] after this.
+    hold_from: Instant,
     /// Whether it gained a report since it was last judged.
     dirty: bool,
-    /// While its reports disagree without deciding it, when it is decided on the ones it has.
-    settle_by: Option<Instant>,
+    /// Whether its reports disagree without deciding it.
+    held: bool,
+}
+
+impl JudgedStep {
+    fn hold_is_over(&self, now: Instant) -> bool {
+        now >= self.hold_from + STATE_HASH_DEADLINE
+    }
 }
 
 /// What judging a step's reports came to.
@@ -95,15 +107,16 @@ pub(in crate::consensus) struct StateHashTracker {
 }
 
 impl StateHashTracker {
-    /// Records `slot`'s report of `hash` for `step`. A report for a step that isn't on the report
-    /// interval, was judged too long ago to still be held, or is implausibly far past what is
-    /// confirmable is dropped, and a second report of a step keeps the first.
+    /// Records `slot`'s report of `hash` for `step`, arriving at `now`. A report for a step that
+    /// isn't on the report interval, was judged too long ago to still be held, or is implausibly
+    /// far past what is confirmable is dropped, and a second report of a step keeps the first.
     pub(in crate::consensus) fn record(
         &mut self,
         key: &SessionKey,
         slot: SlotId,
         step: u64,
         hash: u64,
+        now: Instant,
     ) {
         if self.dormant || self.excluded.contains(&slot) {
             return;
@@ -131,9 +144,17 @@ impl StateHashTracker {
             }
             return;
         }
-        let (reports, dirty) = match self.judged.get_mut(&step) {
-            Some(judged) if retired => (&mut judged.reports, Some(&mut judged.dirty)),
-            _ => (&mut self.pending.entry(step).or_default().reports, None),
+        let (reports, newest_report_at, dirty) = match self.judged.get_mut(&step) {
+            Some(judged) if retired => (
+                &mut judged.reports,
+                &mut judged.hold_from,
+                Some(&mut judged.dirty),
+            ),
+            _ => {
+                let pending = self.pending.entry(step).or_default();
+                let newest_report_at = pending.newest_report_at.get_or_insert(now);
+                (&mut pending.reports, newest_report_at, None)
+            }
         };
         match reports.iter().find(|x| x.0 == slot) {
             Some(&(_, existing)) if existing != hash => {
@@ -151,6 +172,7 @@ impl StateHashTracker {
             Some(_) => {}
             None => {
                 reports.push((slot, hash));
+                *newest_report_at = (*newest_report_at).max(now);
                 if let Some(dirty) = dirty {
                     *dirty = true;
                 }
@@ -224,7 +246,7 @@ impl StateHashTracker {
         let due: Vec<u64> = self
             .judged
             .iter()
-            .filter(|(_, judged)| judged.dirty || judged.settle_by.is_some_and(|by| now >= by))
+            .filter(|(_, judged)| judged.dirty || (judged.held && judged.hold_is_over(now)))
             .map(|(&step, _)| step)
             .collect();
         for step in due {
@@ -251,12 +273,16 @@ impl StateHashTracker {
             };
             let pending = self.pending.remove(&step).unwrap_or_default();
             self.retired_below = self.retired_below.max(step + 1);
+            let deadline = pending.confirmable_at.unwrap_or(now) + STATE_HASH_DEADLINE;
             self.judged.insert(
                 step,
                 JudgedStep {
                     reports: pending.reports,
+                    hold_from: pending
+                        .newest_report_at
+                        .map_or(deadline, |at| at.max(deadline)),
                     dirty: false,
-                    settle_by: None,
+                    held: false,
                 },
             );
             self.judge_step(step, now, required, false, &mut verdicts);
@@ -265,7 +291,7 @@ impl StateHashTracker {
                     break;
                 };
                 // One still undecided is decided on the reports it has rather than dropped.
-                if judged.settle_by.is_some() {
+                if judged.held {
                     self.judge_step(oldest, now, required, true, &mut verdicts);
                 }
                 self.judged.remove(&oldest);
@@ -274,8 +300,9 @@ impl StateHashTracker {
         verdicts
     }
 
-    /// Judges the judged step `step` as of `now`, pushing any verdict onto `verdicts`. An undecided
-    /// one is decided on the reports it has with `settle`, or once its time to settle has come.
+    /// Judges the judged step `step` as of `now`, pushing any verdict onto `verdicts`. Reports that
+    /// disagree without deciding it are decided on the ones present with `settle`, or once its
+    /// hold has run out.
     fn judge_step(
         &mut self,
         step: u64,
@@ -288,7 +315,7 @@ impl StateHashTracker {
             return;
         };
         judged.dirty = false;
-        let settle = settle || judged.settle_by.is_some_and(|by| now >= by);
+        let settle = settle || judged.hold_is_over(now);
         let reports = std::mem::take(&mut judged.reports);
         let judgment = self.judge(step, &reports, required, settle);
         let Some(judged) = self.judged.get_mut(&step) else {
@@ -296,11 +323,9 @@ impl StateHashTracker {
         };
         judged.reports = reports;
         match judgment {
-            Judgment::Undecided => {
-                judged.settle_by.get_or_insert(now + STATE_HASH_DEADLINE);
-            }
+            Judgment::Undecided => judged.held = true,
             Judgment::Decided(verdict) => {
-                judged.settle_by = None;
+                judged.held = false;
                 verdicts.extend(verdict);
             }
         }

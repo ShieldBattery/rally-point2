@@ -20,7 +20,7 @@ impl DecisionMaker {
         if !self.rollback_enabled || self.observers.contains(&slot) {
             return Vec::new();
         }
-        self.hashes.record(&self.key, slot, step, hash);
+        self.hashes.record(&self.key, slot, step, hash, now);
         self.judge_state_hashes(now)
     }
 

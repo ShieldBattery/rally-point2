@@ -316,6 +316,41 @@ fn only_the_authority_judges_but_every_relay_keeps_the_reports() {
 }
 
 #[test]
+fn a_promoted_relay_settles_a_held_step_when_the_authority_would_have() {
+    let start = Instant::now();
+    let mut m = peer_maker();
+    m.latch_rollback(true);
+    m.set_expected_slots([SlotId(0), SlotId(1), SlotId(2)].into());
+    forward(&mut m, &[0, 1, 2], STATE_HASH_INTERVAL, start);
+    m.observe_state_hash(SlotId(0), 8, A, start);
+    m.observe_state_hash(SlotId(1), 8, B, start);
+    // Promoted after the step's deadline and its hold have both run out, it decides at once.
+    m.authority = Authority::SelfRelay;
+    let verdicts = m.judge_state_hashes(start + STATE_HASH_DEADLINE * 2 + Duration::from_secs(1));
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].no_majority);
+}
+
+#[test]
+fn a_late_report_that_leaves_the_step_undecided_holds_it_from_its_arrival() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2, 3]);
+    forward(&mut m, &[0, 1, 2, 3], STATE_HASH_INTERVAL, start);
+    m.observe_state_hash(SlotId(0), 8, A, start);
+    assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+    let arrived = start + STATE_HASH_DEADLINE * 2;
+    assert!(m.observe_state_hash(SlotId(1), 8, B, arrived).is_empty());
+    let settled = arrived + STATE_HASH_DEADLINE;
+    assert!(
+        m.judge_state_hashes(settled - Duration::from_millis(1))
+            .is_empty()
+    );
+    let verdicts = m.judge_state_hashes(settled);
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].no_majority);
+}
+
+#[test]
 fn observers_are_neither_required_nor_compared() {
     let start = Instant::now();
     let mut m = DecisionMaker::new(
