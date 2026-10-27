@@ -153,6 +153,85 @@ fn a_late_report_that_disagrees_with_the_rest_is_named() {
     assert!(!m.hashes.dormant);
 }
 
+/// A verdict naming only `slot` as diverged at step 8.
+fn diverged_at_8(slot: u8) -> Vec<SyncDivergence> {
+    vec![SyncDivergence {
+        sync_ordinal: 8,
+        game_frame: None,
+        no_majority: false,
+        diverged: vec![SlotId(slot)],
+        missing: Vec::new(),
+    }]
+}
+
+#[test]
+fn late_reports_name_the_minority_in_either_order() {
+    for late in [[(1, B), (2, A)], [(2, A), (1, B)]] {
+        let start = Instant::now();
+        let mut m = rollback_maker(&[0, 1, 2]);
+        forward(&mut m, &[0, 1, 2], STATE_HASH_INTERVAL, start);
+        m.observe_state_hash(SlotId(0), 8, A, start);
+        assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+        let later = start + STATE_HASH_DEADLINE + Duration::from_secs(1);
+        let [(first, first_hash), (second, second_hash)] = late;
+        assert!(
+            m.observe_state_hash(SlotId(first), 8, first_hash, later)
+                .is_empty(),
+            "one of the two hashes holds a third of the slots, so slot {second} decides it",
+        );
+        let verdicts = m.observe_state_hash(SlotId(second), 8, second_hash, later);
+        assert_eq!(verdicts, diverged_at_8(1));
+        assert!(!m.hashes.dormant);
+    }
+}
+
+#[test]
+fn an_even_split_is_only_called_once_every_report_is_in() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2, 3]);
+    forward(&mut m, &[0, 1, 2, 3], STATE_HASH_INTERVAL, start);
+    m.observe_state_hash(SlotId(0), 8, A, start);
+    m.observe_state_hash(SlotId(1), 8, A, start);
+    assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+    let later = start + STATE_HASH_DEADLINE + Duration::from_secs(1);
+    assert!(
+        m.observe_state_hash(SlotId(2), 8, B, later).is_empty(),
+        "slot 3 could still make it 3-1",
+    );
+    let verdicts = m.observe_state_hash(SlotId(3), 8, B, later);
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].no_majority);
+    assert!(m.hashes.dormant);
+}
+
+#[test]
+fn a_disagreement_at_the_deadline_waits_for_the_report_that_decides_it() {
+    for (third, expected) in [(Some(A), diverged_at_8(1)), (None, Vec::new())] {
+        let start = Instant::now();
+        let mut m = rollback_maker(&[0, 1, 2]);
+        forward(&mut m, &[0, 1, 2], STATE_HASH_INTERVAL, start);
+        m.observe_state_hash(SlotId(0), 8, A, start);
+        m.observe_state_hash(SlotId(1), 8, B, start);
+        assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+        let settled = start + STATE_HASH_DEADLINE * 2;
+        if let Some(hash) = third {
+            let verdicts =
+                m.observe_state_hash(SlotId(2), 8, hash, settled - Duration::from_millis(1));
+            assert_eq!(verdicts, expected);
+            assert!(m.judge_state_hashes(settled).is_empty());
+        } else {
+            assert!(
+                m.judge_state_hashes(settled - Duration::from_millis(1))
+                    .is_empty()
+            );
+            // Slot 2 never reports: the step is decided on the two reports it has.
+            let verdicts = m.judge_state_hashes(settled);
+            assert_eq!(verdicts.len(), 1);
+            assert!(verdicts[0].no_majority);
+        }
+    }
+}
+
 #[test]
 fn a_report_for_a_step_judged_too_long_ago_is_dropped() {
     let start = Instant::now();

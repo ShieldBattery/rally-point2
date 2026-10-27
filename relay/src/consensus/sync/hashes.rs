@@ -7,16 +7,19 @@
 //! passed: [`STATE_HASH_DEADLINE`] after the step became confirmable, meaning this relay had
 //! forwarded every required slot's turn for it, so every honest client could have computed the
 //! hash. The deadline is the relay's own observation; no client-sent count or stamp moves it.
-//! A step judged at its deadline is judged on the reports present then, which can be only one, so
-//! a report that arrives later is still compared with them while the step is among the last
-//! [`STATE_HASH_WINDOW`] judged: the deadline settles who is blamed for a missing report, never
-//! that the late one went unchecked. Whenever the verdict can name who is at fault it does: the
-//! minority when the rest agree, and a slot that kept sending turns without its report. A slot
-//! whose turns stopped soon after the step is not blamed for a missing report, since its link went
-//! quiet and the leave machinery settles it. When nobody can be singled out (a 1v1 that disagrees,
-//! an even split, nobody reporting) the verdict names no one.
-
-use std::collections::BTreeSet;
+//!
+//! A verdict is final, so a step is only decided once the reports still to come can't change it:
+//! when they agree, when one hash has more than half of every slot still taking part, or when
+//! every report is in. Reports that disagree without settling it hold the step undecided for
+//! another [`STATE_HASH_DEADLINE`], after which it is decided on the reports it has. A report that
+//! arrives after its step was decided is still compared with the rest while the step is among the
+//! last [`STATE_HASH_WINDOW`] judged, so a client running far behind never goes unchecked.
+//!
+//! Whenever the verdict can name who is at fault it does: the minority when the rest agree, and a
+//! slot that kept sending turns without its report. A slot whose turns stopped soon after the step
+//! is not blamed for a missing report, since its link went quiet and the leave machinery settles
+//! it. When nobody can be singled out (a 1v1 that disagrees, an even split, nobody reporting) the
+//! verdict names no one.
 
 use super::*;
 use crate::rate_limit::RateLimitedCounter;
@@ -26,7 +29,8 @@ use crate::rate_limit::RateLimitedCounter;
 pub(in crate::consensus) const STATE_HASH_INTERVAL: u64 = 8;
 
 /// How long after a step became confirmable its reports are awaited before the slots still
-/// missing are judged.
+/// missing are judged, and how long reports that disagree without deciding the step are awaited
+/// after that.
 pub(in crate::consensus) const STATE_HASH_DEADLINE: Duration = Duration::from_secs(5);
 
 /// How many of a slot's turns past a step this relay must have forwarded before a missing report
@@ -49,16 +53,31 @@ struct PendingStep {
     confirmable_at: Option<Instant>,
 }
 
+/// A step past its deadline or with every report in, kept for the reports that arrive later.
+#[derive(Debug)]
+struct JudgedStep {
+    reports: Vec<(SlotId, u64)>,
+    /// Whether it gained a report since it was last judged.
+    dirty: bool,
+    /// While its reports disagree without deciding it, when it is decided on the ones it has.
+    settle_by: Option<Instant>,
+}
+
+/// What judging a step's reports came to.
+enum Judgment {
+    /// The reports disagree, and the ones still to come could change who is at fault.
+    Undecided,
+    /// Decided, naming whoever the verdict names, if anyone.
+    Decided(Option<SyncDivergence>),
+}
+
 /// The state hash comparator of one rollback session. Every relay serving the session keeps it,
 /// so a promoted authority carries on where the old one stopped; only the authority judges.
 #[derive(Debug, Default)]
 pub(in crate::consensus) struct StateHashTracker {
     pending: BTreeMap<u64, PendingStep>,
-    /// The reports of the newest judged steps, for comparing a report that arrives after its step
-    /// was judged.
-    judged: BTreeMap<u64, Vec<(SlotId, u64)>>,
-    /// Judged steps that gained a report since, to be judged again.
-    rejudge: BTreeSet<u64>,
+    /// The newest judged steps, for comparing a report that arrives after its step was judged.
+    judged: BTreeMap<u64, JudgedStep>,
     /// Each slot's count of turns this relay has forwarded without a gap.
     forwarded: HashMap<SlotId, u64>,
     /// The newest step that is confirmable: this relay has forwarded that many turns of every
@@ -112,9 +131,9 @@ impl StateHashTracker {
             }
             return;
         }
-        let reports = match self.judged.get_mut(&step) {
-            Some(reports) if retired => reports,
-            _ => &mut self.pending.entry(step).or_default().reports,
+        let (reports, dirty) = match self.judged.get_mut(&step) {
+            Some(judged) if retired => (&mut judged.reports, Some(&mut judged.dirty)),
+            _ => (&mut self.pending.entry(step).or_default().reports, None),
         };
         match reports.iter().find(|x| x.0 == slot) {
             Some(&(_, existing)) if existing != hash => {
@@ -132,8 +151,8 @@ impl StateHashTracker {
             Some(_) => {}
             None => {
                 reports.push((slot, hash));
-                if retired {
-                    self.rejudge.insert(step);
+                if let Some(dirty) = dirty {
+                    *dirty = true;
                 }
             }
         }
@@ -190,9 +209,10 @@ impl StateHashTracker {
         self.evict_over_window(key);
     }
 
-    /// Judges again every judged step that gained a report, then every step whose reports are all
-    /// in, or whose deadline has passed by `now`, oldest first, and returns the verdicts that named
-    /// anyone. `required` yields the slots whose reports a step needs.
+    /// Judges again every judged step that gained a report or has been undecided long enough, then
+    /// every step whose reports are all in, or whose deadline has passed by `now`, oldest first,
+    /// and returns the verdicts that named anyone. `required` yields the slots whose reports a step
+    /// needs.
     pub(in crate::consensus) fn judge_ready(
         &mut self,
         now: Instant,
@@ -201,15 +221,17 @@ impl StateHashTracker {
         let required: HashSet<SlotId> = required.collect();
         let required = &required;
         let mut verdicts = Vec::new();
-        while !self.dormant
-            && let Some(step) = self.rejudge.pop_first()
-        {
-            let reports = self.judged.get(&step).cloned().unwrap_or_default();
-            // Who missed its report was settled at the deadline; a late report only adds a hash to
-            // compare.
-            if let Some(verdict) = self.judge(step, &reports, required, false) {
-                verdicts.push(verdict);
+        let due: Vec<u64> = self
+            .judged
+            .iter()
+            .filter(|(_, judged)| judged.dirty || judged.settle_by.is_some_and(|by| now >= by))
+            .map(|(&step, _)| step)
+            .collect();
+        for step in due {
+            if self.dormant {
+                return verdicts;
             }
+            self.judge_step(step, now, required, false, &mut verdicts);
         }
         while !self.dormant {
             // A step is judged only once it is confirmable here too, so every reported hash is
@@ -229,25 +251,70 @@ impl StateHashTracker {
             };
             let pending = self.pending.remove(&step).unwrap_or_default();
             self.retired_below = self.retired_below.max(step + 1);
-            if let Some(verdict) = self.judge(step, &pending.reports, required, true) {
-                verdicts.push(verdict);
-            }
-            self.judged.insert(step, pending.reports);
-            while self.judged.len() > STATE_HASH_WINDOW {
-                self.judged.pop_first();
+            self.judged.insert(
+                step,
+                JudgedStep {
+                    reports: pending.reports,
+                    dirty: false,
+                    settle_by: None,
+                },
+            );
+            self.judge_step(step, now, required, false, &mut verdicts);
+            while self.judged.len() > STATE_HASH_WINDOW && !self.dormant {
+                let Some((&oldest, judged)) = self.judged.first_key_value() else {
+                    break;
+                };
+                // One still undecided is decided on the reports it has rather than dropped.
+                if judged.settle_by.is_some() {
+                    self.judge_step(oldest, now, required, true, &mut verdicts);
+                }
+                self.judged.remove(&oldest);
             }
         }
         verdicts
     }
 
-    /// Judges one step's reports, and with `judge_missing`, the slots that sent none.
+    /// Judges the judged step `step` as of `now`, pushing any verdict onto `verdicts`. An undecided
+    /// one is decided on the reports it has with `settle`, or once its time to settle has come.
+    fn judge_step(
+        &mut self,
+        step: u64,
+        now: Instant,
+        required: &HashSet<SlotId>,
+        settle: bool,
+        verdicts: &mut Vec<SyncDivergence>,
+    ) {
+        let Some(judged) = self.judged.get_mut(&step) else {
+            return;
+        };
+        judged.dirty = false;
+        let settle = settle || judged.settle_by.is_some_and(|by| now >= by);
+        let reports = std::mem::take(&mut judged.reports);
+        let judgment = self.judge(step, &reports, required, settle);
+        let Some(judged) = self.judged.get_mut(&step) else {
+            return;
+        };
+        judged.reports = reports;
+        match judgment {
+            Judgment::Undecided => {
+                judged.settle_by.get_or_insert(now + STATE_HASH_DEADLINE);
+            }
+            Judgment::Decided(verdict) => {
+                judged.settle_by = None;
+                verdicts.extend(verdict);
+            }
+        }
+    }
+
+    /// Judges one step's reports, which stay undecided while they disagree and the reports still
+    /// to come could change who is at fault, unless `settle` decides them on the ones present.
     fn judge(
         &mut self,
         step: u64,
         reports: &[(SlotId, u64)],
         required: &HashSet<SlotId>,
-        judge_missing: bool,
-    ) -> Option<SyncDivergence> {
+        settle: bool,
+    ) -> Judgment {
         let reports: Vec<(SlotId, u64)> = reports
             .iter()
             .copied()
@@ -260,34 +327,51 @@ impl StateHashTracker {
             .filter(|slot| !self.excluded.contains(slot))
             .filter(|slot| !reports.iter().any(|x| x.0 == *slot))
             .filter(|slot| {
-                judge_missing
-                    && self.forwarded.get(slot).copied().unwrap_or(0)
-                        >= step.saturating_add(STATE_HASH_LIVE_TURNS)
+                self.forwarded.get(slot).copied().unwrap_or(0)
+                    >= step.saturating_add(STATE_HASH_LIVE_TURNS)
             })
             .collect();
         missing.sort_unstable();
         let agreed = reports.windows(2).all(|pair| pair[0].1 == pair[1].1);
         if agreed && missing.is_empty() {
-            return None;
+            return Judgment::Decided(None);
         }
         let mut groups: HashMap<u64, Vec<SlotId>> = HashMap::new();
         for &(slot, hash) in &reports {
             groups.entry(hash).or_default().push(slot);
         }
-        let majority = groups
-            .values()
-            .find(|slots| slots.len() * 2 > reports.len())
-            .cloned();
+        let majority_of = |count: usize| {
+            groups
+                .values()
+                .find(|slots| slots.len() * 2 > count)
+                .cloned()
+        };
+        // Every slot still taking part but those withholding their report can still report.
+        let voters = required
+            .iter()
+            .filter(|slot| !self.excluded.contains(slot))
+            .count()
+            .saturating_sub(missing.len());
+        let majority = if agreed {
+            majority_of(reports.len())
+        } else if let Some(majority) = majority_of(voters) {
+            // No report still to come can outvote it.
+            Some(majority)
+        } else if reports.len() < voters && !settle {
+            return Judgment::Undecided;
+        } else {
+            majority_of(reports.len())
+        };
         let Some(majority) = majority else {
             // Nobody to trust: a 1v1 that disagrees, an even split, or nobody reporting at all.
             self.dormant = true;
-            return Some(SyncDivergence {
+            return Judgment::Decided(Some(SyncDivergence {
                 sync_ordinal: step,
                 game_frame: None,
                 no_majority: true,
                 diverged: Vec::new(),
                 missing,
-            });
+            }));
         };
         let mut diverged: Vec<SlotId> = reports
             .iter()
@@ -306,13 +390,13 @@ impl StateHashTracker {
         {
             self.dormant = true;
         }
-        Some(SyncDivergence {
+        Judgment::Decided(Some(SyncDivergence {
             sync_ordinal: step,
             game_frame: None,
             no_majority: false,
             diverged,
             missing,
-        })
+        }))
     }
 
     /// Drops the oldest steps while more than [`STATE_HASH_WINDOW`] are in flight.
