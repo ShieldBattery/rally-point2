@@ -55,6 +55,15 @@ async fn roundtrip() {
             ..MakerSync::new(BufferBounds::new(0, 20).unwrap(), Authority::SelfRelay)
         },
     );
+    // This fixture installs the maker directly, so it also seeds the budget
+    // state normally installed by the session descriptor.
+    mesh.session.disconnect_budgets.configure_session(
+        &key,
+        false,
+        &[SlotId(0), SlotId(1)],
+        &[SlotId(0), SlotId(1)],
+        &[],
+    );
     let (addr, ca, relay) = start_relay_killable(registry_for(&[&tenant]), mesh.clone());
     let endpoint = client_endpoint(&ca);
     let (requests_tx, mut requests) = tokio::sync::mpsc::unbounded_channel();
