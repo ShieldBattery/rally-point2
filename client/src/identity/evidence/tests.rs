@@ -44,6 +44,14 @@ async fn missing_panicking_and_oversized_providers_supply_none() {
         Provider::new(|_| Some(evidence(vec![0; MAX_EVIDENCE_BODY_LEN + 1]))),
     ] {
         assert!(provider.collect(request()).await.is_none());
+        // A callback that outlives the provider timeout keeps its permit until it returns, and
+        // a panicking one can: unwinding prints a backtrace first, which takes a while on a busy
+        // machine. Waiting for the permit checks that it comes back at all.
+        let permit = tokio::time::timeout(Duration::from_secs(30), provider.available.acquire())
+            .await
+            .expect("the callback's permit is released once it returns")
+            .unwrap();
+        drop(permit);
         assert_eq!(provider.available.available_permits(), 1);
     }
 }
