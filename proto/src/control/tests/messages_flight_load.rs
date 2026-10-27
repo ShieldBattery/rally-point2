@@ -88,11 +88,15 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
             lobby_violations: vec![],
         },
         fenced: false,
+        fenced_live: false,
+        closed_slots: vec![],
         setup_settled: false,
         reports_turns: false,
     };
     let json = serde_json::to_string(&message).unwrap();
     assert!(!json.contains("ever_connected"));
+    assert!(!json.contains("fenced_live"));
+    assert!(!json.contains("closed_slots"));
     assert!(!json.contains("started_at_ms"));
     assert!(!json.contains("fenced"));
     assert!(!json.contains("setup_settled"));
@@ -119,14 +123,17 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
             started_at_ms: Some(1_700_000_000_000),
             lobby_violations: vec![SlotId(1)],
         },
-        fenced: true,
+        fenced: false,
+        fenced_live: true,
+        closed_slots: vec![SlotId(0)],
         setup_settled: true,
         reports_turns: true,
     };
     let json = serde_json::to_string(&populated).unwrap();
+    assert!(json.contains("\"fenced_live\":true"));
+    assert!(json.contains("\"closed_slots\":[0]"));
     assert!(json.contains("\"type\":\"load_state_snapshot\""));
     assert!(json.contains("\"ever_connected\":[0,1]"));
-    assert!(json.contains("\"fenced\":true"));
     assert!(json.contains("\"setup_settled\":true"));
     assert!(json.contains("\"lobby_violations\":[1]"));
     assert!(json.contains("\"forwarded\":[0,1]"));
@@ -143,10 +150,19 @@ fn a_snapshot_from_a_relay_predating_the_fence_decodes_unfenced() {
     // and must never be read as having claimed one.
     let json = r#"{"type":"load_state_snapshot","request_id":3,"state":{"tenant":"sb-staging","session":7,"slots":[]}}"#;
     let back: RelayToCoordinator = serde_json::from_str(json).unwrap();
-    let RelayToCoordinator::LoadStateSnapshot { fenced, .. } = back else {
+    let RelayToCoordinator::LoadStateSnapshot {
+        fenced,
+        fenced_live,
+        closed_slots,
+        ..
+    } = back
+    else {
         panic!("decodes as a snapshot");
     };
     assert!(!fenced);
+    // Nor the live half of one: an older relay can never claim more than it ran.
+    assert!(!fenced_live);
+    assert!(closed_slots.is_empty());
 }
 
 #[test]

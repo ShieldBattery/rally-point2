@@ -38,8 +38,11 @@ coordinator outage must leave running games untouched.
   `MAX_INFLIGHT_FLIGHT_UPLOADS` cycle at once; the blob never rides the socket.
 - A load-state answer's `fenced` flag licenses reading its *absences* only. Any
   membership change across the wait (arrival, replaced epoch, a slot that left)
-  makes it `false` while the facts still go up. The seat count in `load_fence.rs`,
-  not the ask channel, bounds concurrent probing.
+  makes it `false` while the facts still go up. It is `fenced_live` (every
+  probe acked, every live link fenced on its epoch) with no `closed_slots`
+  (ever connected, now neither live nor started); the two halves go up
+  separately so a departed slot is named instead of voiding the rest. The seat
+  count in `load_fence.rs`, not the ask channel, bounds concurrent probing.
 - Idle self-exit needs zero slots **and** no control connection, held continuously;
   either half alone reaps a healthy relay.
 

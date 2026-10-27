@@ -65,7 +65,7 @@
 //! meaningful to the caller still waiting on it, and that caller's own deadline
 //! outlives no reconnect worth speaking of.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,7 +73,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use rally_point_proto::control::{SessionPresence, TenantId};
-use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
@@ -174,6 +174,15 @@ pub struct AttestedSnapshot {
     /// back. False is not a refusal — it only means this answer's absences may
     /// not be read as proof.
     pub fenced: bool,
+    /// Whether the relay fenced every slot it homes outside `closed_slots`: every
+    /// probe was acked, and every live, unstarted link at the end acked on the
+    /// epoch it still holds. Implied by `fenced`; false for a relay that predates
+    /// the split.
+    pub fenced_live: bool,
+    /// The slots this relay homes that it has seen connect and that are now
+    /// neither live nor started, ascending. Already restricted to the slots the
+    /// answering relay homes by the time a waiter receives it.
+    pub closed_slots: Vec<SlotId>,
     /// Whether this request made a final setup-lobby ingress cut on the relay.
     pub setup_settled: bool,
     /// Whether the relay records its home slots' forwarded turns, so that their
@@ -196,8 +205,14 @@ pub struct AttestRound {
     pub started_before_any_request: Instant,
     /// The relays that answered inside the round's deadline.
     pub attested: Arc<HashSet<RelayId>>,
-    /// The relays whose answer was fenced — a subset of `attested`.
+    /// The relays whose answer was fenced — a subset of `fenced_live`.
     pub fenced: Arc<HashSet<RelayId>>,
+    /// The relays whose answer fenced every slot outside its closed set — a
+    /// subset of `attested`.
+    pub fenced_live: Arc<HashSet<RelayId>>,
+    /// Every slot an answering relay named closed, each taken only from the relay
+    /// that homes it. A current-state fact as of this round, not a cumulative one.
+    pub closed_slots: Arc<BTreeSet<SlotId>>,
     /// The relays that made a final setup-lobby ingress cut — a subset of `attested`.
     pub setup_settled: Arc<HashSet<RelayId>>,
     /// The relays whose answer reported turn evidence — a subset of `attested`.

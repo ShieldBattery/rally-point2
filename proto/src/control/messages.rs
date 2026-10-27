@@ -568,18 +568,47 @@ pub enum RelayToCoordinator {
         ///
         /// True only when **every** probed slot acked in time *and* no slot the
         /// relay has ever seen connect is currently disconnected without having
-        /// started. A disconnected slot cannot be probed, and its client may
-        /// hold a report parked for its next stream, so it can never be fenced;
-        /// a slot that never connected here holds nothing to fence, so its
-        /// absence is attestable. False is not a refusal — the snapshot's facts
-        /// are as real as any other's — it only means the *absence* of a slot
-        /// from this snapshot must not be read as that slot never having
-        /// started.
+        /// started — that is, `fenced_live` holds and `closed_slots` is empty.
+        /// A disconnected slot cannot be probed, and its client may hold a
+        /// report parked for its next stream, so it can never be fenced; a slot
+        /// that never connected here holds nothing to fence, so its absence is
+        /// attestable. False is not a refusal — the snapshot's facts are as real
+        /// as any other's — it only means the *absence* of a slot from this
+        /// snapshot must not be read as that slot never having started.
         ///
         /// Additive: a relay build that predates the fence omits it and reads as
         /// `false`, so it can never claim a fence it did not run.
         #[serde(default, skip_serializing_if = "is_false")]
         fenced: bool,
+        /// The live half of `fenced`: every probe this relay issued was acked in
+        /// time, and every slot live at the end that has not started acked a
+        /// probe issued against the connection epoch it still holds.
+        ///
+        /// It vouches for every slot this relay homes *except* those in
+        /// `closed_slots`: a live slot's absence from `state.started` is proof it
+        /// had not started, and a slot that never connected here holds nothing
+        /// to fence. `fenced` is this with no closed slot at all, so `fenced`
+        /// implies it.
+        ///
+        /// Additive: a relay build that predates the split omits it and reads as
+        /// `false`, so it can never claim more than the fence it ran.
+        #[serde(default, skip_serializing_if = "is_false")]
+        fenced_live: bool,
+        /// The slots this relay has seen connect that are disconnected now
+        /// without having started, ascending — the slots no fence can vouch
+        /// for, since there is no stream to probe and the client may be holding
+        /// a report for the stream it opens next.
+        ///
+        /// A current-state fact read with the snapshot, not a cumulative one: a
+        /// slot that dials back in leaves the set. Read off the same roster as
+        /// `state`, so a slot outside it is live, started, or never connected
+        /// here; with `fenced_live` set, every one of those is vouched for too.
+        ///
+        /// Additive: a relay build that predates the set omits it, and with
+        /// `fenced_live` reading `false` its silence is never taken for a
+        /// statement that no slot closed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        closed_slots: Vec<SlotId>,
         /// Whether this relay closed future home-authored lobby commands before
         /// taking this snapshot. Absent decodes as false so an older relay can
         /// never attest final setup state.

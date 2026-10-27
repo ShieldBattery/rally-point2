@@ -26,9 +26,11 @@
 //!
 //! A slot that does not ack in time is simply unfenced. So is a slot that
 //! connected earlier and is disconnected now: there is no stream to probe, and
-//! its client may be holding a report for the stream it opens next. A slot that
-//! never connected here holds nothing to fence — no client ever had a stream to
-//! this relay for it — so its absence needs no probe to be attestable.
+//! its client may be holding a report for the stream it opens next; the answer
+//! names such a slot *closed*, so the verdict over every other slot still stands
+//! on its own. A slot that never connected here holds nothing to fence — no
+//! client ever had a stream to this relay for it — so its absence needs no probe
+//! to be attestable.
 //!
 //! # A probe names a connection, not a seat
 //!

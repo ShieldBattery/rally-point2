@@ -261,8 +261,11 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
             },
             // Slot 2 arrived here and is gone: no stream to probe, and its
             // client may be holding a report for the stream it opens next, so
-            // this answer's absences carry no proof.
+            // the whole session is not fenced. It is named instead, and the
+            // only live slot has started, so everything else is vouched for.
             fenced: false,
+            fenced_live: true,
+            closed_slots: vec![rally_point_proto::ids::SlotId(2)],
             setup_settled: false,
             // The turn set needs no fence, and this build always carries it.
             reports_turns: true,

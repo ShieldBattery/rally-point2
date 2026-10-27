@@ -58,6 +58,45 @@ fn retained_load_state_outlives_the_links_it_was_recorded_from() {
 }
 
 #[test]
+fn a_slot_that_left_before_starting_stays_unstarted_and_cannot_add_a_violation_after_settling() {
+    // The two facts a closed slot's verdict rests on. Its arrival outlives the
+    // link while its absence from `started` stays put, which is what names it
+    // closed rather than live or started. And once the home relay settles the
+    // lobby, nothing its client delivers on a later reconnect can add lobby
+    // evidence, so setup can be final while that client is still out of reach.
+    use rally_point_proto::control::{AllowedLobbyCommand, LobbyPolicy};
+
+    let registry = new_decision_makers();
+    let k = key();
+    let _ = registry.sync_maker(
+        &k,
+        MakerSync {
+            lobby_policy: Some(LobbyPolicy {
+                allowed: vec![AllowedLobbyCommand {
+                    slot: SlotId(0),
+                    payload: b"allowed".to_vec(),
+                }],
+            }),
+            ..MakerSync::new(bounds(1, 6), Authority::SelfRelay)
+        },
+    );
+    registry.note_slot_connected(&k, SlotId(0), false, None);
+    assert!(registry.remove_slot_for_epoch(&k, SlotId(0), None));
+
+    let load = load_state_of(&registry, &k);
+    assert_eq!(load.ever_connected, vec![SlotId(0)]);
+    assert!(load.started.is_empty());
+
+    assert!(registry.settle_lobby(&k));
+    registry.note_slot_connected(&k, SlotId(0), true, None);
+    assert_eq!(
+        registry.admit_lobby_command(&k, SlotId(0), b"not allowed"),
+        LobbyCommandVerdict::DroppedAfterSettlement,
+    );
+    assert!(load_state_of(&registry, &k).lobby_violations.is_empty());
+}
+
+#[test]
 fn a_session_without_a_maker_retains_no_load_state() {
     // A session run without a descriptor has no maker to retain anything. It
     // still reports its facts as notices; the heartbeat simply carries empty

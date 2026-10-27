@@ -5,6 +5,7 @@ use rally_point_proto::control::SessionPresence;
 
 use super::*;
 
+mod closed;
 mod evidence;
 
 /// How a stand-in relay answers the questions addressed to it.
@@ -13,6 +14,12 @@ struct AttestOptions {
     /// clients — the difference between a relay that merely answered and one
     /// whose answer rules out a report still queued in a client.
     fenced: bool,
+    /// Whether its snapshot claims every slot outside `closed_slots` was fenced;
+    /// false with `fenced` set stands in for a relay that predates the split.
+    fenced_live: bool,
+    /// The slots its snapshot names as connected once and now neither live nor
+    /// started.
+    closed_slots: Vec<SlotId>,
     /// Whether its snapshot confirms that the relay closed lobby ingress.
     setup_settled: bool,
     /// Whether its snapshot declares turn evidence, as every current relay's
@@ -30,6 +37,8 @@ impl Default for AttestOptions {
     fn default() -> Self {
         Self {
             fenced: true,
+            fenced_live: true,
+            closed_slots: Vec::new(),
             setup_settled: false,
             reports_turns: true,
             release: None,
@@ -53,6 +62,8 @@ fn spawn_attesting_relay(
     let mut asks = setup.attest().subscribe(relay);
     let AttestOptions {
         fenced,
+        fenced_live,
+        closed_slots,
         setup_settled,
         reports_turns,
         mut release,
@@ -74,6 +85,8 @@ fn spawn_attesting_relay(
                     request_id: ask.request_id,
                     state: snapshot.clone(),
                     fenced,
+                    fenced_live,
+                    closed_slots: closed_slots.clone(),
                     setup_settled,
                     reports_turns,
                 })
@@ -156,11 +169,13 @@ async fn settling_read_returns_finality_and_retained_lobby_violation() {
         serde_json::json!({
             "known": true,
             "turnsKnown": true,
+            "closedKnown": true,
             "setupFinal": true,
             "connectedSlots": [],
             "startedSlots": [],
             "forwardedSlots": [],
             "lobbyViolationSlots": [0],
+            "closedSlots": [],
         }),
     );
     assert!(
@@ -309,7 +324,7 @@ async fn every_serving_relay_attesting_makes_the_answer_complete() {
     // completeness is the exchange, not a clock.
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":true,"turnsKnown":true,"setupFinal":false,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":true,"turnsKnown":true,"closedKnown":true,"setupFinal":false,"startedAtMs":1700000000000,"connectedSlots":[0,1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[]}"#,
     );
 }
 
@@ -340,6 +355,7 @@ async fn one_unfenced_relay_costs_the_claim_but_not_the_others_facts() {
         },
         AttestOptions {
             fenced: false,
+            fenced_live: false,
             setup_settled: false,
             ..Default::default()
         },
@@ -349,7 +365,7 @@ async fn one_unfenced_relay_costs_the_claim_but_not_the_others_facts() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":true,"setupFinal":false,"connectedSlots":[0,1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":true,"closedKnown":false,"setupFinal":false,"connectedSlots":[0,1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[]}"#,
         "both relays' positives stand; only the negative inference is withheld",
     );
 }
@@ -414,7 +430,7 @@ async fn concurrent_reads_of_one_session_cost_fewer_rounds_than_reads() {
         let body = read.await.expect("the read completes");
         assert_eq!(
             std::str::from_utf8(&body).unwrap(),
-            r#"{"known":true,"turnsKnown":true,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
+            r#"{"known":true,"turnsKnown":true,"closedKnown":true,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[]}"#,
         );
     }
     assert!(
@@ -490,7 +506,7 @@ async fn one_silent_relay_costs_the_claim_but_not_the_others_facts() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"closedKnown":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[1],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[]}"#,
     );
 }
 
@@ -516,7 +532,7 @@ async fn a_relay_with_no_control_connection_never_attests() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"closedKnown":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[]}"#,
     );
 }
 
@@ -543,7 +559,7 @@ async fn a_broken_lineage_withholds_the_claim_even_when_every_relay_attests() {
     let body = read_load_state(app, 5).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"closedKnown":false,"setupFinal":false,"connectedSlots":[1],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[]}"#,
         "the facts the snapshot carried still stand",
     );
 }
@@ -557,7 +573,7 @@ async fn a_session_the_coordinator_holds_nothing_for_answers_no_information() {
     let body = read_load_state(app, 6).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"closedKnown":false,"setupFinal":false,"connectedSlots":[],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[]}"#,
     );
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(json.get("startedAtMs").is_none(), "absent, never null");
@@ -581,7 +597,7 @@ async fn a_session_this_coordinator_never_created_answers_its_facts_only() {
     let body = read_load_state(app, 7).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"forwardedSlots":[],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":false,"closedKnown":false,"setupFinal":false,"connectedSlots":[0],"startedSlots":[0],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[]}"#,
         "the facts stand; only the read-absence-as-proof claim is withheld",
     );
 }
@@ -613,6 +629,8 @@ async fn a_snapshot_correlated_to_another_relays_request_is_discarded() {
                 ..presence_entry(&tenant, SessionId(5), &[])
             },
             fenced: true,
+            fenced_live: true,
+            closed_slots: Vec::new(),
             setup_settled: false,
             reports_turns: true,
         })
@@ -713,6 +731,7 @@ async fn turn_evidence_is_merged_from_each_slots_home_and_needs_no_fence() {
         },
         AttestOptions {
             fenced: false,
+            fenced_live: false,
             ..Default::default()
         },
     );
@@ -720,7 +739,7 @@ async fn turn_evidence_is_merged_from_each_slots_home_and_needs_no_fence() {
     let body = read_load_state(router(state), session.0).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":true,"setupFinal":false,"connectedSlots":[0,1],"startedSlots":[0,1],"forwardedSlots":[0],"lobbyViolationSlots":[]}"#,
+        r#"{"known":false,"turnsKnown":true,"closedKnown":false,"setupFinal":false,"connectedSlots":[0,1],"startedSlots":[0,1],"forwardedSlots":[0],"lobbyViolationSlots":[],"closedSlots":[]}"#,
     );
 }
 

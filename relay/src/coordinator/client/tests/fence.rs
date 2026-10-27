@@ -37,13 +37,17 @@ async fn a_live_unstarted_slot_that_acks_fences_the_answer() {
             tokio::task::yield_now().await;
         }
     };
-    let ((state, fenced), ()) = tokio::join!(
+    let (load, ()) = tokio::join!(
         fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
         ack,
     );
-    assert!(fenced, "every slot that could hold something back acked");
-    assert_eq!(state.slots, vec![SlotId(0)]);
-    assert!(state.started.is_empty());
+    assert!(
+        load.fenced(),
+        "every slot that could hold something back acked"
+    );
+    assert!(load.fenced_live && load.closed_slots.is_empty());
+    assert_eq!(load.state.slots, vec![SlotId(0)]);
+    assert!(load.state.started.is_empty());
 }
 
 #[tokio::test]
@@ -77,16 +81,21 @@ async fn a_slot_that_arrives_mid_fence_leaves_the_answer_unfenced() {
             tokio::task::yield_now().await;
         }
     };
-    let ((state, fenced), ()) = tokio::join!(
+    let (load, ()) = tokio::join!(
         fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
         ack,
     );
     assert!(
-        !fenced,
+        !load.fenced_live,
         "a slot nobody probed cannot be vouched for, however promptly the rest answered",
     );
+    assert!(!load.fenced());
+    assert!(
+        load.closed_slots.is_empty(),
+        "the arrival is live, not closed"
+    );
     assert_eq!(
-        state.slots,
+        load.state.slots,
         vec![SlotId(0), SlotId(1)],
         "the arrival is still reported; only the negative inference is withheld",
     );
@@ -123,16 +132,20 @@ async fn a_link_replaced_after_acking_leaves_the_answer_unfenced() {
             tokio::task::yield_now().await;
         }
     };
-    let ((state, fenced), ()) = tokio::join!(
+    let (load, ()) = tokio::join!(
         fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
         ack,
     );
     assert!(
-        !fenced,
+        !load.fenced_live,
         "an ack from the connection before the reconnect fences nothing"
     );
+    assert!(
+        load.closed_slots.is_empty(),
+        "a slot that dialed back in is live again, so it is not closed",
+    );
     assert_eq!(
-        state.slots,
+        load.state.slots,
         vec![SlotId(0)],
         "the seat is occupied throughout, so nothing but the epoch gives the swap away",
     );
@@ -155,10 +168,13 @@ async fn a_live_unstarted_slot_that_never_acks_leaves_the_answer_unfenced() {
     registration.disarm();
     decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
 
-    let (state, fenced) =
-        fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
-    assert!(!fenced, "an unanswered probe leaves its slot unfenced");
-    assert_eq!(state.slots, vec![SlotId(0)]);
+    let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+    assert!(
+        !load.fenced_live,
+        "an unanswered probe leaves its slot unfenced"
+    );
+    assert!(load.closed_slots.is_empty());
+    assert_eq!(load.state.slots, vec![SlotId(0)]);
     assert!(
         inbox.try_recv_load_state_probe().is_some(),
         "the probe was written to the slot's stream even though it went unanswered",
@@ -180,10 +196,9 @@ async fn a_started_slot_is_not_probed_at_all() {
     decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
     decision_makers.note_slot_started(&key(7), SlotId(0));
 
-    let (state, fenced) =
-        fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
-    assert!(fenced);
-    assert_eq!(state.started, vec![SlotId(0)]);
+    let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+    assert!(load.fenced());
+    assert_eq!(load.state.started, vec![SlotId(0)]);
     assert!(
         inbox.try_recv_load_state_probe().is_none(),
         "a slot with nothing left to report is not probed",
@@ -207,11 +222,118 @@ async fn a_slot_that_connected_and_then_dropped_can_never_be_fenced() {
     // and not live.
     drop(registration);
 
-    let (state, fenced) =
-        fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
-    assert!(!fenced);
-    assert!(state.slots.is_empty());
-    assert_eq!(state.ever_connected, vec![SlotId(0)]);
+    let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+    assert!(!load.fenced());
+    assert!(load.state.slots.is_empty());
+    assert_eq!(load.state.ever_connected, vec![SlotId(0)]);
+    // It is named rather than silently spoiling the answer, and nothing else
+    // here was left unvouched.
+    assert_eq!(load.closed_slots, vec![SlotId(0)]);
+    assert!(load.fenced_live);
+}
+
+#[tokio::test]
+async fn closed_slots_are_named_while_the_live_ones_are_still_fenced() {
+    // Two slots drop at once beside one that stays and acks. The fence cannot
+    // reach the two, but naming them keeps the third's verdict usable: the
+    // answer vouches for every slot outside the closed set.
+    use rally_point_proto::ids::SlotId;
+
+    let (sessions, decision_makers) = fence_fixture();
+    let fence = crate::coordinator::load_fence::LoadStateFence::new();
+    for slot in [SlotId(0), SlotId(1)] {
+        let (registration, _inbox) =
+            crate::routing::register(&sessions, &key(7), slot, LINK_EPOCH).expect("registers");
+        decision_makers.note_slot_connected(&key(7), slot, false, None);
+        drop(registration);
+    }
+    let (mut registration, mut inbox) =
+        crate::routing::register(&sessions, &key(7), SlotId(2), LINK_EPOCH)
+            .expect("slot 2 registers");
+    registration.disarm();
+    decision_makers.note_slot_connected(&key(7), SlotId(2), false, None);
+
+    let ack = async {
+        loop {
+            if let Some(probe_id) = inbox.try_recv_load_state_probe() {
+                assert!(fence.resolve(probe_id, &key(7), SlotId(2), LINK_EPOCH));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let (load, ()) = tokio::join!(
+        fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
+        ack,
+    );
+    assert_eq!(load.closed_slots, vec![SlotId(0), SlotId(1)]);
+    assert!(load.fenced_live, "the one live slot acked on its own link");
+    assert!(
+        !load.fenced(),
+        "the closed slots still withhold the whole verdict"
+    );
+}
+
+#[tokio::test]
+async fn a_closed_slot_beside_a_silent_live_one_withholds_the_live_verdict() {
+    // Naming the closed slot says nothing about the rest: a live slot that never
+    // acks is as unvouched as ever.
+    use rally_point_proto::ids::SlotId;
+
+    let (sessions, decision_makers) = fence_fixture();
+    let fence =
+        crate::coordinator::load_fence::LoadStateFence::with_timeout(Duration::from_millis(50));
+    let (registration, _inbox) =
+        crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+            .expect("slot 0 registers");
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    drop(registration);
+    let (mut registration, _silent_inbox) =
+        crate::routing::register(&sessions, &key(7), SlotId(1), LINK_EPOCH)
+            .expect("slot 1 registers");
+    registration.disarm();
+    decision_makers.note_slot_connected(&key(7), SlotId(1), false, None);
+
+    let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+    assert_eq!(load.closed_slots, vec![SlotId(0)]);
+    assert!(!load.fenced_live);
+}
+
+#[tokio::test]
+async fn a_slot_that_dropped_and_dialed_back_in_is_fenced_on_its_new_link() {
+    // A drop the client recovers from before the question is asked leaves
+    // nothing behind: the new link is live, is probed on its own epoch, and
+    // acks, so the slot is neither closed nor unvouched.
+    use rally_point_proto::ids::SlotId;
+
+    let (sessions, decision_makers) = fence_fixture();
+    let fence = crate::coordinator::load_fence::LoadStateFence::new();
+    let (registration, _inbox) =
+        crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
+            .expect("slot 0 registers");
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    drop(registration);
+    let (mut reconnect, mut inbox) =
+        crate::routing::register(&sessions, &key(7), SlotId(0), REPLACEMENT_EPOCH)
+            .expect("the reconnect claims the seat");
+    reconnect.disarm();
+    decision_makers.note_slot_connected(&key(7), SlotId(0), true, None);
+
+    let ack = async {
+        loop {
+            if let Some(probe_id) = inbox.try_recv_load_state_probe() {
+                assert!(fence.resolve(probe_id, &key(7), SlotId(0), REPLACEMENT_EPOCH));
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    };
+    let (load, ()) = tokio::join!(
+        fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
+        ack,
+    );
+    assert!(load.closed_slots.is_empty());
+    assert!(load.fenced());
 }
 
 #[tokio::test]
@@ -222,10 +344,12 @@ async fn a_slot_that_never_connected_here_needs_no_fence() {
     let (sessions, decision_makers) = fence_fixture();
     let fence = crate::coordinator::load_fence::LoadStateFence::new();
 
-    let (state, fenced) =
-        fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
-    assert!(fenced, "an absence with no client behind it needs no probe");
-    assert!(state.slots.is_empty() && state.ever_connected.is_empty());
+    let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+    assert!(
+        load.fenced(),
+        "an absence with no client behind it needs no probe"
+    );
+    assert!(load.state.slots.is_empty() && load.state.ever_connected.is_empty());
 }
 
 #[tokio::test]

@@ -10,11 +10,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rally_point_proto::control::{CoordinatorToRelay, TenantId};
-use rally_point_proto::ids::{RelayId, SessionId};
+use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_proto::time::unix_secs_fail_open;
 
 use crate::flight_store::{self, S3FlightStore};
-use crate::lifecycle::bound_session_slot_lists;
+use crate::lifecycle::{MAX_HEARTBEAT_SESSION_SLOTS, bound_session_slot_lists};
 use crate::notify;
 use crate::tenant;
 
@@ -304,16 +304,19 @@ pub(super) fn handle_flight_upload_done(
 /// only when it names an outstanding request made to *this* relay for *this*
 /// session, so one relay can never answer in another's name, and a late answer from
 /// a read that already gave up finds nothing to resolve.
+///
+/// Every slot claim whose absence a tenant reads against a player — forwarded
+/// turns, lobby violations, closed slots — is kept only from the relay that homes
+/// that slot, so another serving relay can neither vouch for nor accuse a slot it
+/// never carried.
 pub(super) fn handle_load_state_snapshot(
     inbound: &ControlInbound<'_>,
     request_id: u64,
-    mut snapshot: rally_point_proto::control::SessionPresence,
-    fenced: bool,
-    setup_settled: bool,
-    reports_turns: bool,
+    mut answer: crate::attest::AttestedSnapshot,
 ) {
     let relay_id = inbound.relay_id;
-    bound_session_slot_lists(relay_id, &mut snapshot);
+    let snapshot = &mut answer.state;
+    bound_session_slot_lists(relay_id, snapshot);
     if !inbound
         .setup
         .relay_serves_session(relay_id, &snapshot.tenant, snapshot.session)
@@ -329,9 +332,9 @@ pub(super) fn handle_load_state_snapshot(
     inbound.lifecycle.merge_connection_evidence(
         relay_id,
         inbound.generation,
-        std::slice::from_ref(&snapshot),
+        std::slice::from_ref(snapshot),
     );
-    snapshot.lobby_violations.retain(|&slot| {
+    let homed_here = |slot: SlotId, claim: &'static str| {
         let allowed =
             inbound
                 .setup
@@ -342,33 +345,38 @@ pub(super) fn handle_load_state_snapshot(
                 tenant = snapshot.tenant.as_ref(),
                 session = snapshot.session.0,
                 slot = slot.0,
-                "load-state lobby violation from a relay not homing the slot; rejecting",
+                claim,
+                "load-state slot claim from a relay not homing the slot; rejecting",
             );
         }
         allowed
-    });
+    };
+    let lobby_violations = std::mem::take(&mut snapshot.lobby_violations)
+        .into_iter()
+        .filter(|&slot| homed_here(slot, "lobby violation"))
+        .collect();
+    // The closed set rides beside the snapshot rather than in it, so it gets the
+    // same per-session length cap the snapshot's own lists do.
+    answer.closed_slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+    answer.closed_slots.sort_unstable();
+    answer.closed_slots.dedup();
+    answer
+        .closed_slots
+        .retain(|&slot| homed_here(slot, "closed slot"));
+    answer.state.lobby_violations = lobby_violations;
     crate::lifecycle::retain_home_turn_evidence(
         inbound.setup,
         relay_id,
-        &mut snapshot,
+        &mut answer.state,
         "load-state snapshot",
     );
     inbound
         .lifecycle
-        .merge_load_state(std::slice::from_ref(&snapshot));
+        .merge_load_state(std::slice::from_ref(&answer.state));
     if inbound
         .setup
         .attest()
-        .resolve(
-            request_id,
-            relay_id,
-            crate::attest::AttestedSnapshot {
-                state: snapshot,
-                fenced,
-                setup_settled,
-                reports_turns,
-            },
-        )
+        .resolve(request_id, relay_id, answer)
         .is_err()
     {
         tracing::debug!(

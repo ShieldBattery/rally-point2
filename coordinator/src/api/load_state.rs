@@ -86,6 +86,29 @@ struct SessionLoadStateRequest {
 /// absence says. The declaration is needed because a relay build that predates the
 /// set answers without it, whatever it forwarded: a session served by one is never
 /// `turnsKnown`, and its empty set carries no information.
+///
+/// `closedSlots` is unlike every other set here: a **current-state** fact as of
+/// this read, not an ever-set. It names the slots that connected to their home
+/// relay and are now disconnected without having reported their game loop running
+/// — the slots no relay can fence, because there is no stream left to probe and
+/// the client may be holding a report for the one it opens next. Each slot is taken
+/// only from the relay that homes it. A slot that dials back in leaves the set on
+/// the next read.
+///
+/// `closedKnown: true` licenses reading `closedSlots` as the session's whole closed
+/// set, and every slot outside it as fenced: every serving relay answered after
+/// this request reached it, each fenced every slot it homes except the ones it
+/// named closed, and everything `turnsKnown` rests on holds. So a connected slot
+/// absent from `closedSlots` is live or started, and a live slot's absence from
+/// `startedSlots` is proof. What it cannot vouch for is a closed slot's own start,
+/// which may still be parked in its client; `forwardedSlots`, which needs no fence,
+/// is the only word on how far that slot's game got, which is why `closedKnown`
+/// requires `turnsKnown`. A `known` answer has no closed slot to name: its relays
+/// fenced every slot they home.
+///
+/// `setupFinal: true` (only on a read that asked to settle the lobby) means
+/// `lobbyViolationSlots` is complete and stays so: every home relay cut lobby
+/// ingress before answering, and every answer fenced at least its live slots.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionLoadStateResponse {
@@ -93,6 +116,7 @@ struct SessionLoadStateResponse {
     evidence: Vec<crate::notify::SlotEvidencePayload>,
     known: bool,
     turns_known: bool,
+    closed_known: bool,
     setup_final: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     started_at_ms: Option<u64>,
@@ -100,6 +124,7 @@ struct SessionLoadStateResponse {
     started_slots: Vec<u8>,
     forwarded_slots: Vec<u8>,
     lobby_violation_slots: Vec<u8>,
+    closed_slots: Vec<u8>,
 }
 
 /// Session load-progress read: which slots ever connected, which ever reported
@@ -183,6 +208,8 @@ pub(super) async fn session_load_state(
             forwarded_slots: Vec::new(),
             turns_known: false,
             lobby_violation_slots: Vec::new(),
+            closed_known: false,
+            closed_slots: Vec::new(),
         })
         .into_response());
     };
@@ -210,38 +237,51 @@ pub(super) async fn session_load_state(
             forwarded_slots: before.forwarded_slots.iter().map(|s| s.0).collect(),
             turns_known: false,
             lobby_violation_slots: before.lobby_violation_slots.iter().map(|s| s.0).collect(),
+            closed_known: false,
+            closed_slots: round.closed_slots.iter().map(|s| s.0).collect(),
         })
         .into_response());
     };
     // A session with no serving relays has nobody who could attest, so it can never
     // complete — the same reason a state no registration built cannot. Membership in
-    // `fenced` implies membership in `attested`, so this one check covers both:
-    // every serving relay answered, and every answer ruled out a report still queued
-    // in one of that relay's clients.
-    let every_relay_fenced = !before.serving_relays.is_empty()
-        && before
-            .serving_relays
-            .iter()
-            .all(|relay| round.fenced.contains(relay));
+    // `fenced` implies membership in `fenced_live`, which implies membership in
+    // `attested`, so each check here also covers the ones beneath it: every serving
+    // relay answered, and every answer ruled out a report still queued in one of
+    // that relay's clients (all of them, or all but the ones it named closed).
+    let every_serving_relay_in = |relays: &std::collections::HashSet<RelayId>| {
+        !before.serving_relays.is_empty()
+            && before
+                .serving_relays
+                .iter()
+                .all(|relay| relays.contains(relay))
+    };
+    let every_relay_fenced = every_serving_relay_in(&round.fenced);
+    let every_relay_fenced_live = every_serving_relay_in(&round.fenced_live);
     // Turn evidence needs no fence: it holds only what each relay itself forwarded,
     // so no client can be holding a turn the set owes it. It needs everything else
     // `known` does, plus a relay build that records the set at all — an older one
     // answers without it whatever it forwarded.
-    let turns_known = after.created_here
-        && after.attestable
-        && !before.serving_relays.is_empty()
-        && before
-            .serving_relays
-            .iter()
-            .all(|relay| round.reports_turns.contains(relay));
+    let turns_known =
+        after.created_here && after.attestable && every_serving_relay_in(&round.reports_turns);
+    // Each serving relay named every slot of its own that sits beyond its fence and
+    // vouched for every other, so the union is the session's closed set as of this
+    // round. Turn evidence is required beside it because a closed slot's own start
+    // report may still be parked in its client: only the forwarded set, which needs
+    // no fence, shows whether that slot's game got anywhere.
+    let closed_known = turns_known && every_relay_fenced_live;
+    // Setup finality claims only that the lobby-violation evidence is complete, and
+    // the settle cut is what makes it so: once a home relay has settled, every lobby
+    // command its clients author afterwards — including one a disconnected client
+    // delivers when it dials back in — is dropped without a violation, so nothing a
+    // closed slot's client still holds can add one. The fence is needed only to rule
+    // out a start report still queued in a live client, which the live half of each
+    // verdict covers; a closed slot is named in `closedSlots` rather than withholding
+    // finality, while `known` still demands the whole fence.
     let setup_final = request.settle_lobby
         && after.created_here
         && after.attestable
-        && every_relay_fenced
-        && before
-            .serving_relays
-            .iter()
-            .all(|relay| round.setup_settled.contains(relay))
+        && every_relay_fenced_live
+        && every_serving_relay_in(&round.setup_settled)
         && state
             .setup
             .settle_lobby(&request.tenant, session, &before.serving_relays, || {
@@ -264,6 +304,8 @@ pub(super) async fn session_load_state(
         forwarded_slots: after.forwarded_slots.iter().map(|s| s.0).collect(),
         turns_known,
         lobby_violation_slots: after.lobby_violation_slots.iter().map(|s| s.0).collect(),
+        closed_known,
+        closed_slots: round.closed_slots.iter().map(|s| s.0).collect(),
     })
     .into_response())
 }
@@ -285,8 +327,9 @@ async fn attest_round(
 }
 
 /// Asks every relay in `serving` for its snapshot of the session and reports which
-/// of them answered, and which of those fenced. Each answer is merged where it is
-/// received, so this only has to record who produced one.
+/// of them answered, which of those fenced (wholly, or all but their closed slots),
+/// and which slots they named closed. Each answer's facts are merged where it is
+/// received, so this only has to record who produced one and what it vouched for.
 ///
 /// Every request goes out before any answer is waited on, and all of them share one
 /// absolute deadline, so the whole exchange costs at most the state's
@@ -320,6 +363,8 @@ async fn attest_serving_relays(
     let deadline = tokio::time::Instant::now() + state.attest_timeout;
     let mut attested = std::collections::HashSet::new();
     let mut fenced = std::collections::HashSet::new();
+    let mut fenced_live = std::collections::HashSet::new();
+    let mut closed_slots = std::collections::BTreeSet::new();
     let mut setup_settled = std::collections::HashSet::new();
     let mut reports_turns = std::collections::HashSet::new();
     for (relay, waiter) in &mut pending {
@@ -328,6 +373,13 @@ async fn attest_serving_relays(
             if snapshot.fenced {
                 fenced.insert(*relay);
             }
+            // A whole fence is a live fence with nothing closed, so a relay that
+            // predates the split and answers only `fenced` still vouches for its
+            // live slots and names no closed one.
+            if snapshot.fenced_live || snapshot.fenced {
+                fenced_live.insert(*relay);
+            }
+            closed_slots.extend(snapshot.closed_slots);
             if snapshot.setup_settled {
                 setup_settled.insert(*relay);
             }
@@ -340,6 +392,8 @@ async fn attest_serving_relays(
         started_before_any_request,
         attested: std::sync::Arc::new(attested),
         fenced: std::sync::Arc::new(fenced),
+        fenced_live: std::sync::Arc::new(fenced_live),
+        closed_slots: std::sync::Arc::new(closed_slots),
         setup_settled: std::sync::Arc::new(setup_settled),
         reports_turns: std::sync::Arc::new(reports_turns),
     }

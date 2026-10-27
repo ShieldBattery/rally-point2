@@ -235,19 +235,40 @@ pub(super) fn session_load_snapshot(
 }
 
 /// A finished load-state answer, handed from a fence task back to the write half
-/// that sends it. Carries the fence verdict beside the snapshot because the two are
-/// one claim: the sets say what this relay saw, and `fenced` says whether it could
-/// rule out a slot's report still sitting in that slot's client.
+/// that sends it.
 pub(super) struct LoadStateAnswer {
     /// The coordinator's correlation id, echoed back on the snapshot.
     pub(super) request_id: u64,
-    /// What this relay holds for the session, read after the fence resolved.
-    pub(super) state: SessionPresence,
-    /// Whether every slot that could be holding something back was proven not to
-    /// be (see [`fenced_load_state_snapshot`]).
-    pub(super) fenced: bool,
+    /// The snapshot and the fence verdict over it.
+    pub(super) load: FencedLoadState,
     /// Whether this request made a final home-lobby ingress cut.
     pub(super) setup_settled: bool,
+}
+
+/// One session's snapshot, taken after its fence resolved, with the fence's
+/// verdict beside it. The two travel together because they are one claim: the
+/// sets say what this relay saw, and the verdict says which of its slots it could
+/// rule out still holding a report in their client (see
+/// [`fenced_load_state_snapshot`]).
+#[derive(Debug)]
+pub(super) struct FencedLoadState {
+    /// What this relay holds for the session, read after the fence resolved.
+    pub(super) state: SessionPresence,
+    /// Whether every probe was acked in time and every live, unstarted slot at
+    /// the end acked on the connection epoch it still holds — the verdict over
+    /// every slot except those in `closed_slots`.
+    pub(super) fenced_live: bool,
+    /// The slots this relay has seen connect that are neither live nor started in
+    /// `state`, ascending: the ones no probe can reach.
+    pub(super) closed_slots: Vec<SlotId>,
+}
+
+impl FencedLoadState {
+    /// Whether the whole session was fenced: the live verdict holds and no slot
+    /// sits beyond the fence's reach.
+    pub(super) fn fenced(&self) -> bool {
+        self.fenced_live && self.closed_slots.is_empty()
+    }
 }
 
 /// Starts one routed load-state ask's fence, or sheds it when this relay is already
@@ -311,13 +332,11 @@ fn spawn_load_state_answer(
                         && decision_makers.settle_lobby(&ask.key)
                 })
                 .unwrap_or(false);
-        let (state, fenced) =
-            fenced_load_state_snapshot(&sessions, &decision_makers, &fence, ask.key).await;
+        let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, ask.key).await;
         if answers
             .try_send(LoadStateAnswer {
                 request_id: ask.request_id,
-                state,
-                fenced,
+                load,
                 setup_settled,
             })
             .is_err()
@@ -349,22 +368,29 @@ fn spawn_load_state_answer(
 /// mid-fence would otherwise show up in the final snapshot as live, unstarted and
 /// unprobed, with a report of its own possibly still queued.
 ///
-/// The verdict is `true` only when all of these hold:
+/// The verdict comes in two halves. `fenced_live` holds only when both of these
+/// do:
 ///
 /// - every probe issued was acked within the fence's timeout
 ///   ([`LOAD_STATE_FENCE_TIMEOUT`](super::LOAD_STATE_FENCE_TIMEOUT)) — a probe no
 ///   stream would take, or one that went unanswered, leaves that slot unfenced;
+///   and
 /// - every slot live at the *end* that has not started acked a probe issued
 ///   against the epoch it still holds, so a slot that arrived mid-fence (never
 ///   probed) and one whose link was replaced after acking (probed on the epoch
-///   before) both spoil the verdict; and
-/// - no slot this relay has ever seen connect is now disconnected without having
-///   started. Such a slot has no stream to probe and its client may be holding a
-///   report for the stream it opens next, so it can never be fenced.
+///   before) both spoil the verdict.
 ///
-/// So any membership change across the fence yields `false` and the tenant's next
-/// read simply asks again — the answer's facts are unaffected, only the licence to
-/// read its absences as proof.
+/// `closed_slots` is every slot this relay has ever seen connect that is now
+/// disconnected without having started. Such a slot has no stream to probe and its
+/// client may be holding a report for the stream it opens next, so it can never be
+/// fenced; naming it lets a reader trust everything else the answer vouches for
+/// while knowing exactly which slots it cannot. The whole session is fenced
+/// ([`FencedLoadState::fenced`]) only when `fenced_live` holds and no slot is
+/// closed.
+///
+/// So any membership change across the fence withholds the live verdict and the
+/// tenant's next read simply asks again — the answer's facts are unaffected, only
+/// the licence to read its absences as proof.
 ///
 /// A slot that never connected here is not probed and does not spoil the verdict:
 /// no client ever held a stream to this relay for it, so there is nothing of its to
@@ -374,7 +400,7 @@ pub(super) async fn fenced_load_state_snapshot(
     decision_makers: &crate::consensus::DecisionMakers,
     fence: &crate::coordinator::load_fence::LoadStateFence,
     key: SessionKey,
-) -> (SessionPresence, bool) {
+) -> FencedLoadState {
     let started: HashSet<SlotId> = decision_makers
         .retained_load_state(&key)
         .started
@@ -426,14 +452,18 @@ pub(super) async fn fenced_load_state_snapshot(
     let every_live_link_fenced = links
         .iter()
         .all(|(slot, epoch)| state.started.contains(slot) || acked.get(slot) == Some(epoch));
-    let unfenceable = state
+    // `ever_connected` is ascending, so the filtered set is too.
+    let closed_slots = state
         .ever_connected
         .iter()
-        .any(|slot| !state.slots.contains(slot) && !state.started.contains(slot));
-    (
+        .copied()
+        .filter(|slot| !state.slots.contains(slot) && !state.started.contains(slot))
+        .collect();
+    FencedLoadState {
         state,
-        every_probe_acked && every_live_link_fenced && !unfenceable,
-    )
+        fenced_live: every_probe_acked && every_live_link_fenced,
+        closed_slots,
+    }
 }
 
 /// Assembles one [`SessionPresence`] from a session's key, its connected slots, and

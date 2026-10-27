@@ -468,8 +468,10 @@ pub(super) async fn write_control_frames(
                     .expect("the write half holds an answer sender for the connection's life");
                 let frame = serde_json::to_string(&RelayToCoordinator::LoadStateSnapshot {
                     request_id: answer.request_id,
-                    state: answer.state,
-                    fenced: answer.fenced,
+                    fenced: answer.load.fenced(),
+                    fenced_live: answer.load.fenced_live,
+                    closed_slots: answer.load.closed_slots,
+                    state: answer.load.state,
                     setup_settled: answer.setup_settled,
                     // Every snapshot this build answers with carries its home
                     // slots' forwarded set, empty or not.

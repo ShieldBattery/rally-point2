@@ -1754,6 +1754,17 @@ to it for that slot, so there is nothing anywhere that could be queued, and its 
 as it stands. That asymmetry is what keeps the read useful — the common answer a tenant wants is "these
 players never arrived at all", and it is precisely the never-arrived case that needs no fence.
 
+The verdict therefore goes up in two halves. `fenced_live` covers the probes and the live links; `closed_slots`
+names the slots that connected and are now neither live nor started; `fenced` is the first with the second
+empty. A departed slot then costs only the claim about itself: the coordinator answers `closedKnown` (every
+serving relay fenced its live slots, each closed slot taken only from its home, plus everything `turnsKnown`
+needs) beside `known`, so a tenant can still blame the one player who closed their game mid-setup while
+everyone else is vouched for. Turn evidence is required because a closed slot's own start report may still be
+parked in its client, and the forwarded set — which needs no fence — is the only word on how far that slot got.
+Setup finality rests on the live half too: once every home relay settles the lobby, any lobby command a
+departed client delivers when it dials back in is dropped without a violation, so its unreachable client
+cannot add to the evidence that finality vouches for.
+
 Two further conditions ride with the answers. The coordinator must have held the session **since it created
 it** (a restarted process's sets start wherever it came up, not at the session's beginning), and the relay
 memory covering the session must be unbroken. Retained load state lives in a relay process; when a serving

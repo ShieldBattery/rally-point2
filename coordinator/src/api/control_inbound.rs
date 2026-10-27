@@ -295,16 +295,22 @@ pub(super) fn note_inbound(
             request_id,
             state,
             fenced,
+            fenced_live,
+            closed_slots,
             setup_settled,
             reports_turns,
         }) => {
             handle_load_state_snapshot(
                 inbound,
                 request_id,
-                state,
-                fenced,
-                setup_settled,
-                reports_turns,
+                crate::attest::AttestedSnapshot {
+                    state,
+                    fenced,
+                    fenced_live,
+                    closed_slots,
+                    setup_settled,
+                    reports_turns,
+                },
             );
             InboundAction::None
         }
