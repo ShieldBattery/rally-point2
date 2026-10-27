@@ -7,11 +7,16 @@
 //! passed: [`STATE_HASH_DEADLINE`] after the step became confirmable, meaning this relay had
 //! forwarded every required slot's turn for it, so every honest client could have computed the
 //! hash. The deadline is the relay's own observation; no client-sent count or stamp moves it.
-//! Whenever the verdict can name who is at fault it does: the minority when the rest agree, and a
-//! slot that kept sending turns without its report. A slot whose turns stopped soon after the
-//! step is not blamed for a missing report, since its link went quiet and the leave machinery
-//! settles it. When nobody can be singled out (a 1v1 that disagrees, an even split, nobody
-//! reporting) the verdict names no one.
+//! A step judged at its deadline is judged on the reports present then, which can be only one, so
+//! a report that arrives later is still compared with them while the step is among the last
+//! [`STATE_HASH_WINDOW`] judged: the deadline settles who is blamed for a missing report, never
+//! that the late one went unchecked. Whenever the verdict can name who is at fault it does: the
+//! minority when the rest agree, and a slot that kept sending turns without its report. A slot
+//! whose turns stopped soon after the step is not blamed for a missing report, since its link went
+//! quiet and the leave machinery settles it. When nobody can be singled out (a 1v1 that disagrees,
+//! an even split, nobody reporting) the verdict names no one.
+
+use std::collections::BTreeSet;
 
 use super::*;
 use crate::rate_limit::RateLimitedCounter;
@@ -49,6 +54,11 @@ struct PendingStep {
 #[derive(Debug, Default)]
 pub(in crate::consensus) struct StateHashTracker {
     pending: BTreeMap<u64, PendingStep>,
+    /// The reports of the newest judged steps, for comparing a report that arrives after its step
+    /// was judged.
+    judged: BTreeMap<u64, Vec<(SlotId, u64)>>,
+    /// Judged steps that gained a report since, to be judged again.
+    rejudge: BTreeSet<u64>,
     /// Each slot's count of turns this relay has forwarded without a gap.
     forwarded: HashMap<SlotId, u64>,
     /// The newest step that is confirmable: this relay has forwarded that many turns of every
@@ -67,8 +77,8 @@ pub(in crate::consensus) struct StateHashTracker {
 
 impl StateHashTracker {
     /// Records `slot`'s report of `hash` for `step`. A report for a step that isn't on the report
-    /// interval, was already judged, or is implausibly far past what is confirmable is dropped, and
-    /// a second report of a step keeps the first.
+    /// interval, was judged too long ago to still be held, or is implausibly far past what is
+    /// confirmable is dropped, and a second report of a step keeps the first.
     pub(in crate::consensus) fn record(
         &mut self,
         key: &SessionKey,
@@ -84,9 +94,9 @@ impl StateHashTracker {
             .saturating_add(STATE_HASH_WINDOW as u64 * STATE_HASH_INTERVAL);
         // A later step can be judged before an earlier one whose reports aren't all in, so a step
         // below `retired_below` still counts as open while it is pending.
-        let judged = step < self.retired_below && !self.pending.contains_key(&step);
+        let retired = step < self.retired_below && !self.pending.contains_key(&step);
         let on_interval = step >= STATE_HASH_INTERVAL && step.is_multiple_of(STATE_HASH_INTERVAL);
-        if !on_interval || judged || step > horizon {
+        if !on_interval || (retired && !self.judged.contains_key(&step)) || step > horizon {
             if self.invalid_warns.observe() {
                 tracing::warn!(
                     tenant = key.tenant.as_ref(),
@@ -97,13 +107,16 @@ impl StateHashTracker {
                     horizon,
                     count = self.invalid_warns.count(),
                     "state hash report for a step that isn't on the report interval, was \
-                     already judged, or can't be confirmed yet; ignoring it",
+                     judged too long ago, or can't be confirmed yet; ignoring it",
                 );
             }
             return;
         }
-        let pending = self.pending.entry(step).or_default();
-        match pending.reports.iter().find(|x| x.0 == slot) {
+        let reports = match self.judged.get_mut(&step) {
+            Some(reports) if retired => reports,
+            _ => &mut self.pending.entry(step).or_default().reports,
+        };
+        match reports.iter().find(|x| x.0 == slot) {
             Some(&(_, existing)) if existing != hash => {
                 if self.conflict_warns.observe() {
                     tracing::warn!(
@@ -117,7 +130,12 @@ impl StateHashTracker {
                 }
             }
             Some(_) => {}
-            None => pending.reports.push((slot, hash)),
+            None => {
+                reports.push((slot, hash));
+                if retired {
+                    self.rejudge.insert(step);
+                }
+            }
         }
         self.evict_over_window(key);
     }
@@ -172,9 +190,9 @@ impl StateHashTracker {
         self.evict_over_window(key);
     }
 
-    /// Judges every step whose reports are all in, or whose deadline has passed by `now`, oldest
-    /// first, and returns the verdicts that named anyone. `required` yields the slots whose
-    /// reports a step needs.
+    /// Judges again every judged step that gained a report, then every step whose reports are all
+    /// in, or whose deadline has passed by `now`, oldest first, and returns the verdicts that named
+    /// anyone. `required` yields the slots whose reports a step needs.
     pub(in crate::consensus) fn judge_ready(
         &mut self,
         now: Instant,
@@ -183,6 +201,16 @@ impl StateHashTracker {
         let required: HashSet<SlotId> = required.collect();
         let required = &required;
         let mut verdicts = Vec::new();
+        while !self.dormant
+            && let Some(step) = self.rejudge.pop_first()
+        {
+            let reports = self.judged.get(&step).cloned().unwrap_or_default();
+            // Who missed its report was settled at the deadline; a late report only adds a hash to
+            // compare.
+            if let Some(verdict) = self.judge(step, &reports, required, false) {
+                verdicts.push(verdict);
+            }
+        }
         while !self.dormant {
             // A step is judged only once it is confirmable here too, so every reported hash is
             // of a step whose turns this relay has seen.
@@ -201,19 +229,24 @@ impl StateHashTracker {
             };
             let pending = self.pending.remove(&step).unwrap_or_default();
             self.retired_below = self.retired_below.max(step + 1);
-            if let Some(verdict) = self.judge(step, &pending.reports, required) {
+            if let Some(verdict) = self.judge(step, &pending.reports, required, true) {
                 verdicts.push(verdict);
+            }
+            self.judged.insert(step, pending.reports);
+            while self.judged.len() > STATE_HASH_WINDOW {
+                self.judged.pop_first();
             }
         }
         verdicts
     }
 
-    /// Judges one step's reports.
+    /// Judges one step's reports, and with `judge_missing`, the slots that sent none.
     fn judge(
         &mut self,
         step: u64,
         reports: &[(SlotId, u64)],
         required: &HashSet<SlotId>,
+        judge_missing: bool,
     ) -> Option<SyncDivergence> {
         let reports: Vec<(SlotId, u64)> = reports
             .iter()
@@ -227,8 +260,9 @@ impl StateHashTracker {
             .filter(|slot| !self.excluded.contains(slot))
             .filter(|slot| !reports.iter().any(|x| x.0 == *slot))
             .filter(|slot| {
-                self.forwarded.get(slot).copied().unwrap_or(0)
-                    >= step.saturating_add(STATE_HASH_LIVE_TURNS)
+                judge_missing
+                    && self.forwarded.get(slot).copied().unwrap_or(0)
+                        >= step.saturating_add(STATE_HASH_LIVE_TURNS)
             })
             .collect();
         missing.sort_unstable();

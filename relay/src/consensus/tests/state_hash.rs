@@ -107,6 +107,73 @@ fn a_slot_that_keeps_playing_without_its_report_is_named_at_the_deadline() {
 }
 
 #[test]
+fn a_report_after_the_deadline_is_still_compared() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1]);
+    forward(&mut m, &[0, 1], 2 * STATE_HASH_INTERVAL, start);
+    m.observe_state_hash(SlotId(0), 8, A, start);
+    m.observe_state_hash(SlotId(0), 16, A, start);
+    // Slot 1 lags: its reports arrive after the deadline judged both steps on slot 0's alone.
+    assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+    let later = start + STATE_HASH_DEADLINE * 2;
+    assert!(m.observe_state_hash(SlotId(1), 8, A, later).is_empty());
+    let verdicts = m.observe_state_hash(SlotId(1), 16, B, later);
+    assert_eq!(
+        verdicts,
+        vec![SyncDivergence {
+            sync_ordinal: 16,
+            game_frame: None,
+            no_majority: true,
+            diverged: Vec::new(),
+            missing: Vec::new(),
+        }]
+    );
+    assert!(m.hashes.dormant);
+}
+
+#[test]
+fn a_late_report_that_disagrees_with_the_rest_is_named() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2]);
+    forward(&mut m, &[0, 1, 2], STATE_HASH_INTERVAL, start);
+    m.observe_state_hash(SlotId(0), 8, A, start);
+    m.observe_state_hash(SlotId(1), 8, A, start);
+    assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+    let verdicts = m.observe_state_hash(SlotId(2), 8, B, start + STATE_HASH_DEADLINE * 2);
+    assert_eq!(
+        verdicts,
+        vec![SyncDivergence {
+            sync_ordinal: 8,
+            game_frame: None,
+            no_majority: false,
+            diverged: vec![SlotId(2)],
+            missing: Vec::new(),
+        }]
+    );
+    assert!(!m.hashes.dormant);
+}
+
+#[test]
+fn a_report_for_a_step_judged_too_long_ago_is_dropped() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1]);
+    for step in 1..=STATE_HASH_WINDOW as u64 + 1 {
+        forward(&mut m, &[0, 1], step * STATE_HASH_INTERVAL, start);
+        m.observe_state_hash(SlotId(0), step * STATE_HASH_INTERVAL, A, start);
+        assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+    }
+    // The oldest judged step is no longer held; the next oldest still is.
+    let later = start + STATE_HASH_DEADLINE * 2;
+    assert!(
+        m.observe_state_hash(SlotId(1), STATE_HASH_INTERVAL, B, later)
+            .is_empty()
+    );
+    let verdicts = m.observe_state_hash(SlotId(1), 2 * STATE_HASH_INTERVAL, B, later);
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].no_majority);
+}
+
+#[test]
 fn a_slot_whose_turns_stopped_is_left_to_the_leave_machinery() {
     let start = Instant::now();
     let mut m = rollback_maker(&[0, 1]);

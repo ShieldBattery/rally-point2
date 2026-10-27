@@ -16,7 +16,7 @@ mod turns;
 pub(in crate::consensus) use hashes::StateHashTracker;
 #[cfg(test)]
 pub(in crate::consensus) use hashes::{
-    STATE_HASH_DEADLINE, STATE_HASH_INTERVAL, STATE_HASH_LIVE_TURNS,
+    STATE_HASH_DEADLINE, STATE_HASH_INTERVAL, STATE_HASH_LIVE_TURNS, STATE_HASH_WINDOW,
 };
 pub(in crate::consensus) use turns::{SyncCommand, SyncGap, SyncTurn, SyncTurns};
 
