@@ -17,11 +17,11 @@ use crate::key::SessionKey;
 #[cfg(test)]
 mod tests;
 
-/// Total disconnected time available to a slot for the life of a session.
+/// Cumulative disconnect grace before a survivor may immediately request a drop.
 pub const DISCONNECT_ALLOWANCE: Duration = Duration::from_secs(180);
 
-// 180 completed outages exhaust the allowance; one further running outage
-// must still be representable so its exhausted slot can be dropped.
+// Every completed outage costs at least one second, bounding the history
+// needed before the allowance is exhausted.
 const MAX_EPISODES_PER_SLOT: usize = 181;
 fn new_bootstrap_id() -> u64 {
     let mut bytes = [0; 8];
@@ -111,7 +111,6 @@ pub struct DisconnectBudgets {
 /// Why a guarded reconnect did not complete.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReconnectError<E> {
-    Exhausted,
     /// The session is awaiting a complete peer baseline.
     Unsynced,
     /// The expected outage is no longer the sole running episode for the slot.
@@ -295,21 +294,6 @@ impl DisconnectBudgets {
         }
     }
 
-    /// Slots with at least one running outage, in slot order.
-    pub fn running_slots(&self, key: &SessionKey) -> Vec<SlotId> {
-        let inner = self.inner.lock();
-        let mut slots: Vec<_> = inner
-            .episodes
-            .iter()
-            .filter_map(|((session, slot, _), episode)| {
-                (session == key && !episode.complete).then_some(*slot)
-            })
-            .collect();
-        slots.sort_unstable_by_key(|slot| slot.0);
-        slots.dedup();
-        slots
-    }
-
     /// Snapshots configured local homes and every slot with recorded episodes.
     /// Unlisted slots have the full allowance and no running outage.
     pub fn status(&self, key: &SessionKey, now: Instant) -> Vec<SlotBudgetStatus> {
@@ -382,11 +366,17 @@ impl DisconnectBudgets {
             .iter()
             .filter(|((session, subject, _), _)| session == key && *subject == slot)
             .count();
-        if existing_count >= MAX_EPISODES_PER_SLOT
-            || episodes.iter().any(|((session, subject, _), episode)| {
-                session == key && *subject == slot && !episode.complete
-            })
-        {
+        if episodes.iter().any(|((session, subject, _), episode)| {
+            session == key && *subject == slot && !episode.complete
+        }) {
+            return false;
+        }
+        // Once completed episodes consume the allowance, future outages cannot
+        // change the balance. Avoid growing the retained history indefinitely.
+        if spent(episodes, key, slot, now) >= DISCONNECT_ALLOWANCE {
+            return true;
+        }
+        if existing_count >= MAX_EPISODES_PER_SLOT {
             return false;
         }
         episodes.insert(
@@ -422,7 +412,7 @@ impl DisconnectBudgets {
     /// Runs admission while accounting is locked. `epoch` must name the sole
     /// running outage, or be `None` when the slot has no running outage. A
     /// successful admission completes that outage; a refused one leaves it
-    /// running. The check includes the deadline itself, independent of timers.
+    /// running. Exhaustion does not prevent admission.
     /// The closure must not re-enter this registry.
     pub fn try_reconnect<T, E>(
         &self,
@@ -449,9 +439,6 @@ impl DisconnectBudgets {
         let current = running.next();
         if running.next().is_some() || current != epoch {
             return Err(ReconnectError::StaleEpisode);
-        }
-        if spent(episodes, key, slot, now) >= DISCONNECT_ALLOWANCE {
-            return Err(ReconnectError::Exhausted);
         }
         let result = admit().map_err(ReconnectError::Admission)?;
         if let Some(id) = current {

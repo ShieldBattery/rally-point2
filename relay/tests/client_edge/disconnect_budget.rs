@@ -3,14 +3,12 @@
 use std::time::{Duration, Instant};
 
 use crate::helpers::*;
-use rally_point_proto::close_codes;
 use rally_point_proto::control::TenantId;
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh::{MeshState, control::MeshControl};
 use rally_point_relay::session::disconnect_budget::{DISCONNECT_ALLOWANCE, EpisodeSnapshot};
 use rally_point_transport::control::{ControlInbound, spawn_control_reader};
-use rally_point_transport::noq;
 
 fn managed_relay(tenant: &Tenant, session: SessionId) -> TestRelay {
     let mesh = MeshState::default();
@@ -33,7 +31,7 @@ fn key(session: SessionId) -> SessionKey {
 }
 
 #[tokio::test]
-async fn exhausted_disconnected_slot_is_refused_on_resume() {
+async fn exhausted_disconnected_slot_can_resume_before_manual_drop() {
     let tenant = make_default_tenant();
     let session = SessionId(960);
     let relay = managed_relay(&tenant, session);
@@ -58,25 +56,16 @@ async fn exhausted_disconnected_slot_is_refused_on_resume() {
         Instant::now(),
     );
 
-    let client_key = keypair();
-    let token = mint_token(&tenant, session, SlotId(1), client_key.public);
-    let redial = endpoint
-        .connect(relay.addr, "localhost")
-        .unwrap()
-        .await
-        .unwrap();
-    // Admission can reject after acknowledging the handshake, so inspect the close.
-    let _ = handshake(&redial, &token, &client_key, &[(SlotId(1), 0)]).await;
-    let closed = tokio::time::timeout(Duration::from_secs(5), redial.closed())
-        .await
-        .expect("the exhausted resume is closed");
-    match closed {
-        noq::ConnectionError::ApplicationClosed(close) => assert_eq!(
-            u64::from(close.error_code),
-            u64::from(close_codes::SLOT_DEPARTED)
-        ),
-        other => panic!("expected the terminal departed close, got {other:?}"),
-    }
+    let _resumed = connect_slot_resuming(
+        &endpoint,
+        relay.addr,
+        &tenant,
+        session,
+        SlotId(1),
+        &[(SlotId(1), 0)],
+    )
+    .await;
+    wait_for_connectivity(&mut control0, SlotId(1), true).await;
 }
 
 #[tokio::test]

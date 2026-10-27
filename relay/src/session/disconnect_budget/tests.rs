@@ -34,21 +34,21 @@ fn accumulates_episodes_without_refilling_and_preserves_tenant_and_slot_isolatio
 }
 
 #[test]
-fn reconnect_at_deadline_is_refused_without_invoking_admission() {
+fn reconnect_at_deadline_succeeds_and_settles_the_outage() {
     let budgets = DisconnectBudgets::default();
     let key = session_key(1);
     let slot = SlotId(1);
     let now = Instant::now();
     assert!(budgets.start_outage(&key, slot, 7, now));
-    let result = budgets.try_reconnect(
-        &key,
-        slot,
-        Some(7),
-        now + seconds(180),
-        || -> Result<(), ()> { panic!("exhausted admission must not run") },
+    assert_eq!(
+        budgets.try_reconnect(&key, slot, Some(7), now + seconds(180), || Ok::<_, ()>(42)),
+        Ok(42),
     );
-    assert_eq!(result, Err(ReconnectError::Exhausted));
-    assert!(!budgets.snapshot(&key, now + seconds(180))[0].complete);
+    assert!(budgets.snapshot(&key, now + seconds(180))[0].complete);
+    assert_eq!(
+        budgets.remaining(&key, slot, now + seconds(180)),
+        Duration::ZERO
+    );
 }
 
 #[test]
@@ -336,7 +336,6 @@ fn running_helpers_reflect_outages_and_ignore_other_sessions() {
     assert!(budgets.start_outage(&key, SlotId(2), 9, now));
     assert!(budgets.start_outage(&other, SlotId(1), 8, now));
     assert_eq!(budgets.running_epoch(&key, SlotId(2)), Some(9));
-    assert_eq!(budgets.running_slots(&key), vec![SlotId(2)]);
     assert_eq!(
         budgets.status(&key, now + seconds(2)),
         vec![
@@ -354,7 +353,7 @@ fn running_helpers_reflect_outages_and_ignore_other_sessions() {
     );
     assert!(budgets.end_outage(&key, SlotId(2), 9, now + seconds(3)));
     assert_eq!(budgets.running_epoch(&key, SlotId(2)), None);
-    assert!(budgets.running_slots(&key).is_empty());
+    assert!(!budgets.status(&key, now + seconds(3))[1].running);
 }
 
 #[test]
@@ -424,9 +423,16 @@ fn completed_episodes_are_charged_at_least_one_whole_second_and_bounded() {
         assert!(budgets.end_outage(&key, slot, epoch, now + Duration::from_millis(1)));
     }
     assert_eq!(budgets.remaining(&key, slot, now), Duration::ZERO);
-    assert!(budgets.start_outage(&key, slot, 180, now));
-    assert!(!budgets.start_outage(&key, slot, 181, now));
-    assert_eq!(budgets.snapshot(&key, now).len(), 181);
+    for epoch in 180..1_000 {
+        assert!(budgets.start_outage(&key, slot, epoch, now));
+        assert_eq!(budgets.running_epoch(&key, slot), None);
+        assert_eq!(
+            budgets.try_reconnect(&key, slot, None, now, || Ok::<_, ()>(())),
+            Ok(())
+        );
+        assert_eq!(budgets.remaining(&key, slot, now), Duration::ZERO);
+    }
+    assert_eq!(budgets.snapshot(&key, now).len(), 180);
 }
 
 #[test]

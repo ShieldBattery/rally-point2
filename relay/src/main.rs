@@ -247,7 +247,6 @@ async fn main() -> Result<()> {
         rally_point_relay::routing::STATE_HASH_CHECK_INTERVAL,
     ));
     tokio::spawn(rally_point_relay::routing::run_disconnect_budget_watch(
-        Arc::clone(&sessions),
         mesh_state.clone(),
     ));
 
