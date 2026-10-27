@@ -19,12 +19,17 @@ impl DecisionMakers {
     /// restates the retained set, so the fact survives a lost notice; the notice is
     /// only the fast path. A session run without a decision-maker retains nothing
     /// and still reports, with a notice that simply carries no correlation ids.
+    ///
+    /// `connection_epoch` is the activating link's epoch, retained as the slot's
+    /// latest activated link in the same critical section that adds it to the
+    /// ever-connected set (see [`DecisionMaker::note_slot_connected`]).
     pub fn note_slot_connected(
         &self,
         key: &SessionKey,
         slot: SlotId,
         resumed: bool,
         evidence: Option<rally_point_proto::control::EvidenceObservation>,
+        connection_epoch: Option<u64>,
     ) -> bool {
         if evidence
             .as_ref()
@@ -43,7 +48,7 @@ impl DecisionMakers {
                 if let Some(observation) = &evidence {
                     maker.record_evidence(slot, observation.clone());
                 }
-                maker.note_slot_connected(slot);
+                maker.note_slot_connected(slot, connection_epoch);
             } else if evidence.is_some() && self.descriptors_required() {
                 return false;
             }

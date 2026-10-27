@@ -72,7 +72,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use rally_point_proto::control::{SessionPresence, TenantId};
+use rally_point_proto::control::{ClosedSlot, SessionPresence, TenantId};
 use rally_point_proto::ids::{RelayId, SessionId, SlotId};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
@@ -180,9 +180,10 @@ pub struct AttestedSnapshot {
     /// the split.
     pub fenced_live: bool,
     /// The slots this relay homes that it has seen connect and that are now
-    /// neither live nor started, ascending. Already restricted to the slots the
-    /// answering relay homes by the time a waiter receives it.
-    pub closed_slots: Vec<SlotId>,
+    /// neither live nor started, ascending, each with the link whose closure left
+    /// it disconnected. Already restricted to the slots the answering relay homes
+    /// by the time a waiter receives it.
+    pub closed_slots: Vec<ClosedSlot>,
     /// The slots this relay homes whose link was live when it snapshotted,
     /// ascending: `state.slots` restricted to the answering relay's home slots by
     /// the time a waiter receives it.
@@ -214,9 +215,10 @@ pub struct AttestRound {
     /// The relays whose answer fenced every slot outside its closed set — a
     /// subset of `attested`.
     pub fenced_live: Arc<HashSet<RelayId>>,
-    /// Every slot an answering relay named closed, each taken only from the relay
-    /// that homes it. A current-state fact as of this round, not a cumulative one.
-    pub closed_slots: Arc<BTreeSet<SlotId>>,
+    /// Every slot an answering relay named closed, with the link whose closure
+    /// left it disconnected, each taken only from the relay that homes it. A
+    /// current-state fact as of this round, not a cumulative one.
+    pub closed_slots: Arc<BTreeSet<ClosedSlot>>,
     /// Every slot an answering relay held a live link for, each taken only from the
     /// relay that homes it. A current-state fact as of this round, read off the same
     /// snapshots as `closed_slots`.

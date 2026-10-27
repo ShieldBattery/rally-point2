@@ -65,6 +65,7 @@ fn with_activation(
                 slot,
                 activation.resumed_dial,
                 Some(observation),
+                Some(activation.connection_epoch),
             ) {
                 return Err(ActivationRefusal::AssignmentChanged);
             }

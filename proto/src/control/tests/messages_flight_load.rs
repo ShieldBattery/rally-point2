@@ -125,13 +125,26 @@ fn an_empty_load_state_snapshot_roundtrips_and_omits_its_absent_fields() {
         },
         fenced: false,
         fenced_live: true,
-        closed_slots: vec![SlotId(0)],
+        closed_slots: vec![
+            ClosedSlot {
+                slot: SlotId(0),
+                link_epoch: Some(u64::MAX),
+            },
+            ClosedSlot {
+                slot: SlotId(2),
+                link_epoch: None,
+            },
+        ],
         setup_settled: true,
         reports_turns: true,
     };
     let json = serde_json::to_string(&populated).unwrap();
     assert!(json.contains("\"fenced_live\":true"));
-    assert!(json.contains("\"closed_slots\":[0]"));
+    // The epoch is exact on this Rust-to-Rust hop; an unrecorded one stays off the wire.
+    assert!(json.contains(&format!(
+        "\"closed_slots\":[{{\"slot\":0,\"link_epoch\":{}}},{{\"slot\":2}}]",
+        u64::MAX
+    )));
     assert!(json.contains("\"type\":\"load_state_snapshot\""));
     assert!(json.contains("\"ever_connected\":[0,1]"));
     assert!(json.contains("\"setup_settled\":true"));

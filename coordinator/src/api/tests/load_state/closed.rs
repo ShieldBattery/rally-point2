@@ -2,7 +2,36 @@
 //! started, which no fence can reach. The read names them, vouches for everything
 //! else, and lets setup finality rest on the live half of each relay's fence.
 
+use rally_point_proto::control::ClosedSlot;
+
 use super::*;
+
+/// The epoch the stand-in relays give slot `n`'s closing link: past 2^53, so the
+/// response has to carry it as a string to be exact.
+fn epoch_of(slot: u8) -> u64 {
+    (1 << 60) + u64::from(slot)
+}
+
+/// `slots` closed on the links [`epoch_of`] names.
+fn closed_on(slots: &[u8]) -> Vec<ClosedSlot> {
+    slots
+        .iter()
+        .map(|&slot| ClosedSlot {
+            slot: SlotId(slot),
+            link_epoch: Some(epoch_of(slot)),
+        })
+        .collect()
+}
+
+/// The `closedSlots` the response carries for `slots` closed on [`epoch_of`]'s links.
+fn closed_json(slots: &[u8]) -> serde_json::Value {
+    serde_json::Value::Array(
+        slots
+            .iter()
+            .map(|&slot| serde_json::json!({ "slot": slot, "epoch": epoch_of(slot).to_string() }))
+            .collect(),
+    )
+}
 
 /// One relay homing every slot of a six-player session, registered the way
 /// production does.
@@ -31,7 +60,7 @@ fn closed_on_a_live_fence(closed: &[u8]) -> AttestOptions {
     AttestOptions {
         fenced: closed.is_empty(),
         fenced_live: true,
-        closed_slots: slots(closed),
+        closed_slots: closed_on(closed),
         ..Default::default()
     }
 }
@@ -61,7 +90,7 @@ async fn a_closed_slot_is_named_and_setup_still_finalizes() {
     let body = settle_lobby_load_state(router(state), session.0).await;
     assert_eq!(
         std::str::from_utf8(&body).unwrap(),
-        r#"{"known":false,"turnsKnown":true,"closedKnown":true,"setupFinal":true,"startedAtMs":1700000000000,"connectedSlots":[0,1,2,3,4,5],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[0],"liveSlots":[1,2,3,4,5]}"#,
+        r#"{"known":false,"turnsKnown":true,"closedKnown":true,"setupFinal":true,"startedAtMs":1700000000000,"connectedSlots":[0,1,2,3,4,5],"startedSlots":[],"forwardedSlots":[],"lobbyViolationSlots":[],"closedSlots":[{"slot":0,"epoch":"1152921504606846976"}],"liveSlots":[1,2,3,4,5]}"#,
     );
 }
 
@@ -84,7 +113,7 @@ async fn several_closed_slots_are_all_named() {
     assert_eq!(response["closedKnown"], true);
     assert_eq!(
         response["closedSlots"],
-        serde_json::json!([0, 2, 4]),
+        closed_json(&[0, 2, 4]),
         "ascending, whatever order the relay listed them in",
     );
 }
@@ -139,7 +168,7 @@ async fn an_unfenced_live_slot_withholds_the_closed_claim_and_finality() {
         AttestOptions {
             fenced: false,
             fenced_live: false,
-            closed_slots: slots(&[0]),
+            closed_slots: closed_on(&[0]),
             setup_settled: true,
             ..Default::default()
         },
@@ -149,7 +178,7 @@ async fn an_unfenced_live_slot_withholds_the_closed_claim_and_finality() {
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(response["closedKnown"], false);
     assert_eq!(response["setupFinal"], false);
-    assert_eq!(response["closedSlots"], serde_json::json!([0]));
+    assert_eq!(response["closedSlots"], closed_json(&[0]));
 }
 
 #[tokio::test]
@@ -253,7 +282,7 @@ async fn a_broken_lineage_withholds_the_closed_claim() {
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(response["closedKnown"], false);
     assert_eq!(response["setupFinal"], false);
-    assert_eq!(response["closedSlots"], serde_json::json!([0]));
+    assert_eq!(response["closedSlots"], closed_json(&[0]));
 }
 
 #[tokio::test]
@@ -280,7 +309,7 @@ async fn a_slot_that_started_and_left_is_neither_live_nor_closed() {
     assert_eq!(response["closedKnown"], true);
     assert_eq!(response["connectedSlots"], serde_json::json!([0, 1]));
     assert_eq!(response["startedSlots"], serde_json::json!([0]));
-    assert_eq!(response["closedSlots"], serde_json::json!([1]));
+    assert_eq!(response["closedSlots"], closed_json(&[1]));
     assert_eq!(response["liveSlots"], serde_json::json!([]));
 }
 
@@ -312,6 +341,33 @@ async fn a_relay_cannot_vouch_that_a_slot_it_does_not_home_is_live() {
 
     let body = read_load_state(router(state), session.0).await;
     let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(response["closedSlots"], serde_json::json!([0]));
+    assert_eq!(response["closedSlots"], closed_json(&[0]));
     assert_eq!(response["liveSlots"], serde_json::json!([1]));
+}
+
+#[tokio::test]
+async fn a_closed_slot_without_an_epoch_is_reported_without_one() {
+    // A relay that recorded no link epoch for the slot cannot say which closure
+    // it saw, so the entry goes out bare and no later read can match it.
+    let (state, session) = state_with_one_home_for_six();
+    let tenant = tenant_id();
+    let _relay = spawn_attesting_relay(
+        &state,
+        RelayId(1),
+        SessionPresence {
+            ever_connected: slots(&[0, 1]),
+            ..presence_entry(&tenant, session, &[1])
+        },
+        AttestOptions {
+            closed_slots: vec![ClosedSlot {
+                slot: SlotId(0),
+                link_epoch: None,
+            }],
+            ..closed_on_a_live_fence(&[])
+        },
+    );
+
+    let body = read_load_state(router(state), session.0).await;
+    let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(response["closedSlots"], serde_json::json!([{ "slot": 0 }]));
 }

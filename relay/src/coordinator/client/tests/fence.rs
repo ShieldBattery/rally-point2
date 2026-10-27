@@ -9,6 +9,11 @@ use super::*;
 const LINK_EPOCH: u64 = 0x51;
 const REPLACEMENT_EPOCH: u64 = 0x52;
 
+/// The slots an answer names closed, without their epochs.
+fn closed_slot_ids(load: &FencedLoadState) -> Vec<rally_point_proto::ids::SlotId> {
+    load.closed_slots.iter().map(|closed| closed.slot).collect()
+}
+
 #[tokio::test]
 async fn a_live_unstarted_slot_that_acks_fences_the_answer() {
     // The fence's positive case: the one slot that could be holding a report
@@ -23,7 +28,7 @@ async fn a_live_unstarted_slot_that_acks_fences_the_answer() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
 
     // Stand in for slot 0's link task: take the probe off its push queue and
     // resolve it exactly as `run_slot_link` does on the client's ack, with the
@@ -65,7 +70,7 @@ async fn a_slot_that_arrives_mid_fence_leaves_the_answer_unfenced() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
 
     let ack = async {
         loop {
@@ -116,7 +121,7 @@ async fn a_link_replaced_after_acking_leaves_the_answer_unfenced() {
             .expect("slot 0 registers");
     // Left armed: dropping it is how this test ends the link that acked.
     let mut original = Some(registration);
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
 
     let ack = async {
         loop {
@@ -166,7 +171,7 @@ async fn a_live_unstarted_slot_that_never_acks_leaves_the_answer_unfenced() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
 
     let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
     assert!(
@@ -193,7 +198,7 @@ async fn a_started_slot_is_not_probed_at_all() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
     decision_makers.note_slot_started(&key(7), SlotId(0));
 
     let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
@@ -217,7 +222,7 @@ async fn a_slot_that_connected_and_then_dropped_can_never_be_fenced() {
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
     // The link ends: the guard deregisters the slot, leaving it ever-connected
     // and not live.
     drop(registration);
@@ -228,7 +233,7 @@ async fn a_slot_that_connected_and_then_dropped_can_never_be_fenced() {
     assert_eq!(load.state.ever_connected, vec![SlotId(0)]);
     // It is named rather than silently spoiling the answer, and nothing else
     // here was left unvouched.
-    assert_eq!(load.closed_slots, vec![SlotId(0)]);
+    assert_eq!(closed_slot_ids(&load), vec![SlotId(0)]);
     assert!(load.fenced_live);
 }
 
@@ -244,14 +249,14 @@ async fn closed_slots_are_named_while_the_live_ones_are_still_fenced() {
     for slot in [SlotId(0), SlotId(1)] {
         let (registration, _inbox) =
             crate::routing::register(&sessions, &key(7), slot, LINK_EPOCH).expect("registers");
-        decision_makers.note_slot_connected(&key(7), slot, false, None);
+        decision_makers.note_slot_connected(&key(7), slot, false, None, None);
         drop(registration);
     }
     let (mut registration, mut inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(2), LINK_EPOCH)
             .expect("slot 2 registers");
     registration.disarm();
-    decision_makers.note_slot_connected(&key(7), SlotId(2), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(2), false, None, None);
 
     let ack = async {
         loop {
@@ -266,7 +271,7 @@ async fn closed_slots_are_named_while_the_live_ones_are_still_fenced() {
         fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)),
         ack,
     );
-    assert_eq!(load.closed_slots, vec![SlotId(0), SlotId(1)]);
+    assert_eq!(closed_slot_ids(&load), vec![SlotId(0), SlotId(1)]);
     assert!(load.fenced_live, "the one live slot acked on its own link");
     assert!(
         !load.fenced(),
@@ -286,16 +291,16 @@ async fn a_closed_slot_beside_a_silent_live_one_withholds_the_live_verdict() {
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
     drop(registration);
     let (mut registration, _silent_inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(1), LINK_EPOCH)
             .expect("slot 1 registers");
     registration.disarm();
-    decision_makers.note_slot_connected(&key(7), SlotId(1), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(1), false, None, None);
 
     let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
-    assert_eq!(load.closed_slots, vec![SlotId(0)]);
+    assert_eq!(closed_slot_ids(&load), vec![SlotId(0)]);
     assert!(!load.fenced_live);
 }
 
@@ -311,13 +316,13 @@ async fn a_slot_that_dropped_and_dialed_back_in_is_fenced_on_its_new_link() {
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
     drop(registration);
     let (mut reconnect, mut inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), REPLACEMENT_EPOCH)
             .expect("the reconnect claims the seat");
     reconnect.disarm();
-    decision_makers.note_slot_connected(&key(7), SlotId(0), true, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), true, None, None);
 
     let ack = async {
         loop {
@@ -352,7 +357,7 @@ async fn a_slot_activating_mid_snapshot_is_never_taken_for_a_closed_one() {
             crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
                 .expect("slot 0 registers");
         registration.disarm();
-        decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+        decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
         arrival = Some(inbox);
     })
     .await;
@@ -380,7 +385,7 @@ async fn a_slot_leaving_mid_snapshot_is_reported_closed() {
     let (registration, mut inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
     let mut link = Some(registration);
 
     let ack = async {
@@ -399,9 +404,77 @@ async fn a_slot_leaving_mid_snapshot_is_reported_closed() {
         ack,
     );
     assert!(link.is_none(), "the link ended between the reads");
-    assert_eq!(load.closed_slots, vec![SlotId(0)]);
+    assert_eq!(closed_slot_ids(&load), vec![SlotId(0)]);
     assert!(load.state.slots.is_empty());
     assert!(load.fenced_live);
+}
+
+#[tokio::test]
+async fn a_closed_slot_names_the_link_whose_closure_left_it_closed() {
+    // Two closed readings of one slot are one disconnection only if nothing
+    // reconnected in between, so each names its link: a slot that comes back and
+    // leaves again is reported on its new link's epoch.
+    use rally_point_proto::control::ClosedSlot;
+    use rally_point_proto::ids::SlotId;
+
+    let (sessions, decision_makers) = fence_fixture();
+    let fence = crate::coordinator::load_fence::LoadStateFence::new();
+    let closed_on = |epoch| ClosedSlot {
+        slot: SlotId(0),
+        link_epoch: Some(epoch),
+    };
+    for epoch in [LINK_EPOCH, REPLACEMENT_EPOCH] {
+        let (registration, _inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0), epoch).expect("registers");
+        decision_makers.note_slot_connected(
+            &key(7),
+            SlotId(0),
+            epoch != LINK_EPOCH,
+            None,
+            Some(epoch),
+        );
+        drop(registration);
+
+        let load = fenced_load_state_snapshot(&sessions, &decision_makers, &fence, key(7)).await;
+        assert_eq!(load.closed_slots, vec![closed_on(epoch)]);
+        assert!(load.fenced_live);
+    }
+}
+
+#[tokio::test]
+async fn a_link_that_comes_and_goes_mid_snapshot_withholds_the_live_verdict() {
+    // The closed slot's epoch is read before the roster. A link of the slot that
+    // activates and closes between the two reads leaves that epoch naming the
+    // earlier closure, not the one the roster saw, so the answer must not vouch
+    // for it.
+    use rally_point_proto::ids::SlotId;
+
+    let (sessions, decision_makers) = fence_fixture();
+    let fence = crate::coordinator::load_fence::LoadStateFence::new();
+    let (registration, _inbox) =
+        crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH).expect("registers");
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, Some(LINK_EPOCH));
+    drop(registration);
+
+    let load = fenced_load_state_snapshot_with(&sessions, &decision_makers, &fence, key(7), || {
+        let (registration, _inbox) =
+            crate::routing::register(&sessions, &key(7), SlotId(0), REPLACEMENT_EPOCH)
+                .expect("the reconnect registers");
+        decision_makers.note_slot_connected(
+            &key(7),
+            SlotId(0),
+            true,
+            None,
+            Some(REPLACEMENT_EPOCH),
+        );
+        drop(registration);
+    })
+    .await;
+    assert_eq!(closed_slot_ids(&load), vec![SlotId(0)]);
+    assert!(
+        !load.fenced_live,
+        "the closure the roster saw is not the one named"
+    );
 }
 
 #[tokio::test]
@@ -435,7 +508,7 @@ async fn an_ask_beyond_the_fence_cap_is_shed_without_probing() {
         crate::routing::register(&sessions, &key(7), SlotId(0), LINK_EPOCH)
             .expect("slot 0 registers");
     registration.disarm();
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
     let sources = HeartbeatSources {
         session_gates: crate::session::gate::SessionGates::default(),
         provisional_turns: crate::session::provisional_turns::ProvisionalTurnPen::default(),

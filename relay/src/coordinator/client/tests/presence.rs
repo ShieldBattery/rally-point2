@@ -38,8 +38,20 @@ async fn a_heartbeat_carries_the_live_roster_as_presence() {
     // The session's decision-maker holds the load state the beat restates:
     // slot 2 arrived and dropped again (so it is off the live roster but
     // still ever-connected), slot 3 arrived and reported its game loop.
-    decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(2), false, None);
-    decision_makers.note_slot_connected(&key(7), rally_point_proto::ids::SlotId(3), false, None);
+    decision_makers.note_slot_connected(
+        &key(7),
+        rally_point_proto::ids::SlotId(2),
+        false,
+        None,
+        None,
+    );
+    decision_makers.note_slot_connected(
+        &key(7),
+        rally_point_proto::ids::SlotId(3),
+        false,
+        None,
+        None,
+    );
     decision_makers.note_slot_started(&key(7), rally_point_proto::ids::SlotId(3));
 
     SubscriberFixture {
@@ -108,7 +120,7 @@ fn a_beat_restates_the_load_state_of_a_session_whose_last_slot_left() {
     let (sessions, decision_makers) = fence_fixture();
     let (registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
     decision_makers.note_slot_started(&key(7), SlotId(0));
 
     // The slot's link ends: the routing group goes with it, the maker stays.
@@ -197,12 +209,14 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
         crate::routing::register(&sessions, &key(7), rally_point_proto::ids::SlotId(3), 1)
             .expect("slot 3 registers");
     guard.disarm();
-    for slot in [2u8, 3] {
+    // Slot 2's link (epoch 2) has since closed; slot 3's (epoch 1) is live.
+    for (slot, epoch) in [(2u8, 2), (3, 1)] {
         decision_makers.note_slot_connected(
             &key(7),
             rally_point_proto::ids::SlotId(slot),
             false,
             None,
+            Some(epoch),
         );
     }
     decision_makers.note_slot_started(&key(7), rally_point_proto::ids::SlotId(3));
@@ -265,7 +279,10 @@ async fn a_load_state_request_is_answered_on_the_control_connection() {
             // only live slot has started, so everything else is vouched for.
             fenced: false,
             fenced_live: true,
-            closed_slots: vec![rally_point_proto::ids::SlotId(2)],
+            closed_slots: vec![rally_point_proto::control::ClosedSlot {
+                slot: rally_point_proto::ids::SlotId(2),
+                link_epoch: Some(2),
+            }],
             setup_settled: false,
             // The turn set needs no fence, and this build always carries it.
             reports_turns: true,
@@ -283,7 +300,7 @@ fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
     let (sessions, decision_makers) = fence_fixture();
     let (_registration, _inbox) =
         crate::routing::register(&sessions, &key(7), SlotId(0), 1).expect("slot 0 registers");
-    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None);
+    decision_makers.note_slot_connected(&key(7), SlotId(0), false, None, None);
     decision_makers.note_slot_started(&key(7), SlotId(0));
 
     let sources = HeartbeatSources {
@@ -296,7 +313,7 @@ fn a_load_state_snapshot_reports_the_same_session_a_beat_would() {
         load_fence: crate::coordinator::load_fence::LoadStateFence::new(),
     };
     assert_eq!(
-        session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7), || {}).0,
+        session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7), || {}).state,
         heartbeat_presence(&sources)
             .into_iter()
             .find(|entry| entry.session == SessionId(7))
@@ -319,7 +336,7 @@ fn a_session_this_relay_does_not_hold_snapshots_to_empty_rather_than_nothing() {
         load_fence: crate::coordinator::load_fence::LoadStateFence::new(),
     };
     assert_eq!(
-        session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7), || {}).0,
+        session_load_snapshot(&sources.sessions, &sources.decision_makers, key(7), || {}).state,
         SessionPresence {
             evidence_history: Vec::new(),
             periodic_evidence: Vec::new(),
@@ -402,7 +419,8 @@ fn heartbeat_roster_stays_compact_while_requested_snapshots_retain_full_observat
                     verdict: EvidenceVerdict::Valid,
                     key_id: Some(7),
                     body: vec![255; MAX_EVIDENCE_BODY_LEN],
-                })
+                }),
+                None
             ));
         }
     }
@@ -432,7 +450,7 @@ fn heartbeat_roster_stays_compact_while_requested_snapshots_retain_full_observat
         "the complete roster stays comfortably below the control-message cap"
     );
 
-    let (snapshot, _) = session_load_snapshot(&sessions, &decision_makers, key(0), || {});
+    let snapshot = session_load_snapshot(&sessions, &decision_makers, key(0), || {}).state;
     assert_eq!(snapshot.slots, vec![SlotId(0), SlotId(1)]);
     assert_eq!(snapshot.evidence.len(), 2);
     for entry in &snapshot.evidence {

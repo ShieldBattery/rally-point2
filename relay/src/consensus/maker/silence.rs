@@ -369,10 +369,22 @@ impl DecisionMaker {
         }
     }
 
+    /// Each slot's latest activated link epoch, ascending by slot.
+    pub fn sorted_last_link_epochs(&self) -> Vec<(SlotId, u64)> {
+        let mut epochs: Vec<(SlotId, u64)> = self
+            .last_link_epochs
+            .iter()
+            .map(|(&slot, &epoch)| (slot, epoch))
+            .collect();
+        epochs.sort_unstable();
+        epochs
+    }
+
     /// Progress facts only; bounded observations are selected separately before cloning.
     pub fn heartbeat_load_state(&self) -> RetainedLoadState {
         RetainedLoadState {
             ever_connected: sorted_slots(&self.connected_slots),
+            last_link_epochs: self.sorted_last_link_epochs(),
             started: sorted_slots(&self.started_slots),
             forwarded: sorted_slots(&self.forwarded_slots),
             lobby_violations: self.lobby_violations(),

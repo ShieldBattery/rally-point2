@@ -1761,7 +1761,10 @@ serving relay fenced its live slots, each closed slot taken only from its home, 
 needs) beside `known`, so a tenant can still blame the one player who closed their game mid-setup while
 everyone else is vouched for. It answers `liveSlots` from the same snapshots, each slot again taken only from
 its home, so a tenant can tell a player who stayed from one who reported starting and then left too — the
-latter is in neither set. Turn evidence is required because a closed slot's own start report may still be
+latter is in neither set. Each closed slot carries the connection epoch of the link whose closure left it
+disconnected, so two reads naming one slot closed on the same epoch saw one unbroken disconnection — a reconnect
+in between would have activated a new link — and reads, being answered only from rounds that began after they
+arrived, order that disconnection against who was live in the later read. Turn evidence is required because a closed slot's own start report may still be
 parked in its client, and the forwarded set — which needs no fence — is the only word on how far that slot got.
 Setup finality rests on the live half too: once every home relay settles the lobby, any lobby command a
 departed client delivers when it dials back in is dropped without a violation, so its unreachable client

@@ -288,6 +288,11 @@ pub struct DecisionMaker {
     /// the whole set: the matching notice is dropped once its send succeeds, so
     /// the beat is what survives a coordinator losing or forgetting one.
     pub(in crate::consensus) connected_slots: HashSet<SlotId>,
+    /// The connection epoch of each slot's latest activated link on this relay.
+    /// Written with `connected_slots` and never cleared, so once a slot's link has
+    /// closed this names the link whose closure left it disconnected — until the
+    /// next activation replaces it.
+    pub(in crate::consensus) last_link_epochs: HashMap<SlotId, u64>,
     /// Every slot whose game-loop report this relay accepted **from its own home
     /// client**. Grows monotonically and is restated on every heartbeat, for the
     /// same reasons as `connected_slots` — and stays home-only precisely so the
@@ -561,6 +566,7 @@ impl DecisionMaker {
             live_slots: HashSet::new(),
             started: false,
             connected_slots: HashSet::new(),
+            last_link_epochs: HashMap::new(),
             started_slots: HashSet::new(),
             peer_started_slots: HashSet::new(),
             start_learned_at: HashMap::new(),

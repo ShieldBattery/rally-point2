@@ -38,6 +38,17 @@ impl DecisionMakers {
             .unwrap_or_default()
     }
 
+    /// Each slot's latest activated link epoch in one session, ascending by slot;
+    /// empty for a session this relay holds no maker for. The narrow re-read of
+    /// [`retained_load_state`](Self::retained_load_state)'s epochs, for a caller
+    /// checking that none moved across a read of its own.
+    pub fn last_link_epochs(&self, key: &SessionKey) -> Vec<(SlotId, u64)> {
+        self.lock()
+            .get(key)
+            .map(|maker| maker.sorted_last_link_epochs())
+            .unwrap_or_default()
+    }
+
     /// Every session whose decision-maker names a slot that has gone silent,
     /// marking nothing.
     ///

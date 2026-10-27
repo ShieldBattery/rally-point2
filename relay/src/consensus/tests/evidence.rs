@@ -40,7 +40,7 @@ fn stale_assignment_cannot_activate_or_replace_retained_evidence() {
         key_id: Some(7),
         body: vec![8],
     };
-    assert!(registry.note_slot_connected(&key, SlotId(0), false, Some(observation.clone())));
+    assert!(registry.note_slot_connected(&key, SlotId(0), false, Some(observation.clone()), None));
     let first = registry.retained_load_state(&key).evidence;
     assert_eq!(first[0].observation, observation);
     assert!(
@@ -48,7 +48,7 @@ fn stale_assignment_cannot_activate_or_replace_retained_evidence() {
     );
     install(&registry, &key, config(2));
     assert!(!registry.evidence_assignment_current(&key, SlotId(0), 1));
-    assert!(!registry.note_slot_connected(&key, SlotId(0), true, Some(observation.clone())));
+    assert!(!registry.note_slot_connected(&key, SlotId(0), true, Some(observation.clone()), None));
     assert_eq!(registry.retained_load_state(&key).evidence, first);
     assert!(rx.try_recv().is_err());
     let next = EvidenceObservation {
@@ -58,13 +58,13 @@ fn stale_assignment_cannot_activate_or_replace_retained_evidence() {
         assignment_revision: 2,
         ..observation
     };
-    assert!(registry.note_slot_connected(&key, SlotId(0), true, Some(next.clone())));
+    assert!(registry.note_slot_connected(&key, SlotId(0), true, Some(next.clone()), None));
     assert_eq!(
         registry.retained_load_state(&key).evidence[0].observation,
         next
     );
     registry.deregister_maker(&key);
-    assert!(!registry.note_slot_connected(&key, SlotId(0), true, Some(next)));
+    assert!(!registry.note_slot_connected(&key, SlotId(0), true, Some(next), None));
 }
 
 #[test]
@@ -104,7 +104,13 @@ fn pending_obligations_and_failure_history_are_bounded_even_with_an_oversized_de
             key_id: Some(7),
             body: vec![8],
         };
-        assert!(registry.note_slot_connected(&key, SlotId(slot), false, Some(admission.clone())));
+        assert!(registry.note_slot_connected(
+            &key,
+            SlotId(slot),
+            false,
+            Some(admission.clone()),
+            None
+        ));
         let sample = EvidenceObservation {
             interruption: None,
             sample_id: 1,
@@ -181,7 +187,7 @@ fn pending_outbox_fixture() -> (DecisionMakers, SessionKey, EvidenceObservation)
         key_id: Some(7),
         body: vec![6],
     };
-    assert!(registry.note_slot_connected(&key, SlotId(0), false, Some(admission.clone())));
+    assert!(registry.note_slot_connected(&key, SlotId(0), false, Some(admission.clone()), None));
     let pending = EvidenceObservation {
         interruption: None,
         sample_id: 1,
@@ -266,7 +272,8 @@ fn acknowledged_history_is_not_reenqueued_by_snapshots_reconnect_or_revocation()
             connection_id: [9; 32],
             sequence: next_evidence_sequence().unwrap(),
             ..admission
-        })
+        }),
+        None
     ));
     registry.deregister_maker(&key);
     assert!(
@@ -333,7 +340,7 @@ fn a_new_assignment_can_report_its_own_first_failure_after_prior_receipt() {
     admission.assignment_revision = 2;
     admission.connection_id = [8; 32];
     admission.sequence = next_evidence_sequence().unwrap();
-    assert!(registry.note_slot_connected(&key, SlotId(0), true, Some(admission.clone())));
+    assert!(registry.note_slot_connected(&key, SlotId(0), true, Some(admission.clone()), None));
     assert!(registry.begin_periodic_evidence(
         &key,
         SlotId(0),

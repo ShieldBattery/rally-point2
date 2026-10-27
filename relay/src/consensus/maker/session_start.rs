@@ -77,8 +77,15 @@ impl DecisionMaker {
     /// Records that `slot`'s link activated on this relay, into the ever-connected
     /// set the heartbeat restates. Idempotent: a reconnect re-inserts a slot the
     /// set already holds, and nothing ever removes one.
-    pub fn note_slot_connected(&mut self, slot: SlotId) {
+    ///
+    /// `connection_epoch` is the activating link's epoch, which replaces the slot's
+    /// latest activated epoch. A link that registers and never activates never
+    /// rejoined the session and leaves the epoch as it was.
+    pub fn note_slot_connected(&mut self, slot: SlotId, connection_epoch: Option<u64>) {
         self.connected_slots.insert(slot);
+        if let Some(epoch) = connection_epoch {
+            self.last_link_epochs.insert(slot, epoch);
+        }
     }
 
     /// Records that `slot` reported its game loop running, into the ever-started

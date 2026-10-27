@@ -120,7 +120,7 @@ pub(super) fn reporting_fixture() -> (HeartbeatSources, EvidenceObservation, Evi
         key_id: Some(7),
         body: vec![1],
     };
-    assert!(makers.note_slot_connected(&key(7), slot, false, Some(admission.clone())));
+    assert!(makers.note_slot_connected(&key(7), slot, false, Some(admission.clone()), None));
     assert!(collect_sample(
         &makers,
         &key(7),
@@ -651,7 +651,7 @@ async fn historical_report_batch_yields_to_load_state_asks_and_ready_answers() {
         },
     );
     assert!(makers.activate_connection_epoch(&key(7), SlotId(1), 1));
-    assert!(makers.note_slot_connected(&key(7), SlotId(1), false, Some(admission.clone())));
+    assert!(makers.note_slot_connected(&key(7), SlotId(1), false, Some(admission.clone()), None));
     for slot in [SlotId(0), SlotId(1)] {
         assert!(makers.begin_periodic_evidence(
             &key(7),

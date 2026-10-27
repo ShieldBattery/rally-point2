@@ -356,16 +356,21 @@ pub(super) fn handle_load_state_snapshot(
         .filter(|&slot| homed_here(slot, "lobby violation"))
         .collect();
     // The closed and live sets ride beside the snapshot rather than in it, so they
-    // get the same per-session length cap the snapshot's own lists do.
-    for (claim, slots) in [
-        ("closed slot", &mut answer.closed_slots),
-        ("live slot", &mut answer.live_slots),
-    ] {
-        slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
-        slots.sort_unstable();
-        slots.dedup();
-        slots.retain(|&slot| homed_here(slot, claim));
-    }
+    // get the same per-session length cap the snapshot's own lists do. A slot named
+    // closed twice keeps only its first entry: two epochs for one closure would
+    // leave nothing to compare a later answer against.
+    answer.closed_slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+    answer.closed_slots.sort_unstable();
+    answer.closed_slots.dedup_by_key(|closed| closed.slot);
+    answer
+        .closed_slots
+        .retain(|closed| homed_here(closed.slot, "closed slot"));
+    answer.live_slots.truncate(MAX_HEARTBEAT_SESSION_SLOTS);
+    answer.live_slots.sort_unstable();
+    answer.live_slots.dedup();
+    answer
+        .live_slots
+        .retain(|&slot| homed_here(slot, "live slot"));
     answer.state.lobby_violations = lobby_violations;
     crate::lifecycle::retain_home_turn_evidence(
         inbound.setup,

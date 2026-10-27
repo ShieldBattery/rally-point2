@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rally_point_proto::control::{
-    MAX_PERIODIC_EVIDENCE_SLOTS, RegionRttReport, SessionPresence, SlotEvidenceHistory,
+    ClosedSlot, MAX_PERIODIC_EVIDENCE_SLOTS, RegionRttReport, SessionPresence, SlotEvidenceHistory,
 };
 use rally_point_proto::ids::SlotId;
 use tokio::sync::mpsc::Sender;
@@ -243,14 +243,29 @@ pub(super) fn session_load_snapshot(
     decision_makers: &crate::consensus::DecisionMakers,
     key: SessionKey,
     between_reads: impl FnOnce(),
-) -> (SessionPresence, Vec<(SlotId, u64)>) {
-    let load = decision_makers.retained_load_state(&key);
+) -> SessionLoadSnapshot {
+    let mut load = decision_makers.retained_load_state(&key);
+    let last_link_epochs = std::mem::take(&mut load.last_link_epochs);
     between_reads();
     let links = crate::routing::live_session_slot_epochs(sessions, &key);
-    (
-        presence_entry(key, links.iter().map(|(slot, _)| *slot).collect(), load),
+    SessionLoadSnapshot {
+        state: presence_entry(key, links.iter().map(|(slot, _)| *slot).collect(), load),
         links,
-    )
+        last_link_epochs,
+    }
+}
+
+/// One [`session_load_snapshot`]: the session as a heartbeat would describe it,
+/// plus what a fence judges it against.
+pub(super) struct SessionLoadSnapshot {
+    /// What this relay holds for the session.
+    pub(super) state: SessionPresence,
+    /// The connection epoch behind each slot in `state.slots`, read under the same
+    /// roster lock as the slot list itself.
+    pub(super) links: Vec<(SlotId, u64)>,
+    /// Each slot's latest activated link epoch, read with the retained state
+    /// (before the roster), ascending by slot.
+    pub(super) last_link_epochs: Vec<(SlotId, u64)>,
 }
 
 /// A finished load-state answer, handed from a fence task back to the write half
@@ -278,8 +293,9 @@ pub(super) struct FencedLoadState {
     /// every slot except those in `closed_slots`.
     pub(super) fenced_live: bool,
     /// The slots this relay has seen connect that are neither live nor started in
-    /// `state`, ascending: the ones no probe can reach.
-    pub(super) closed_slots: Vec<SlotId>,
+    /// `state`, ascending: the ones no probe can reach, each with the link whose
+    /// closure left it disconnected.
+    pub(super) closed_slots: Vec<ClosedSlot>,
 }
 
 impl FencedLoadState {
@@ -480,22 +496,49 @@ pub(super) async fn fenced_load_state_snapshot_with(
     // and that is precisely the fact the fence exists to capture. The epochs come
     // back with it, so the roster this is judged against is the one that exists
     // now, not the one the probes went out to.
-    let (state, links) = session_load_snapshot(sessions, decision_makers, key, between_reads);
+    let SessionLoadSnapshot {
+        state,
+        links,
+        last_link_epochs,
+    } = session_load_snapshot(sessions, decision_makers, key.clone(), between_reads);
     let every_live_link_fenced = links
         .iter()
         .all(|(slot, epoch)| state.started.contains(slot) || acked.get(slot) == Some(epoch));
     // `ever_connected` is ascending, so the filtered set is too.
-    let closed_slots = state
+    let closed_slots: Vec<ClosedSlot> = state
         .ever_connected
         .iter()
         .copied()
         .filter(|slot| !state.slots.contains(slot) && !state.started.contains(slot))
+        .map(|slot| ClosedSlot {
+            slot,
+            link_epoch: link_epoch_of(&last_link_epochs, slot),
+        })
         .collect();
+    // A closed slot's epoch was read before the roster, so a link of its that
+    // activated and closed again between the two reads would leave the epoch
+    // naming the earlier closure. The roster read is the one that found the slot
+    // gone; no epoch moving between the first read and this one means no link of
+    // the slot activated across it, so the epoch read first is still the latest
+    // and names the closure the roster saw. A moved epoch is a membership change
+    // like any other across the fence, and withholds the live verdict.
+    let epochs_after = decision_makers.last_link_epochs(&key);
+    let closed_epochs_settled = closed_slots
+        .iter()
+        .all(|closed| link_epoch_of(&epochs_after, closed.slot) == closed.link_epoch);
     FencedLoadState {
         state,
-        fenced_live: every_probe_acked && every_live_link_fenced,
+        fenced_live: every_probe_acked && every_live_link_fenced && closed_epochs_settled,
         closed_slots,
     }
+}
+
+/// The epoch recorded for `slot` in an ascending `(slot, epoch)` list.
+fn link_epoch_of(epochs: &[(SlotId, u64)], slot: SlotId) -> Option<u64> {
+    epochs
+        .binary_search_by_key(&slot, |(entry, _)| *entry)
+        .ok()
+        .map(|index| epochs[index].1)
 }
 
 /// Assembles one [`SessionPresence`] from a session's key, its connected slots, and

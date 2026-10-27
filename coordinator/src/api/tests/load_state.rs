@@ -19,7 +19,7 @@ struct AttestOptions {
     fenced_live: bool,
     /// The slots its snapshot names as connected once and now neither live nor
     /// started.
-    closed_slots: Vec<SlotId>,
+    closed_slots: Vec<rally_point_proto::control::ClosedSlot>,
     /// Whether its snapshot confirms that the relay closed lobby ingress.
     setup_settled: bool,
     /// Whether its snapshot declares turn evidence, as every current relay's

@@ -542,6 +542,8 @@ pub fn new_decision_makers_with_region_delay(region_release_delay: Duration) -> 
 pub struct RetainedLoadState {
     /// Slots whose links ever activated on this relay, ascending.
     pub ever_connected: Vec<SlotId>,
+    /// Each slot's latest activated link epoch on this relay, ascending by slot.
+    pub last_link_epochs: Vec<(SlotId, u64)>,
     /// Slots that ever reported their game loop running here, ascending.
     pub started: Vec<SlotId>,
     /// Home slots at least one of whose turns this relay forwarded, ascending.

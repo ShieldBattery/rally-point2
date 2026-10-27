@@ -41,7 +41,8 @@ fn admit(context: &Context, id: [u8; 32], epoch: u64) {
             verdict: EvidenceVerdict::Valid,
             key_id: Some(7),
             body: vec![1],
-        })
+        }),
+        None
     ));
 }
 fn fixture() -> Context {
@@ -272,7 +273,13 @@ fn periodic_sample_cannot_enter_admission_path() {
     let before = makers.retained_load_state(&context.key);
     let mut observation = before.evidence[0].observation.clone();
     observation.sample_id = 1;
-    assert!(!makers.note_slot_connected(&context.key, context.slot, false, Some(observation)));
+    assert!(!makers.note_slot_connected(
+        &context.key,
+        context.slot,
+        false,
+        Some(observation),
+        None
+    ));
     assert_eq!(makers.retained_load_state(&context.key), before);
 }
 
@@ -449,7 +456,13 @@ fn optional_missing_admission_is_ineligible_but_required_missing_is_eligible() {
             key_id: None,
             body: Vec::new(),
         };
-        assert!(makers.note_slot_connected(&other_key, context.slot, false, Some(observation)));
+        assert!(makers.note_slot_connected(
+            &other_key,
+            context.slot,
+            false,
+            Some(observation),
+            None
+        ));
         assert_eq!(
             makers
                 .periodic_evidence_config(

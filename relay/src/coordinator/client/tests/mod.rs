@@ -9,8 +9,9 @@ use bytes::Bytes;
 
 use super::connect::{build_request, to_ws_scheme};
 use super::heartbeat::{
-    LoadStateAnswer, LoadStateAsk, fenced_load_state_snapshot, fenced_load_state_snapshot_with,
-    heartbeat_presence, heartbeat_region_rtts, session_load_snapshot, start_load_state_answer,
+    FencedLoadState, LoadStateAnswer, LoadStateAsk, fenced_load_state_snapshot,
+    fenced_load_state_snapshot_with, heartbeat_presence, heartbeat_region_rtts,
+    session_load_snapshot, start_load_state_answer,
 };
 use super::reader::{apply_message, reconcile};
 use super::writer::{FlightGrant, WriterRoutes, send_notice, write_control_frames};

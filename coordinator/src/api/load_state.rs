@@ -93,7 +93,11 @@ struct SessionLoadStateRequest {
 /// — the slots no relay can fence, because there is no stream left to probe and
 /// the client may be holding a report for the one it opens next. Each slot is taken
 /// only from the relay that homes it. A slot that dials back in leaves the set on
-/// the next read.
+/// the next read. Each entry carries the connection epoch of the link whose closure
+/// left the slot disconnected, as a decimal string: two reads naming one slot
+/// closed with the same epoch saw a single disconnection that lasted from the
+/// first read's snapshot through the second's, since any reconnect in between
+/// would have activated a new link with a new epoch.
 ///
 /// `closedKnown: true` licenses reading `closedSlots` as the session's whole closed
 /// set, and every slot outside it as fenced: every serving relay answered after
@@ -131,8 +135,33 @@ struct SessionLoadStateResponse {
     started_slots: Vec<u8>,
     forwarded_slots: Vec<u8>,
     lobby_violation_slots: Vec<u8>,
-    closed_slots: Vec<u8>,
+    closed_slots: Vec<ClosedSlotResponse>,
     live_slots: Vec<u8>,
+}
+
+/// One entry of `closedSlots`: the slot, and the connection epoch of the link whose
+/// closure left it disconnected as a decimal string, since a 64-bit epoch does not
+/// survive a JSON number in the tenant's JavaScript. `epoch` is absent when the
+/// home relay recorded none, and such a closure can never be matched against a
+/// later read's.
+#[derive(Debug, Serialize)]
+struct ClosedSlotResponse {
+    slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch: Option<String>,
+}
+
+/// The response entries for a round's closed slots, in slot order.
+fn closed_slot_entries(
+    closed: &std::collections::BTreeSet<rally_point_proto::control::ClosedSlot>,
+) -> Vec<ClosedSlotResponse> {
+    closed
+        .iter()
+        .map(|closed| ClosedSlotResponse {
+            slot: closed.slot.0,
+            epoch: closed.link_epoch.map(|epoch| epoch.to_string()),
+        })
+        .collect()
 }
 
 /// Session load-progress read: which slots ever connected, which ever reported
@@ -247,7 +276,7 @@ pub(super) async fn session_load_state(
             turns_known: false,
             lobby_violation_slots: before.lobby_violation_slots.iter().map(|s| s.0).collect(),
             closed_known: false,
-            closed_slots: round.closed_slots.iter().map(|s| s.0).collect(),
+            closed_slots: closed_slot_entries(&round.closed_slots),
             live_slots: round.live_slots.iter().map(|s| s.0).collect(),
         })
         .into_response());
@@ -315,7 +344,7 @@ pub(super) async fn session_load_state(
         turns_known,
         lobby_violation_slots: after.lobby_violation_slots.iter().map(|s| s.0).collect(),
         closed_known,
-        closed_slots: round.closed_slots.iter().map(|s| s.0).collect(),
+        closed_slots: closed_slot_entries(&round.closed_slots),
         live_slots: round.live_slots.iter().map(|s| s.0).collect(),
     })
     .into_response())

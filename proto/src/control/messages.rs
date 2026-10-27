@@ -604,11 +604,15 @@ pub enum RelayToCoordinator {
         /// `state`, so a slot outside it is live, started, or never connected
         /// here; with `fenced_live` set, every one of those is vouched for too.
         ///
+        /// Each entry names the link whose closure left the slot disconnected
+        /// (see [`ClosedSlot`]), so two snapshots naming the same slot closed on
+        /// the same link describe one unbroken disconnection.
+        ///
         /// Additive: a relay build that predates the set omits it, and with
         /// `fenced_live` reading `false` its silence is never taken for a
         /// statement that no slot closed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        closed_slots: Vec<SlotId>,
+        closed_slots: Vec<ClosedSlot>,
         /// Whether this relay closed future home-authored lobby commands before
         /// taking this snapshot. Absent decodes as false so an older relay can
         /// never attest final setup state.
@@ -634,6 +638,29 @@ pub enum RelayToCoordinator {
     /// here so the coordinator skips it rather than dropping the connection.
     #[serde(other)]
     Unknown,
+}
+
+/// One closed slot in a [`RelayToCoordinator::LoadStateSnapshot`]: a slot the
+/// reporting relay has seen connect that is now disconnected without having
+/// started, and which of its links that disconnection began with.
+///
+/// `link_epoch` is the connection epoch of the slot's latest link to activate on
+/// the relay, which — since no link of the slot is live — is the link whose
+/// closure left it disconnected. Epochs are never reused within a session, so
+/// two snapshots naming the same slot closed with the same epoch saw one
+/// disconnection that lasted from the first through the second: a reconnect in
+/// between would have activated a new link and changed the epoch.
+///
+/// `None` when the relay recorded no epoch for the slot (a session served
+/// without epoch-aware links); such a closure cannot be told apart from a later
+/// one, so it can never be read as unbroken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ClosedSlot {
+    /// The closed slot.
+    pub slot: SlotId,
+    /// The epoch of the link whose closure left the slot disconnected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_epoch: Option<u64>,
 }
 
 /// What one relay holds for one session, as carried in a
