@@ -8,7 +8,9 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use rally_point_proto::ids::SlotId;
-use rally_point_proto::messages::{LeadReport, LeaveDirective, Payload, RollbackStats};
+use rally_point_proto::messages::{
+    DisconnectBudget, LeadReport, LeaveDirective, Payload, RollbackStats,
+};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -133,6 +135,7 @@ pub(super) struct GameSeam {
     /// The newest lead report, to hand to the game thread (see
     /// [`TurnChannels::lead_report`]).
     pub(super) lead_report: watch::Sender<Option<LeadReport>>,
+    pub(super) disconnect_budgets: watch::Sender<Vec<DisconnectBudget>>,
     /// The highest `turns_complete` stamp received, to hand to the game thread (see
     /// [`TurnChannels::turns_complete`]).
     pub(super) turns_complete: watch::Sender<u64>,
@@ -189,6 +192,7 @@ impl GameSeam {
         // Lead reports each restate the whole window, so the newest is the only
         // one the game needs.
         let (lead_report_tx, lead_report_rx) = watch::channel(None);
+        let (disconnect_budgets_tx, disconnect_budgets_rx) = watch::channel(Vec::new());
         // The relay's count only matters at its newest, and only grows.
         let (turns_complete_tx, turns_complete_rx) = watch::channel(0);
         // Rollback statistics are cumulative, so the game's newest snapshot is
@@ -213,6 +217,7 @@ impl GameSeam {
             region_labels: region_labels_tx,
             phase_status: phase_status_tx,
             lead_report: lead_report_tx,
+            disconnect_budgets: disconnect_budgets_tx,
             turns_complete: turns_complete_tx,
             rollback_stats: rollback_stats_rx,
         };
@@ -236,6 +241,7 @@ impl GameSeam {
             region_labels: region_labels_rx,
             phase_status: phase_status_rx,
             lead_report: lead_report_rx,
+            disconnect_budgets: disconnect_budgets_rx,
             turns_complete: turns_complete_rx,
             rollback_stats: rollback_stats_tx,
         };

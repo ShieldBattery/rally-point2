@@ -77,6 +77,8 @@ pub(super) struct SlotLinkCtx {
     acks_owed: bool,
     /// The next maintenance flush.
     flush_deadline: Instant,
+    /// The next disconnect-budget snapshot.
+    budget_deadline: Instant,
     /// Whether to keep resampling this slot's link conditions on the pre-start
     /// tick.
     pre_start_sampling: bool,
@@ -391,6 +393,7 @@ pub async fn run_slot_link(
         delivery_share,
         acks_owed,
         flush_deadline,
+        budget_deadline: Instant::now(),
         pre_start_sampling,
         pre_start_deadline,
         leave_announced,
@@ -636,6 +639,11 @@ pub async fn run_slot_link(
             }
             _ = sleep_until(ctx.flush_deadline) => {
                 if maintenance::maintenance_flush(&mut link, &mut ctx).is_break() {
+                    break 'serve;
+                }
+            }
+            _ = sleep_until(ctx.budget_deadline) => {
+                if maintenance::push_disconnect_budgets(&mut ctx).await.is_break() {
                     break 'serve;
                 }
             }

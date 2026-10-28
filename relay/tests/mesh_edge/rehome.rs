@@ -53,6 +53,13 @@ async fn replay_survivor_history(replacement_first: bool, next: u64) -> Result<(
         .homed([0])
         .apply();
     survivor.mesh.session.decision_makers.mark_started(&key);
+    survivor.mesh.session.disconnect_budgets.configure_session(
+        &key,
+        false,
+        &[SlotId(0)],
+        &[SlotId(0), SlotId(1)],
+        &[RelayId(0)],
+    );
     let _survivor_client = connect_client(&survivor, &tenant, session, SlotId(0)).await?;
 
     // Feed the validated forwarding boundary before the replacement has any
@@ -101,25 +108,6 @@ async fn replay_survivor_history(replacement_first: bool, next: u64) -> Result<(
     assert!(replacement.mesh.session.decision_makers.is_started(&key));
     assert!(!mesh::has_resumable_state(&replacement.mesh.seen, &key));
 
-    // The reconnect handshake carries the exact peer cursor the returning
-    // client needs, but the replacement's local replay ring is still empty.
-    let endpoint = client_endpoint(&replacement.ca);
-    let client_key = keypair();
-    let token = mint_token(&tenant, session, SlotId(1), client_key.public);
-    let connection = endpoint.connect(replacement.addr, "localhost")?.await?;
-    handshake(
-        &connection,
-        &token,
-        &client_key,
-        &[(SlotId(0), missing), (SlotId(1), next - 512)],
-    )
-    .await?;
-    let mut client = Link::new(connection);
-    client.anchor_receive_window(SlotId(0), missing);
-    let mut incoming_control = spawn_control_reader(client.connection().clone());
-    let mut beacon_send = client.connection().open_uni().await?;
-    let mut beacon = rally_point_transport::beacon::BeaconWriter::new();
-
     let (survivor_link, replacement_link, _survivor_ep, _replacement_ep) = mesh_link_pair().await;
     let survivor_commands = spawn_mesh_link(
         survivor_link,
@@ -142,6 +130,31 @@ async fn replay_survivor_history(replacement_first: bool, next: u64) -> Result<(
         assert!(control.register_link(RelayId(0), 1, replacement_commands));
         wait_for_mesh_link(&replacement.mesh, &key).await;
     }
+
+    wait_until(
+        "replacement receives the survivor's budget baseline",
+        || replacement.mesh.session.disconnect_budgets.is_synced(&key),
+    )
+    .await;
+
+    // The reconnect handshake carries the exact peer cursor the returning
+    // client needs from the survivor's retained history.
+    let endpoint = client_endpoint(&replacement.ca);
+    let client_key = keypair();
+    let token = mint_token(&tenant, session, SlotId(1), client_key.public);
+    let connection = endpoint.connect(replacement.addr, "localhost")?.await?;
+    handshake(
+        &connection,
+        &token,
+        &client_key,
+        &[(SlotId(0), missing), (SlotId(1), next - 512)],
+    )
+    .await?;
+    let mut client = Link::new(connection);
+    client.anchor_receive_window(SlotId(0), missing);
+    let mut incoming_control = spawn_control_reader(client.connection().clone());
+    let mut beacon_send = client.connection().open_uni().await?;
+    let mut beacon = rally_point_transport::beacon::BeaconWriter::new();
 
     // No survivor produces another turn while waiting for the missing peer.
     // The only way these three turns can arrive is the mesh replay handshake.

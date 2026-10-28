@@ -33,7 +33,9 @@ pub mod edge;
 
 mod clock_heartbeat;
 mod conditions;
+mod disconnect_budget;
 mod dispatch;
+pub(crate) use disconnect_budget::{broadcast_disconnect_budget, checkpoint_disconnect_budget};
 mod dispatch_finalize;
 mod fan_out;
 mod forward;
@@ -51,6 +53,7 @@ pub use conditions::{
     ConditionsRegistry, activate_conditions, new_conditions_registry, publish_conditions,
     snapshot_conditions, unpublish_conditions,
 };
+pub(crate) use fan_out::fan_out_control;
 pub use fan_out::fan_out_to_mesh;
 pub(crate) use fan_out::{
     broadcast_leaves, fan_out_chat, fan_out_delivery_cursors, fan_out_evict_slot,

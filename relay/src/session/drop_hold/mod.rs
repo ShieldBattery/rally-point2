@@ -5,13 +5,11 @@
 //! A dropped slot's departure is recorded and announced immediately (so every
 //! relay knows it left and survivors learn who disconnected), but the decision
 //! that removes it from lockstep — the permanent
-//! [`LeaveDirective`](rally_point_proto::messages::LeaveDirective) — is **never
-//! made automatically**. A disconnect drop is always a human decision: after a
-//! slot has been gone a while, any single surviving member sends a `RequestDrop`
-//! for it, and the session's authority relay honors that request once the hold
-//! has stood past [`DROP_UNLOCK`]. Until such a request arrives — which may be
-//! never — the slot stays held, the survivors stay stalled but alive, and the
-//! game waits on a person rather than a timer. A clean leave (the client
+//! [`LeaveDirective`](rally_point_proto::messages::LeaveDirective) — waits for a
+//! survivor's decision. A survivor may request a drop once the hold has stood
+//! past [`DROP_UNLOCK`] or the slot's cumulative disconnect allowance is spent.
+//! Until a request arrives the slot stays held, and a reconnect may reinstate it.
+//! A clean leave (the client
 //! announced its own intent) is never held: an F10 quit must unstall survivors
 //! at once.
 //!

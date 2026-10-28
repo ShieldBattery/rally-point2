@@ -174,6 +174,17 @@ pub(crate) fn announce_departure_recorded(
                 reason,
                 connection_epoch,
             );
+            if outcome == consensus::DepartureRecordOutcome::Pending
+                && decision_makers.is_started(key)
+                && let Some(epoch) = connection_epoch
+            {
+                mesh.session.disconnect_budgets.start_outage(
+                    key,
+                    slot,
+                    epoch,
+                    std::time::Instant::now(),
+                );
+            }
             (
                 outcome,
                 outcome == consensus::DepartureRecordOutcome::Pending,
@@ -193,6 +204,7 @@ pub(crate) fn announce_departure_recorded(
     if outcome != consensus::DepartureRecordOutcome::Pending {
         return false;
     }
+    crate::mesh::broadcast_disconnect_budget(mesh, key);
     crate::mesh::fan_out_slot_departed(&mesh.links, key, slot, &stamps, reason, connection_epoch);
     // Turn the recorded departure into the synced leave — but a *drop* is only
     // marked as an undecided hold, never decided here: survivors are removed on a

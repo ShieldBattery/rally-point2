@@ -128,6 +128,7 @@ pub(super) fn activate_slot(
         // client ignores connectivity until it cares — and a re-register (a later
         // reconnect feature) reuses this same signal. Independent of the session-start
         // and leave paths.
+        crate::mesh::broadcast_disconnect_budget(mesh, key);
         broadcast_connectivity(
             sessions,
             &mesh.links,

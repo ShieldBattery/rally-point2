@@ -246,6 +246,9 @@ async fn main() -> Result<()> {
         },
         rally_point_relay::routing::STATE_HASH_CHECK_INTERVAL,
     ));
+    tokio::spawn(rally_point_relay::routing::run_disconnect_budget_watch(
+        mesh_state.clone(),
+    ));
 
     // A read handle onto the coordinator control-connection state, hoisted out of
     // the coordinator-config block so the idle self-exit can watch it. Populated

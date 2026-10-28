@@ -108,7 +108,11 @@ async fn region_labels_reach_clients_only_after_the_release_delay() {
     for reader in [&mut reader0, &mut reader1] {
         loop {
             match tokio::time::timeout(Duration::from_millis(150), reader.recv()).await {
-                Ok(Some(ControlInbound::Connectivity(_) | ControlInbound::SessionStart(_))) => {
+                Ok(Some(
+                    ControlInbound::Connectivity(_)
+                    | ControlInbound::SessionStart(_)
+                    | ControlInbound::DisconnectBudgets(_),
+                )) => {
                     continue;
                 }
                 Ok(Some(other)) => {

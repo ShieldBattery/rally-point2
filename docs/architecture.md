@@ -1888,8 +1888,14 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   the box's tailscale sidecar (never published; the public listener is untouched); relays are never
   scrape targets (scale-to-zero makes them transient) — fleet health exports coordinator-side; no
   alerting until production baselines exist.
-- **No auto-drop of disconnected players.** Holds are decided only by a survivor's `RequestDrop`
-  (30s relay floor) or the 45s abandoned-session force-decide. Silent-slot eviction does not change
+- **Disconnected players have a finite allowance.** Each slot has 180 seconds per session,
+  with completed outages rounded up to whole seconds and no refill on reconnect. The client offers
+  manual drop after 45 seconds, or when the remaining allowance expires. Exhaustion automatically
+  attempts the same home-finalized synced drop; it never bypasses the final-turn-count proof.
+  Debits are replicated by connection epoch and checkpointed on every serving peer before reconnect
+  admission. A replacement obtains a complete baseline from every configured peer before admitting
+  clients; unavailable accounting fails closed. The 45s abandoned-session force-decide remains.
+  Silent-slot eviction does not change
   this: it manufactures the *disconnect* for a connected slot that stopped producing turns while its
   link kept carrying packets, and the hold it leaves behind is decided exactly as any other. A slot
   whose link carries nothing is not evicted at all; the transport's idle timeout disconnects it and

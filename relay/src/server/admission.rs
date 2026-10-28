@@ -68,6 +68,8 @@ pub(super) enum Rollback {
 /// slot are the admission's own, so a gate only has to name the cause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RefusalKind {
+    /// A reconnect must retry after its accounting baseline has arrived.
+    BudgetUnavailable,
     /// The authorized slot is not among the session descriptor's homed set for
     /// this relay.
     SlotNotHomed,
@@ -93,6 +95,7 @@ impl RefusalKind {
     fn into_error(self, key: SessionKey, slot: SlotId) -> ConnError {
         let SessionKey { tenant, session } = key;
         match self {
+            RefusalKind::BudgetUnavailable => ConnError::AuthTimeout,
             RefusalKind::SlotNotHomed => ConnError::SlotNotHomed {
                 tenant,
                 session,
@@ -176,6 +179,14 @@ pub(super) const DEPARTED_AT_ADMISSION: Refusal = Refusal {
     code: close_codes::SLOT_DEPARTED,
     reason: b"slot already departed",
     kind: RefusalKind::SlotDeparted,
+    rollback: Rollback::Scaffolding,
+};
+
+/// A descriptor changed the required accounting baseline while admission ran.
+pub(super) const BUDGET_UNAVAILABLE: Refusal = Refusal {
+    code: close_codes::AUTH_TIMEOUT,
+    reason: b"disconnect accounting unavailable",
+    kind: RefusalKind::BudgetUnavailable,
     rollback: Rollback::Scaffolding,
 };
 

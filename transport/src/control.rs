@@ -25,10 +25,10 @@
 use prost::bytes::Bytes;
 use rally_point_proto::control_stream::encode_frame;
 use rally_point_proto::messages::{
-    ControlFrame, GameChat, GameResult, GameStarted, LeadReport, LeaveDirective, LeaveIntent,
-    LoadStateProbe, LoadStateProbeAck, LobbyCommand, Payload, PhaseApplied, PhaseDirective,
-    PlayerSkin, RegionLabel, RegionLabels, RequestDrop, RollbackStats, SessionStart,
-    SlotConnectivity, control_frame,
+    ControlFrame, DisconnectBudgets, GameChat, GameResult, GameStarted, LeadReport, LeaveDirective,
+    LeaveIntent, LoadStateProbe, LoadStateProbeAck, LobbyCommand, Payload, PhaseApplied,
+    PhaseDirective, PlayerSkin, RegionLabel, RegionLabels, RequestDrop, RollbackStats,
+    SessionStart, SlotConnectivity, control_frame,
 };
 use tokio::sync::mpsc;
 
@@ -155,6 +155,8 @@ pub enum ControlInbound {
     /// only the latest. A relay never receives one from a client, so the relay
     /// edge ignores a stray one just as it does a `Leave`.
     LeadReport(LeadReport),
+    /// A relay-authored snapshot of disconnect balances.
+    DisconnectBudgets(DisconnectBudgets),
     /// A rollback client's cumulative statistics for the game so far (client →
     /// relay only). The relay binds them to the authenticated connection's slot
     /// and only records them; a client never receives one back, so the client
@@ -259,6 +261,9 @@ pub fn spawn_control_reader(connection: noq::Connection) -> mpsc::Receiver<Contr
                 ControlFrame {
                     kind: Some(control_frame::Kind::LeadReport(report)),
                 } => ControlInbound::LeadReport(report),
+                ControlFrame {
+                    kind: Some(control_frame::Kind::DisconnectBudgets(budgets)),
+                } => ControlInbound::DisconnectBudgets(budgets),
                 ControlFrame {
                     kind: Some(control_frame::Kind::RollbackStats(stats)),
                 } => ControlInbound::RollbackStats(stats),
@@ -547,6 +552,19 @@ pub async fn send_control_phase_directive(
 ) -> Result<(), ControlSendError> {
     let frame = ControlFrame {
         kind: Some(control_frame::Kind::PhaseDirective(directive)),
+    };
+    let encoded = encode_frame(&frame)?;
+    control_send.write_all(&encoded).await?;
+    Ok(())
+}
+
+/// Sends a complete disconnect budget snapshot to a client.
+pub async fn send_control_disconnect_budgets(
+    control_send: &mut noq::SendStream,
+    budgets: DisconnectBudgets,
+) -> Result<(), ControlSendError> {
+    let frame = ControlFrame {
+        kind: Some(control_frame::Kind::DisconnectBudgets(budgets)),
     };
     let encoded = encode_frame(&frame)?;
     control_send.write_all(&encoded).await?;

@@ -145,6 +145,13 @@ async fn a_fresh_rehomed_authority_keeps_both_clients_lead_reports_advancing()
     let replacement = Relay::start(&tenant, 513);
     seed_rollback(&former, &key, 1, Authority::SelfRelay);
     seed_rollback(&survivor, &key, 0, Authority::Peer);
+    survivor.mesh.session.disconnect_budgets.configure_session(
+        &key,
+        false,
+        &[SlotId(0)],
+        &[SlotId(0), SlotId(1)],
+        &[RelayId(0)],
+    );
     for relay in [&former, &survivor, &replacement] {
         tokio::spawn(mesh::run_session_clock_heartbeat(
             relay.mesh.clone(),
@@ -254,17 +261,6 @@ async fn a_fresh_rehomed_authority_keeps_both_clients_lead_reports_advancing()
         }];
         control.apply_descriptor(&resumed);
     }
-    let (survivor_send, survivor_received) =
-        resumed_client(&survivor, &tenant, key.session, SlotId(0), NEXT, NEXT).await?;
-    let (replacement_send, replacement_received) = resumed_client(
-        &replacement,
-        &tenant,
-        key.session,
-        SlotId(1),
-        NEXT - 512,
-        NEXT,
-    )
-    .await?;
     let (survivor_link, replacement_link, _survivor_endpoint2, _replacement_endpoint) =
         mesh_link_pair().await;
     let survivor_commands = spawn_mesh_link(
@@ -281,6 +277,22 @@ async fn a_fresh_rehomed_authority_keeps_both_clients_lead_reports_advancing()
     assert!(replacement_control.register_link(RelayId(0), 1, replacement_commands));
     wait_for_mesh_link(&survivor.mesh, &key).await;
     wait_for_mesh_link(&replacement.mesh, &key).await;
+    wait_until(
+        "replacement receives the survivor's budget baseline",
+        || replacement.mesh.session.disconnect_budgets.is_synced(&key),
+    )
+    .await;
+    let (survivor_send, survivor_received) =
+        resumed_client(&survivor, &tenant, key.session, SlotId(0), NEXT, NEXT).await?;
+    let (replacement_send, replacement_received) = resumed_client(
+        &replacement,
+        &tenant,
+        key.session,
+        SlotId(1),
+        NEXT - 512,
+        NEXT,
+    )
+    .await?;
     wait_until(
         "the fresh replacement becomes authority and adopts the old clock",
         || {
