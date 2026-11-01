@@ -17,6 +17,15 @@
 //! limit as final: it measures a turn only once its step is that far, and never moves a deadline
 //! it has made final, so no measurement is ever read against a deadline that moves afterwards.
 //!
+//! A turn is read against its deadline as it stood when the turn arrived. A stop that began after
+//! a turn arrived still moves that turn's final deadline, but its sender, who sent it before the
+//! clock stopped, could not have known of the stop, and reading it early by the whole stop would
+//! have its pacing move by the stop twice. So the stretch of each stop that came after the turn
+//! arrived is taken back out, and what came before it counts: a turn the clock stood waiting for
+//! arrived after every moment of the wait. Each stop is placed in time where the relay's copy has
+//! the clock standing still (from its step's deadline, for its pause), so the reading is the same
+//! whenever the relay learned of the stop, and copies anchored alike place a stop alike.
+//!
 //! Relays share no timebase, and no relay's copy is the original. The authority makes the stops,
 //! from what it can confirm; every relay sends its copy to the others on a heartbeat and merges
 //! each copy it gets (see [`SessionClock::merge`]): the stopped time before each step is the most
@@ -171,10 +180,36 @@ impl SessionClock {
                 .sum::<Duration>()
     }
 
+    /// When the turn with seq `seq` was due as the clock stood at `arrived`: its deadline (see
+    /// [`due_at`](Self::due_at), whose `None`s this shares) less every part of a stop before its
+    /// step that came after `arrived`. Each stop stood still from its step's deadline for its
+    /// pause; stops kept only as the base's sum all count, as if they came before. An early turn
+    /// is thereby early by the clock's running time still to pass before its deadline, and a late
+    /// one late by all the time since its deadline, since every stop before a step ends before
+    /// that step's deadline.
+    fn due_as_it_stood(&self, seq: u64, arrived: Instant) -> Option<Instant> {
+        let (anchor_seq, at) = self.anchor?;
+        let after = seq.checked_sub(anchor_seq)?;
+        if seq > self.final_through || seq < self.base_step {
+            return None;
+        }
+        let mut stopped = self.base_pause;
+        let mut came_after = Duration::ZERO;
+        for stop in self.stops.iter().take_while(|stop| stop.step < seq) {
+            let stood_from = at + stopped + steps_duration(stop.step.saturating_sub(anchor_seq));
+            let resumed = stood_from + stop.pause;
+            came_after += resumed.saturating_duration_since(arrived.max(stood_from));
+            stopped += stop.pause;
+        }
+        Some(at + (stopped - came_after) + steps_duration(after))
+    }
+
     /// How late the turn with seq `seq` was when it arrived at `arrived`, in microseconds
-    /// (negative when early), or `None` when [`due_at`](Self::due_at) has no deadline for it.
+    /// (negative when early), against its deadline as it stood then (see the module docs and
+    /// [`due_as_it_stood`](Self::due_as_it_stood)), or `None` when [`due_at`](Self::due_at) has
+    /// no deadline for it.
     pub(in crate::consensus) fn lateness_us(&self, seq: u64, arrived: Instant) -> Option<i64> {
-        let due = self.due_at(seq)?;
+        let due = self.due_as_it_stood(seq, arrived)?;
         Some(match arrived.checked_duration_since(due) {
             Some(late) => i64::try_from(late.as_micros()).unwrap_or(i64::MAX),
             None => -i64::try_from((due - arrived).as_micros()).unwrap_or(i64::MAX),

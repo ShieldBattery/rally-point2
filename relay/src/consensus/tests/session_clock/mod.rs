@@ -1,11 +1,12 @@
 //! A rollback session's clock and the lead reports measured against it, with the fixtures every
 //! topic shares: the authority's clock (`stopping`), home slots measured against it
-//! (`measuring`), copies of it merged across relays (`copies`), and authority changes
-//! (`handoff`).
+//! (`measuring`), turns on their way across a stop (`in_flight`), copies of it merged across
+//! relays (`copies`), and authority changes (`handoff`).
 
 mod copies;
 mod handoff;
 mod home_arrival;
+mod in_flight;
 mod measuring;
 mod recovery;
 mod rehome_measuring;

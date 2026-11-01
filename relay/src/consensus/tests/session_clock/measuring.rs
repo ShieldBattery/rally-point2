@@ -157,7 +157,8 @@ fn a_turn_that_arrives_while_the_clock_stands_still_is_measured_against_the_stop
     let update = forward(&mut m, &[0, 1], 101, resumed).expect("stopped");
     assert!(update.frame.is_some());
     // The stop sends slot 0 its report at once, with its window as it was and the waiting turn
-    // measured against the deadline the stop moved: two seconds early, not on time.
+    // measured against its deadline as it stood when the turn arrived: moved by the step the clock
+    // had stood still by then, not by the rest of the stop, which came after.
     assert_eq!(update.reports.len(), 1, "only slot 0 was measured here");
     let (slot, report) = update.reports[0];
     assert_eq!(slot, SlotId(0));
@@ -169,11 +170,13 @@ fn a_turn_that_arrives_while_the_clock_stands_still_is_measured_against_the_stop
         (3_000, 3_000),
         "the late one of the two"
     );
-    let samples = m.take_lead_samples().unwrap();
     assert_eq!(
-        samples.slots[0].1.lateness_histogram[0], 1,
-        "two seconds early"
+        m.clock.lateness_us(limit + 1, stopped_at + STEP),
+        Some(-us(STEP)),
+        "a step early, as far as its step is past the one the clock stood at, not two seconds",
     );
+    let samples = m.take_lead_samples().unwrap();
+    assert_eq!(samples.slots[0].1.lateness_histogram[0], 1, "a step early");
 }
 
 #[test]

@@ -5,7 +5,9 @@
 //! — including turns that arrive together in a catch-up burst, because a turn that arrived in a
 //! burst arrived late. A turn is measured as soon as the clock's deadline for it is final; one that
 //! arrives before then (early, or while the clock may yet stop before its step) waits in the slot's
-//! queue until the clock moves far enough on. A slot's window is its last [`LEAD_WINDOW_TURNS`]
+//! queue until the clock moves far enough on, and is then read against the deadline as it stood
+//! when it arrived: a stop that came after it doesn't count against it (see
+//! [`SessionClock::lateness_us`]). A slot's window is its last [`LEAD_WINDOW_TURNS`]
 //! turns measured, and it gets a report every [`LEAD_REPORT_EVERY`] turns. The turn path never
 //! allocates: each slot's window is a fixed ring, its queue is sized when the slot is first seen,
 //! and a report is computed on the stack.

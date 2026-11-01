@@ -111,9 +111,11 @@ fn another_relay_measures_a_turn_that_arrived_before_it_heard_of_the_stop() {
         "its deadline isn't final there yet",
     );
 
-    // The stop arrives a hop after it ended. The waiting turn is measured against the deadline it
-    // moved, more than a second early: not two seconds late, as it would read against the clock
-    // as the other relay knew it when the turn arrived.
+    // The stop arrives a hop after it ended. The waiting turn is measured against its deadline as
+    // it stood when the turn arrived, two seconds into the stop: a step early, as far as its step
+    // is past the one the clock stood at. Not two seconds late, as it would read against the clock
+    // as the other relay knew it then, nor three seconds early, counting the second of the stop
+    // that came after it arrived.
     let update = forward(&mut authority, &[0, 1], 101, resumed).expect("stopped");
     let reports = peer.merge_session_clock(&update.frame.unwrap(), resumed + 20 * MS, 40_000);
     assert_eq!(reports.len(), 1);
@@ -122,12 +124,14 @@ fn another_relay_measures_a_turn_that_arrived_before_it_heard_of_the_stop() {
     assert_eq!(report.pause_us, 3_000_000);
     assert_eq!((report.samples, report.p90_us), (2, 1_000));
     assert_eq!(report.through_step, limit + 1);
+    assert_eq!(
+        peer.clock
+            .lateness_us(limit + 1, stopped_at + Duration::from_secs(2)),
+        Some(-us(STEP)),
+    );
     let samples = peer.take_lead_samples().unwrap();
     assert_eq!(samples.slots[0].1.max_lateness_us, Some(1_000));
-    assert_eq!(
-        samples.slots[0].1.lateness_histogram[0], 1,
-        "more than a second early"
-    );
+    assert_eq!(samples.slots[0].1.lateness_histogram[0], 1, "a step early");
 }
 
 #[test]
