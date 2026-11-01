@@ -105,13 +105,34 @@ impl TokenBucket {
     /// is seconds long is covered by advancing an `Instant` instead of
     /// sleeping. A `now` at or before the last refill simply refills nothing.
     pub(crate) fn try_take_at(&mut self, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last_refill);
-        let interval_ms = self.refill_interval.as_millis().max(1);
-        let intervals = elapsed.as_millis() / interval_ms;
+        // Whole intervals in exact nanoseconds: truncating either side to
+        // milliseconds would credit a token early (a 1.5 ms interval counted
+        // as 1 ms) or late (a sub-millisecond one as 1 ms) while the anchor
+        // below still moves by the true interval.
+        let elapsed = now.saturating_duration_since(self.last_refill).as_nanos();
+        let interval = self.refill_interval.as_nanos().max(1);
+        let intervals = elapsed / interval;
         if intervals > 0 {
-            let intervals = u32::try_from(intervals).unwrap_or(self.burst);
-            self.tokens = self.tokens.saturating_add(intervals).min(self.burst);
-            self.last_refill += self.refill_interval * intervals;
+            let missing = self.burst - self.tokens;
+            if intervals >= u128::from(missing) {
+                // Refilled to the cap: the anchor moves to the last whole
+                // interval boundary at or before `now`, however many
+                // intervals that is, so the next refill is a full interval
+                // away rather than a backlog of uncredited intervals behind.
+                self.tokens = self.burst;
+                let remainder = elapsed % interval;
+                let nanos_per_sec = 1_000_000_000;
+                self.last_refill = now
+                    - Duration::new(
+                        (remainder / nanos_per_sec) as u64,
+                        (remainder % nanos_per_sec) as u32,
+                    );
+            } else {
+                // Fewer than `missing <= burst` intervals, so this fits u32.
+                let intervals = intervals as u32;
+                self.tokens += intervals;
+                self.last_refill += self.refill_interval * intervals;
+            }
         }
         if self.tokens == 0 {
             false
@@ -165,6 +186,55 @@ mod tests {
         assert!(
             !bucket.try_take_at(start + interval),
             "and exactly one — the refill does not reopen the whole burst",
+        );
+    }
+
+    #[test]
+    fn token_bucket_refills_a_sub_millisecond_interval_once_per_interval() {
+        // A 500 us interval used to be counted as 1 ms while the anchor moved
+        // by 500 us, leaving it behind `now` so every call at one instant
+        // refilled again.
+        let interval = Duration::from_micros(500);
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new_at(1, interval, start);
+        assert!(bucket.try_take_at(start));
+
+        let later = start + Duration::from_millis(10);
+        let admitted = (0..10).filter(|_| bucket.try_take_at(later)).count();
+        assert_eq!(admitted, 1, "one instant admits at most the burst");
+        assert!(!bucket.try_take_at(later + interval / 2));
+        assert!(bucket.try_take_at(later + interval));
+    }
+
+    #[test]
+    fn token_bucket_waits_a_whole_non_millisecond_interval() {
+        // A 1.5 ms interval used to be counted as 1 ms, crediting a token a
+        // third of an interval early.
+        let interval = Duration::from_micros(1_500);
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new_at(1, interval, start);
+        assert!(bucket.try_take_at(start));
+        assert!(
+            !bucket.try_take_at(start + Duration::from_millis(1)),
+            "a millisecond is not a whole 1.5 ms interval",
+        );
+        assert!(bucket.try_take_at(start + interval));
+    }
+
+    #[test]
+    fn token_bucket_refills_only_the_burst_after_an_enormous_idle() {
+        // More elapsed intervals than fit in a u32 used to advance the anchor
+        // by only `burst` intervals, so every later call refilled again.
+        let start = Instant::now();
+        let mut bucket = TokenBucket::new_at(2, Duration::from_millis(1), start);
+        assert!(bucket.try_take_at(start));
+        assert!(bucket.try_take_at(start));
+
+        let later = start + Duration::from_secs(60 * 24 * 3600);
+        let admitted = (0..10).filter(|_| bucket.try_take_at(later)).count();
+        assert_eq!(
+            admitted, 2,
+            "an idle bucket refills to its burst, not past it"
         );
     }
 
