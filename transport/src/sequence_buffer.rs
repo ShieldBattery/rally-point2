@@ -127,8 +127,14 @@ impl<T: Clone + Default> SequenceBuffer<T> {
                 self.entries[index] = T::default();
             }
         } else {
+            // Clear by slot, not via `remove`: `remove` only empties a slot
+            // holding exactly the seq asked for, but a skipped slot holds an
+            // entry from a previous rotation (a seq one or more capacities
+            // older), which must go too.
             for sequence in first_sequence..=last_sequence {
-                self.remove(sequence);
+                let index = self.index(sequence);
+                self.entry_sequences[index] = -1;
+                self.entries[index] = T::default();
             }
         }
     }
@@ -195,6 +201,26 @@ mod tests {
 
         // the last insert should have rotated the data structure completely, so the old 9 entry
         // should have been removed
+        assert_eq!(count_entries(&buffer), 1);
+    }
+
+    /// Advancing the cursor by less than a full capacity still evicts the
+    /// previous rotation's entries in every slot it passes, even though those
+    /// slots hold seqs other than the ones being skipped over.
+    #[test]
+    fn advancing_clears_the_previous_rotation_in_skipped_slots() {
+        let mut buffer = SequenceBuffer::with_capacity(4);
+        buffer.insert(0, Data(0));
+        buffer.insert(1, Data(1));
+        // Skips seqs 2..=4, whose slots 2, 3 and 0 belong to this rotation;
+        // slot 0 still holds seq 0, now more than a capacity behind.
+        buffer.insert(5, Data(5));
+
+        assert_eq!(buffer.sequence(), 6);
+        assert!(!buffer.exists(0), "seq 0 is a full rotation stale");
+        assert!(buffer.get(0).is_none());
+        // Seq 1 shared its slot with the new seq 5, so it is overwritten.
+        assert!(!buffer.exists(1));
         assert_eq!(count_entries(&buffer), 1);
     }
 
