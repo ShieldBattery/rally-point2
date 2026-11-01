@@ -608,3 +608,61 @@ fn reenrollment_refreshes_periodic_policy_without_rehoming_the_session() {
         );
     }
 }
+
+#[test]
+fn a_returning_relay_rejoins_the_peer_lists_staged_while_it_was_away() {
+    // Relay 1 homes slot 0; relay 2 (region-b, a real enrolled identity) homes
+    // slot 1; relay 3 is idle.
+    let setup = relayless_setup();
+    let lifecycle = Lifecycle::new(setup.clone());
+    let regions = crate::test_support::regions_config(&["region-b"]);
+    let context = EnrollContext::new(&setup, &lifecycle, &regions, None, None);
+    let relay_two = RelayIdentity::generate();
+    let enroll_two = || {
+        let mut handshake = EnrollHandshake::start(&context, &Arc::new(Semaphore::new(1))).unwrap();
+        let hello = relay_two
+            .hello(2)
+            .with_region(crate::test_support::region("region-b"));
+        let nonce = challenge_nonce(handshake.offer(Some(RelayToCoordinator::Hello(hello))));
+        assert!(matches!(
+            handshake.offer(Some(relay_two.proof(&nonce))),
+            EnrollStep::Enrolled(_)
+        ));
+    };
+    registry::enroll(setup.registry(), crate::test_support::hello(1, 14901));
+    enroll_two();
+    registry::enroll(setup.registry(), crate::test_support::hello(3, 14903));
+    let mut players = crate::test_support::two_players();
+    players[1].region = Some(crate::test_support::region("region-b"));
+    let session = session::create_session(
+        &setup,
+        crate::test_support::request(players),
+        ExpiresAt(u64::MAX),
+    )
+    .unwrap()
+    .response
+    .session;
+
+    // Relay 2's control connection blips while relay 1 dies, and relay 1's group
+    // is re-homed onto relay 3 in that window: relay 3's descriptor is built
+    // while relay 2 is not enrolled.
+    registry::remove(setup.registry(), RelayId(2));
+    registry::remove(setup.registry(), RelayId(1));
+    assert!(matches!(
+        session::rehome(&setup, &tenant_id(), session, RelayId(1), vec![]),
+        session::RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(3)
+    ));
+
+    // Relay 2 reconnects. Both relays serve the session, so relay 3 must be
+    // told to mesh with it again.
+    enroll_two();
+    let staged = setup
+        .descriptors()
+        .current_descriptor(RelayId(3), &tenant_id(), session)
+        .unwrap();
+    assert_eq!(
+        staged.peers.iter().map(|p| p.relay_id).collect::<Vec<_>>(),
+        vec![RelayId(2)],
+        "relay 3's staged peer list names its fellow serving relay",
+    );
+}

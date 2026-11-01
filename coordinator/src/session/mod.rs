@@ -42,6 +42,7 @@ pub use gate::ProvisionGate;
 pub use rehome::{recorded_rehome, rehome, rehome_evicting, rehome_with_assignment_commit};
 pub use setup::SessionSetup;
 
+pub(crate) use descriptor::refresh_peer_lists;
 pub(crate) use persist::SetupRecord;
 pub(crate) use rehome::{refresh_resumed_descriptors, session_capable_cohort};
 

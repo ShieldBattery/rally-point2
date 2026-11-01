@@ -532,6 +532,9 @@ impl<'a> EnrollHandshake<'a> {
                             .is_some_and(|refs| refs.periodic_evidence);
                     setup.descriptors().record(relay_id, descriptor);
                 }
+                // Lists staged for this relay's fellow serving relays while it was
+                // away omit it; put it back before anything is re-synced.
+                session::refresh_peer_lists(setup, relay_id);
             }
             let evict = match &result {
                 Ok(generation) => {

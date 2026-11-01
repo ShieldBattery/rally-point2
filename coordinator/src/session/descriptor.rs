@@ -71,6 +71,8 @@ pub fn build_descriptor(
 
     // The peers are the session's relays except the one this descriptor is
     // for — each relay meshes with the others serving the same session.
+    // A serving relay that is not enrolled right now (its control connection is
+    // down) is left out; `refresh_peer_lists` puts it back when it re-enrolls.
     let peers: Vec<RelayPeer> = relay_ids
         .iter()
         .filter(|&&id| id != relay_id)
@@ -152,6 +154,54 @@ pub fn build_descriptor(
 /// with a region, in ascending relay-id order (a `BTreeMap`'s natural iteration
 /// order). Untagged relays are dropped rather than carried with an empty label,
 /// so an absent entry unambiguously means "no region recorded".
+/// Puts `relay`'s current peer entry (the address and cert it just enrolled
+/// under) into the staged descriptor of every relay serving a session alongside
+/// it, after `relay` (re-)enrolled. A descriptor built while `relay` was
+/// disconnected omits it, and a relay applying that list leaves the session's
+/// mesh with it, so the list has to follow `relay` back; a restart in place
+/// also changes the cert its peers must pin. Only `relay`'s own entry changes:
+/// the other entries, and everything else in each staged descriptor (a resumed
+/// descriptor stays resumed, with its departed seeds), are kept, so a relay
+/// that reconnects first after a coordinator restart does not strip the peers
+/// that have not reconnected yet. Called under the assignment lock.
+pub(crate) fn refresh_peer_lists(setup: &SessionSetup, relay: RelayId) {
+    let Some(entry) = registry::peer(&setup.registry, relay) else {
+        return;
+    };
+    let sessions: Vec<_> = setup
+        .session_relays
+        .lock()
+        .iter()
+        .filter(|(_, serving)| serving.contains(&relay))
+        .map(|(key, serving)| (key.clone(), serving.clone()))
+        .collect();
+    for ((tenant, session), serving) in sessions {
+        for &other in serving.iter().filter(|&&id| id != relay) {
+            let Some(mut staged) = setup
+                .descriptors
+                .current_descriptor(other, &tenant, session)
+            else {
+                continue;
+            };
+            let peers: Vec<RelayPeer> = serving
+                .iter()
+                .filter(|&&id| id != other)
+                .filter_map(|&id| {
+                    if id == relay {
+                        Some(entry.clone())
+                    } else {
+                        staged.peers.iter().find(|p| p.relay_id == id).cloned()
+                    }
+                })
+                .collect();
+            if staged.peers != peers {
+                staged.peers = peers;
+                setup.descriptors.record(other, staged);
+            }
+        }
+    }
+}
+
 pub(super) fn relay_region_labels(
     relay_regions: &std::collections::BTreeMap<RelayId, Option<RegionId>>,
 ) -> Vec<RelayRegionLabel> {
