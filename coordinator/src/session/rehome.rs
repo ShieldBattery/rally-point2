@@ -59,8 +59,12 @@ pub fn recorded_rehome(
         .lock()
         .get(&(tenant.clone(), session, dead_relay))?;
     let entry = registry::entry(&setup.registry, existing)?;
-    evidence_capability_matches(setup, &(tenant.clone(), session), &entry)
-        .then(|| RelayEndpoint::from(&entry))
+    let key = (tenant.clone(), session);
+    // A target that restarted in place since it was recorded presents a cert the
+    // session has not pinned; the full re-home re-pins it before answering.
+    (evidence_capability_matches(setup, &key, &entry)
+        && cert_matches_pin(setup, &key, existing, &entry.cert_der))
+    .then(|| RelayEndpoint::from(&entry))
 }
 
 /// Coordinator-mediated failover: the client believes `dead_relay` has died and
@@ -100,11 +104,15 @@ pub fn rehome(
         true,
         move || departed_slots,
         || {},
-        |_| {},
+        |_, _| {},
     )
 }
 
-/// [`rehome`] with a synchronous assignment-commit hook. The hook runs after the
+/// [`rehome`] with a synchronous assignment-commit hook, called with the relay
+/// the group actually moved off and its replacement. The moved-off relay is
+/// `dead_relay` unless that relay was already re-homed onto a target which has
+/// since restarted in place, in which case the move is off that target. The
+/// hook runs after the
 /// authoritative serving set and slot homes are updated but before resumed
 /// descriptors are published, while the outer assignment lock is still held.
 /// This lets lifecycle bookkeeping install the same assignment boundary before a
@@ -117,7 +125,7 @@ pub fn rehome_with_assignment_commit(
     session: SessionId,
     dead_relay: RelayId,
     read_departed: impl FnOnce() -> Vec<DepartedSlot>,
-    assignment_committed: impl FnOnce(RelayId),
+    assignment_committed: impl FnOnce(RelayId, RelayId),
 ) -> RehomeOutcome {
     rehome_inner(
         setup,
@@ -185,7 +193,7 @@ pub fn rehome_evicting(
         false,
         move || departed_slots,
         || {},
-        |_| {},
+        |_, _| {},
     )
 }
 
@@ -196,7 +204,7 @@ pub(super) fn rehome_inner(
     allow_stay: bool,
     read_departed: impl FnOnce() -> Vec<DepartedSlot>,
     before_mutation: impl FnOnce(),
-    assignment_committed: impl FnOnce(RelayId),
+    assignment_committed: impl FnOnce(RelayId, RelayId),
 ) -> RehomeOutcome {
     let (tenant, session) = (&session_key.0, session_key.1);
     // The outermost assignment lock: this re-home's pick→re-stage span linearizes
@@ -223,11 +231,20 @@ pub(super) fn rehome_inner(
     // the honest answer for it. (The handler runs the same lookup lock-free first —
     // see [`recorded_rehome`] — to answer a recorded re-ask without a rate-limit
     // token; this copy stays here so the read-and-mutate below is atomic.)
+    //
+    // A recorded target that has since restarted in place presents a cert the
+    // session never pinned, and an answer naming it would never pass the API's
+    // readiness gate. Its group has to move again, so re-home off the target
+    // itself: the alias re-pointing below carries this straggler's record along.
+    let mut dead_relay = dead_relay;
     if let Some(&existing) = rehomes.get(&(tenant.clone(), session, dead_relay))
         && let Some(entry) = registry::entry(&setup.registry, existing)
         && evidence_capability_matches(setup, &key, &entry)
     {
-        return RehomeOutcome::NewTarget(RelayEndpoint::from(&entry));
+        if cert_matches_pin(setup, &key, existing, &entry.cert_der) {
+            return RehomeOutcome::NewTarget(RelayEndpoint::from(&entry));
+        }
+        dead_relay = existing;
     }
 
     // The named relay is still enrolled, still serving this session, and the cert
@@ -429,7 +446,17 @@ pub(super) fn rehome_inner(
     // would simply retire this whole `session_refs` entry afterward regardless
     // of what this leaves in `homes`/`relay_certs`. Must still run before the
     // descriptor-rebuild loop below, which is what this position guarantees.
+    let mut target_restarted = false;
     if let Some(refs) = setup.session_refs.lock().get_mut(&key) {
+        // An already-serving target whose pin is stale restarted in place: its own
+        // clients still hold the old cert. Overwriting the pin below would make
+        // their re-home ask read as a false alarm and answer Stay, so record the
+        // move for them too (target -> target).
+        target_restarted = r_new != dead_relay
+            && refs
+                .relay_certs
+                .get(&r_new)
+                .is_some_and(|&pin| pin != cert_fingerprint(&new_entry.cert_der));
         refs.retire_evidence_assignments(
             dead_relay,
             rally_point_proto::time::unix_secs_fail_closed(),
@@ -461,7 +488,7 @@ pub(super) fn rehome_inner(
     // descriptors. The assignment lock held across this function also gates
     // terminal-close handling, so a replacement close can only run after this
     // callback has completed.
-    assignment_committed(r_new);
+    assignment_committed(dead_relay, r_new);
 
     // Read the departed accounting only now, at descriptor-build time under the
     // assignment lock, never as a caller-side snapshot: a departure notice can
@@ -506,6 +533,9 @@ pub(super) fn rehome_inner(
         }
     }
     rehomes.insert((tenant.clone(), session, dead_relay), r_new);
+    if target_restarted {
+        rehomes.insert((tenant.clone(), session, r_new), r_new);
+    }
     tracing::info!(
         tenant = tenant.as_ref(),
         session = session.0,

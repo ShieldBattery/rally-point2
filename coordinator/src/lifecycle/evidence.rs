@@ -59,7 +59,7 @@ impl Lifecycle {
             session,
             relay,
             || self.departed_slots(tenant, session),
-            |replacement| self.on_rehome(tenant, session, relay, replacement),
+            |moved_off, replacement| self.on_rehome(tenant, session, moved_off, replacement),
         );
         if !matches!(outcome, crate::session::RehomeOutcome::Unavailable) {
             tracing::info!(

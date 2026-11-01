@@ -404,10 +404,10 @@ pub(super) async fn rehome_session(
         session,
         dead_relay,
         || state.lifecycle.departed_slots(&tenant, session),
-        |replacement| {
+        |moved_off, replacement| {
             state
                 .lifecycle
-                .on_rehome(&tenant, session, dead_relay, replacement);
+                .on_rehome(&tenant, session, moved_off, replacement);
         },
     );
     // Durable before the client is pointed at the replacement, for the same reason

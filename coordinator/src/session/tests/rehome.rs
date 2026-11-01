@@ -50,7 +50,7 @@ fn a_departure_recorded_mid_rehome_still_seeds_the_resumed_descriptors() {
                 final_turn_count: None,
             });
         },
-        |_| {},
+        |_, _| {},
     );
     assert!(matches!(outcome, RehomeOutcome::NewTarget(_)));
 
@@ -194,7 +194,7 @@ fn rehome_commit_hook_precedes_resumed_descriptor_publication() {
         resp.session,
         RelayId(1),
         Vec::new,
-        |replacement| {
+        |_, replacement| {
             assert_eq!(replacement, RelayId(2));
             assert_eq!(
                 setup.serving_relays(&tid(), resp.session),
@@ -556,4 +556,106 @@ async fn settlement_refuses_a_same_set_lifecycle_break_inside_the_assignment_cut
         !setup.descriptors().current_for(RelayId(1))[0].lobby_settled,
         "a stale load-state read cannot publish finality to the replacement",
     );
+}
+
+#[test]
+fn rehome_onto_a_serving_relay_that_restarted_still_moves_its_own_clients() {
+    // Relay 1 homes slot 0, relay 2 (region-b) homes slot 1.
+    let setup = region_b_fleet();
+    let resp = create_session(
+        &setup,
+        request(two_players_slot_1_in_region_b()),
+        ExpiresAt(u64::MAX),
+    )
+    .unwrap()
+    .response;
+
+    // Relay 2 restarts in place under a fresh cert; slot 1's client still pins
+    // the old one. Before that client asks, relay 1 dies and its group moves
+    // onto relay 2, the serving relay it can still reach.
+    registry::enroll(
+        setup.registry(),
+        hello_with_cert(2, 14901, vec![0xEE; 4]).with_region(region("region-b")),
+    );
+    registry::remove(setup.registry(), RelayId(1));
+    let RehomeOutcome::NewTarget(moved) = rehome(&setup, &tid(), resp.session, RelayId(1), vec![])
+    else {
+        panic!("relay 1's group moves");
+    };
+    assert_eq!(moved.relay_id, RelayId(2));
+
+    // Slot 1's client can never accept relay 2's new cert under its old pin, so
+    // Stay would wedge it: it must be handed relay 2 under the cert it presents.
+    let outcome = rehome(&setup, &tid(), resp.session, RelayId(2), vec![]);
+    assert!(
+        matches!(
+            &outcome,
+            RehomeOutcome::NewTarget(e) if e.relay_id == RelayId(2) && e.cert_der == vec![0xEE; 4]
+        ),
+        "expected relay 2 under its fresh cert, got {outcome:?}",
+    );
+}
+
+#[test]
+fn a_recorded_target_that_restarted_again_is_re_pinned_before_it_is_answered() {
+    // Relay 5 restarts in place, and its group is re-homed onto its own fresh
+    // cert (a same-id move, recorded as 5 -> 5).
+    let setup = fleet(&[(5, 14900, None, false)]).0;
+    let resp = create_default_session(&setup);
+    registry::enroll(setup.registry(), hello_with_cert(5, 14900, vec![0xEE; 4]));
+    assert!(matches!(
+        rehome(&setup, &tid(), resp.session, RelayId(5), vec![]),
+        RehomeOutcome::NewTarget(ref e) if e.cert_der == vec![0xEE; 4]
+    ));
+
+    // It restarts again. The recorded answer must not hand out the new cert
+    // while the session still pins the previous one: the readiness gate only
+    // releases a target whose recorded pin matches what it presents, so the
+    // clients' asks would time out for as long as the stale record stands.
+    registry::enroll(setup.registry(), hello_with_cert(5, 14900, vec![0xDD; 4]));
+    let outcome = rehome(&setup, &tid(), resp.session, RelayId(5), vec![]);
+    assert!(
+        matches!(&outcome, RehomeOutcome::NewTarget(e) if e.cert_der == vec![0xDD; 4]),
+        "expected relay 5 under its newest cert, got {outcome:?}",
+    );
+    let refs = session_refs(&setup, &tid(), resp.session).unwrap();
+    assert_eq!(
+        refs.relay_certs.get(&RelayId(5)),
+        Some(&cert_fingerprint(&[0xDD; 4])),
+        "the pin follows the cert the answer handed out",
+    );
+}
+
+#[test]
+fn the_commit_hook_names_the_restarted_target_a_straggler_is_moved_off() {
+    // 1 -> 2 is recorded; relay 2 then restarts in place and drains, so a
+    // straggler's re-ask about relay 1 moves the group off relay 2 onto relay 3.
+    // The lifecycle's cached serving set swaps the relay that actually left.
+    let (setup, _, _) = two_relay_fleet_with_generations();
+    enroll_fleet(setup.registry(), &[(3, 14902, None, false)]);
+    let resp = create_default_session(&setup);
+    registry::remove(setup.registry(), RelayId(1));
+    assert!(matches!(
+        rehome(&setup, &tid(), resp.session, RelayId(1), vec![]),
+        RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2)
+    ));
+    let generation = registry::enroll(setup.registry(), hello_with_cert(2, 14901, vec![0xEE; 4]));
+    assert!(registry::mark_draining(
+        setup.registry(),
+        RelayId(2),
+        generation
+    ));
+
+    let moved = std::cell::Cell::new(None);
+    let outcome = rehome_with_assignment_commit(
+        &setup,
+        &tid(),
+        resp.session,
+        RelayId(1),
+        Vec::new,
+        |moved_off, replacement| moved.set(Some((moved_off, replacement))),
+    );
+    assert!(matches!(outcome, RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(3)));
+    assert_eq!(moved.get(), Some((RelayId(2), RelayId(3))));
+    assert_eq!(setup.serving_relays(&tid(), resp.session), vec![RelayId(3)]);
 }

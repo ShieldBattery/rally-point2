@@ -208,7 +208,7 @@ fn a_rehome_racing_a_full_close_bails_without_recording_or_pushing() {
             // holds, and the take is the step that opens the race window anyway.
             setup.take_session_membership(&tid(), resp.session);
         },
-        |_| {},
+        |_, _| {},
     );
 
     assert_eq!(
