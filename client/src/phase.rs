@@ -51,19 +51,27 @@ pub struct PhaseStatus {
 /// applied delay toward it at the commanded (bounded) rate as time passes.
 #[derive(Debug)]
 pub(crate) struct PhaseSlew {
-    applied_us: u64,
+    /// The applied delay in [`UNITS_PER_US`] units. A nanosecond of elapsed
+    /// time at a rate in µs/s moves it a whole number of units, so every
+    /// advance credits all of its elapsed time at the rate in force: no
+    /// fraction of a microsecond is dropped (which would slow the slew below
+    /// its commanded rate at fine poll cadences) or left pending to be
+    /// credited later at a different rate.
+    applied_units: u64,
     target_us: u64,
     rate_us_per_s: u64,
-    /// When the applied delay was last walked forward. Advancing only consumes
-    /// elapsed time when it produces a whole microsecond of movement, so
-    /// frequent small advances never round the progress away.
+    /// When the applied delay was last walked forward.
     last_advance: Instant,
 }
+
+/// Resolution of the applied delay: units per microsecond, so that
+/// `elapsed_ns × rate_us_per_s` is exactly the movement in units.
+const UNITS_PER_US: u64 = 1_000_000_000;
 
 impl PhaseSlew {
     pub(crate) fn new(now: Instant) -> Self {
         PhaseSlew {
-            applied_us: 0,
+            applied_units: 0,
             target_us: 0,
             rate_us_per_s: DEFAULT_SLEW_US_PER_S,
             last_advance: now,
@@ -87,28 +95,32 @@ impl PhaseSlew {
     /// Walks the applied delay toward the target by however much the elapsed
     /// time allows, returning the delay to hold the next outbound turn by.
     pub(crate) fn advance(&mut self, now: Instant) -> u64 {
-        let elapsed_us = now
+        let elapsed_ns = now
             .saturating_duration_since(self.last_advance)
-            .as_micros()
+            .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
+        self.last_advance = self.last_advance.max(now);
         // Elapsed time is bounded by session length and the rate by its clamp,
-        // so the product stays far inside u64.
-        let step = elapsed_us.saturating_mul(self.rate_us_per_s) / 1_000_000;
-        if step > 0 {
-            self.last_advance = now;
-            self.applied_us = if self.applied_us < self.target_us {
-                (self.applied_us + step).min(self.target_us)
-            } else {
-                self.applied_us.saturating_sub(step).max(self.target_us)
-            };
-        }
-        self.applied_us
+        // so the product stays far inside u64 (and saturates past it).
+        let step = elapsed_ns.saturating_mul(self.rate_us_per_s);
+        let target_units = self.target_us * UNITS_PER_US;
+        self.applied_units = if self.applied_units < target_units {
+            self.applied_units.saturating_add(step).min(target_units)
+        } else {
+            self.applied_units.saturating_sub(step).max(target_units)
+        };
+        self.applied_us()
+    }
+
+    /// The applied delay in whole microseconds.
+    fn applied_us(&self) -> u64 {
+        self.applied_units / UNITS_PER_US
     }
 
     /// The current state, for the embedder-facing watch channel.
     pub(crate) fn status(&self) -> PhaseStatus {
         PhaseStatus {
-            applied_us: u32::try_from(self.applied_us).unwrap_or(u32::MAX),
+            applied_us: u32::try_from(self.applied_us()).unwrap_or(u32::MAX),
             target_us: u32::try_from(self.target_us).unwrap_or(u32::MAX),
         }
     }
@@ -191,5 +203,35 @@ mod tests {
         let mut slew = PhaseSlew::new(start);
         slew.retarget(10_000, 0, start);
         assert_eq!(slew.advance(start + Duration::from_secs(1)), 2_000);
+    }
+
+    #[test]
+    fn polls_finer_than_a_microsecond_of_movement_keep_the_commanded_rate() {
+        // At 2 ms/s, a poll every 999 us moves 1.998 us. Crediting only the
+        // whole microsecond and discarding the rest of the elapsed time would
+        // halve the slew rate; the full 999 ms must move 1998 us.
+        let start = Instant::now();
+        let mut slew = PhaseSlew::new(start);
+        slew.retarget(10_000, 2_000, start);
+        let mut at = start;
+        for _ in 0..1_000 {
+            at += Duration::from_micros(999);
+            slew.advance(at);
+        }
+        assert_eq!(slew.advance(at), 1_998);
+    }
+
+    #[test]
+    fn time_before_a_retarget_is_never_credited_at_the_new_rate() {
+        // 9 ms at the slowest rate is under one microsecond of movement. That
+        // time belongs to the old directive (whose target, zero, it had
+        // already reached); none of it may be walked at the new 10 ms/s rate.
+        let start = Instant::now();
+        let mut slew = PhaseSlew::new(start);
+        slew.retarget(0, 100, start);
+        let at = start + Duration::from_millis(9);
+        slew.retarget(10_000, 10_000, at);
+        assert_eq!(slew.advance(at), 0);
+        assert_eq!(slew.advance(at + Duration::from_millis(1)), 10);
     }
 }
