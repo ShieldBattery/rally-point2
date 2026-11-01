@@ -376,7 +376,10 @@ impl DecisionMaker {
     /// Idempotent: a re-request after the leave was already decided answers
     /// from the decided directive's finalized count (or `RejectedLive` when the
     /// slot was decided without one — nothing here may ever contradict a
-    /// decided leave).
+    /// decided leave), and one for a departure already sealed with a count
+    /// answers with that count, leaving the seal standing. Re-reading the
+    /// cursor instead could answer a different count than the one already
+    /// handed out, or lift the seal the first answer rests on.
     ///
     /// `requested_epoch` is the departed connection generation the requester is
     /// finalizing, checked against this relay's own departure record for the
@@ -401,6 +404,14 @@ impl DecisionMaker {
         }
         if self.departure_epoch(slot) != requested_epoch {
             return Err(FinalizeOutcome::RejectedLive);
+        }
+        if let Some(final_turn_count) = self
+            .departures
+            .get(&slot)
+            .filter(|departure| departure.finalized)
+            .and_then(|departure| departure.final_turn_count)
+        {
+            return Err(FinalizeOutcome::Finalized { final_turn_count });
         }
         // A home gained mid-session (rehome) has a cursor covering only what
         // it forwarded itself, not the slot's whole ingress history — a

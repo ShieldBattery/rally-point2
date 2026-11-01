@@ -593,3 +593,39 @@ fn a_counted_leave_stays_schedulable_after_the_last_framed_slot_departs() {
     assert!(leave.finalized);
     assert_eq!(leave.apply_at_frame, 0);
 }
+
+/// A repeat request for a departure already sealed with a count — an authority
+/// re-asking after a lost or stale-epoch answer, or the home re-finalizing an
+/// evicted slot — answers from the sealed record rather than re-reading the
+/// cursor, which could answer a second count or lift the seal under the first.
+#[test]
+fn a_repeat_finalization_answers_from_the_sealed_record() {
+    let mut maker = maker();
+    maker.set_homed_slots([SlotId(0)].into());
+    maker.latch_finalized_drops(true);
+    assert!(maker.activate_connection_epoch(SlotId(0), 1, Instant::now()));
+    maker.observe_frame(SlotId(0), GameFrameCount(40));
+    assert!(
+        maker.record_departure_for_epoch(SlotId(0), framed(40), LEAVE_REASON_DROPPED, Some(1),)
+    );
+    assert_eq!(maker.seal_for_finalize(SlotId(0), Some(1)), Ok(()));
+    assert_eq!(
+        maker.finish_finalize(SlotId(0), ForwardGateReading::Count(5)),
+        FinalizeOutcome::Finalized {
+            final_turn_count: 5
+        },
+    );
+
+    assert_eq!(
+        maker.seal_for_finalize(SlotId(0), Some(1)),
+        Err(FinalizeOutcome::Finalized {
+            final_turn_count: 5
+        }),
+        "the repeat answers with the sealed count",
+    );
+    assert!(
+        maker.finalizing_drops.contains(&SlotId(0)),
+        "the seal over a sealed count stays standing",
+    );
+    assert_eq!(maker.departures[&SlotId(0)].final_turn_count, Some(5));
+}
