@@ -865,6 +865,18 @@ targets.
   the merge below). So no measurement is ever read against a deadline that moves afterwards, and a
   stop needs no reset: windows carry on through it, and the client trusts reports on either side
   of it.
+- **Lateness as it stood.** A turn is read against its deadline as it stood when the turn arrived:
+  the stretch of any stop before its step that came after its arrival is taken back out of its
+  final deadline. A turn already on its way when the clock stopped reads the lead it was sent
+  with, rather than that lead plus a stop its sender couldn't have known of, which the client also
+  moves its schedule by (it would move by the stop twice). A turn the clock stood waiting for
+  arrived after the whole wait, so a player whose late turns stop the clock still reads every
+  moment of it. Each stop is placed where the relay's copy has the clock standing still (from its
+  step's deadline, for its pause), so this needs nothing recorded at arrival and reads the same
+  whenever the relay learned of the stop. A player homed off the authority can read up to one
+  mesh hop later than against the final deadline, never earlier: a turn reaching its relay less
+  than a hop after the turn that ends a stop (a burst) arrived while the authority's clock still
+  stood waiting for that turn.
 - **Copies, merged.** Relays share no timebase, and no relay's copy of the clock is the original.
   Every relay sends its copy's whole state over the mesh (`SessionClock`: the anchor step and age,
   the limit, and the stops, those older than any relay still measures folded into one base sum)
