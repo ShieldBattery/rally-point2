@@ -196,3 +196,22 @@ fn forward_collapse_absorbs_only_a_contiguous_run_at_the_new_lower_bound() {
     }
     assert_eq!(dedup.delivered_through(slot), Some(10));
 }
+
+/// A receipt seed carries no window bound, so it can sit beyond the window.
+/// Offered again, it is a duplicate: a collapse must not fold it into the new
+/// prefix and then report it new a second time, and strict mode must not
+/// refuse it as out of window.
+#[test]
+fn a_seeded_seq_beyond_the_window_is_a_duplicate() {
+    let slot = SlotId(0);
+    let mut collapsing = Dedup::with_window(1);
+    collapsing.forward_collapse = true;
+    collapsing.mark_delivered(slot, 7);
+    assert_eq!(collapsing.accept(slot, 7), Delivery::Duplicate);
+    assert_eq!(collapsing.accept(slot, 7), Delivery::Duplicate);
+
+    let mut strict = Dedup::with_window(1);
+    strict.mark_delivered(slot, 7);
+    assert_eq!(strict.accept(slot, 7), Delivery::Duplicate);
+    assert_eq!(strict.delivered_through(slot), None);
+}

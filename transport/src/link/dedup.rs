@@ -279,6 +279,15 @@ impl Dedup {
             return Delivery::New;
         }
 
+        // A seq already delivered out of order is a duplicate wherever it sits.
+        // Judging it against the window first would misreport a receipt seed
+        // (which carries no window bound) beyond the window: strict mode would
+        // refuse it as out of window, and a collapse could fold it into the new
+        // prefix and then re-insert it above, reporting it new a second time.
+        if state.ahead.contains(&seq) {
+            return Delivery::Duplicate;
+        }
+
         if seq - base >= self.window {
             if !self.forward_collapse {
                 return Delivery::OutOfWindow;
