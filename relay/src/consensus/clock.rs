@@ -183,14 +183,24 @@ impl SessionClock {
     /// When the turn with seq `seq` was due as the clock stood at `arrived`: its deadline (see
     /// [`due_at`](Self::due_at), whose `None`s this shares) less every part of a stop before its
     /// step that came after `arrived`. Each stop stood still from its step's deadline for its
-    /// pause; stops kept only as the base's sum all count, as if they came before. An early turn
-    /// is thereby early by the clock's running time still to pass before its deadline, and a late
-    /// one late by all the time since its deadline, since every stop before a step ends before
-    /// that step's deadline.
+    /// pause. An early turn is thereby early by the clock's running time still to pass before its
+    /// deadline, and a late one late by all the time since its deadline, since every stop before a
+    /// step ends before that step's deadline.
+    ///
+    /// Stops kept only as the base's sum have no place in time, but all of them ended before the
+    /// base step's deadline. A turn that arrived before then may have arrived ahead of some of
+    /// them, which can't be told, so it has no deadline as it stood (`None`). Only a turn measured
+    /// long after its deadline became final arrived that far ahead of its step, as when a copy
+    /// that had fallen behind catches up by a merge.
     fn due_as_it_stood(&self, seq: u64, arrived: Instant) -> Option<Instant> {
         let (anchor_seq, at) = self.anchor?;
         let after = seq.checked_sub(anchor_seq)?;
         if seq > self.final_through || seq < self.base_step {
+            return None;
+        }
+        let base_due =
+            at + self.base_pause + steps_duration(self.base_step.saturating_sub(anchor_seq));
+        if !self.base_pause.is_zero() && arrived < base_due {
             return None;
         }
         let mut stopped = self.base_pause;
@@ -206,8 +216,7 @@ impl SessionClock {
 
     /// How late the turn with seq `seq` was when it arrived at `arrived`, in microseconds
     /// (negative when early), against its deadline as it stood then (see the module docs and
-    /// [`due_as_it_stood`](Self::due_as_it_stood)), or `None` when [`due_at`](Self::due_at) has
-    /// no deadline for it.
+    /// [`due_as_it_stood`](Self::due_as_it_stood)), or `None` when there is no such deadline.
     pub(in crate::consensus) fn lateness_us(&self, seq: u64, arrived: Instant) -> Option<i64> {
         let due = self.due_as_it_stood(seq, arrived)?;
         Some(match arrived.checked_duration_since(due) {

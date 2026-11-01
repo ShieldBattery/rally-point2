@@ -415,3 +415,45 @@ fn a_slot_a_hop_away_stopping_the_clock_every_step_reads_late_and_reads_others_o
         assert_eq!((report.median_us, report.p90_us), (ahead, ahead));
     }
 }
+
+#[test]
+fn a_turn_that_arrived_before_stops_kept_only_as_a_sum_has_no_reading() {
+    let start = Instant::now();
+    let mut m = rollback(maker(), &[0, 1]);
+    play_on_schedule(&mut m, &[0, 1], 100, start);
+    let limit = 99 + STALL_SLACK_STEPS;
+    let stopped_at = on_time(start, limit);
+    // A turn arrives 100 ms ahead of its step, then the clock stands at its limit, just before
+    // that step, for twenty seconds.
+    let seq = limit + 1;
+    let arrived = on_time(start, seq) - 100 * MS;
+    let pause = Duration::from_secs(20);
+    let _ = forward(&mut m, &[0, 1], 101, stopped_at + pause).expect("stopped");
+    assert_eq!(m.clock.lateness_us(seq, arrived), Some(-100_000));
+
+    // The clock runs on until the stop is behind the steps it keeps stops for and folds into the
+    // base's sum, while the turn's step is still one it has a deadline for.
+    let mut count = 101;
+    let base_step = loop {
+        count += 1;
+        let _ = forward(&mut m, &[0, 1], count, on_time(start, count - 1) + pause);
+        let base_step = m.clock.to_frame(stopped_at + pause).unwrap().base_step;
+        if base_step > limit {
+            break base_step;
+        }
+    };
+    assert!(base_step <= seq, "the turn's step still has a deadline");
+    assert_eq!(
+        m.clock.lateness_us(seq, arrived),
+        None,
+        "it arrived before a stop that is now only part of a sum, so its reading can't be made, \
+         and reading it twenty seconds early would be wrong",
+    );
+    // A turn that arrived after every folded stop is still read exactly.
+    let newest = count - 1;
+    assert_eq!(
+        m.clock
+            .lateness_us(newest, on_time(start, newest) + pause + 5 * MS),
+        Some(5_000)
+    );
+}
