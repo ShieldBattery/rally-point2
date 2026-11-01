@@ -347,3 +347,44 @@ fn sustained_arrival_stretch_presses_the_buffer_target() {
     );
     assert_eq!(maker.buffer(), BufferSize(2));
 }
+
+/// A departed slot's late in-flight turn (a mesh datagram, unordered against
+/// the reliable `SlotDeparted` that retired it) and a local client's ack of it
+/// must not put the slot's cross-relay pair back in the delivery fold: nothing
+/// forgets it again, so survivors sharing one relay would keep paying the
+/// extra-hop cushion for the rest of the session.
+#[test]
+fn a_departed_slots_late_turn_does_not_re_enter_the_delivery_fold() {
+    use crate::consensus::delivery::DeliveryHome;
+    let k = key();
+    let registry = new_decision_makers();
+    let _ = sync_default(&registry, &k, bounds(0, 20), Authority::SelfRelay);
+    let peer = DeliveryHome::Peer(RelayId(2));
+    for seq in 1..=10 {
+        let frame = GameFrameCount(seq as u32);
+        registry.observe_turn_frame(&k, SlotId(0), seq, frame, DeliveryHome::Local);
+        registry.observe_turn_frame(&k, SlotId(2), seq, frame, DeliveryHome::Local);
+        registry.observe_turn_frame(&k, SlotId(1), seq, frame, peer);
+    }
+    registry.observe_delivery(&k, SlotId(0), SlotId(2), 10, DeliveryHome::Local);
+    registry.observe_delivery(&k, SlotId(2), SlotId(0), 10, DeliveryHome::Local);
+    registry.observe_delivery(&k, SlotId(0), SlotId(1), 10, DeliveryHome::Local);
+    let cushion = |registry: &DecisionMakers| registry.lock()[&k].delivery.cushion_turns();
+    assert_eq!(
+        cushion(&registry),
+        1,
+        "slot 1 is a cross-relay pair while it plays"
+    );
+
+    registry.record_departure(&k, SlotId(1), framed(10), LEAVE_REASON_DROPPED);
+    assert_eq!(cushion(&registry), 0, "the survivors share a relay");
+
+    registry.observe_turn_frame(&k, SlotId(1), 11, GameFrameCount(11), peer);
+    registry.observe_delivery(&k, SlotId(0), SlotId(1), 11, DeliveryHome::Local);
+    registry.observe_delivery(&k, SlotId(1), SlotId(0), 10, peer);
+    assert_eq!(
+        cushion(&registry),
+        0,
+        "a departed slot's straggler must not restore the cross-relay cushion",
+    );
+}

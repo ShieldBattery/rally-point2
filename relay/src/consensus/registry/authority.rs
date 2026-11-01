@@ -351,8 +351,14 @@ impl DecisionMakers {
             // delivery tracking: the newest seq this relay has seen from `slot`,
             // and — because turns are never re-forwarded relay-to-relay — the
             // source it arrived by is the slot's home relay, which is what hop
-            // inference keys on.
-            maker.delivery_mut().observe_origin(slot, seq, home);
+            // inference keys on. A departed slot's straggler — a mesh datagram
+            // is unordered against the reliable departure that retired it — is
+            // left out, as the frame above is: re-recording it would put the
+            // gone slot's pairs (and their hop cushion) back in the fold, where
+            // no later departure frame forgets them.
+            if !maker.has_departure(slot) {
+                maker.delivery_mut().observe_origin(slot, seq, home);
+            }
             regression
         };
         // Reported outside the maker lock: the recorder takes its own per-session
@@ -397,7 +403,12 @@ impl DecisionMakers {
         delivered_seq: u64,
         home: crate::consensus::delivery::DeliveryHome,
     ) {
-        if let Some(maker) = self.lock().get_mut(key) {
+        // A cursor naming a departed slot at either end describes a pair the
+        // departure already forgot; folding it would recreate frozen state.
+        if let Some(maker) = self.lock().get_mut(key)
+            && !maker.has_departure(dest)
+            && !maker.has_departure(origin)
+        {
             maker
                 .delivery_mut()
                 .observe_delivery(dest, origin, delivered_seq, home);
