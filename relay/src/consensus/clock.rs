@@ -104,17 +104,17 @@ impl CopiedStops {
         }
     }
 
-    /// The stopped time this copy knows of before `step`: none before its base, where it only
-    /// knows a sum.
-    fn pause_before(&self, step: u64) -> Duration {
-        if step < self.base_step {
+    /// The stopped time this copy knows of at or before `step`, which moves the step after it:
+    /// none before the step before its base, where it only knows a sum.
+    fn pause_through(&self, step: u64) -> Duration {
+        if step.saturating_add(1) < self.base_step {
             return Duration::ZERO;
         }
         self.base_pause
             + self
                 .stops
                 .iter()
-                .take_while(|stop| stop.step < step)
+                .take_while(|stop| stop.step <= step)
                 .map(|stop| stop.pause)
                 .sum::<Duration>()
     }
@@ -212,6 +212,19 @@ impl SessionClock {
             stopped += stop.pause;
         }
         Some(at + (stopped - came_after) + steps_duration(after))
+    }
+
+    /// The stopped time at or before step `step`: what moves the step after it. Unlike
+    /// `pause_before(step + 1)` it has a value at the last step a `u64` holds, which a peer's copy
+    /// can carry as its limit.
+    fn pause_through(&self, step: u64) -> Duration {
+        self.base_pause
+            + self
+                .stops
+                .iter()
+                .filter(|stop| stop.step <= step)
+                .map(|stop| stop.pause)
+                .sum::<Duration>()
     }
 
     /// How late the turn with seq `seq` was when it arrived at `arrived`, in microseconds
@@ -397,9 +410,7 @@ impl SessionClock {
             .collect();
         let mut before = self.pause_before(frontier);
         for step in steps {
-            let after = self
-                .pause_before(step + 1)
-                .max(theirs.pause_before(step + 1));
+            let after = self.pause_through(step).max(theirs.pause_through(step));
             if after > before {
                 merged.push_back(Stop {
                     step,

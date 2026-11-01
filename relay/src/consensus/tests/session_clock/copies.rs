@@ -494,3 +494,29 @@ fn a_stop_taken_in_at_the_limit_reaches_every_relay_that_merges_the_copy() {
     let _ = third.merge_session_clock(&copy, on_time(start, 99), 0);
     assert_eq!(third.clock.pause(), 10_210 * MS);
 }
+
+#[test]
+fn a_copy_whose_limit_is_the_last_step_merges_without_overflowing() {
+    let start = Instant::now();
+    let copy = |final_through, stops| SessionClockFrame {
+        anchor_step: ANCHOR,
+        since_anchor_us: 0,
+        final_through,
+        base_step: 0,
+        base_pause_us: 0,
+        stops,
+    };
+    let mut clock = SessionClock::default();
+    assert!(clock.merge(&copy(u64::MAX, Vec::new()), start, 0));
+    // Another copy knows of a stop before the limit: it is taken in at the limit, which no step
+    // lies past, so every deadline stays where it was.
+    let stop = ClockStop {
+        step: 100,
+        pause_us: 1_000,
+    };
+    assert!(clock.merge(&copy(101, vec![stop]), start, 0));
+    assert_eq!(clock.final_through(), Some(u64::MAX));
+    assert_eq!(clock.pause(), MS);
+    assert_eq!(clock.pause_before(u64::MAX), Duration::ZERO);
+    assert!(!clock.merge(&copy(u64::MAX, Vec::new()), start, 0));
+}
