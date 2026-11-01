@@ -34,10 +34,20 @@ struct Bucket {
     last_refill: Instant,
 }
 
+/// The buckets plus the newest instant any check has presented.
+struct State<K> {
+    buckets: HashMap<K, Bucket>,
+    /// `check` reads the clock before taking the lock, so concurrent callers
+    /// arrive with out-of-order instants. Every check runs at the newest instant
+    /// seen so far: anchoring a refill or a fresh bucket at an older one would
+    /// credit the span between the two a second time.
+    clock: Option<Instant>,
+}
+
 /// A keyed token-bucket rate limiter. Clone it cheaply (the state is behind one
 /// `Arc`) to hand a copy to a router state or a lifecycle that prunes it.
 pub struct KeyedTokenBuckets<K> {
-    buckets: Arc<Mutex<HashMap<K, Bucket>>>,
+    state: Arc<Mutex<State<K>>>,
     burst: u32,
     refill_interval: Duration,
     /// Hard cap on live bucket count. When an insert would exceed it, the stalest
@@ -48,7 +58,7 @@ pub struct KeyedTokenBuckets<K> {
 impl<K> Clone for KeyedTokenBuckets<K> {
     fn clone(&self) -> Self {
         Self {
-            buckets: Arc::clone(&self.buckets),
+            state: Arc::clone(&self.state),
             burst: self.burst,
             refill_interval: self.refill_interval,
             bucket_cap: self.bucket_cap,
@@ -61,7 +71,10 @@ impl<K: Eq + Hash + Clone> KeyedTokenBuckets<K> {
     /// one token per `refill_interval`, holding at most `bucket_cap` live buckets.
     pub fn new(burst: u32, refill_interval: Duration, bucket_cap: usize) -> Self {
         Self {
-            buckets: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(State {
+                buckets: HashMap::new(),
+                clock: None,
+            })),
             burst,
             refill_interval,
             bucket_cap: bucket_cap.max(1),
@@ -74,7 +87,10 @@ impl<K: Eq + Hash + Clone> KeyedTokenBuckets<K> {
     pub fn check_at(&self, key: &K, now: Instant) -> bool {
         let refill_per_sec = 1.0 / self.refill_interval.as_secs_f64();
         let burst = f64::from(self.burst);
-        let mut buckets = self.buckets.lock();
+        let mut state = self.state.lock();
+        let now = state.clock.map_or(now, |clock| clock.max(now));
+        state.clock = Some(now);
+        let buckets = &mut state.buckets;
         // Prune idle buckets: one untouched long enough to have refilled from empty
         // all the way back to its full burst says exactly what a never-seen key
         // says, so dropping it loses no state and keeps the map bounded by the keys
@@ -124,14 +140,14 @@ impl<K: Eq + Hash + Clone> KeyedTokenBuckets<K> {
     /// Drops every bucket whose key `predicate` accepts — how a caller retires the
     /// buckets of something that no longer exists.
     pub fn retain_not(&self, predicate: impl Fn(&K) -> bool) {
-        self.buckets.lock().retain(|key, _| !predicate(key));
+        self.state.lock().buckets.retain(|key, _| !predicate(key));
     }
 
     /// The number of live buckets — the hook the tests assert the map's bounds
     /// with, and nothing else reads.
     #[cfg(test)]
     pub(crate) fn bucket_count(&self) -> usize {
-        self.buckets.lock().len()
+        self.state.lock().buckets.len()
     }
 }
 

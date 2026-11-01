@@ -53,6 +53,47 @@ fn refill_is_capped_at_the_burst() {
 }
 
 #[test]
+fn an_earlier_instant_does_not_re_credit_elapsed_time() {
+    // `check` reads `Instant::now()` before taking the lock, so a caller that
+    // lost the race arrives with an instant older than the bucket's anchor.
+    // Re-anchoring there would credit the gap between the two instants again.
+    let buckets = limiter(1, Duration::from_secs(1));
+    let t0 = Instant::now() + Duration::from_secs(10);
+    assert!(buckets.check_at(&1, t0));
+    assert!(
+        !buckets.check_at(&1, t0 - Duration::from_millis(900)),
+        "the late caller finds the token spent",
+    );
+    assert!(
+        !buckets.check_at(&1, t0 + Duration::from_millis(500)),
+        "half an interval past the newest check is not a whole token",
+    );
+    assert!(buckets.check_at(&1, t0 + Duration::from_secs(1)));
+}
+
+#[test]
+fn a_bucket_created_at_an_earlier_instant_is_not_idle_evicted_early() {
+    // A fresh bucket stamped at a late caller's older instant would look idle
+    // that much sooner, and its eviction re-grants a full burst early.
+    let buckets = limiter(2, Duration::from_secs(1));
+    let t0 = Instant::now() + Duration::from_secs(10);
+    assert!(buckets.check_at(&0, t0));
+    // Key 1 first appears with an instant 2.5 s older than the newest check,
+    // and spends its burst.
+    let late = t0 - Duration::from_millis(2_500);
+    assert!(buckets.check_at(&1, late));
+    assert!(buckets.check_at(&1, late));
+    // Half a second after the newest check, key 1 has refilled half a token.
+    // Anchored at `late` it would read 3 s idle -- the (burst + 1) interval
+    // eviction threshold -- and come back with a fresh burst.
+    let t1 = t0 + Duration::from_millis(500);
+    assert!(
+        !buckets.check_at(&1, t1),
+        "a spent bucket is not evicted half an interval after it was spent",
+    );
+}
+
+#[test]
 fn idle_buckets_evict_on_access() {
     // The map must stay bounded by the keys actually in use: a bucket idle long
     // enough to have fully refilled is pruned on the next access.
