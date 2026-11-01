@@ -377,7 +377,8 @@ impl StateHashTracker {
             .filter(|slot| !self.excluded.contains(slot))
             .count()
             .saturating_sub(missing.len());
-        let majority = if agreed {
+        // No report at all agrees with nothing: the slots yet to report decide it.
+        let majority = if agreed && !reports.is_empty() {
             majority_of(reports.len())
         } else if let Some(majority) = majority_of(voters) {
             // No report still to come can outvote it.

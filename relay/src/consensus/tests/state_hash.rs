@@ -281,6 +281,33 @@ fn nobody_reporting_names_nobody() {
 }
 
 #[test]
+fn a_missing_report_with_none_in_yet_waits_for_the_rest() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2]);
+    forward(&mut m, &[0, 1, 2], STATE_HASH_INTERVAL, start);
+    // Slot 0 goes on sending turns without its report; 1 and 2 lag and haven't reported yet.
+    forward(&mut m, &[0], 8 + STATE_HASH_LIVE_TURNS, start);
+    assert!(
+        m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty(),
+        "slots 1 and 2 may yet report, so there is no telling there is no majority",
+    );
+    let later = start + STATE_HASH_DEADLINE + Duration::from_secs(1);
+    assert_eq!(
+        m.observe_state_hash(SlotId(1), 8, A, later),
+        vec![SyncDivergence {
+            sync_ordinal: 8,
+            game_frame: None,
+            no_majority: false,
+            diverged: Vec::new(),
+            missing: vec![SlotId(0)],
+        }],
+        "only the slot that withheld its report is named",
+    );
+    assert!(m.observe_state_hash(SlotId(2), 8, A, later).is_empty());
+    assert!(!m.hashes.dormant);
+}
+
+#[test]
 fn reports_wait_until_the_step_is_confirmable_here() {
     let start = Instant::now();
     let mut m = rollback_maker(&[0, 1]);
