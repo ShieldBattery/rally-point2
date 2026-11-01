@@ -293,6 +293,26 @@ fn a_slot_that_goes_on_playing_without_its_report_after_its_step_was_decided_is_
 }
 
 #[test]
+fn a_full_window_keeps_the_step_awaiting_its_verdict() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2]);
+    forward(&mut m, &[0, 1, 2], STATE_HASH_INTERVAL, start);
+    // Fill the window past capacity with steps beyond what is confirmable before step 8's
+    // remaining reports arrive.
+    let horizon = STATE_HASH_INTERVAL * (1 + STATE_HASH_WINDOW as u64);
+    for step in (2 * STATE_HASH_INTERVAL..=horizon).step_by(STATE_HASH_INTERVAL as usize) {
+        assert!(m.observe_state_hash(SlotId(2), step, B, start).is_empty());
+    }
+    m.observe_state_hash(SlotId(0), 8, A, start);
+    m.observe_state_hash(SlotId(1), 8, A, start);
+    assert_eq!(
+        m.observe_state_hash(SlotId(2), 8, B, start),
+        diverged_at_8(2),
+        "step 8 is still judged",
+    );
+}
+
+#[test]
 fn a_slot_whose_turns_stopped_is_left_to_the_leave_machinery() {
     let start = Instant::now();
     let mut m = rollback_maker(&[0, 1]);

@@ -54,9 +54,10 @@ pub(in crate::consensus) const STATE_HASH_DEADLINE: Duration = Duration::from_se
 /// report it. Still short of what a slot sends before [`STATE_HASH_DEADLINE`].
 pub(in crate::consensus) const STATE_HASH_LIVE_TURNS: u64 = 96;
 
-/// The most report steps held in flight before the oldest is dropped unjudged. The deadline
-/// resolves every step long before this in a live session; the bound only matters for one whose
-/// turns stopped, where steps can go on being reported without ever becoming confirmable.
+/// The most report steps held in flight before one is dropped unjudged: the newest not yet
+/// confirmable, else the oldest. The deadline resolves every step long before this in a live
+/// session; the bound only matters for one whose turns stopped, where steps can go on being
+/// reported without ever becoming confirmable.
 pub(in crate::consensus) const STATE_HASH_WINDOW: usize = 64;
 
 /// One step's reports, when the newest arrived, and when it became confirmable.
@@ -504,13 +505,25 @@ impl StateHashTracker {
         *from = (*from).min(step);
     }
 
-    /// Drops the oldest steps while more than [`STATE_HASH_WINDOW`] are in flight.
+    /// Drops steps while more than [`STATE_HASH_WINDOW`] are in flight: the newest one that isn't
+    /// confirmable yet if there is one, else the oldest. A step past what is confirmable can't be
+    /// judged yet anyway, so it goes before a step whose turns are all here and whose verdict is
+    /// still to come.
     fn evict_over_window(&mut self, key: &SessionKey) {
         while self.pending.len() > STATE_HASH_WINDOW {
-            let Some((step, _)) = self.pending.pop_first() else {
-                return;
+            let step = match self.pending.last_key_value() {
+                Some((&step, _)) if step > self.confirmable_until => {
+                    self.pending.remove(&step);
+                    step
+                }
+                _ => {
+                    let Some((step, _)) = self.pending.pop_first() else {
+                        return;
+                    };
+                    self.retired_below = self.retired_below.max(step + 1);
+                    step
+                }
             };
-            self.retired_below = self.retired_below.max(step + 1);
             if self.evict_warns.observe() {
                 tracing::warn!(
                     tenant = key.tenant.as_ref(),
