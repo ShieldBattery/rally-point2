@@ -19,6 +19,7 @@ impl DecisionMaker {
         if self.departures.contains_key(&slot) {
             return;
         }
+        self.framed_turn_seen = true;
         let state = self.slots.entry(slot).or_default();
         if state.frame.is_none_or(|current| frame > current) {
             state.frame = Some(frame);
@@ -60,6 +61,7 @@ impl DecisionMaker {
         if self.departures.contains_key(&slot) {
             return None;
         }
+        self.framed_turn_seen = true;
         // Only the window back to `frontier − buffer_max` is ever consulted; keep
         // a little more than the buffer depth so the fastest survivor's history
         // still reaches the threshold turn even under a bit of reordering.

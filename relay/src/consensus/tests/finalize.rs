@@ -555,3 +555,41 @@ fn only_a_counted_leave_commits_before_any_framed_turn() {
     assert_eq!(leave.final_turn_count, Some(4));
     assert_eq!(leave.apply_at_frame, 0);
 }
+
+/// The drop-hold release reads `counted_leave_schedulable` as a check-then-act,
+/// so it must never revert: the live session frame does, the moment the last
+/// framed slot departs, and the counted leave a finalization sealed would then
+/// fail to commit after its hold was released.
+#[test]
+fn a_counted_leave_stays_schedulable_after_the_last_framed_slot_departs() {
+    let mut maker = maker();
+    maker.set_homed_slots([SlotId(0)].into());
+    maker.latch_finalized_drops(true);
+    assert!(maker.activate_connection_epoch(SlotId(0), 1, Instant::now()));
+    maker.observe_frame(SlotId(1), GameFrameCount(40));
+    assert!(maker.record_departure_for_epoch(
+        SlotId(0),
+        DepartureStamps::default(),
+        LEAVE_REASON_DROPPED,
+        Some(1),
+    ));
+    assert_eq!(maker.seal_for_finalize(SlotId(0), Some(1)), Ok(()));
+    assert_eq!(
+        maker.finish_finalize(SlotId(0), ForwardGateReading::Count(5)),
+        FinalizeOutcome::Finalized {
+            final_turn_count: 5
+        },
+    );
+    assert!(maker.counted_leave_schedulable(SlotId(0)));
+
+    // The only framed slot departs before any game-loop report reached here.
+    maker.record_departure(SlotId(1), framed(40), LEAVE_REASON_DROPPED);
+
+    assert!(maker.counted_leave_schedulable(SlotId(0)));
+    let leave = maker
+        .decide_leave(SlotId(0), LEAVE_REASON_DROPPED)
+        .expect("the sealed count still commits");
+    assert_eq!(leave.final_turn_count, Some(5));
+    assert!(leave.finalized);
+    assert_eq!(leave.apply_at_frame, 0);
+}

@@ -218,11 +218,16 @@ impl DecisionMaker {
                 _ => base,
             }
             .saturating_add(1),
-            // No framed turn anywhere, but a game loop is running: survivors
-            // are stalled in the game's first steps, before any turn they
-            // send carries a frame. A counted leave needs no frame — clients
+            // No framed turn live anywhere, but a game loop is running —
+            // survivors stalled in the game's first steps, before any turn
+            // they send carries a frame — or a framed turn was seen and its
+            // slot has since gone. A counted leave needs no frame — clients
             // apply it by consumption — so it commits, at the earliest frame.
-            None if final_turn_count.is_some() && self.game_underway() => 0,
+            None if final_turn_count.is_some()
+                && (self.game_underway() || self.framed_turn_seen) =>
+            {
+                0
+            }
             // No game loop running (lobby / loading), or no count to apply by:
             // nothing to schedule against, so hold.
             None => return None,
@@ -251,19 +256,21 @@ impl DecisionMaker {
 
     /// Whether a leave for `slot` that carries an exact final turn count — a
     /// finalized drop's, the only kind the callers decide — would actually
-    /// commit if decided right now: a framed scheduling basis exists (a session
-    /// frame, or a last frame on the slot's own departure record), or the game
-    /// is underway, which are the short-circuits
-    /// [`commit_leave`](Self::commit_leave) applies to a counted leave.
+    /// commit if decided right now: a framed turn was ever observed here (a
+    /// session frame now, or one since gone with its slot), the slot's own
+    /// departure record carries a last frame, or the game is underway, which
+    /// are the short-circuits [`commit_leave`](Self::commit_leave) applies to a
+    /// counted leave.
     ///
     /// Read before releasing a drop hold whose decide must not silently fail: a
     /// released hold with no committed leave strands the departure with nothing
-    /// left to retry against. Monotone-safe as a check-then-act — frames only
-    /// accumulate and a started game loop is never forgotten, so a `true` here
-    /// never becomes `false` by decide time.
+    /// left to retry against. Monotone-safe as a check-then-act — every leg is a
+    /// one-way latch or a record the decide reads, so a `true` here never
+    /// becomes `false` by decide time. (The live session frame alone is not:
+    /// it vanishes when the last framed slot departs.)
     pub(in crate::consensus) fn counted_leave_schedulable(&self, slot: SlotId) -> bool {
         self.game_underway()
-            || self.session_frame().is_some()
+            || self.framed_turn_seen
             || self
                 .departures
                 .get(&slot)

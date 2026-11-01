@@ -507,6 +507,12 @@ pub struct DecisionMaker {
     /// nothing look like it stopped later than it did. `None` until the session
     /// starts, which holds both gates shut.
     pub(in crate::consensus) started_at: Option<Instant>,
+    /// Whether this relay has ever observed a framed turn for the session. A
+    /// one-way latch: the session frame is a minimum over *live* slots, so it
+    /// vanishes when the last framed slot departs or is torn down, but a counted
+    /// leave's scheduling basis must not — the drop-hold release reads it as a
+    /// check-then-act (see `counted_leave_schedulable`).
+    pub(in crate::consensus) framed_turn_seen: bool,
 }
 
 impl DecisionMaker {
@@ -601,6 +607,7 @@ impl DecisionMaker {
             region_labels: Vec::new(),
             region_labels_released: false,
             started_at: None,
+            framed_turn_seen: false,
         }
     }
 
