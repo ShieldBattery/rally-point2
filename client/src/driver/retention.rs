@@ -187,18 +187,33 @@ pub(super) fn rehome_own_slot_anchor(
 /// seeding exactly as a nonzero anchor does. "0 is the window's default base
 /// anyway" must never optimize the cursor away: it would leave the seeding
 /// unrequested and wedge the resumed window's prefix on the first acked hole.
+///
+/// `floor` is the lowest anchor this relay may be handed: 0 on the session's
+/// original home, and on a relay this client re-homed to, the anchor that
+/// re-home presented. The seeding above only closes holes the *dialed* relay
+/// acknowledged; a replacement holds no receipts for seqs the dead relay
+/// acked, and the unacked window can still hold seqs below such a hole (the
+/// re-home anchor stopped above them, so they were replayed only to be
+/// discarded as below its base). A drop before the replacement acks those
+/// replays leaves them unacked, and anchoring a same-relay resume at them
+/// would base the window below a hole no source will ever re-send — a void
+/// the prefix never passes, until the live stream runs a whole receive window
+/// past it and the relay closes the link as out of window. Never anchoring
+/// below the re-home anchor keeps the promise that re-home already made.
 pub(super) fn same_relay_resume_cursors(
     peer_cursors: &[(SlotId, u64)],
     oldest_replayable: Option<u64>,
     oldest_restaged_oversize: Option<u64>,
     own_slot: SlotId,
     next_outbound_seq: u64,
+    floor: u64,
 ) -> Vec<(SlotId, u64)> {
     let anchor = match (oldest_replayable, oldest_restaged_oversize) {
         (Some(datagram), Some(oversize)) => datagram.min(oversize),
         (Some(only), None) | (None, Some(only)) => only,
         (None, None) => next_outbound_seq,
-    };
+    }
+    .max(floor);
     let mut cursors = peer_cursors.to_vec();
     cursors.push((own_slot, anchor));
     cursors

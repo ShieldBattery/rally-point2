@@ -168,6 +168,12 @@ pub(super) struct ReconnectTarget {
     /// [`Reconnect::relay_id`] and updated only on a successful re-home dial (never a
     /// failed one), so it always names the relay the driver is actually homed on.
     pub(super) relay_id: u64,
+    /// The lowest own-slot anchor a same-relay resume to this relay may
+    /// present (see [`same_relay_resume_cursors`]): 0 for the session's
+    /// original home, whose receipts span the slot's whole stream, and the
+    /// anchor the re-home dial presented for a replacement, which holds no
+    /// receipts for anything the dead relay acknowledged below it.
+    pub(super) own_anchor_floor: u64,
 }
 
 impl ReconnectTarget {
@@ -189,6 +195,7 @@ impl ReconnectTarget {
             addrs,
             server_name,
             relay_id,
+            own_anchor_floor: 0,
         }
     }
 
@@ -345,6 +352,7 @@ pub(super) async fn reconnect_link(
             state.retention.oldest_oversize_seq(),
             own_slot,
             state.next_outbound_seq,
+            rc.target.own_anchor_floor,
         );
         let addr = rc.target.current_addr();
         match rc
@@ -483,11 +491,12 @@ pub(super) async fn reconnect_link(
                                     // needed (the window bases at 0, correct for a slot that
                                     // never sent).
                                     let mut rehome_cursors = cursors.clone();
-                                    if let Some(anchor) = rehome_own_slot_anchor(
+                                    let rehome_anchor = rehome_own_slot_anchor(
                                         link,
                                         own_slot,
                                         state.retention.front_seq(),
-                                    ) {
+                                    );
+                                    if let Some(anchor) = rehome_anchor {
                                         rehome_cursors.push((own_slot, anchor));
                                     }
                                     let mut new_target = ReconnectTarget::new(
@@ -498,6 +507,9 @@ pub(super) async fn reconnect_link(
                                         server_name,
                                         relay_id,
                                     );
+                                    // Later same-relay resumes to the replacement
+                                    // never anchor below what this dial promised it.
+                                    new_target.own_anchor_floor = rehome_anchor.unwrap_or(0);
                                     match dial_each_address(
                                         &mut new_target,
                                         &rc.identity,

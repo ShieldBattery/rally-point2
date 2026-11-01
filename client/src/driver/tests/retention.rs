@@ -284,6 +284,7 @@ async fn same_relay_resume_anchors_at_the_oldest_in_flight_seq_for_a_nonzero_slo
         state.retention.oldest_oversize_seq(),
         own_slot,
         state.next_outbound_seq,
+        0,
     );
 
     assert_eq!(
@@ -321,18 +322,60 @@ fn same_relay_cursor_anchors_below_a_restaged_oversize_turn() {
 
     let own_slot = SlotId(1);
     assert_eq!(
-        same_relay_resume_cursors(&[], None, oversize, own_slot, 2),
+        same_relay_resume_cursors(&[], None, oversize, own_slot, 2, 0),
         vec![(own_slot, 0)],
         "with no datagram replay, the restaged oversize turn is the anchor",
     );
     // With both sources, the anchor is the older of the two.
     assert_eq!(
-        same_relay_resume_cursors(&[], Some(5), Some(3), own_slot, 9),
+        same_relay_resume_cursors(&[], Some(5), Some(3), own_slot, 9, 0),
         vec![(own_slot, 3)],
     );
     assert_eq!(
-        same_relay_resume_cursors(&[], Some(2), Some(7), own_slot, 9),
+        same_relay_resume_cursors(&[], Some(2), Some(7), own_slot, 9, 0),
         vec![(own_slot, 2)],
+    );
+}
+
+#[tokio::test]
+async fn a_same_relay_resume_after_a_re_home_never_anchors_below_the_re_home_anchor() {
+    // The shape a re-home leaves behind: the dead relay acked 6..=87, but the
+    // acks for 5 never came back, so the unacked window holds 5 below that
+    // hole plus the retained ring 88..=99 the re-home re-injected. The re-home
+    // anchor descends from the retention front only through contiguous
+    // unacked seqs, so it promises the replacement 88 onward and 5 is replayed
+    // only to be discarded below its base.
+    let (mut link, _peer, _ea, _eb) = connected_links().await;
+    let own_slot = SlotId(0);
+    link.reinject_unacked(turn(5, &[0x05]));
+    for seq in 88..100u64 {
+        link.reinject_unacked(turn(seq, &[0x42]));
+    }
+    let rehome_anchor = rehome_own_slot_anchor(&link, own_slot, Some(88));
+    assert_eq!(rehome_anchor, Some(88));
+
+    // The fresh connection dies before the replacement acks anything, and the
+    // driver resumes against the replacement same-relay. The replacement's
+    // receipts start at 88; anchoring at the oldest unacked seq (5) would base
+    // its window under 6..=87, which nothing will ever send it again: a void
+    // the window's prefix never passes.
+    let cursors = same_relay_resume_cursors(
+        &[],
+        link.oldest_replayable_seq(own_slot),
+        None,
+        own_slot,
+        100,
+        rehome_anchor.unwrap(),
+    );
+    assert_eq!(
+        cursors,
+        vec![(own_slot, 88)],
+        "a same-relay resume to a replacement keeps the re-home's anchor as its floor",
+    );
+    // The floor only ever raises: an anchor above it is untouched.
+    assert_eq!(
+        same_relay_resume_cursors(&[], Some(95), None, own_slot, 100, 88),
+        vec![(own_slot, 95)],
     );
 }
 
