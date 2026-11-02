@@ -1,7 +1,8 @@
 //! Shared fixtures for the phase-controller tests, split by topic:
 //! [`alignment`] (correction mechanics, the command fence, cluster/dwell
-//! bookkeeping) and [`health_and_stretch`] (the health gate, the give-up
-//! latch, and the buffer-pressure stretch term).
+//! bookkeeping), [`carried_delay`] (the delay slots carry across rounds), and
+//! [`health_and_stretch`] (the health gate, the give-up latch, and the
+//! buffer-pressure stretch term).
 
 use super::*;
 
@@ -119,4 +120,5 @@ pub(super) fn run_to_convergence(
 }
 
 mod alignment;
+mod carried_delay;
 mod health_and_stretch;

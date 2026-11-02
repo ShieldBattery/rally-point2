@@ -48,7 +48,9 @@
 //!   delay-*reducing* direction when the floor allows and it is shorter), so a
 //!   large misalignment converges over several gated rounds instead of one
 //!   long slew that drifts arrivals across every consumer's poll boundary for
-//!   many seconds.
+//!   many seconds. A slot partway through such a walk is never the target:
+//!   its phase sits wherever the last capped step left it, and letting it
+//!   pull everyone else there would abandon the walk halfway.
 //! - **A give-up latch.** If repeated correcting rounds never measure the
 //!   population inside the dead-band, the phases are not quasi-static (the
 //!   plant is moving for reasons alignment cannot fix) and the controller
@@ -226,6 +228,13 @@ pub struct PhaseController {
     /// it deliberately survives dead-band crossings and link teardowns, so
     /// neither span jitter nor reconnect cycles can re-open it unearned.
     awaiting_ack: HashSet<SlotId>,
+    /// Slots whose newest command was capped short of the delay that round
+    /// wanted for them: partway through a walk spanning several rounds. Their
+    /// measured phase is a waypoint, not a place anyone should align to, so
+    /// they are left out of choosing the target (they still count toward the
+    /// span). Cleared per slot by an uncapped command, and wholesale once the
+    /// population measures inside the dead-band.
+    walking: HashSet<SlotId>,
     /// The next instant `evaluate` will actually evaluate. Holds the
     /// first-evaluation delay, the idle cadence, and — after corrections — the
     /// slew-plus-settle dwell that keeps each iteration from measuring the
@@ -270,6 +279,7 @@ impl PhaseController {
             slots: HashMap::new(),
             commanded_us: HashMap::new(),
             awaiting_ack: HashSet::new(),
+            walking: HashSet::new(),
             next_eval_at: None,
             unconverged_rounds: 0,
             disabled: false,
@@ -423,26 +433,7 @@ impl PhaseController {
         // ever hold a turn back, no client is ever asked to send earlier than
         // its game produced the data.
         phases.sort_by_key(|&(_, phase)| phase);
-        let count = phases.len();
-        let mut widest_gap = 0i64;
-        let mut cluster_end = 0usize; // index of the cluster's latest phase
-        for i in 0..count {
-            // The last phase's gap wraps to the first one a cycle later.
-            // Taken as a plain difference rather than reduced modulo the
-            // cycle: when every phase coincides that wrap gap is the whole
-            // cycle (span zero), where a modulo would fold it to zero and
-            // read a perfectly aligned population as a full turn apart.
-            let this = phases[i].1;
-            let next = match phases.get(i + 1) {
-                Some(&(_, next)) => next,
-                None => phases[0].1 + self.turn_us,
-            };
-            let gap = next - this;
-            if gap > widest_gap {
-                widest_gap = gap;
-                cluster_end = i;
-            }
-        }
+        let (cluster_end, widest_gap) = find_widest_gap(&phases, self.turn_us);
         let span = self.turn_us - widest_gap;
         self.last_span_us = Some(span);
         if span <= SPAN_DEAD_BAND_US {
@@ -456,6 +447,7 @@ impl PhaseController {
             // still-fenced slot in a converged population simply never
             // mattered.
             self.unconverged_rounds = 0;
+            self.walking.clear();
             self.next_eval_at = Some(now + IDLE_REEVAL);
             return Vec::new();
         }
@@ -478,7 +470,21 @@ impl PhaseController {
             return Vec::new();
         }
 
-        let target = phases[cluster_end].1;
+        // The target is the cluster's latest phase among the slots not
+        // partway through a capped walk. A walker's phase is only where its
+        // last step left it; were it to become the target as it sweeps the
+        // cycle, every settled slot would be walked toward that waypoint and
+        // the population would chase a moving point round after round.
+        let settled: Vec<(SlotId, i64)> = phases
+            .iter()
+            .copied()
+            .filter(|(slot, _)| !self.walking.contains(slot))
+            .collect();
+        let target = if settled.is_empty() {
+            phases[cluster_end].1
+        } else {
+            settled[find_widest_gap(&settled, self.turn_us).0].1
+        };
         let mut corrections = Vec::new();
         let mut widest_change = 0i64;
         for &(slot, phase) in &phases {
@@ -522,6 +528,11 @@ impl PhaseController {
             } else {
                 forward
             };
+            if change.abs() > SLOT_MAX_CHANGE_US {
+                self.walking.insert(slot);
+            } else {
+                self.walking.remove(&slot);
+            }
             let change = change.clamp(-SLOT_MAX_CHANGE_US, SLOT_MAX_CHANGE_US);
             let next = (current + change).clamp(0, self.turn_us - 1);
             let change = next - current;
@@ -696,6 +707,30 @@ impl PhaseController {
     pub fn last_span_us(&self) -> Option<i64> {
         self.last_span_us
     }
+}
+
+/// Finds the widest gap between circular neighbors of `sorted` (phases in
+/// ascending order on a `turn_us` cycle), returning the index of the phase
+/// that opens it — the latest phase of the tightest cluster — and its width.
+fn find_widest_gap(sorted: &[(SlotId, i64)], turn_us: i64) -> (usize, i64) {
+    let mut widest = 0i64;
+    let mut end = 0usize;
+    for (i, &(_, this)) in sorted.iter().enumerate() {
+        // The last phase's gap wraps to the first one a cycle later. Taken as
+        // a plain difference rather than reduced modulo the cycle: when every
+        // phase coincides that wrap gap is the whole cycle (span zero), where
+        // a modulo would fold it to zero and read a perfectly aligned
+        // population as a full turn apart.
+        let next = match sorted.get(i + 1) {
+            Some(&(_, next)) => next,
+            None => sorted[0].1 + turn_us,
+        };
+        if next - this > widest {
+            widest = next - this;
+            end = i;
+        }
+    }
+    (end, widest)
 }
 
 #[cfg(test)]
