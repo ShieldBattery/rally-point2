@@ -307,3 +307,85 @@ async fn a_fresh_webhook_re_arms_the_idle_reap() {
     .await
     .expect("the state is reaped once the idle grace elapses with no new webhook");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_reaped_slot_that_re_homes_takes_its_pending_close_along() {
+    // Relay 1 homes both slots; relay 2 is idle.
+    let (setup, _) = fleet(&[(1, 14900, None, false), (2, 14901, None, false)]);
+    let lc = Lifecycle::with_tunables(
+        setup.clone(),
+        LifecycleTunables {
+            holdout_grace: SHORT,
+            ..Default::default()
+        },
+    );
+    let tenant = crate::test_support::tid();
+    let session = crate::session::create_or_provision_session_with_commit(
+        &setup,
+        request(two_players()),
+        rally_point_proto::token::ExpiresAt(u64::MAX),
+        |session, serving: &[RelayId]| {
+            lc.register_session(
+                tenant.clone(),
+                session,
+                serving.to_vec(),
+                HashSet::from([SlotId(0), SlotId(1)]),
+                HashSet::new(),
+            );
+        },
+    );
+    let Ok(crate::session::CreateOutcome::Created(created)) = session else {
+        panic!("the session is created");
+    };
+    let s = created.response.session;
+
+    // Slot 0 departs, slot 1 holds out past the grace: its close is staged for
+    // relay 1, which is unreachable and never applies it.
+    lc.on_departure(
+        tenant.clone(),
+        s,
+        SlotId(0),
+        DepartureKind::Dropped,
+        None,
+        false,
+    );
+    // Let the timer task start its sleep, then run past the grace.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(SHORT * 2).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        setup
+            .reaps()
+            .export_pending()
+            .iter()
+            .any(|(relay, close)| *relay == RelayId(1) && close.slots == vec![SlotId(1)]),
+        "the holdout reap staged its close for relay 1",
+    );
+    registry::remove(setup.registry(), RelayId(1));
+
+    // The holdout's client re-homes onto relay 2. The close must follow it
+    // there; nothing re-arms the holdout reap, so relay 2 is its last chance.
+    lc.prepare_rehome(&tenant, s);
+    let outcome = crate::session::rehome_with_assignment_commit(
+        &setup,
+        &tenant,
+        s,
+        RelayId(1),
+        || lc.departed_slots(&tenant, s),
+        |moved_off, replacement| lc.on_rehome(&tenant, s, moved_off, replacement),
+    );
+    assert!(
+        matches!(outcome, crate::session::RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2))
+    );
+    let pending: Vec<(RelayId, SlotClose)> = setup.reaps().export_pending();
+    assert!(
+        pending.iter().any(|(relay, close)| *relay == RelayId(2)
+            && close.session == s
+            && close.slots == vec![SlotId(1)]),
+        "relay 2 holds the holdout's close, got {pending:?}",
+    );
+}

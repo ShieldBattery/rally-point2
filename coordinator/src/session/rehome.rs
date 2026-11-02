@@ -520,6 +520,25 @@ pub(super) fn rehome_inner(
         }
     }
 
+    // A slot close the reap policies staged for the dead relay names slots that
+    // now home on R_new. If the dead relay never applied it (it was unreachable,
+    // which is when its slots re-home), only R_new can, and nothing re-arms the
+    // reap that staged it: stage the same closes there. A same-id move keeps them
+    // where they are.
+    if r_new != dead_relay {
+        let slots = setup.reaps().pending(dead_relay, tenant, session);
+        if !slots.is_empty() {
+            setup.reaps().send(
+                r_new,
+                crate::descriptors::SlotClose {
+                    tenant: tenant.clone(),
+                    session,
+                    slots,
+                },
+            );
+        }
+    }
+
     // Re-point this session's earlier rehome records that answered with the
     // relay this rehome just moved off: after R1 → R2 and now R2 → R3, a
     // straggler still asking about R1 must be sent to R3, not to a

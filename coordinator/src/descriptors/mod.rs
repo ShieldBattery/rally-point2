@@ -182,6 +182,18 @@ impl RelayReaps {
         }
     }
 
+    /// The slots `relay_id` still has pending closes for in `session`, in the
+    /// order they were first staged. A re-home reads them to stage the same
+    /// closes on the relay the moved slots now home on.
+    pub fn pending(&self, relay_id: RelayId, tenant: &TenantId, session: SessionId) -> Vec<SlotId> {
+        self.relays
+            .lock()
+            .get(&relay_id)
+            .and_then(|state| state.pending.get(&(tenant.clone(), session)))
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Retires every pending directive for `session` across all relays — called
     /// when the session's lifecycle state is removed. A directive already delivered
     /// stays applied on the relay (a closed link does not reopen); retiring only
