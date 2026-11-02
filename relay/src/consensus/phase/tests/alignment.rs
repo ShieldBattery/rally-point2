@@ -355,6 +355,73 @@ fn seq_history_from_before_measurement_does_not_skew_the_phase() {
 }
 
 #[test]
+fn a_forward_walk_past_the_cycle_takes_the_shorter_delay_instead() {
+    // Two obedient slots. Slot 1 starts 21 ms after slot 0 and is walked
+    // forward ~20.7 ms onto it (across the wrap). Slot 0's uplink then gets
+    // slower twice (+15 ms, then +10 ms), and slot 1 follows forward each
+    // time — until following forward would take its delay past a whole turn
+    // (35.7 ms + 10 ms). The equivalent delay one turn shorter (~4 ms) puts
+    // it on the same phase, so the controller must reach alignment that way
+    // rather than pin the delay just under a turn short of the target and
+    // eventually give up on a cooperative session. Slot 2 shares slot 0's
+    // uplink and sits 0.9 ms ahead of it, too close to ever be corrected.
+    let mut controller = PhaseController::new(TURN_US);
+    let start = Instant::now();
+    let turn = i64::from(TURN_US);
+    let mut commanded: HashMap<SlotId, i64> = HashMap::new();
+    let mut seq = 0u64;
+    let mut link0 = 0i64;
+    let mut run_round = |controller: &mut PhaseController, link0: i64| {
+        let held = |id| commanded.get(&id).copied().unwrap_or(0);
+        let effective = [
+            (slot(0), link0 + held(slot(0))),
+            (slot(1), 21_000 + held(slot(1))),
+            (slot(2), link0 + turn - 900 + held(slot(2))),
+        ];
+        let clock = feed_at_cadence(
+            controller,
+            at_turn(start, seq),
+            &effective,
+            seq..seq + ROUND_TURNS,
+            turn,
+        );
+        seq += ROUND_TURNS;
+        let corrections = controller.evaluate(clock + Duration::from_millis(1));
+        for &(id, delay) in &corrections {
+            commanded.insert(id, i64::from(delay));
+            controller.note_applied(id, delay, clock + Duration::from_millis(2));
+        }
+        corrections.is_empty()
+    };
+    for step in [0, 15_000, 10_000] {
+        link0 += step;
+        // Each step converges well inside the give-up latch's budget.
+        let mut settled = false;
+        for _ in 0..6 {
+            if run_round(&mut controller, link0) {
+                settled = true;
+                break;
+            }
+        }
+        assert!(
+            settled,
+            "slot 1 kept being corrected after the {step} us step"
+        );
+        assert!(
+            !controller.is_disabled(),
+            "latched after the {step} us step"
+        );
+        assert!(
+            controller
+                .last_span_us()
+                .is_some_and(|span| span <= SPAN_DEAD_BAND_US),
+            "settled outside the dead-band after the {step} us step: {:?}",
+            controller.last_span_us()
+        );
+    }
+}
+
+#[test]
 fn exactly_coincident_phases_read_as_aligned() {
     // Every slot's phase estimate landing on the same microsecond is what a
     // successful correction aims for. That population is perfectly aligned:

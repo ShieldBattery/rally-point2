@@ -508,11 +508,16 @@ impl PhaseController {
             // through the zero floor, so a slot is never asked to send before
             // its game produced the data. Each round's move is capped: a big
             // walk becomes several small, health-gated slews instead of one
-            // long drift across every consumer's poll boundary.
+            // long drift across every consumer's poll boundary. A forward
+            // walk that would carry the delay to a whole turn or past it
+            // walks backward instead: the delay stays under a turn, and
+            // walking forward into that ceiling would leave the slot short
+            // of the target for good.
             let forward = (target - phase).rem_euclid(self.turn_us);
             let backward = forward - self.turn_us;
             let current = i64::from(self.commanded_us.get(&slot).copied().unwrap_or(0));
-            let change = if current + backward >= 0 && backward.abs() < forward {
+            let past_ceiling = current + forward >= self.turn_us;
+            let change = if past_ceiling || (current + backward >= 0 && backward.abs() < forward) {
                 backward
             } else {
                 forward
