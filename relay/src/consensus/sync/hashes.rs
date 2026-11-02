@@ -22,7 +22,8 @@
 //! slot's turns only get that far afterwards (a slot running slower than the deadline). A slot
 //! whose turns stopped soon after the step is not blamed for a missing report, since its link went
 //! quiet and the leave machinery settles it. When nobody can be singled out (a 1v1 that disagrees,
-//! an even split, nobody reporting) the verdict names no one.
+//! an even split, nobody reporting) the verdict names no one. A step with fewer than two slots
+//! taking part (the rest left) has nothing to compare, so it decides nothing about anyone.
 
 use super::*;
 use crate::rate_limit::RateLimitedCounter;
@@ -357,6 +358,16 @@ impl StateHashTracker {
         required: &HashSet<SlotId>,
         settle: bool,
     ) -> Judgment {
+        // With fewer than two slots taking part there is no other hash to compare one with, so a
+        // missing report hides nothing (a 1v1 whose opponent has left).
+        if required
+            .iter()
+            .filter(|x| !self.excluded.contains(x))
+            .count()
+            < 2
+        {
+            return Judgment::Decided(None);
+        }
         let reports: Vec<(SlotId, u64)> = reports
             .iter()
             .copied()

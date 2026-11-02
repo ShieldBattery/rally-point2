@@ -305,6 +305,23 @@ fn a_slot_whose_turns_stopped_is_left_to_the_leave_machinery() {
 }
 
 #[test]
+fn the_last_slot_left_in_the_game_is_never_judged_alone() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1]);
+    forward(&mut m, &[0, 1], STATE_HASH_INTERVAL, start);
+    // Slot 1 leaves; slot 0 plays on well past the step without reporting it, with nobody left
+    // to compare a hash with.
+    m.note_departure(SlotId(1), framed(1), 0, None);
+    forward(&mut m, &[0], 8 + STATE_HASH_LIVE_TURNS, start);
+    assert!(
+        m.judge_state_hashes(start + STATE_HASH_DEADLINE * 3)
+            .is_empty()
+    );
+    assert!(m.claim_desync_evictions().is_empty());
+    assert!(!m.hashes.dormant);
+}
+
+#[test]
 fn nobody_reporting_names_nobody() {
     let start = Instant::now();
     let mut m = rollback_maker(&[0, 1]);
