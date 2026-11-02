@@ -384,3 +384,35 @@ fn cleanup_db(path: &Path) {
     let _ = std::fs::remove_file(path.with_extension("sqlite-wal"));
     let _ = std::fs::remove_file(path.with_extension("sqlite-shm"));
 }
+
+#[test]
+fn a_token_ttl_past_the_signed_range_still_reads_as_an_unexpired_launch() {
+    // A launch deadline configured large enough to push the token's expiry past
+    // `i64::MAX` seconds must still read as a live launch to the sweeps, the
+    // same way the enroll path reads it, not as already expired.
+    let ledger = ledger();
+    let minted = ledger
+        .mint_at(1_000, None, Duration::from_secs(i64::MAX as u64))
+        .unwrap();
+    assert_eq!(ledger.count_launching(None, 1_001).unwrap(), 1);
+    assert!(
+        ledger.expired_launching(1_001).unwrap().is_empty(),
+        "the launch-deadline sweep must not reap a launch whose token is still valid",
+    );
+    ledger
+        .record_task(minted.relay_id, "task/ttl", &[], &[advertise_addr()])
+        .unwrap();
+    assert!(matches!(
+        ledger.authorize_enroll_at(
+            1_001,
+            minted.relay_id,
+            fingerprint(1),
+            Some(&minted.token),
+            None
+        ),
+        Ok(AuthorizedEnroll {
+            kind: Authorized::FirstEnroll { .. },
+            ..
+        })
+    ));
+}

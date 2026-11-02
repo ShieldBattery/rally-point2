@@ -253,7 +253,10 @@ impl RelayLedger {
         // without escaping.
         let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
         let token_hash = sha256(token.as_bytes());
-        let expires_at = now.saturating_add(token_ttl.as_secs());
+        // Capped at the largest value the signed column holds: past it the stored
+        // expiry would wrap negative, and the sweeps (which compare in SQL) would
+        // read a token the enroll path still honors as already expired.
+        let expires_at = now.saturating_add(token_ttl.as_secs()).min(i64::MAX as u64);
 
         let conn = self.conn.lock();
         conn.execute(
