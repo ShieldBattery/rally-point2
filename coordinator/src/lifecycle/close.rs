@@ -58,11 +58,11 @@ impl Lifecycle {
     /// still open, the terminal webhook already fired, or the state was already
     /// removed by an earlier close.
     ///
-    /// Every mutation that can newly satisfy the all-relays-closed condition
-    /// funnels through here so the evaluation is never dropped on the floor: a
-    /// relay reporting closed ([`on_session_closed`](Self::on_session_closed))
-    /// and a re-home swapping the cached serving set
-    /// ([`on_rehome`](Self::on_rehome)).
+    /// Its only caller is [`on_session_closed`](Self::on_session_closed), the one
+    /// mutation that adds close evidence. A re-home
+    /// ([`on_rehome`](Self::on_rehome)) never completes a session: it clears the
+    /// departing and target relays' close evidence, so it can only make the
+    /// condition harder to satisfy.
     ///
     /// Takes the held `sessions` guard by value rather than a `&mut` to it so it
     /// can enforce the retire discipline [`close_and_retire`](Self::close_and_retire)
