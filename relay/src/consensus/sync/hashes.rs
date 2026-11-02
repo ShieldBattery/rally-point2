@@ -88,6 +88,17 @@ impl JudgedStep {
     }
 }
 
+/// What the reports of slots named at a later step make of a split among the slots still taking
+/// part (see [`StateHashTracker::backed_majority`]).
+enum Backing {
+    /// This hash's slots have a majority however the backing reports still to come fall.
+    Majority(Vec<SlotId>),
+    /// A backing report still to come could change the outcome.
+    Awaited,
+    /// No hash has a majority.
+    None,
+}
+
 /// What judging a step's reports came to.
 enum Judgment {
     /// The reports disagree, and the ones still to come could change who is at fault.
@@ -426,8 +437,14 @@ impl StateHashTracker {
             Some(majority)
         } else if reports.len() < voters && !settle {
             return Judgment::Undecided;
+        } else if let Some(majority) = majority_of(reports.len()) {
+            Some(majority)
         } else {
-            majority_of(reports.len()).or_else(|| self.backed_majority(step, all_reports, &groups))
+            match self.backed_majority(step, all_reports, &groups, settle) {
+                Backing::Majority(majority) => Some(majority),
+                Backing::Awaited => return Judgment::Undecided,
+                Backing::None => None,
+            }
         };
         let Some(majority) = majority else {
             // Nobody to trust: a 1v1 that disagrees, an even split, or nobody reporting at all.
@@ -466,18 +483,30 @@ impl StateHashTracker {
         }))
     }
 
-    /// The slots of whichever hash in `groups` (the reports of the slots still taking part in
-    /// `step`, which have no majority among themselves) has a majority once the reports of slots
-    /// named at a later step are added where they back one of those hashes. Such a slot took part
-    /// in this step, and judging the later step first must not take its report back here; but
-    /// being named, it only ever backs a hash a slot still taking part reported, so it can settle a
-    /// split, never cause one, and is never named again.
+    /// Whichever hash in `groups` (the reports of the slots still taking part in `step`, which
+    /// have no majority among themselves) has a majority once the reports of slots named at a later
+    /// step are added where they back one of those hashes. Such a slot took part in this step, and
+    /// judging the later step first must not take its report back here; but being named, it only
+    /// ever backs a hash a slot still taking part reported, so it can settle a split, never cause
+    /// one, and is never named again.
+    ///
+    /// A named slot whose report of this step hasn't arrived could still back either side, so a
+    /// majority counts only if it holds however those reports fall, and until then the step waits
+    /// for them unless `settle` decides it on the reports present. Otherwise the order reports
+    /// arrive in would pick the verdict.
     fn backed_majority(
         &self,
         step: u64,
         all_reports: &[(SlotId, u64)],
         groups: &HashMap<u64, Vec<SlotId>>,
-    ) -> Option<Vec<SlotId>> {
+        settle: bool,
+    ) -> Backing {
+        let backers = || {
+            self.excluded
+                .iter()
+                .filter(move |&(_, &from)| from > step)
+                .map(|(&slot, _)| slot)
+        };
         let backing: Vec<u64> = all_reports
             .iter()
             .filter(|(slot, hash)| {
@@ -486,16 +515,28 @@ impl StateHashTracker {
             })
             .map(|&(_, hash)| hash)
             .collect();
-        if backing.is_empty() {
-            return None;
-        }
+        let outstanding = backers()
+            .filter(|slot| !all_reports.iter().any(|x| x.0 == *slot))
+            .count();
         let count = groups.values().map(Vec::len).sum::<usize>() + backing.len();
-        groups
-            .iter()
-            .find(|(hash, slots)| {
-                (slots.len() + backing.iter().filter(|x| x == hash).count()) * 2 > count
-            })
-            .map(|(_, slots)| slots.clone())
+        let majority_over = |count: usize| {
+            groups
+                .iter()
+                .find(|(hash, slots)| {
+                    (slots.len() + backing.iter().filter(|x| x == hash).count()) * 2 > count
+                })
+                .map(|(_, slots)| slots.clone())
+        };
+        if let Some(majority) = majority_over(count + outstanding) {
+            return Backing::Majority(majority);
+        }
+        if outstanding > 0 && !settle {
+            return Backing::Awaited;
+        }
+        match majority_over(count) {
+            Some(majority) => Backing::Majority(majority),
+            None => Backing::None,
+        }
     }
 
     /// Notes that a verdict on `step` named `slot`, whether this relay judged it or the authority

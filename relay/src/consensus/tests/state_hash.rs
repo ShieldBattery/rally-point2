@@ -440,6 +440,75 @@ fn a_relay_told_of_a_later_verdict_judges_an_earlier_step_like_the_authority_did
     );
 }
 
+/// Slots 4 and 5 are named at step 24. At step 16 the rest split two and two, slot 4 reported
+/// slot 0's hash, and slot 5's report is still on its way: it could leave the split even, so the
+/// step waits for it rather than letting the order reports arrive in pick the verdict.
+#[test]
+fn a_split_waits_for_every_report_of_the_slots_named_later() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2, 3, 4, 5]);
+    forward(&mut m, &[0, 1, 2, 3, 4, 5], 3 * STATE_HASH_INTERVAL, start);
+    for (slot, hash) in [(0, A), (1, A), (2, B), (3, B), (4, A)] {
+        assert!(
+            m.observe_state_hash(SlotId(slot), 16, hash, start)
+                .is_empty()
+        );
+    }
+    for (slot, hash) in [(0, A), (1, A), (2, A), (3, A), (4, 0xcccc)] {
+        assert!(
+            m.observe_state_hash(SlotId(slot), 24, hash, start)
+                .is_empty()
+        );
+    }
+    assert_eq!(
+        m.observe_state_hash(SlotId(5), 24, 0xdddd, start),
+        vec![SyncDivergence {
+            sync_ordinal: 24,
+            game_frame: None,
+            no_majority: false,
+            diverged: vec![SlotId(4), SlotId(5)],
+            missing: Vec::new(),
+        }],
+        "step 16 is not decided on slot 4's report alone",
+    );
+    assert_eq!(
+        m.observe_state_hash(SlotId(5), 16, B, start),
+        vec![SyncDivergence {
+            sync_ordinal: 16,
+            game_frame: None,
+            no_majority: true,
+            diverged: Vec::new(),
+            missing: Vec::new(),
+        }]
+    );
+}
+
+/// The same split with slot 5's report never arriving is decided on the reports present once the
+/// step's hold runs out.
+#[test]
+fn a_split_awaiting_a_report_of_a_slot_named_later_is_settled_at_its_hold() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2, 3, 4, 5]);
+    forward(&mut m, &[0, 1, 2, 3, 4, 5], 3 * STATE_HASH_INTERVAL, start);
+    for (slot, hash) in [(0, A), (1, A), (2, B), (3, B), (4, A)] {
+        m.observe_state_hash(SlotId(slot), 16, hash, start);
+    }
+    for (slot, hash) in [(0, A), (1, A), (2, A), (3, A), (4, 0xcccc), (5, 0xdddd)] {
+        m.observe_state_hash(SlotId(slot), 24, hash, start);
+    }
+    assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+    assert_eq!(
+        m.judge_state_hashes(start + STATE_HASH_DEADLINE * 2),
+        vec![SyncDivergence {
+            sync_ordinal: 16,
+            game_frame: None,
+            no_majority: false,
+            diverged: vec![SlotId(2), SlotId(3)],
+            missing: Vec::new(),
+        }]
+    );
+}
+
 #[test]
 fn nobody_reporting_names_nobody() {
     let start = Instant::now();
