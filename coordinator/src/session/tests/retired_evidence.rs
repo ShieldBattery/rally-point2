@@ -143,3 +143,48 @@ fn same_id_restart_cannot_borrow_either_current_or_retired_process_authority() {
         2
     ));
 }
+
+#[test]
+fn a_group_moving_onto_a_restarted_relay_reassigns_that_relay_s_own_slots_to_its_new_process() {
+    // Relay 1 homes slot 0 and relay 2 homes slot 1. Relay 2 restarts in place,
+    // then relay 1 dies and its group moves onto relay 2.
+    let setup = region_b_fleet();
+    registry::note_boot_id(setup.registry(), RelayId(1), Some(11));
+    registry::note_boot_id(setup.registry(), RelayId(2), Some(22));
+    let session = create_session(
+        &setup,
+        request(two_players_slot_1_in_region_b()),
+        ExpiresAt(u64::MAX),
+    )
+    .unwrap()
+    .response
+    .session;
+    registry::enroll(
+        setup.registry(),
+        hello_with_cert(2, 14901, vec![0xEE; 4]).with_region(region("region-b")),
+    );
+    registry::note_boot_id(setup.registry(), RelayId(2), Some(33));
+    registry::remove(setup.registry(), RelayId(1));
+    assert!(matches!(
+        rehome(&setup, &tid(), session, RelayId(1), vec![]),
+        RehomeOutcome::NewTarget(ref e) if e.relay_id == RelayId(2)
+    ));
+
+    // Relay 2's new process holds both slots' current assignments, and its old
+    // one keeps authority over the history it reported for slot 1.
+    for slot in [SlotId(0), SlotId(1)] {
+        assert!(
+            setup.current_evidence_history_assignment(RelayId(2), 33, &tid(), session, slot, 2),
+            "slot {slot:?}",
+        );
+    }
+    assert!(setup.evidence_history_assignment(RelayId(2), 22, &tid(), session, SlotId(1), 1));
+    assert!(!setup.current_evidence_history_assignment(
+        RelayId(2),
+        22,
+        &tid(),
+        session,
+        SlotId(1),
+        1
+    ));
+}

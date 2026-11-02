@@ -359,12 +359,23 @@ pub(super) fn rehome_inner(
         return RehomeOutcome::Unavailable;
     };
 
+    // An already-serving target whose pin is stale restarted in place: its own
+    // clients still hold the old cert, and its own slots' evidence assignments
+    // still name the process that is gone.
+    let target_restarted = r_new != dead_relay
+        && setup.session_refs.lock().get(&key).is_some_and(|refs| {
+            refs.relay_certs
+                .get(&r_new)
+                .is_some_and(|&pin| pin != cert_fingerprint(&new_entry.cert_der))
+        });
+
     // Compute every successor before mutating membership: a revision must never
-    // wrap and make an old assignment current again.
+    // wrap and make an old assignment current again. A restarted target's own
+    // slots get one too, so its new process can report their history.
     let mut assignment_revisions = Vec::new();
     if let Some(refs) = setup.session_refs.lock().get(&key) {
         for (&slot, &home) in &refs.homes {
-            if home == dead_relay {
+            if home == dead_relay || (target_restarted && home == r_new) {
                 let Some(revision) = refs
                     .evidence_assignments
                     .get(&slot)
@@ -446,21 +457,16 @@ pub(super) fn rehome_inner(
     // would simply retire this whole `session_refs` entry afterward regardless
     // of what this leaves in `homes`/`relay_certs`. Must still run before the
     // descriptor-rebuild loop below, which is what this position guarantees.
-    let mut target_restarted = false;
     if let Some(refs) = setup.session_refs.lock().get_mut(&key) {
-        // An already-serving target whose pin is stale restarted in place: its own
-        // clients still hold the old cert. Overwriting the pin below would make
-        // their re-home ask read as a false alarm and answer Stay, so record the
-        // move for them too (target -> target).
-        target_restarted = r_new != dead_relay
-            && refs
-                .relay_certs
-                .get(&r_new)
-                .is_some_and(|&pin| pin != cert_fingerprint(&new_entry.cert_der));
-        refs.retire_evidence_assignments(
-            dead_relay,
-            rally_point_proto::time::unix_secs_fail_closed(),
-        );
+        // A restarted target's clients still hold its old cert. Overwriting the
+        // pin below would make their re-home ask read as a false alarm and answer
+        // Stay, so the move is recorded for them too (target -> target), and the
+        // old process's assignments retire alongside the dead relay's.
+        let now = rally_point_proto::time::unix_secs_fail_closed();
+        refs.retire_evidence_assignments(dead_relay, now);
+        if target_restarted {
+            refs.retire_evidence_assignments(r_new, now);
+        }
         let replacement_boot = registry::boot_id(&setup.registry, r_new);
         for &(slot, _) in &assignment_revisions {
             if let Some(boot) = replacement_boot {
