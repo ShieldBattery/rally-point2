@@ -177,3 +177,85 @@ fn a_decided_slots_client_turn_is_fenced_at_its_home_only() {
         "a mesh-delivered turn for the decided slot still reaches survivors",
     );
 }
+
+/// A peer-homed expected slot that drops before the session starts and
+/// reconnects to its home: the home announces the slot present before it
+/// broadcasts the slot connected (the order `activate_slot` and the join
+/// reconcile both use), so the authority receives `SlotPresent` while it still
+/// holds the departure, and only then the `SlotConnectivity` that reinstates
+/// it. Once every expected slot is back, the session must still start — on
+/// whichever arrival completes the set, the reconnect included.
+#[test]
+fn a_pre_start_reconnect_of_a_peer_homed_slot_still_completes_coverage() {
+    let sessions: routing::Sessions = Arc::default();
+    let mesh_state = test_mesh_state();
+    let makers = Arc::clone(&mesh_state.session.decision_makers);
+    let key = control_key();
+    let _ = crate::test_support::seed_maker(
+        &makers,
+        &key,
+        crate::consensus::Authority::SelfRelay,
+        &[0, 1],
+        &[],
+    );
+    let joined = joined_state(&mesh_state.links, &key);
+    let frame = |kind| MeshControlFrame {
+        session: key.session.0,
+        kind: Some(kind),
+    };
+    let present = || {
+        frame(mesh_control_frame::Kind::SlotPresent(
+            rally_point_proto::messages::SlotPresent { slot: 1 },
+        ))
+    };
+    let connected = |epoch| {
+        frame(mesh_control_frame::Kind::SlotConnectivity(
+            SlotConnectivity {
+                slot: 1,
+                connected: true,
+                connection_epoch: Some(epoch),
+            },
+        ))
+    };
+    let dispatch = |f: MeshControlFrame| {
+        dispatch_mesh_control(f, RelayId(9), 0, &joined, &sessions, &mesh_state)
+    };
+
+    // Slot 1 dials its home: present, then connected.
+    dispatch(present());
+    dispatch(connected(1));
+    // It drops before the session starts.
+    dispatch(frame(mesh_control_frame::Kind::SlotDeparted(
+        SlotDeparted {
+            finalized: false,
+            slot: 1,
+            last_frame: None,
+            reachable_frame: None,
+            reason: crate::consensus::LEAVE_REASON_DROPPED,
+            result_payload: Vec::new().into(),
+            result_arrival_ms: 0,
+            result_session_frame: None,
+            result_slot_frame: None,
+            connection_epoch: Some(1),
+            final_turn_count: None,
+        },
+    )));
+    assert!(mesh_state.session.drop_holds.is_pending(&key, SlotId(1)));
+    // The other expected slot arrives meanwhile; slot 1 is gone, so no start.
+    assert!(!makers.note_slot_present(&key, SlotId(0)));
+    // Slot 1 reconnects to its home: present, then connected on a new epoch.
+    dispatch(present());
+    assert!(
+        !makers.is_started(&key),
+        "still departed when present arrives"
+    );
+    dispatch(connected(2));
+    assert!(
+        !makers.has_departure(&key, SlotId(1)),
+        "the reconnect reinstated it"
+    );
+    assert!(
+        makers.is_started(&key),
+        "every expected slot is present again, so the start fires"
+    );
+}

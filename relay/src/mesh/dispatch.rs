@@ -388,14 +388,7 @@ fn dispatch_mesh_control_frame(
             // every peer (including the origin, harmlessly: it latches started and
             // fans to its own locals, but the frame is idempotent). A non-authority
             // relay just records it, for a later promotion.
-            if mesh.session.decision_makers.note_slot_present(&key, slot) {
-                // Coverage fired here (this relay is the authority): the maker
-                // sized and stored the initial buffer depth as the latch fired, so
-                // both fan-out legs carry it.
-                let initial_buffer_turns = mesh.session.decision_makers.initial_buffer_turns(&key);
-                routing::fan_out_session_start(sessions, &key, initial_buffer_turns);
-                fan_out_session_start(&mesh.links, &key, initial_buffer_turns);
-            }
+            note_peer_slot_present(sessions, mesh, &key, slot);
         }
         Some(mesh_control_frame::Kind::SlotStarted(started)) => {
             let Ok(slot) = u8::try_from(started.slot).map(SlotId) else {
@@ -489,6 +482,14 @@ fn dispatch_mesh_control_frame(
                     change.connection_epoch,
                 )
             };
+            // A connected frame comes only from the slot's home, for a slot
+            // registered there, so it is presence too. The home announces the
+            // slot present before it announces it connected, and while this
+            // relay still held the slot's pre-start departure that announce was
+            // refused; the reinstatement just above is what lets it count now.
+            if change.connected && !rejected {
+                note_peer_slot_present(sessions, mesh, &key, slot);
+            }
             if rejected {
                 mesh.session.decision_makers.flight_recorder().record(
                     &key,
@@ -590,5 +591,22 @@ fn dispatch_mesh_control_frame(
                 "unknown mesh control frame kind; skipping"
             );
         }
+    }
+}
+
+/// Records a peer-homed slot as present and, when that completes the expected
+/// set on the authority, fans the one `SessionStart` to this relay's local slots
+/// and every peer. The maker sized and stored the initial buffer depth as the
+/// latch fired, so both fan-out legs carry it.
+fn note_peer_slot_present(
+    sessions: &routing::Sessions,
+    mesh: &MeshState,
+    key: &SessionKey,
+    slot: SlotId,
+) {
+    if mesh.session.decision_makers.note_slot_present(key, slot) {
+        let initial_buffer_turns = mesh.session.decision_makers.initial_buffer_turns(key);
+        routing::fan_out_session_start(sessions, key, initial_buffer_turns);
+        fan_out_session_start(&mesh.links, key, initial_buffer_turns);
     }
 }
