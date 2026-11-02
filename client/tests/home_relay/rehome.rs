@@ -1,8 +1,9 @@
 //! Failover to a replacement relay: a fixed re-home provider standing in for
 //! the embedder's coordinator round-trip, a full two-relay failover proving
-//! exactly-once turn delivery across the move, and the receive-window
-//! regression for a client resuming its own slot's seq stream at a high
-//! anchor on the fresh relay.
+//! exactly-once turn delivery across the move, the receive-window regression
+//! for a client resuming its own slot's seq stream at a high anchor on the
+//! fresh relay, and the send-phase delay a re-homed client drops because the
+//! fresh relay never commanded it.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -265,4 +266,121 @@ async fn a_re_homed_clients_high_seq_own_turn_is_accepted_by_the_fresh_relay() {
         got.slot, 0,
         "bound to the sender's authorized slot, like any turn"
     );
+}
+
+/// A driver that re-dials relay A (id 1) and, once A stays unreachable, re-homes
+/// onto relay B (id 2) at `addr_b`.
+fn reconnect_via(
+    endpoint: rally_point_client::ClientEndpoint,
+    addr_a: SocketAddr,
+    identity: rally_point_client::Identity,
+    ca_b: &CertificateDer<'static>,
+    addr_b: SocketAddr,
+) -> rally_point_client::Reconnect {
+    rally_point_client::Reconnect {
+        endpoint,
+        relay_addr: addr_a,
+        fallback_addrs: Vec::new(),
+        server_name: "localhost".to_owned(),
+        relay_id: 1,
+        identity,
+        rehome: Some(Arc::new(FixedTarget {
+            ca: ca_b.clone(),
+            addr: addr_b,
+            expected_dead: 1,
+            relay_id: 2,
+        })),
+        escalate_after: Some(Duration::from_millis(50)),
+        escalate_retry: Some(Duration::from_millis(50)),
+        fresh_port_redials: true,
+    }
+}
+
+#[tokio::test]
+async fn a_re_homed_client_drops_the_send_delay_its_dead_relay_commanded() {
+    use rally_point_client::{LinkDriver, PhaseStatus};
+
+    // A commanded send-phase delay is the commanding relay's record: it re-pushes it
+    // to a reconnecting slot, and its later commands are absolute delays worked out
+    // from it. A replacement relay holds no record and takes the slot as holding no
+    // delay, so the client must not carry the dead relay's across the move.
+    let tenant = make_tenant(KID, TENANT);
+    let session = SessionId(81);
+    let slots = [SlotId(0), SlotId(1)];
+
+    let mesh_a = rally_point_relay::mesh::MeshState::default();
+    let key_a = seed_session_authority(&mesh_a, &tenant, session, &slots);
+    let makers_a = mesh_a.session.decision_makers.clone();
+    let (addr_a, ca_a, endpoint_a) = start_relay_killable(registry_for(&[&tenant]), mesh_a);
+
+    let mesh_b = rally_point_relay::mesh::MeshState::default();
+    let key_b = seed_session_authority(&mesh_b, &tenant, session, &slots);
+    mesh_b.session.decision_makers.mark_started(&key_b);
+    let (addr_b, ca_b, _endpoint_b) = start_relay_killable(registry_for(&[&tenant]), mesh_b);
+
+    let id0 = identity_for(&tenant, session, SlotId(0));
+    let id1 = identity_for(&tenant, session, SlotId(1));
+    let ep0 = client_endpoint(&ca_a);
+    let ep1 = client_endpoint(&ca_a);
+
+    // Slot 1 runs a driver; slot 0 completes the roster on a bare link, so the
+    // session starts on relay A.
+    let link1 = ep1.connect(addr_a, "localhost", &id1).await.unwrap();
+    let (driver1, mut chan1) = LinkDriver::new(link1);
+    let task1 =
+        tokio::spawn(driver1.run_reconnecting(reconnect_via(ep1, addr_a, id1, &ca_b, addr_b)));
+    let bare0 = ep0.connect(addr_a, "localhost", &id0).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), chan1.session_start.recv())
+        .await
+        .expect("session start never fired on slot 1")
+        .expect("slot 1's session-start channel closed");
+
+    // Relay A measures slot 0's turns arriving 20 ms ahead of slot 1's in every
+    // turn cycle, and commands slot 0 a delay.
+    let turn_us = 1_000_000 / 24;
+    let start = std::time::Instant::now();
+    for seq in 0..300u64 {
+        for (slot, offset_us) in [(SlotId(0), 0), (SlotId(1), 20_000)] {
+            let at = start + Duration::from_micros(seq * turn_us + offset_us);
+            let _ = makers_a.ingest_arrival_phase(&key_a, slot, seq, at);
+        }
+    }
+    let commanded = makers_a
+        .commanded_phase_delay(&key_a, SlotId(0))
+        .expect("relay A commanded slot 0 a delay");
+    assert!(commanded > 0);
+
+    // Slot 0 comes back under a driver, which takes the delay up from relay A's
+    // connect-time re-push.
+    drop(bare0);
+    let link0 = ep0.connect(addr_a, "localhost", &id0).await.unwrap();
+    let (driver0, mut chan0) = LinkDriver::new(link0);
+    let task0 =
+        tokio::spawn(driver0.run_reconnecting(reconnect_via(ep0, addr_a, id0, &ca_b, addr_b)));
+    tokio::time::timeout(Duration::from_secs(5), chan0.session_start.recv())
+        .await
+        .expect("session start never reached slot 0")
+        .expect("slot 0's session-start channel closed");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        chan0
+            .phase_status
+            .wait_for(|status| status.target_us == commanded),
+    )
+    .await
+    .expect("relay A's commanded delay never reached slot 0")
+    .expect("slot 0's phase status channel closed");
+
+    // Relay A dies and slot 0 re-homes onto relay B, which commanded it nothing.
+    endpoint_a.close(noq::VarInt::from_u32(0), b"relay A down");
+    wait_connectivity(&mut chan0.connectivity, (SlotId(0), false)).await;
+    wait_connectivity(&mut chan0.connectivity, (SlotId(0), true)).await;
+    assert_eq!(*chan0.phase_status.borrow(), PhaseStatus::default());
+
+    drop(chan0.outbound);
+    drop(chan0.inbound);
+    drop(chan1.outbound);
+    drop(chan1.inbound);
+    let _ = task0.await;
+    let _ = task1.await;
 }

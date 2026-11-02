@@ -16,6 +16,7 @@ use tokio::time::Instant;
 
 use crate::dial::{ClientEndpoint, DialError};
 use crate::identity::Identity;
+use crate::phase::PhaseSlew;
 
 use super::DriverError;
 use super::backoff::{Backoff, EscalationWait, WaitOutcome, await_rehome, wait_backoff};
@@ -527,6 +528,18 @@ pub(super) async fn reconnect_link(
                                             // it naming a relay it isn't homed on.
                                             link.rebind_from(fresh);
                                             reinject_retention(link, state);
+                                            // The send-phase delay was the dead relay's
+                                            // command. The replacement holds no record of
+                                            // it and takes this slot as holding none, and
+                                            // its commands are absolute delays worked out
+                                            // from that, so keeping ours would put its
+                                            // first command's change on the wrong base.
+                                            // Drop it at once rather than slewing: the
+                                            // outage already broke the alignment it held.
+                                            state.phase_slew = PhaseSlew::new(Instant::now());
+                                            let _ = seam
+                                                .phase_status
+                                                .send_replace(state.phase_slew.status());
                                             let new_addr = new_target.current_addr();
                                             rc.target = new_target;
                                             backoff.reset();

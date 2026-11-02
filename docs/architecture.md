@@ -790,9 +790,12 @@ other clients, and a client can drag the shared target only with its actual wire
 limited by the dead-band (no corrections under a ~3 ms span), the re-evaluation dwell (slew time
 plus settle), and the client-side slew clamp. The loop is closed-loop and self-correcting: measured
 phases already include whatever delay each client applies, so the controller needs no knowledge of
-client state (a rehomed or disobedient client just keeps showing up misaligned and only its own
-correction keeps moving), and an aligned population inside the dead-band is never touched — which
-also kills any ratchet from common-mode drift.
+client state (a disobedient client just keeps showing up misaligned and only its own correction
+keeps moving), and an aligned population inside the dead-band is never touched — which also kills
+any ratchet from common-mode drift. Commands are absolute delays worked out from the relay's record
+of what it last commanded, so a client re-homed onto a replacement relay, which holds no record and
+takes it to hold no delay, drops its delay to zero at the move; the relay outage has already broken
+the alignment that delay held.
 
 The stability caveat that makes or breaks this controller: a phase is only quasi-static while the
 session actually runs at the nominal turn period. A game client's *production* schedule couples to

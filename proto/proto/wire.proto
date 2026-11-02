@@ -1024,7 +1024,9 @@ message RegionLabel {
 // Absolute and idempotent, like `RegionLabels`: each frame carries the whole
 // commanded delay, a newer frame replaces an older one, a repeat is harmless,
 // and the relay re-pushes the current value to a slot that connects after one
-// was issued. Best-effort: a lost frame costs an unaligned phase (some
+// was issued. The commanded delay is the issuing relay's record, so a client
+// re-homed onto a replacement relay drops its delay to zero, the value the
+// replacement takes it to hold. Best-effort: a lost frame costs an unaligned phase (some
 // micro-stall exposure), never correctness. Additive on the `ControlFrame`
 // oneof — a client that predates it skips the frame, keeps its natural send
 // phase, and simply doesn't benefit.

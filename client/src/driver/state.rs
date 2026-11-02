@@ -311,9 +311,10 @@ pub(super) struct LoopState {
     pub(super) connectivity: ConnectivityFence,
     /// The send-phase delay this client is applying under the relay's
     /// `PhaseDirective`s: the newest commanded target and the applied value
-    /// slewing toward it. Persisted across a reconnect — the delay is part of
-    /// the session's phase alignment, not the connection's state — and the
-    /// relay restates the current directive on register anyway.
+    /// slewing toward it. Persisted across a same-relay reconnect — the delay
+    /// is part of the session's phase alignment, not the connection's state —
+    /// and the relay restates the current directive on register anyway. A
+    /// re-home drops it: the replacement relay never commanded it.
     pub(super) phase_slew: PhaseSlew,
     /// Outbound turns held for their send-phase delay, oldest first, each with
     /// the deadline its wire handoff waits for. Deadlines are monotonic (a
