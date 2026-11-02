@@ -830,7 +830,7 @@ inter-arrival interval deviates from the turn interval beyond a small tolerance 
 correction itself causes closes the gate until the session relaxes), a **per-round change cap**
 (bounded steps toward the target, delay-reducing direction preferred when the zero floor allows,
 never a wrap-around slew — large misalignments converge over several gated rounds, and a slot
-partway through such a walk is never the target, so nobody chases its waypoints), and a
+partway through such a walk is never the target and never turns back), and a
 **give-up latch** (repeated correcting rounds that never measure inside the dead-band mean the
 phases are not quasi-static; the controller disables itself for the session rather than stir it),
 and a **per-slot command fence** (a slot is never issued a further command while its previous one

@@ -48,9 +48,10 @@
 //!   delay-*reducing* direction when the floor allows and it is shorter), so a
 //!   large misalignment converges over several gated rounds instead of one
 //!   long slew that drifts arrivals across every consumer's poll boundary for
-//!   many seconds. A slot partway through such a walk is never the target:
-//!   its phase sits wherever the last capped step left it, and letting it
-//!   pull everyone else there would abandon the walk halfway.
+//!   many seconds. A slot partway through such a walk is never the target
+//!   (its phase sits wherever the last capped step left it, and letting it
+//!   pull everyone else there would abandon the walk halfway), and it keeps
+//!   heading for the delay it set out for rather than turning back.
 //! - **A give-up latch.** If repeated correcting rounds never measure the
 //!   population inside the dead-band, the phases are not quasi-static (the
 //!   plant is moving for reasons alignment cannot fix) and the controller
@@ -229,12 +230,14 @@ pub struct PhaseController {
     /// neither span jitter nor reconnect cycles can re-open it unearned.
     awaiting_ack: HashSet<SlotId>,
     /// Slots whose newest command was capped short of the delay that round
-    /// wanted for them: partway through a walk spanning several rounds. Their
-    /// measured phase is a waypoint, not a place anyone should align to, so
-    /// they are left out of choosing the target (they still count toward the
-    /// span). Cleared per slot by an uncapped command, and wholesale once the
-    /// population measures inside the dead-band.
-    walking: HashSet<SlotId>,
+    /// wanted for them — partway through a walk spanning several rounds —
+    /// each with the delay its walk is heading for. Their measured phase is a
+    /// waypoint, not a place anyone should align to, so they are left out of
+    /// choosing the target (they still count toward the span), and the next
+    /// round keeps them heading the same way. Cleared per slot by an uncapped
+    /// command, and wholesale once the population measures inside the
+    /// dead-band.
+    walking: HashMap<SlotId, i64>,
     /// The next instant `evaluate` will actually evaluate. Holds the
     /// first-evaluation delay, the idle cadence, and — after corrections — the
     /// slew-plus-settle dwell that keeps each iteration from measuring the
@@ -279,7 +282,7 @@ impl PhaseController {
             slots: HashMap::new(),
             commanded_us: HashMap::new(),
             awaiting_ack: HashSet::new(),
-            walking: HashSet::new(),
+            walking: HashMap::new(),
             next_eval_at: None,
             unconverged_rounds: 0,
             disabled: false,
@@ -478,7 +481,7 @@ impl PhaseController {
         let settled: Vec<(SlotId, i64)> = phases
             .iter()
             .copied()
-            .filter(|(slot, _)| !self.walking.contains(slot))
+            .filter(|(slot, _)| !self.walking.contains_key(slot))
             .collect();
         let target = if settled.is_empty() {
             phases[cluster_end].1
@@ -518,18 +521,36 @@ impl PhaseController {
             // walk that would carry the delay to a whole turn or past it
             // walks backward instead: the delay stays under a turn, and
             // walking forward into that ceiling would leave the slot short
-            // of the target for good.
+            // of the target for good. Either end of that range tolerates an
+            // overshoot within a correction's noise floor, clamped: a slot
+            // whose wanted delay sits a hair past zero or a whole turn would
+            // otherwise walk most of a turn the other way to fix a
+            // sub-millisecond error.
+            //
+            // A walk already under way keeps heading for the delay it set
+            // out for whenever both moves fit. Its delay plus the forward
+            // walk is the same sum at every step, so a target near either
+            // end of the range leaves the choice between the two moves to
+            // estimate noise each round — and a walk that turned back and
+            // forth would never arrive.
             let forward = (target - phase).rem_euclid(self.turn_us);
             let backward = forward - self.turn_us;
             let current = i64::from(self.commanded_us.get(&slot).copied().unwrap_or(0));
-            let past_ceiling = current + forward >= self.turn_us;
-            let change = if past_ceiling || (current + backward >= 0 && backward.abs() < forward) {
-                backward
-            } else {
-                forward
+            let forward_fits = current + forward < self.turn_us + SLOT_MIN_CHANGE_US;
+            let backward_fits = current + backward >= -SLOT_MIN_CHANGE_US;
+            let change = match self.walking.get(&slot) {
+                Some(&heading) if forward_fits && backward_fits => {
+                    if (current + forward - heading).abs() <= (current + backward - heading).abs() {
+                        forward
+                    } else {
+                        backward
+                    }
+                }
+                _ if !forward_fits || (backward_fits && backward.abs() < forward) => backward,
+                _ => forward,
             };
             if change.abs() > SLOT_MAX_CHANGE_US {
-                self.walking.insert(slot);
+                self.walking.insert(slot, current + change);
             } else {
                 self.walking.remove(&slot);
             }
