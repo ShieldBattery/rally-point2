@@ -235,21 +235,61 @@ fn a_disagreement_at_the_deadline_waits_for_the_report_that_decides_it() {
 #[test]
 fn a_report_for_a_step_judged_too_long_ago_is_dropped() {
     let start = Instant::now();
-    let mut m = rollback_maker(&[0, 1]);
+    let mut m = rollback_maker(&[0, 1, 2]);
+    // Slot 2 drops after its first two steps' turns, and the game goes on without it for longer
+    // than the judged steps held.
+    forward(&mut m, &[0, 1, 2], 2 * STATE_HASH_INTERVAL, start);
+    m.note_departure(SlotId(2), framed(1), 0, None);
     for step in 1..=STATE_HASH_WINDOW as u64 + 1 {
         forward(&mut m, &[0, 1], step * STATE_HASH_INTERVAL, start);
         m.observe_state_hash(SlotId(0), step * STATE_HASH_INTERVAL, A, start);
+        m.observe_state_hash(SlotId(1), step * STATE_HASH_INTERVAL, A, start);
         assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
     }
-    // The oldest judged step is no longer held; the next oldest still is.
+    // It comes back, and its reports of those two steps arrive. The oldest judged step is no
+    // longer held; the next oldest still is.
+    assert!(m.reinstate_slot(SlotId(2)));
     let later = start + STATE_HASH_DEADLINE * 2;
     assert!(
-        m.observe_state_hash(SlotId(1), STATE_HASH_INTERVAL, B, later)
+        m.observe_state_hash(SlotId(2), STATE_HASH_INTERVAL, B, later)
             .is_empty()
     );
-    let verdicts = m.observe_state_hash(SlotId(1), 2 * STATE_HASH_INTERVAL, B, later);
-    assert_eq!(verdicts.len(), 1);
-    assert!(verdicts[0].no_majority);
+    assert_eq!(
+        m.observe_state_hash(SlotId(2), 2 * STATE_HASH_INTERVAL, B, later),
+        vec![SyncDivergence {
+            sync_ordinal: 2 * STATE_HASH_INTERVAL,
+            game_frame: None,
+            no_majority: false,
+            diverged: vec![SlotId(2)],
+            missing: Vec::new(),
+        }]
+    );
+}
+
+#[test]
+fn a_slot_that_goes_on_playing_without_its_report_after_its_step_was_decided_is_named() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2]);
+    forward(&mut m, &[0, 1, 2], STATE_HASH_INTERVAL, start);
+    m.observe_state_hash(SlotId(0), 8, A, start);
+    m.observe_state_hash(SlotId(1), 8, A, start);
+    // At the deadline slot 2's turns are short of what counts its missing report against it, so
+    // the step is decided without naming it.
+    forward(&mut m, &[2], 8 + STATE_HASH_LIVE_TURNS - 1, start);
+    assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+    // Its turns go on, still without the report.
+    let later = start + STATE_HASH_DEADLINE + Duration::from_secs(1);
+    forward(&mut m, &[2], 8 + STATE_HASH_LIVE_TURNS, later);
+    assert_eq!(
+        m.judge_state_hashes(later),
+        vec![SyncDivergence {
+            sync_ordinal: 8,
+            game_frame: None,
+            no_majority: false,
+            diverged: Vec::new(),
+            missing: vec![SlotId(2)],
+        }]
+    );
 }
 
 #[test]

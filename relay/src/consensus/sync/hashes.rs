@@ -18,10 +18,11 @@
 //! last [`STATE_HASH_WINDOW`] judged, so a client running far behind never goes unchecked.
 //!
 //! Whenever the verdict can name who is at fault it does: the minority when the rest agree, and a
-//! slot that kept sending turns without its report. A slot whose turns stopped soon after the step
-//! is not blamed for a missing report, since its link went quiet and the leave machinery settles
-//! it. When nobody can be singled out (a 1v1 that disagrees, an even split, nobody reporting) the
-//! verdict names no one.
+//! slot that kept sending turns without its report, judged again for a step already decided if the
+//! slot's turns only get that far afterwards (a slot running slower than the deadline). A slot
+//! whose turns stopped soon after the step is not blamed for a missing report, since its link went
+//! quiet and the leave machinery settles it. When nobody can be singled out (a 1v1 that disagrees,
+//! an even split, nobody reporting) the verdict names no one.
 
 use super::*;
 use crate::rate_limit::RateLimitedCounter;
@@ -63,7 +64,8 @@ struct JudgedStep {
     /// The later of the step's deadline and its newest report. Reports that disagree without
     /// deciding it are decided on the ones present [`STATE_HASH_DEADLINE`] after this.
     hold_from: Instant,
-    /// Whether it gained a report since it was last judged.
+    /// Whether it gained a report, or a slot that hasn't reported it went on to send enough turns
+    /// past it to be blamed, since it was last judged.
     dirty: bool,
     /// Whether its reports disagree without deciding it.
     held: bool,
@@ -205,7 +207,22 @@ impl StateHashTracker {
         required: impl Iterator<Item = SlotId>,
     ) {
         let entry = self.forwarded.entry(slot).or_default();
-        *entry = (*entry).max(count);
+        let before = *entry;
+        *entry = before.max(count);
+        if count > before {
+            // A judged step the slot hasn't reported is judged again once its turns run far
+            // enough past the step for the missing report to count against it: a slot slower
+            // than the deadline still owes the report it never sent.
+            let first = (before + 1).saturating_sub(STATE_HASH_LIVE_TURNS);
+            let last = count.saturating_sub(STATE_HASH_LIVE_TURNS);
+            if last >= first {
+                for (_, judged) in self.judged.range_mut(first..=last) {
+                    if !judged.reports.iter().any(|x| x.0 == slot) {
+                        judged.dirty = true;
+                    }
+                }
+            }
+        }
         let until = required
             .filter(|slot| !self.excluded.contains(slot))
             .map(|slot| self.forwarded.get(&slot).copied().unwrap_or(0))
