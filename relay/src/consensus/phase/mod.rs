@@ -11,16 +11,20 @@
 //!
 //! Why arrival phase *at the relay* is the right thing to align: client `C`
 //! consuming at buffer one needs peer `P`'s turn `k` before its own boundary
-//! `k+1`, which works out to `(t_P - t_C) + d_P_up + d_C_down <= T` per ordered
-//! pair — send-phase offset plus the P→relay→C path must fit in one turn.
-//! Rewriting against relay-observed arrival phases `a = t + d_up` collapses it
-//! to `a_P - a_C + d_C_up + d_C_down <= T`; drive all arrival phases equal and
-//! what remains is `d_C_up + d_C_down <= T` — each client's own relay round
-//! trip under one turn interval, a per-client, phase-free condition that is
-//! exactly the regime where the buffer law legitimately sits at depth one. So
-//! minimizing the spread of arrival phases at the relay is not a proxy for the
-//! objective; it *is* the objective, even with heterogeneous path delays, and
-//! it needs no client-side measurement at all.
+//! `k+1`, which works out to `(t_P - t_C) + h_P + d_P_up + d_C_down <= T` per
+//! ordered pair (`t` the production phase, `h` the send delay a client holds
+//! its turns by) — production offset plus P's hold plus the P→relay→C path
+//! must fit in one turn. Rewriting against relay-observed arrival phases
+//! `a = t + h + d_up` collapses it to `a_P - a_C + h_C + d_C_up + d_C_down <= T`;
+//! drive all arrival phases equal and what remains is
+//! `h_C + d_C_up + d_C_down <= T` — each client's own relay round trip plus
+//! its own hold under one turn interval, a per-client, phase-free condition
+//! that is exactly the regime where the buffer law legitimately sits at depth
+//! one. So minimizing the spread of arrival phases at the relay is not a proxy
+//! for the objective; it *is* the objective, even with heterogeneous path
+//! delays, and it needs no client-side measurement at all — provided no client
+//! holds more delay than alignment needs, which is why delay common to every
+//! slot is given back (see `evaluate`).
 //!
 //! Stability — the part that is easy to get wrong: a phase is only a
 //! well-defined, quasi-static quantity while the session's turn flow actually
@@ -72,12 +76,16 @@
 //! across relays would need a shared clock, and mesh sessions carry a hop
 //! cushion in their initial buffer depth that keeps them off depth one anyway.
 //!
-//! Security: corrections are computed from relay-side arrival timestamps only.
-//! No client-asserted value (frame counts, stall telemetry) feeds a decision
-//! that reaches other clients — a client can influence its peers' corrections
-//! only as far as its *actual wire behavior* moves the shared target, and the
-//! dead-band, the re-evaluation dwell, and the client-side slew cap each bound
-//! how fast that influence can move anyone.
+//! Security: who aligns to whom is computed from relay-side arrival timestamps
+//! only. No client-asserted value (frame counts, stall telemetry) feeds a
+//! decision that reaches other clients — a client can influence its peers'
+//! corrections only as far as its *actual wire behavior* moves the shared
+//! target, and the dead-band, the re-evaluation dwell, and the client-side
+//! slew cap each bound how fast that influence can move anyone. The one
+//! decision that reads command state across slots, giving back delay every
+//! slot holds, can only lower every delay by the same amount: a slot's own
+//! command (and the acknowledgements that advance it) can at most withhold
+//! that give-back from its peers, never raise their delays or misalign them.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -488,8 +496,9 @@ impl PhaseController {
         } else {
             settled[find_widest_gap(&settled, self.turn_us).0].1
         };
-        let mut corrections = Vec::new();
-        let mut widest_change = 0i64;
+        // Each unfenced slot's current and wanted delay, before the cap.
+        let mut wanted: Vec<(SlotId, i64, i64)> = Vec::with_capacity(phases.len());
+        let mut any_fenced = false;
         for &(slot, phase) in &phases {
             // A slot that has not acknowledged its previous command gets no
             // further one. The acknowledgement is explicit (`PhaseApplied`,
@@ -508,6 +517,7 @@ impl PhaseController {
             // outright — never another slot's. Held rounds still count toward
             // the give-up latch above.
             if self.awaiting_ack.contains(&slot) {
+                any_fenced = true;
                 continue;
             }
             // The forward walk that puts this slot's phase on the target, and
@@ -549,6 +559,34 @@ impl PhaseController {
                 _ if !forward_fits || (backward_fits && backward.abs() < forward) => backward,
                 _ => forward,
             };
+            wanted.push((slot, current, current + change));
+        }
+
+        // Give back delay every slot would carry: it aligns nothing, yet each
+        // client's hold comes straight out of the one turn its own round trip
+        // must fit inside at depth one. Following the latest slot only ever
+        // adds delay, so without this each link change would leave everyone
+        // holding more, until walks into the one-turn ceiling stopped the
+        // session converging. Lowering every slot by the smallest wanted
+        // delay moves every phase together (no difference changes, no delay
+        // crosses the floor or the cycle), so it waits for a round in which
+        // no measured slot is fenced: one left behind would be misaligned.
+        if !any_fenced {
+            let shed = wanted
+                .iter()
+                .map(|&(_, _, want)| want)
+                .min()
+                .unwrap_or(0)
+                .max(0);
+            for (_, _, want) in &mut wanted {
+                *want -= shed;
+            }
+        }
+
+        let mut corrections = Vec::new();
+        let mut widest_change = 0i64;
+        for (slot, current, want) in wanted {
+            let change = want - current;
             if change.abs() > SLOT_MAX_CHANGE_US {
                 self.walking.insert(slot, current + change);
             } else {

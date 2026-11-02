@@ -790,7 +790,8 @@ into per-slot **arrival-phase** estimates (an EWMA of the arrival residual again
 interval, kept unwrapped and reduced modulo the interval only at evaluation), and periodically finds
 the tightest cluster of phases on the circle. Everyone is pulled onto the cluster's *latest* phase —
 delay-only, so no client is ever asked to send earlier than its game produced the data, and the
-largest-gap choice minimizes the biggest delay anyone is asked to add. Corrections go down each
+largest-gap choice minimizes the biggest delay anyone is asked to add — and each correcting round
+also gives back whatever delay every slot would be left holding (below). Corrections go down each
 corrected client's reliable control stream as an **absolute** `PhaseDirective` (whole commanded
 delay, newest wins, re-pushed on reconnect), and the client's driver holds each outbound turn's
 *wire handoff* by the applied delay — the game's local echo has already happened, so nothing about
@@ -798,23 +799,39 @@ when the game runs changes — slewing toward a new target at a bounded rate (~2
 per directive, client-clamped) so the relay's pacing statistics never see the shift as jitter.
 
 Why aligning arrival phases *at the relay* is the right objective and not a proxy: the depth-one
-stall-free condition per ordered pair (P feeding C) is `(t_P − t_C) + d_P_up + d_C_down ≤ T`.
-Rewritten against relay-observed arrival phases `a = t + d_up`, it collapses to
-`(a_P − a_C) + d_C_up + d_C_down ≤ T` — so once arrival phases are equal, what remains is each
-client's **own** relay round trip fitting inside one turn, a per-client, phase-free condition that
-is exactly the regime where the law legitimately holds depth one. Heterogeneous path delays drop out
-entirely, which is also why no client-side measurement is needed or wanted: corrections are computed
-from relay-side arrival timestamps alone, no client-asserted value feeds a decision that reaches
-other clients, and a client can drag the shared target only with its actual wire behavior, rate-
-limited by the dead-band (no corrections under a ~3 ms span), the re-evaluation dwell (slew time
-plus settle), and the client-side slew clamp. The loop is closed-loop and self-correcting: measured
-phases already include whatever delay each client applies, so the controller needs no knowledge of
-client state (a disobedient client just keeps showing up misaligned and only its own correction
-keeps moving), and an aligned population inside the dead-band is never touched — which also kills
-any ratchet from common-mode drift. Commands are absolute delays worked out from the relay's record
-of what it last commanded, so a client re-homed onto a replacement relay, which holds no record and
-takes it to hold no delay, drops its delay to zero at the move; the relay outage has already broken
-the alignment that delay held.
+stall-free condition per ordered pair (P feeding C) is
+`(t_P − t_C) + h_P + d_P_up + d_C_down ≤ T`, with `t` the turn's production phase and `h` the send
+delay its client holds it by. Rewritten against relay-observed arrival phases `a = t + h + d_up`,
+it collapses to `(a_P − a_C) + h_C + d_C_up + d_C_down ≤ T` — so once arrival phases are equal,
+what remains is each client's **own** relay round trip plus its own held delay fitting inside one
+turn, a per-client, phase-free condition that is exactly the regime where the law legitimately
+holds depth one, as long as nobody holds more delay than alignment needs. Heterogeneous path delays
+drop out entirely, which is also why no client-side measurement is needed or wanted: who lines up
+with whom is computed from relay-side arrival timestamps alone, no client-asserted value feeds a
+decision that reaches other clients (beyond the bounded give-back below), and a client can drag the
+shared target only with its actual wire behavior, rate-limited by the dead-band (no corrections
+under a ~3 ms span), the re-evaluation dwell (slew time plus settle), and the client-side slew
+clamp. The loop is closed-loop and self-correcting: measured phases already include whatever delay
+each client applies, so the controller needs no knowledge of client state beyond its own commands (a
+disobedient client just keeps showing up misaligned and only its own correction keeps moving), and an
+aligned population inside the dead-band is never touched. Commands are absolute delays worked out from
+the relay's record of what it last commanded, so a client re-homed onto a replacement relay, which holds
+no record and takes it to hold no delay, drops its delay to zero at the move; the relay outage has
+already broken the alignment that delay held.
+
+The one thing measured phases cannot show is delay *every* slot holds: it moves every arrival
+together. Following the latest phase only ever adds delay — a slot whose link slows is followed by
+everyone, one whose link speeds up follows everyone — so without a give-back each link change left
+the whole population holding more, eating every client's depth-one budget until forward walks into
+the one-turn ceiling kept the session from converging and the give-up latch switched alignment off.
+So each correcting round, having worked out every slot's wanted delay from the measured phases,
+lowers all of them by the smallest one, using the relay's own record of what it commanded. The
+shift moves every phase together and changes no difference between them; it only ever lowers
+delays (never through the floor, never across the cycle); and it happens only in a round where
+every measured slot can be commanded, since a fenced slot left behind would be knocked out of
+alignment. That bounds what a client can do through it: its own command is just one term of the
+minimum, so the most its acknowledgements can do is withhold the give-back from its peers — the
+give-back itself never raises anyone's delay or moves anyone relative to anyone else.
 
 The stability caveat that makes or breaks this controller: a phase is only quasi-static while the
 session actually runs at the nominal turn period. A game client's *production* schedule couples to

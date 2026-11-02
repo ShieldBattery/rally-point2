@@ -1,5 +1,5 @@
 //! The delay slots carry from round to round: walks that take several capped
-//! rounds to finish.
+//! rounds to finish, and giving back delay the whole population carries.
 
 use super::*;
 
@@ -137,4 +137,32 @@ fn a_slot_at_the_floor_measured_a_hair_late_is_not_walked_a_turn_forward() {
     let last = feed_steady(&mut controller, start, &offsets, 0, 300);
     let corrections = controller.evaluate(last + Duration::from_millis(1));
     assert_eq!(corrections, vec![(slot(3), 6_000)]);
+}
+
+#[test]
+fn delay_the_whole_population_carries_is_given_back() {
+    // Two slots on the same phase. Slot 0's uplink gets 10 ms slower, so
+    // slot 1 follows it with 10 ms of delay; then it recovers, leaving slot 0
+    // 10 ms early. Re-aligning by delaying slot 0 too would leave both
+    // holding 10 ms that aligns nothing, and every further round trip of the
+    // link would add another 10 ms until walks into the one-turn ceiling kept
+    // the pair from converging. Each re-alignment must instead hand back the
+    // delay both would share, ending with no delay held at all.
+    let mut population = Population::new(&[(slot(0), 10_000), (slot(1), 10_000)]);
+    for cycle in 0..5 {
+        for natural in [20_000, 10_000] {
+            population.natural[0].1 = natural;
+            let mut rounds = 0;
+            while !population.round().is_empty() {
+                rounds += 1;
+                assert!(rounds <= 3, "cycle {cycle}: still correcting");
+            }
+            assert!(!population.controller.is_disabled(), "cycle {cycle}");
+            let shared = population.held(slot(0)).min(population.held(slot(1)));
+            assert!(
+                shared <= SLOT_MIN_CHANGE_US,
+                "cycle {cycle}: both slots hold {shared} us after re-aligning"
+            );
+        }
+    }
 }
