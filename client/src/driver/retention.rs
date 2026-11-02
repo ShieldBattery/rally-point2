@@ -121,15 +121,52 @@ fn retained_size(payload: &Payload) -> usize {
 /// permanently stalling a peer that never received them from the dead relay on that
 /// seq. The clone is cheap next to that risk (these turns are rare and the batch
 /// tiny), and paid only while turns remain to send.
+///
+/// A successful write is not delivery either: the connection can die before the
+/// relay reads the stream, and by then the turn may have left the retention ring
+/// (the outage-buffer flush right behind this drain pushes turns into it), so no
+/// later resume would restage it. A turn that aged out of retention like that is
+/// old enough that its peers may already hold it, but the relay this drain wrote
+/// to may still need it to close its receive window's contiguous prefix, which
+/// otherwise never moves past the seq. So each written turn moves to `owed` and
+/// stays there until the relay's delivered-through cursor covers it
+/// ([`confirm_owed_control`]), and every drain writes the owed turns again first,
+/// the way an unacked datagram is re-carried until its ack.
 pub(super) async fn redivert_pending_control(
     control_send: &mut noq::SendStream,
     pending: &mut Vec<Payload>,
+    owed: &mut Vec<Payload>,
 ) -> Result<(), ControlSendError> {
+    for turn in owed.drain(..) {
+        stage_control_redivert(pending, turn);
+    }
+    pending.sort_by_key(|turn| turn.seq);
     while let Some(turn) = pending.first().cloned() {
         send_control_turn(control_send, turn).await?;
-        pending.remove(0);
+        owed.push(pending.remove(0));
     }
     Ok(())
+}
+
+/// Drops the owed control-path turns (see [`redivert_pending_control`]) that a
+/// delivered-through cursor for this client's own slot covers: the relay that
+/// sent it holds every seq up to the cursor, so none of those needs writing again.
+pub(super) fn confirm_owed_control(owed: &mut Vec<Payload>, delivered_through: u64) {
+    owed.retain(|turn| turn.seq > delivered_through);
+}
+
+/// The oldest own turn the next connection's control-stream drain will write:
+/// across the retained oversize turns a same-relay resume restages, the turns
+/// already staged, and the owed turns no relay has confirmed. A same-relay
+/// resume must anchor at or below it, or the relay's dedup discards the write as
+/// already delivered.
+pub(super) fn oldest_restaged_control_seq(state: &LoopState) -> Option<u64> {
+    let staged = state
+        .pending_control_redivert
+        .iter()
+        .chain(&state.control_owed)
+        .map(|turn| turn.seq);
+    staged.chain(state.retention.oldest_oversize_seq()).min()
 }
 
 /// The own-slot receive-window anchor a re-home dial presents to the fresh relay:

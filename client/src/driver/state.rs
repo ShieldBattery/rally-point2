@@ -290,6 +290,12 @@ pub(super) struct LoopState {
     /// stream it opens on the new connection — the same divert path an
     /// oversize turn takes when first sent — and it empties on each drain.
     pub(super) pending_control_redivert: Vec<Payload>,
+    /// Turns a drain of [`pending_control_redivert`](Self::pending_control_redivert)
+    /// wrote that no relay has yet covered with its delivered-through cursor for
+    /// this client's slot. A control-stream write carries no acknowledgment and the
+    /// turn may since have left the retention ring, so each stays here, and every
+    /// new connection's drain writes it again, until a cursor covers it.
+    pub(super) control_owed: Vec<Payload>,
     /// Every lobby command this client authored, seq-stamped, written again on
     /// each new control stream (a write onto a connection that silently died is
     /// otherwise lost with nothing to report it), and the pacing all those
@@ -334,6 +340,7 @@ impl LoopState {
             game_started: false,
             retention: RetentionRing::default(),
             pending_control_redivert: Vec::new(),
+            control_owed: Vec::new(),
             lobby_outbox: LobbyOutbox::new(Instant::now()),
             lobby_receipts: LobbyReceipts::default(),
             connectivity: ConnectivityFence::default(),

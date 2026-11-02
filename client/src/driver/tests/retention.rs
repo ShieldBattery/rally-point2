@@ -389,6 +389,7 @@ async fn staged_oversize_turns_survive_a_control_stream_send_failure_and_deliver
     // dead relay would stall forever on that seq.
     let oversize = |seq: u64, byte: u8| turn(seq, &vec![byte; 4096]);
     let mut pending = vec![oversize(0, 0x11), oversize(1, 0x22)];
+    let mut owed = Vec::new();
 
     // Attempt 1: a connection closed before the send, so `write_all` fails. Every
     // staged turn must remain — none dropped on the failure.
@@ -396,7 +397,7 @@ async fn staged_oversize_turns_survive_a_control_stream_send_failure_and_deliver
         let (link_a, _link_b, _ea, _eb) = connected_links().await;
         let (mut control_send, _recv) = link_a.connection().open_bi().await.unwrap();
         link_a.connection().close(noq::VarInt::from_u32(0), b"boom");
-        let result = redivert_pending_control(&mut control_send, &mut pending).await;
+        let result = redivert_pending_control(&mut control_send, &mut pending, &mut owed).await;
         assert!(result.is_err(), "a send over a dead connection must fail");
         assert_eq!(
             pending.len(),
@@ -410,7 +411,7 @@ async fn staged_oversize_turns_survive_a_control_stream_send_failure_and_deliver
     let (link_a, link_b, _ea, _eb) = connected_links().await;
     let mut control_rx = spawn_control_reader(link_b.connection().clone());
     let (mut control_send, _recv) = link_a.connection().open_bi().await.unwrap();
-    redivert_pending_control(&mut control_send, &mut pending)
+    redivert_pending_control(&mut control_send, &mut pending, &mut owed)
         .await
         .expect("the retry over a live connection delivers the staged turns");
     assert!(
@@ -435,4 +436,84 @@ async fn staged_oversize_turns_survive_a_control_stream_send_failure_and_deliver
             other => panic!("expected an oversize turn on the control stream, got {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn a_drained_redivert_turn_stays_owed_until_a_relay_cursor_covers_it() {
+    // A re-home stages a retained oversize turn for the replacement's control
+    // stream, and the drain writes it there. The outage-buffer flush right
+    // behind the drain pushes enough turns to evict it from retention, and the
+    // connection dies before the replacement reads its stream. The turn is now
+    // in no retention ring, no unacked window and no staging: unless the drain
+    // keeps it owed, the next resume neither writes it again nor anchors at it,
+    // and the replacement's receive prefix never gets past its seq.
+    let (mut link_a, _link_b, _ea, _eb) = connected_links().await;
+    let own_slot = SlotId(0);
+    let mut state = LoopState::new(Arc::new(AtomicBool::new(false)), TEST_TIMING);
+    state.retention.push(&turn(0, &[0x01]));
+    state.retention.push(&sized_turn(1, 4096));
+    let floor = rehome_own_slot_anchor(&link_a, own_slot, state.retention.front_seq())
+        .expect("a re-home with retained turns declares an anchor");
+    reinject_retention(&mut link_a, &mut state);
+    {
+        let (mut control_send, _recv) = link_a.connection().open_bi().await.unwrap();
+        redivert_pending_control(
+            &mut control_send,
+            &mut state.pending_control_redivert,
+            &mut state.control_owed,
+        )
+        .await
+        .expect("the write succeeds locally");
+    }
+    assert!(state.pending_control_redivert.is_empty());
+    for seq in 2..600 {
+        state.retention.push(&turn(seq, &[0x02]));
+    }
+    assert_eq!(
+        state.retention.oldest_oversize_seq(),
+        None,
+        "the flush evicted the drained turn from retention",
+    );
+
+    // The next resume is same-relay to the replacement, which acked every
+    // datagram: the anchor still has to sit at the turn its control stream
+    // never delivered.
+    assert_eq!(
+        same_relay_resume_cursors(
+            &[],
+            None,
+            oldest_restaged_control_seq(&state),
+            own_slot,
+            600,
+            floor,
+        ),
+        vec![(own_slot, 1)],
+    );
+    // A cursor short of it confirms nothing.
+    confirm_owed_control(&mut state.control_owed, 0);
+
+    // The next connection's drain writes it again.
+    let (link_c, link_d, _ec, _ed) = connected_links().await;
+    let mut control_rx = spawn_control_reader(link_d.connection().clone());
+    let (mut control_send, _recv) = link_c.connection().open_bi().await.unwrap();
+    redivert_pending_control(
+        &mut control_send,
+        &mut state.pending_control_redivert,
+        &mut state.control_owed,
+    )
+    .await
+    .expect("the drain over a live connection writes the owed turn");
+    let delivered = tokio::time::timeout(Duration::from_secs(5), control_rx.recv())
+        .await
+        .expect("the owed turn never crossed the fresh control stream")
+        .expect("control reader closed early");
+    match delivered {
+        ControlInbound::OversizeTurn(payload) => assert_eq!(payload.seq, 1),
+        other => panic!("expected an oversize turn on the control stream, got {other:?}"),
+    }
+
+    // Once the relay's delivered-through cursor covers it, nothing owes it.
+    confirm_owed_control(&mut state.control_owed, 1);
+    assert!(state.control_owed.is_empty());
+    assert_eq!(oldest_restaged_control_seq(&state), None);
 }

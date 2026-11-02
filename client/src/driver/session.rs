@@ -14,7 +14,7 @@ use rally_point_transport::Link;
 use rally_point_transport::control::send_control_game_started;
 use tokio::time::{Instant, sleep_until};
 
-use super::retention::redivert_pending_control;
+use super::retention::{confirm_owed_control, redivert_pending_control};
 use super::send::{OutboundSend, send_game_turn, send_packet, window_cap_error};
 use super::state::{GameSeam, LoopState};
 use super::wire::Wire;
@@ -64,10 +64,14 @@ impl LinkDriver {
         // otherwise invisible). They ride the fresh control stream — the same
         // divert path an oversize turn takes when first sent — before the
         // buffered live turns below, preserving seq order (a retained turn's seq
-        // always precedes a turn produced during the outage).
-        if let Err(error) =
-            redivert_pending_control(&mut wire.control_send, &mut state.pending_control_redivert)
-                .await
+        // always precedes a turn produced during the outage). Turns an earlier
+        // drain wrote that no relay has confirmed go again with them.
+        if let Err(error) = redivert_pending_control(
+            &mut wire.control_send,
+            &mut state.pending_control_redivert,
+            &mut state.control_owed,
+        )
+        .await
         {
             return state
                 .announcer
@@ -331,6 +335,9 @@ impl LinkDriver {
                     match received {
                         Some((slot, cursor)) => {
                             link.retire_through(slot, cursor);
+                            if slot == own_slot {
+                                confirm_owed_control(&mut state.control_owed, cursor);
+                            }
                             if let Some(error) = window_cap_error(link) {
                                 return Err(error);
                             }

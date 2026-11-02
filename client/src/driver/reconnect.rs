@@ -20,8 +20,8 @@ use crate::identity::Identity;
 use super::DriverError;
 use super::backoff::{Backoff, EscalationWait, WaitOutcome, await_rehome, wait_backoff};
 use super::retention::{
-    redivert_oversize_retention_on_same_relay_resume, rehome_own_slot_anchor, reinject_retention,
-    same_relay_resume_cursors,
+    oldest_restaged_control_seq, redivert_oversize_retention_on_same_relay_resume,
+    rehome_own_slot_anchor, reinject_retention, same_relay_resume_cursors,
 };
 use super::state::{
     GameSeam, LoopState, OUTAGE_OUTBOUND_BUFFER_CAP, RECONNECT_DIAL_TIMEOUT,
@@ -333,8 +333,9 @@ pub(super) async fn reconnect_link(
         // seq this resume will actually re-send, across BOTH of its re-send
         // paths: the AckManager's oldest replayable unacked seq (the redundancy
         // pass re-carries the unacked window oldest-first over the rebound
-        // connection) and the oldest retained OVERSIZE turn (restaged onto the
-        // fresh control stream by the resume — it never entered the unacked
+        // connection) and the oldest OVERSIZE turn the fresh control stream will
+        // carry (a retained one the resume restages, or one an earlier drain
+        // wrote that no relay has confirmed — it never entered the unacked
         // window, and anchoring above it would have the relay's dedup discard
         // the restaged retry as a duplicate, permanently stranding peers on its
         // seq). With neither source, it is the next seq we will produce (the
@@ -349,7 +350,7 @@ pub(super) async fn reconnect_link(
         let same_relay_cursors = same_relay_resume_cursors(
             &cursors,
             link.oldest_replayable_seq(own_slot),
-            state.retention.oldest_oversize_seq(),
+            oldest_restaged_control_seq(state),
             own_slot,
             state.next_outbound_seq,
             rc.target.own_anchor_floor,

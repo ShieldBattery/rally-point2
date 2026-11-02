@@ -400,7 +400,7 @@ returning clients to replay. Recovery combines that client replay with surviving
   arrive and close the window's prefix, and selective packet acks make the unacked window *sparse*, so the
   bare oldest-unacked seq cannot honor it alone. On a **same-relay resume** the anchor is the oldest seq
   the resume will re-send over EITHER of its paths — the datagram redundancy's oldest still-unacked seq,
-  min'd with the oldest retained oversize turn the resume restages onto the fresh control stream (an
+  min'd with the oldest oversize turn the fresh control stream will carry, retained or still owed (an
   oversize turn never enters the unacked window, and the relay's dedup gates its control-delivered retry
   exactly as it gates a datagram, so an anchor above it would discard the retry as a duplicate) — and it
   is presented even at 0, since its presence is what requests the seeding below. The **relay closes the
@@ -437,7 +437,13 @@ returning clients to replay. Recovery combines that client replay with surviving
   origin `(slot, seq)`. This closes the window where the dead relay acked a turn but died before fanning it
   out. An oversize retained turn (one that rides the reliable control streams end to end, never datagrams) is staged for the fresh connection's reliable control
   stream and kept staged until its send succeeds, so a mid-drain stream failure retries it on the next
-  session rather than losing it. An undecided drop-hold at relay death is deliberately lost — survivors
+  session rather than losing it. A successful write is not delivery either, so once written the turn
+  stays **owed** until the relay's delivered-through beacon cursor covers it, and every new connection
+  writes the owed turns again (a same-relay resume anchors at or below them). The ring cannot stand in
+  for that: the outage buffer's flush right behind the drain can evict the turn, and even when every
+  peer already holds it, a replacement whose stream never delivered it needs it to close its receive
+  prefix. Without it the prefix stalls at that seq until the live stream runs a whole receive window
+  past it and the relay closes the link as out of window. An undecided drop-hold at relay death is deliberately lost — survivors
   re-wait the fresh 30s floor on the new relay.
 
 **Destination resume cursors are queue floors.** Each returning client's peer cursors are installed
@@ -2195,7 +2201,9 @@ Entries marked **(SB-side)** bind the ShieldBattery integration rather than a cr
   / 256 KiB, drop-oldest) — so "while its session lives" holds for it only as far as the ring
   reaches. That an evicted oversize turn is never one a peer still needs is a game-model fact,
   not a transport invariant: lockstep stalls turn production behind an undelivered turn, so the
-  ring can only rotate hundreds of turns past one that every peer has already consumed.
+  ring can only rotate hundreds of turns past one that every peer has already consumed. A relay's
+  receive prefix can still need such a turn after a re-home, so one a resume's drain wrote stays
+  owed outside the ring until the relay's cursor confirms it.
   Accepted trade:
   burst-loss worst-case tails roughly double (a payload whose dense carries all died waits the
   backoff before its next try) and a blackout's backlog drains over a few packets instead of one —
