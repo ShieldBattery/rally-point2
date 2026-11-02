@@ -291,12 +291,7 @@ pub(super) fn deliver_turn_to_locals(
             }
         }
     }
-    // NOTE: player-leaves are NOT stamped here. A leave is delivered over the
-    // reliable control stream (the relay pushes it to each surviving client), not
-    // the turn envelope — a drop stops the turn stream, so an envelope stamp would
-    // never reach the survivors it must unstall. See `routing`'s leave trigger.
-    routing::fan_out(sessions, key, slot, for_clients(&payload));
-    // Record the fanned turn into the session's replay ring so a client that drops
+    // Record the turn into the session's replay ring so a client that drops
     // and re-dials while its drop is undecided can be replayed what it missed. This is the one
     // choke point every turn-delivery path funnels through, placed right after the
     // `mark_seen` dedup, so each distinct `(slot, seq)` is recorded exactly once
@@ -316,6 +311,17 @@ pub(super) fn deliver_turn_to_locals(
         };
         turn_ring.record(key, &payload, origin, slots);
     }
+    // Fan out only once the turn is recorded. A reconnecting client registers
+    // and then reads the ring, neither excluded by this delivery, so recording
+    // after the fan-out would let one register in between and miss the turn on
+    // both paths. This order can hand it the turn on both instead, which its
+    // per-slot dedup absorbs.
+    //
+    // NOTE: player-leaves are NOT stamped here. A leave is delivered over the
+    // reliable control stream (the relay pushes it to each surviving client), not
+    // the turn envelope — a drop stops the turn stream, so an envelope stamp would
+    // never reach the survivors it must unstall. See `routing`'s leave trigger.
+    routing::fan_out(sessions, key, slot, for_clients(&payload));
     Some(payload)
 }
 
