@@ -24,7 +24,7 @@ impl SessionLink {
     /// Mirrors [`Link::process_incoming`](crate::Link) but on the per-session
     /// state this struct owns.
     pub(super) fn process_incoming(&mut self, mut packet: Packet) -> Result<Received, LinkError> {
-        self.acks.handle_incoming(&packet)?;
+        self.acks.handle_incoming_acks(&packet)?;
 
         // Whether the peer is waiting on an ack for delivered turns: a packet
         // that carried payloads (even all-redundant ones) needs an ack back,
@@ -35,6 +35,10 @@ impl SessionLink {
         // transactional rollback, and in-place compaction cannot drift between
         // the two receive paths.
         retain_fresh_payloads(&mut self.dedup, &mut packet.payloads)?;
+        // Acked only once dedup has accepted the packet (duplicates included, so a lost
+        // ack is repeated): a rejected packet must not leave an acked hole the peer
+        // then stops re-carrying into.
+        self.acks.record_received(packet.seq);
         Ok(Received {
             fresh: packet.payloads,
             carried_payloads,

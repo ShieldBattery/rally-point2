@@ -274,3 +274,49 @@ async fn same_relay_resume_on_a_nonzero_slot_accepts_a_wire_slot_zero_stream() {
         other => panic!("expected the wire-slot-keyed edge to reject, got {other:?}"),
     }
 }
+
+/// The ack a link would send back right now: the newest packet seq it has
+/// recorded from the peer.
+fn ack_to_send(link: &mut Link) -> Option<u32> {
+    link.acks.build_outgoing(None, 1200).unwrap().ack
+}
+
+fn packet_with(seq: u32, payload_seq: u64) -> Packet {
+    Packet {
+        seq,
+        ack: None,
+        ack_bits: 0,
+        payloads: vec![Payload {
+            seq: payload_seq,
+            slot: 0,
+            commands: vec![0xAA].into(),
+            ..Default::default()
+        }],
+        turns_complete: None,
+    }
+}
+
+/// A packet dedup rejects is not acked, so a caller that keeps receiving after the
+/// error does not leave the peer believing the packet's payloads were delivered.
+/// A duplicate is not a rejection: it is acked again in case the first ack was lost.
+#[tokio::test]
+async fn a_packet_dedup_rejects_is_not_acked_but_a_duplicate_is() {
+    let (raw, _peer, _ea, _eb) = test_util::loopback(Edge::Client).await;
+    let mut link = Link::new(raw);
+
+    link.process_incoming(packet_with(0, 0)).unwrap();
+    assert_eq!(ack_to_send(&mut link), Some(0));
+
+    // Beyond the receive window: rejected, and packet seq 1 must stay unacked.
+    assert!(matches!(
+        link.process_incoming(packet_with(1, u64::MAX)),
+        Err(LinkError::PayloadOutOfWindow { .. })
+    ));
+    assert_eq!(ack_to_send(&mut link), Some(0), "rejected packet not acked");
+
+    // The same payload again in a new packet is a duplicate and is acked.
+    let received = link.process_incoming(packet_with(2, 0)).unwrap();
+    assert!(received.fresh.is_empty());
+    assert!(received.carried_payloads);
+    assert_eq!(ack_to_send(&mut link), Some(2), "duplicate packet acked");
+}

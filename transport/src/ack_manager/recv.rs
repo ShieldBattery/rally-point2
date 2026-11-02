@@ -21,6 +21,24 @@ impl AckManager {
     /// what to do with that — a relay may disconnect the peer; a client may log
     /// and continue.
     pub fn handle_incoming(&mut self, incoming: &Packet) -> Result<(), AckError> {
+        self.handle_incoming_acks(incoming)?;
+        self.record_received(incoming.seq);
+        Ok(())
+    }
+
+    /// Records a received packet's seq so it is acked back to the peer.
+    ///
+    /// A receive path that can still reject the packet after its acks are folded in
+    /// (payload dedup) calls this only once the packet is accepted, so a rejected
+    /// packet is never acked and the peer keeps re-carrying its payloads.
+    pub(crate) fn record_received(&mut self, seq: u32) {
+        self.received_packets.record(seq);
+    }
+
+    /// The ack half of [`handle_incoming`](Self::handle_incoming): validates the
+    /// packet and retires what its acks cover, without recording the packet itself
+    /// for our own acking (see [`record_received`](Self::record_received)).
+    pub(crate) fn handle_incoming_acks(&mut self, incoming: &Packet) -> Result<(), AckError> {
         match incoming.ack {
             Some(ack) => {
                 if ack >= self.packet_seq {
@@ -44,8 +62,6 @@ impl AckManager {
                 }
             }
         }
-
-        self.received_packets.record(incoming.seq);
 
         if let Some(ack) = incoming.ack {
             let ack = u64::from(ack);
