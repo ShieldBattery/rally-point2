@@ -115,7 +115,8 @@ impl<K: Eq + Hash + Clone> EndpointLimiter<K> {
     /// rounded up to whole seconds because `Retry-After` counts in seconds and
     /// rounding down would invite an immediately-refused retry.
     pub fn retry_after_secs(&self) -> u64 {
-        self.refill_interval.as_secs().max(1)
+        let interval = self.refill_interval;
+        (interval.as_secs() + u64::from(interval.subsec_nanos() > 0)).max(1)
     }
 }
 

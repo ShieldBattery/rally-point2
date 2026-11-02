@@ -51,3 +51,12 @@ fn forget_drops_a_sessions_buckets() {
     limiter.forget(&tid(), SessionId(1));
     assert!(limiter.check_at(&(tid(), SessionId(1)), t0));
 }
+
+#[test]
+fn retry_after_rounds_the_refill_interval_up_to_whole_seconds() {
+    let after = |interval| RehomeLimiter::new(1, interval).retry_after_secs();
+    assert_eq!(after(Duration::from_millis(100)), 1);
+    assert_eq!(after(Duration::from_secs(5)), 5);
+    // Truncating would say 1 and invite a retry the bucket still refuses.
+    assert_eq!(after(Duration::from_millis(1500)), 2);
+}
