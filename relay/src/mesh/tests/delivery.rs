@@ -67,6 +67,64 @@ fn the_replay_ring_is_bounded_by_the_sessions_actual_slot_count() {
     );
 }
 
+/// A game turn delivered before this relay latched the session started is
+/// recorded, so it stays replayable: a peer's first game turns can outrun the
+/// start on the control stream, and a re-homed client can re-inject before
+/// the latch. A frameless pre-start turn is lobby traffic and stays out.
+#[test]
+fn a_game_turn_before_the_start_latch_is_recorded_for_replay() {
+    use crate::consensus::delivery::DeliveryHome;
+    use crate::consensus::{self, Authority};
+    use rally_point_proto::control::BufferBounds;
+
+    let sessions = routing::Sessions::default();
+    let mesh = MeshState::default();
+    let key = control_key();
+    let _ = mesh.session.decision_makers.sync_maker(
+        &key,
+        consensus::MakerSync {
+            expected_slots: [SlotId(0), SlotId(1), SlotId(2)].into(),
+            ..consensus::MakerSync::new(BufferBounds::new(1, 6).unwrap(), Authority::Peer)
+        },
+    );
+    assert!(!mesh.session.decision_makers.is_started(&key));
+
+    let turn = |slot: u8, frame: Option<u32>| Payload {
+        seq: 0,
+        slot: u32::from(slot),
+        game_frame_count: frame,
+        ..Default::default()
+    };
+    for (slot, frame, home) in [
+        (0, Some(1), DeliveryHome::Peer(RelayId(9))),
+        (1, Some(1), DeliveryHome::Local),
+        (2, None, DeliveryHome::Local),
+    ] {
+        deliver_turn_to_locals(
+            &sessions,
+            &mesh,
+            &key,
+            SlotId(slot),
+            turn(slot, frame),
+            home,
+        );
+    }
+
+    let ring = &mesh.session.turn_ring;
+    let replayed: Vec<u32> = ring
+        .replay(&key, &HashMap::new(), SlotId(3))
+        .iter()
+        .map(|p| p.slot)
+        .collect();
+    assert_eq!(replayed, vec![0, 1], "both game turns, not the lobby turn");
+    let answered: Vec<u32> = ring
+        .replay_local(&key, &HashMap::new(), true)
+        .iter()
+        .map(|p| p.slot)
+        .collect();
+    assert_eq!(answered, vec![1], "a resume ask gets the local game turn");
+}
+
 /// The registries the production turn path runs against, wired to a maker
 /// whose region-label release delay is `region_delay` — `Duration::ZERO` for a
 /// gate that is open the instant the session starts, a long delay for one that

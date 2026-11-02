@@ -254,7 +254,8 @@ impl TurnRing {
     /// single fan-out choke point, after the session-level dedup — so ingress
     /// overlap records a repeated turn exactly once, under whichever origin
     /// the winning copy actually arrived by. The
-    /// caller gates this on the session having started; pre-start lobby
+    /// caller gates this on the session having started, here or (for a game
+    /// turn, which carries a frame) at the turn's origin; pre-start lobby
     /// traffic has its own replay log and must not be double-buffered here.
     ///
     /// `slots` is the session's slot count as best the caller knows it — it
@@ -300,9 +301,9 @@ impl TurnRing {
     /// empty cursor set does not mean a first arrival: a client that has neither sent
     /// nor received a turn presents no cursors when it re-homes, and lands on a relay
     /// whose ring can already hold the session's turns. It costs a genuine first
-    /// arrival nothing either — turns are recorded only after the session starts, and
-    /// a session starts only once every expected slot is present, so the ring a first
-    /// arrival reads is empty.
+    /// arrival nothing either — turns are recorded only after the session starts (here,
+    /// or for a game turn at its origin), and a session starts only once every expected
+    /// slot is present, so the ring a first arrival reads is empty.
     ///
     /// Turns replay in the order the ring recorded them (arrival order at this relay),
     /// which is not guaranteed to be seq order within a slot: the client's per-slot

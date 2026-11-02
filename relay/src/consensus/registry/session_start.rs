@@ -235,16 +235,17 @@ impl DecisionMakers {
         self.lock().get(key).is_some_and(DecisionMaker::is_resumed)
     }
 
-    /// The slot count `key`'s session is shaped for, or `None` when the session has
-    /// not started (or no maker exists). The started gate mirrors
-    /// [`is_started`](Self::is_started) so a caller sizing started-session state gets the gate
-    /// and the shape in one registry lock; the count itself is
+    /// The slot count to size `key`'s replay ring by for one turn, or `None` when
+    /// the turn is not recorded at all: no maker exists, or the session has not
+    /// started here and the turn carries no game frame. A framed turn is a game
+    /// turn, so its game has started at its origin even when this relay's own
+    /// start latch still lags behind it. The count is
     /// [`DecisionMaker::session_slot_count`], including its `0`-means-unknown
-    /// convention.
-    pub fn started_session_slot_count(&self, key: &SessionKey) -> Option<usize> {
+    /// convention; gate and shape are read under one registry lock.
+    pub fn ring_slot_count(&self, key: &SessionKey, framed: bool) -> Option<usize> {
         let makers = self.lock();
         let maker = makers.get(key)?;
-        maker.is_started().then(|| maker.session_slot_count())
+        (framed || maker.is_started()).then(|| maker.session_slot_count())
     }
 
     /// Latches `key`'s session started without firing — used when a peer relay's

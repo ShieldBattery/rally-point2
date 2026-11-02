@@ -295,12 +295,16 @@ pub(super) fn deliver_turn_to_locals(
     // and re-dials while its drop is undecided can be replayed what it missed. This is the one
     // choke point every turn-delivery path funnels through, placed right after the
     // `mark_seen` dedup, so each distinct `(slot, seq)` is recorded exactly once
-    // even when ingress overlap presents a redundant copy. Buffered only once the
+    // even when ingress overlap presents a redundant copy. Buffered once the
     // session has started: pre-start lobby traffic has its own ordered replay log
-    // and must not be double-buffered here. The session's slot count rides along
-    // so the ring's bounds fit the session's actual shape rather than assuming
-    // the largest possible game.
-    if let Some(slots) = decision_makers.started_session_slot_count(key) {
+    // and must not be double-buffered here. A game turn (one carrying a frame) is
+    // buffered even before this relay latches the start: the start reaches it on
+    // the control stream, and a peer's first game turns can outrun it there, or a
+    // re-homed client re-inject its turns first. Fanned out but unrecorded, such a
+    // turn could never be replayed to a reconnecting client or answer a peer's
+    // resume ask. The session's slot count rides along so the ring's bounds fit
+    // the session's actual shape rather than assuming the largest possible game.
+    if let Some(slots) = decision_makers.ring_slot_count(key, payload.game_frame_count.is_some()) {
         let origin = match home {
             crate::consensus::delivery::DeliveryHome::Local => {
                 crate::session::turn_ring::TurnOrigin::Local
