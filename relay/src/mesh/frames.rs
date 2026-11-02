@@ -146,6 +146,28 @@ pub(super) fn slot_connectivity_frame(
                 slot: u32::from(slot.0),
                 connected,
                 connection_epoch,
+                restated: false,
+            },
+        )),
+    }
+}
+
+/// Builds a `SlotConnectivity` mesh control frame restating a departed
+/// generation's history for `session` (see the frame's `restated` field).
+pub(super) fn restated_connectivity_frame(
+    session: SessionId,
+    slot: SlotId,
+    connected: bool,
+    connection_epoch: Option<u64>,
+) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::SlotConnectivity(
+            SlotConnectivity {
+                slot: u32::from(slot.0),
+                connected,
+                connection_epoch,
+                restated: true,
             },
         )),
     }

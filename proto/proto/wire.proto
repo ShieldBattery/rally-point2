@@ -1711,6 +1711,13 @@ message SlotConnectivity {
   // sidecars and later teardown for any other epoch are stale. Absent for a
   // legacy sender, preserving rolling compatibility.
   optional fixed64 connection_epoch = 3;
+
+  // Set when the home restates a generation that has since departed, on a
+  // mesh Join, so a peer that missed it can apply the departure that follows
+  // to the right generation. It orders that history and nothing else: the
+  // slot is not present, and a restated `connected` frame never counts toward
+  // the session start. Mesh only; never set on the client edge.
+  bool restated = 4;
 }
 
 // The authority's request that a dropped slot's home finalize the drop — see

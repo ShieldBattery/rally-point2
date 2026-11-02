@@ -485,6 +485,7 @@ pub async fn send_control_connectivity(
             slot: u32::from(slot),
             connected,
             connection_epoch,
+            restated: false,
         })),
     };
     let encoded = encode_frame(&frame)?;

@@ -488,7 +488,10 @@ fn dispatch_mesh_control_frame(
             // slot present before it announces it connected, and while this
             // relay still held the slot's pre-start departure that announce was
             // refused; the reinstatement just above is what lets it count now.
-            if change.connected && !rejected {
+            // A restated generation has departed since: it only orders that
+            // departure, and counting it would start a session around a slot
+            // that is gone.
+            if change.connected && !rejected && !change.restated {
                 note_peer_slot_present(sessions, mesh, &key, slot);
             }
             if rejected {

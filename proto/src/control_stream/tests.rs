@@ -292,6 +292,7 @@ fn every_control_frame_kind_round_trips_through_the_shared_framing() {
                 slot: 2,
                 connected: false,
                 connection_epoch: Some(17),
+                restated: false,
             }),
         ),
         // The whole-session label map: client-edge only, since every relay gets
@@ -405,6 +406,7 @@ fn every_mesh_control_frame_kind_round_trips_through_the_shared_framing() {
                 slot: 5,
                 connected: true,
                 connection_epoch: Some(18),
+                restated: true,
             }),
         ),
         (

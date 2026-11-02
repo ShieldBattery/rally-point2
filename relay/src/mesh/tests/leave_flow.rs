@@ -169,6 +169,7 @@ async fn a_mesh_slot_connectivity_true_releases_a_local_drop_hold() {
                 slot: 0,
                 connected: true,
                 connection_epoch: None,
+                restated: false,
             },
         )),
     };
@@ -209,6 +210,7 @@ async fn terminal_or_decided_generation_true_never_activates_or_fans_out() {
                 slot: 0,
                 connected: true,
                 connection_epoch: Some(epoch),
+                restated: false,
             },
         )),
     };
@@ -265,6 +267,7 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
                     slot: 0,
                     connected: true,
                     connection_epoch: Some(epoch),
+                    restated: false,
                 },
             )),
         };

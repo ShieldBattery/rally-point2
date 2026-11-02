@@ -134,8 +134,11 @@ fn join_replays_each_departed_home_generation_before_its_departure() {
                 format!("present {}", present.slot)
             }
             Some(mesh_control_frame::Kind::SlotConnectivity(change)) => format!(
-                "connected {} {} {:?}",
-                change.slot, change.connected, change.connection_epoch
+                "connected {} {} {:?}{}",
+                change.slot,
+                change.connected,
+                change.connection_epoch,
+                if change.restated { " restated" } else { "" },
             ),
             Some(mesh_control_frame::Kind::SlotDeparted(departed)) => {
                 format!("departed {} {:?}", departed.slot, departed.connection_epoch)
@@ -148,9 +151,9 @@ fn join_replays_each_departed_home_generation_before_its_departure() {
         [
             "present 2",
             "connected 2 true Some(23)",
-            "connected 1 true Some(11)",
+            "connected 1 true Some(11) restated",
             "departed 1 Some(11)",
-            "connected 1 false Some(11)",
+            "connected 1 false Some(11) restated",
         ]
     );
 }
@@ -273,6 +276,33 @@ fn a_peer_that_saw_the_departure_live_keeps_its_hold() {
     assert!(makers.has_departure(key, SlotId(1)));
     assert!(peer.mesh.session.drop_holds.is_pending(key, SlotId(1)));
     assert!(makers.connection_epoch_matches(key, SlotId(1), Some(1)));
+}
+
+/// A generation that departed before the start, restated to a peer that missed
+/// it, orders that departure and nothing else: it never counts as the slot's
+/// presence, so the session does not start around a slot that is gone.
+#[test]
+fn a_restated_generation_never_counts_toward_the_session_start() {
+    let peer = Peer::new();
+    let key = &peer.key;
+    let makers = &peer.mesh.session.decision_makers;
+    assert!(!makers.note_slot_present(key, SlotId(0)));
+
+    let home = crate::consensus::new_decision_makers();
+    let _ = crate::test_support::seed_maker(
+        &home,
+        key,
+        crate::consensus::Authority::Peer,
+        &[0, 1],
+        &[1],
+    );
+    depart(&home, key, 1, 1);
+    for frame in join_frames(&new_conditions_registry(), &home, key) {
+        peer.dispatch(frame);
+    }
+
+    assert!(!makers.is_started(key));
+    assert!(makers.has_departure(key, SlotId(1)));
 }
 
 /// Latches `key`'s maker into a rollback session, where state hash verdicts evict.

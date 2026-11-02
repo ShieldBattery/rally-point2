@@ -214,6 +214,7 @@ fn a_pre_start_reconnect_of_a_peer_homed_slot_still_completes_coverage() {
                 slot: 1,
                 connected: true,
                 connection_epoch: Some(epoch),
+                restated: false,
             },
         ))
     };

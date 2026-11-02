@@ -108,7 +108,7 @@ pub(super) fn reconcile_local_slots_on_join(
         if active.is_some_and(|slots| slots.contains_key(&slot)) {
             continue;
         }
-        let _ = control_tx.send(slot_connectivity_frame(key.session, slot, true, epoch));
+        let _ = control_tx.send(restated_connectivity_frame(key.session, slot, true, epoch));
         let _ = control_tx.send(slot_departed_frame(
             key.session,
             slot,
@@ -117,7 +117,7 @@ pub(super) fn reconcile_local_slots_on_join(
             epoch,
         ));
         if reason == crate::consensus::LEAVE_REASON_DROPPED {
-            let _ = control_tx.send(slot_connectivity_frame(key.session, slot, false, epoch));
+            let _ = control_tx.send(restated_connectivity_frame(key.session, slot, false, epoch));
         }
     }
 }

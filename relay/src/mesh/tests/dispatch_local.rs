@@ -114,6 +114,7 @@ fn a_peer_relays_local_fan_out_frames_deliver_locally_and_never_echo() {
             slot: 0,
             connected: false,
             connection_epoch: None,
+            restated: false,
         },
     ));
     assert_eq!(
@@ -220,6 +221,7 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
                 slot: 0,
                 connected: false,
                 connection_epoch: Some(11),
+                restated: false,
             },
         )),
     };
@@ -269,6 +271,7 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
                 slot: 0,
                 connected: false,
                 connection_epoch: Some(22),
+                restated: false,
             },
         )),
     };
@@ -322,6 +325,7 @@ fn departure_then_same_epoch_connectivity_reaches_the_survivor() {
             slot: 0,
             connected: false,
             connection_epoch: Some(22),
+            restated: false,
         },
     ));
     assert_eq!(inbox.try_recv_connectivity(), Some((SlotId(0), false)));
@@ -366,6 +370,7 @@ fn a_stale_mesh_reconnect_records_rejection_without_releasing_the_hold() {
                     slot: 0,
                     connected: true,
                     connection_epoch: Some(11),
+                    restated: false,
                 },
             )),
         },
