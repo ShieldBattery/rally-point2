@@ -101,6 +101,12 @@ impl DecisionMaker {
         }
     }
 
+    /// Every slot a state hash verdict named, with the step that named it, as this relay knows
+    /// them: from its own verdicts or the eviction orders it received.
+    pub fn state_hash_exclusions(&self) -> Vec<(SlotId, u64)> {
+        self.hashes.exclusions()
+    }
+
     /// Judges every step whose reports are all in or whose deadline has passed by `now`, if this
     /// relay is the session's authority. Every relay keeps the reports; only the authority judges.
     /// Every slot a verdict names, or every player for a verdict with no majority, is also queued

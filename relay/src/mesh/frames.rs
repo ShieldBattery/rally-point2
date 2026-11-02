@@ -4,7 +4,7 @@
 
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
-    GameChat, LeaveDirective, LobbyCommand, MeshControlFrame, PlayerSkin, RequestDrop,
+    EvictSlot, GameChat, LeaveDirective, LobbyCommand, MeshControlFrame, PlayerSkin, RequestDrop,
     SessionClock, SessionStart, SlotConnectivity, SlotDeparted, SlotPresent, SlotStarted,
     mesh_control_frame,
 };
@@ -148,6 +148,22 @@ pub(super) fn slot_connectivity_frame(
                 connection_epoch,
             },
         )),
+    }
+}
+
+/// Builds an `EvictSlot` mesh control frame for `session`: the verdict on state hash step
+/// `sync_ordinal` named `slot`.
+pub(super) fn evict_slot_frame(
+    session: SessionId,
+    slot: SlotId,
+    sync_ordinal: u64,
+) -> MeshControlFrame {
+    MeshControlFrame {
+        session: session.0,
+        kind: Some(mesh_control_frame::Kind::EvictSlot(EvictSlot {
+            slot: u32::from(slot.0),
+            sync_ordinal,
+        })),
     }
 }
 

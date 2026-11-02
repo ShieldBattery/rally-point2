@@ -164,6 +164,12 @@ pub(super) fn dispatch_evict_slot(
     mesh.session
         .decision_makers
         .exclude_from_state_hashes(key, slot, evict.sync_ordinal);
+    // A Join restates every order a peer knows, so the home sees one it already acted on again.
+    if mesh.session.decision_makers.eviction(key, slot)
+        == Some(crate::consensus::EvictionCause::Desync)
+    {
+        return;
+    }
     if !mesh.session.decision_makers.mark_desync_evicted(key, slot) {
         return;
     }

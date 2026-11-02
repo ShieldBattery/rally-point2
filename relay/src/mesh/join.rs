@@ -1,5 +1,5 @@
 //! What a freshly registered link replays to converge: the leave, slot,
-//! started-report, lobby-log and resume-cursor re-sends a Join enqueues, and the
+//! eviction, started-report, lobby-log and resume-cursor re-sends a Join enqueues, and the
 //! presence push that carries a session's live-player count.
 
 use std::collections::HashMap;
@@ -119,6 +119,23 @@ pub(super) fn reconcile_local_slots_on_join(
         if reason == crate::consensus::LEAVE_REASON_DROPPED {
             let _ = control_tx.send(slot_connectivity_frame(key.session, slot, false, epoch));
         }
+    }
+}
+
+/// Re-sends every state hash eviction order this relay knows for `key` down a freshly registered
+/// link's control channel. An order is broadcast once, when the authority's verdict names a slot,
+/// so a peer whose link was down then never learns which step named it: promoted, it would compare
+/// that slot's reports in steps before it differently from the authority that named it, and the
+/// slot's home would leave it playing. Every relay re-sends what it knows, its own verdicts and the
+/// orders it received alike, so the step survives the authority. Idempotent on receipt: a slot's
+/// earliest named step stands, and its home evicts it once.
+pub(super) fn reconcile_evictions_on_join(
+    decision_makers: &crate::consensus::DecisionMakers,
+    control_tx: &MeshControlTx,
+    key: &SessionKey,
+) {
+    for (slot, step) in decision_makers.state_hash_exclusions(key) {
+        let _ = control_tx.send(evict_slot_frame(key.session, slot, step));
     }
 }
 

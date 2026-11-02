@@ -66,6 +66,15 @@ impl DecisionMakers {
         }
     }
 
+    /// Every slot a state hash verdict named in `key`'s session, with the step that named it (see
+    /// [`DecisionMaker::state_hash_exclusions`]). Empty when no maker exists.
+    pub fn state_hash_exclusions(&self, key: &SessionKey) -> Vec<(SlotId, u64)> {
+        self.lock()
+            .get(key)
+            .map(DecisionMaker::state_hash_exclusions)
+            .unwrap_or_default()
+    }
+
     /// Marks `slot` evicted for desync in `key`'s session if this relay strictly homes it, and
     /// returns whether it does (see [`DecisionMaker::mark_desync_evicted`]). For a verdict another
     /// relay produced; `false` when no maker exists.

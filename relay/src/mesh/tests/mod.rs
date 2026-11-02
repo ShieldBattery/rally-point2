@@ -23,8 +23,8 @@ use super::fan_out::{apply_ack_cursors, fold_oversize_into_link, reconcile_ack_c
 use super::forward::{deliver_turn_to_locals, resume_replay_for_frame, send_turn_over_link};
 use super::frames::*;
 use super::join::{
-    SentPresence, presence_catch_up, presence_statement, reconcile_leaves_on_join,
-    reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
+    SentPresence, presence_catch_up, presence_statement, reconcile_evictions_on_join,
+    reconcile_leaves_on_join, reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
     reconcile_session_clock_on_join, reconcile_started_slots_on_join,
 };
 use super::link_run::{MeshMaintenanceTimer, defer_flush_after_send};

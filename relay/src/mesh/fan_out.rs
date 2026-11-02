@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use rally_point_proto::ids::{SessionId, SlotId};
 use rally_point_proto::messages::{
-    EvictSlot, FinalizeDrop, FinalizeDropResult, GameChat, LeaveDirective, LobbyCommand,
-    MeshControlFrame, Payload, PlayerSkin, SessionClock, mesh_control_frame,
+    FinalizeDrop, FinalizeDropResult, GameChat, LeaveDirective, LobbyCommand, MeshControlFrame,
+    Payload, PlayerSkin, SessionClock, mesh_control_frame,
 };
 use tokio::sync::{Notify, mpsc};
 
@@ -484,13 +484,7 @@ pub(crate) fn fan_out_evict_slot(
     fan_out_control(
         links,
         key,
-        MeshControlFrame {
-            session: key.session.0,
-            kind: Some(mesh_control_frame::Kind::EvictSlot(EvictSlot {
-                slot: u32::from(slot.0),
-                sync_ordinal,
-            })),
-        },
+        evict_slot_frame(key.session, slot, sync_ordinal),
     );
 }
 

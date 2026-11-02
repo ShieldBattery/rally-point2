@@ -24,8 +24,8 @@ use super::fan_out::{apply_ack_cursors, fold_oversize_into_link, reconcile_ack_c
 use super::forward::resume_replay_for_frame;
 use super::join::{
     SentPresence, local_presence, presence_catch_up, presence_statement, presence_updates,
-    push_presence_updates, reconcile_leaves_on_join, reconcile_lobby_on_join,
-    reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
+    push_presence_updates, reconcile_evictions_on_join, reconcile_leaves_on_join,
+    reconcile_lobby_on_join, reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
     reconcile_session_clock_on_join, reconcile_started_slots_on_join,
 };
 use super::link_run::MeshMaintenanceTimer;
@@ -463,6 +463,7 @@ impl LinkDriver {
                         // sent, and a synced leave or start lost with the old
                         // link has no other way back to it.
                         reconcile_leaves_on_join(decision_makers, control_forward_tx, &key);
+                        reconcile_evictions_on_join(decision_makers, control_forward_tx, &key);
                         reconcile_local_slots_on_join(
                             conditions,
                             decision_makers,

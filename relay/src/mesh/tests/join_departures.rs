@@ -1,5 +1,6 @@
-//! A redialed link's replay of the generations its own home slots departed on,
-//! and what a peer that missed those generations makes of it.
+//! A redialed link's replay of the generations its own home slots departed on
+//! and of the state hash eviction orders it knows, and what a peer that missed
+//! them makes of it.
 
 use super::*;
 
@@ -30,6 +31,7 @@ fn join_frames(
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
     reconcile_local_slots_on_join(conditions, makers, &control_tx, key);
     reconcile_leaves_on_join(makers, &control_tx, key);
+    reconcile_evictions_on_join(makers, &control_tx, key);
     std::iter::from_fn(|| control_rx.try_recv().ok()).collect()
 }
 
@@ -271,4 +273,50 @@ fn a_peer_that_saw_the_departure_live_keeps_its_hold() {
     assert!(makers.has_departure(key, SlotId(1)));
     assert!(peer.mesh.session.drop_holds.is_pending(key, SlotId(1)));
     assert!(makers.connection_epoch_matches(key, SlotId(1), Some(1)));
+}
+
+/// Latches `key`'s maker into a rollback session, where state hash verdicts evict.
+fn rollback(makers: &crate::consensus::DecisionMakers, key: &SessionKey) {
+    makers
+        .lock()
+        .get_mut(key)
+        .expect("a seeded maker")
+        .latch_rollback(true);
+}
+
+/// A relay whose link was down when the authority ordered slots out learns from
+/// the redialed link's Join which step named each, so promoted it compares the
+/// steps before it as the authority did, and a slot it homes is evicted then.
+#[test]
+fn a_join_restates_the_step_that_named_each_evicted_slot() {
+    let peer = Peer::new();
+    let key = &peer.key;
+    rollback(&peer.mesh.session.decision_makers, key);
+
+    let authority = crate::consensus::new_decision_makers();
+    let _ = crate::test_support::seed_maker(
+        &authority,
+        key,
+        crate::consensus::Authority::SelfRelay,
+        &[0, 1],
+        &[1],
+    );
+    rollback(&authority, key);
+    authority.exclude_from_state_hashes(key, SlotId(0), 24);
+    authority.exclude_from_state_hashes(key, SlotId(1), 32);
+    for frame in join_frames(&new_conditions_registry(), &authority, key) {
+        peer.dispatch(frame);
+    }
+
+    let makers = &peer.mesh.session.decision_makers;
+    assert_eq!(
+        makers.state_hash_exclusions(key),
+        [(SlotId(0), 24), (SlotId(1), 32)]
+    );
+    assert_eq!(
+        makers.eviction(key, SlotId(0)),
+        Some(crate::consensus::EvictionCause::Desync),
+        "slot 0's home evicts it",
+    );
+    assert_eq!(makers.eviction(key, SlotId(1)), None, "homed elsewhere");
 }

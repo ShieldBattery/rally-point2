@@ -539,6 +539,17 @@ impl StateHashTracker {
         }
     }
 
+    /// Every slot a verdict named, with the step that named it, in slot order.
+    pub(in crate::consensus) fn exclusions(&self) -> Vec<(SlotId, u64)> {
+        let mut exclusions: Vec<(SlotId, u64)> = self
+            .excluded
+            .iter()
+            .map(|(&slot, &step)| (slot, step))
+            .collect();
+        exclusions.sort_unstable();
+        exclusions
+    }
+
     /// Notes that a verdict on `step` named `slot`, whether this relay judged it or the authority
     /// that did told it so.
     pub(in crate::consensus) fn exclude(&mut self, slot: SlotId, step: u64) {

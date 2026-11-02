@@ -15,9 +15,9 @@ use super::conditions::snapshot_conditions;
 use super::forward::send_turn_over_link;
 use super::join::{
     local_presence, presence_statement, presence_updates, push_presence_updates,
-    reconcile_leaves_on_join, reconcile_lobby_on_join, reconcile_local_slots_on_join,
-    reconcile_resume_cursors_on_join, reconcile_session_clock_on_join,
-    reconcile_started_slots_on_join,
+    reconcile_evictions_on_join, reconcile_leaves_on_join, reconcile_lobby_on_join,
+    reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
+    reconcile_session_clock_on_join, reconcile_started_slots_on_join,
 };
 use super::link_arms::LinkDriver;
 use super::link_run::{MeshCommand, defer_flush_after_send};
@@ -225,6 +225,9 @@ impl LinkDriver {
                     // redialed (its `joined` empty again) reconverges. All of
                     // these are idempotent (dedup by slot everywhere).
                     reconcile_leaves_on_join(decision_makers, control_forward_tx, &key);
+                    // And which step named each slot a state hash verdict
+                    // evicted, which crosses the mesh once.
+                    reconcile_evictions_on_join(decision_makers, control_forward_tx, &key);
                     // Ask the peer, over the same fresh registration, to
                     // replay whatever this relay's forward-gate is still
                     // missing for the session — the resume-cursor mesh

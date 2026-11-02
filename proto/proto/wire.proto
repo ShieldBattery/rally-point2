@@ -1399,8 +1399,10 @@ message MeshControlFrame {
     // descriptor strictly homes the slot marks it evicted (refusing every later dial for it) and
     // only then closes its link, and once that link is down finalizes the drop and answers with
     // an unprompted `FinalizeDropResult`, so the authority decides a leave carrying the exact
-    // count. Every other relay ignores it, as does a relay that predates this kind. Not
-    // re-broadcast. See `EvictSlot`.
+    // count. Every relay notes the step, so it compares the slot only in the steps before it, as
+    // the authority does; a relay that predates this kind ignores it. Not re-broadcast, but every
+    // relay restates the orders it knows on a mesh Join, so one whose link was down still learns
+    // them. See `EvictSlot`.
     EvictSlot evict_slot = 18;
 
     // A relay's copy of a rollback session's clock, so every relay measures its
@@ -1730,8 +1732,9 @@ message EvictSlot {
   // The slot to evict.
   uint32 slot = 1;
 
-  // The state hash step whose verdict named the slot, carried so the home's own record of the
-  // eviction says which comparison it rested on.
+  // The state hash step whose verdict named the slot. Every relay takes the slot out of its state
+  // hash comparison from this step on, and the home's own record of the eviction says which
+  // comparison it rested on.
   uint64 sync_ordinal = 2;
 }
 
