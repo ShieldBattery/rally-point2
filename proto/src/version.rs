@@ -238,8 +238,10 @@ pub const CONTROL_CLOSE_RETIRED: u16 = 4006;
 /// QUIC application close code a mesh *acceptor* uses to refuse a dialing relay
 /// whose advertised protocol version does not [`negotiate`] against its own.
 /// Sent before the link driver is ever spawned, so an incompatible pair never
-/// half-establishes. Outside the client-edge close-code space (`0x01`–`0x06`) so
-/// a trace never reads one connection type's code through the other's table.
+/// half-establishes. Outside the client-edge close-code space (`0x01`–`0x06`).
+/// The value is shared with the evidence-connection close codes (`0x10`,
+/// `0x11`); that is harmless because each connection type has its own reader
+/// and the two are never interpreted through one table.
 ///
 /// The dial side's reconnect supervision treats the closure like any failed
 /// connection (redial on its ordinary delay); this code only lets it *name* the

@@ -15,7 +15,7 @@
 //!  offset  field           type/size        signed?
 //!  ------  -----           ---------        -------
 //!  0       version         u8 (= 1)         ✓
-//!  1       kid_len         u8
+//!  1       kid_len         u8               ✓
 //!  2       kid             [u8; kid_len]    ✓
 //!  2+kl    tenant_len      u8               ✓
 //!  3+kl    tenant          [u8; tenant_len] ✓

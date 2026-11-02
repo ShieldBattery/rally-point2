@@ -71,8 +71,8 @@ mod tests {
     #[test]
     fn an_empty_body_still_carries_every_separator() {
         assert_eq!(
-            request_message("1700000000", "GET", "/session/1/presence", b""),
-            b"rp2-request-v1:1700000000:GET:/session/1/presence:",
+            request_message("1700000000", "GET", "/tenant/sb-dev/pubkey", b""),
+            b"rp2-request-v1:1700000000:GET:/tenant/sb-dev/pubkey:",
         );
     }
 }
