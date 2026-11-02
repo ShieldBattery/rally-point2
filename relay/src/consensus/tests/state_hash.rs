@@ -321,6 +321,105 @@ fn the_last_slot_left_in_the_game_is_never_judged_alone() {
     assert!(!m.hashes.dormant);
 }
 
+/// Slots 1 and 3 diverge at step 16 and slot 2 at step 24, and slot 0's report for 16 arrives
+/// after step 24 is complete.
+#[test]
+fn a_later_step_judged_first_leaves_the_earlier_verdict_naming_its_minority() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2, 3, 4]);
+    forward(&mut m, &[0, 1, 2, 3, 4], 3 * STATE_HASH_INTERVAL, start);
+    for (slot, hash) in [(1, B), (3, B), (2, A), (4, A)] {
+        assert!(
+            m.observe_state_hash(SlotId(slot), 16, hash, start)
+                .is_empty()
+        );
+    }
+    for slot in [0, 1, 3, 4] {
+        assert!(m.observe_state_hash(SlotId(slot), 24, A, start).is_empty());
+    }
+    assert_eq!(
+        m.observe_state_hash(SlotId(2), 24, 0xcccc, start),
+        vec![SyncDivergence {
+            sync_ordinal: 24,
+            game_frame: None,
+            no_majority: false,
+            diverged: vec![SlotId(2)],
+            missing: Vec::new(),
+        }]
+    );
+    // Its eviction ends its link, so it leaves; its report of step 16, where it agreed with slots
+    // 0 and 4, still backs their hash there.
+    m.note_departure(SlotId(2), framed(1), 0, None);
+    assert_eq!(
+        m.observe_state_hash(SlotId(0), 16, A, start),
+        vec![SyncDivergence {
+            sync_ordinal: 16,
+            game_frame: None,
+            no_majority: false,
+            diverged: vec![SlotId(1), SlotId(3)],
+            missing: Vec::new(),
+        }]
+    );
+    assert!(!m.hashes.dormant);
+}
+
+#[test]
+fn a_slot_named_at_a_later_step_never_splits_an_earlier_one() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2, 3]);
+    forward(&mut m, &[0, 1, 2, 3], 3 * STATE_HASH_INTERVAL, start);
+    m.observe_state_hash(SlotId(3), 16, B, start);
+    for slot in [0, 1, 2] {
+        m.observe_state_hash(SlotId(slot), 24, A, start);
+    }
+    assert_eq!(m.observe_state_hash(SlotId(3), 24, 0xcccc, start).len(), 1);
+    // Slot 3's report of step 16 matches slot 2's, but a named slot's report only ever settles a
+    // split; it never turns a majority into one.
+    m.observe_state_hash(SlotId(0), 16, A, start);
+    m.observe_state_hash(SlotId(1), 16, A, start);
+    assert_eq!(
+        m.observe_state_hash(SlotId(2), 16, B, start),
+        vec![SyncDivergence {
+            sync_ordinal: 16,
+            game_frame: None,
+            no_majority: false,
+            diverged: vec![SlotId(2)],
+            missing: Vec::new(),
+        }]
+    );
+}
+
+#[test]
+fn a_relay_told_of_a_later_verdict_judges_an_earlier_step_like_the_authority_did() {
+    let start = Instant::now();
+    let mut m = peer_maker();
+    m.latch_rollback(true);
+    m.set_expected_slots((0..5).map(SlotId).collect());
+    forward(&mut m, &[0, 1, 2, 3, 4], 3 * STATE_HASH_INTERVAL, start);
+    for (slot, hash) in [(1, B), (3, B), (2, A), (4, A)] {
+        m.observe_state_hash(SlotId(slot), 16, hash, start);
+    }
+    for (slot, hash) in [(0, A), (1, A), (2, 0xcccc), (3, A), (4, A)] {
+        m.observe_state_hash(SlotId(slot), 24, hash, start);
+    }
+    // The authority named slot 2 at step 24 and its eviction order reached this relay, then the
+    // slot left. Promoted, this relay still has slot 2's report back slots 0 and 4 at step 16.
+    m.exclude_from_state_hashes(SlotId(2), 24);
+    m.note_departure(SlotId(2), framed(1), 0, None);
+    m.authority = Authority::SelfRelay;
+    assert!(m.judge_state_hashes(start).is_empty());
+    assert_eq!(
+        m.observe_state_hash(SlotId(0), 16, A, start),
+        vec![SyncDivergence {
+            sync_ordinal: 16,
+            game_frame: None,
+            no_majority: false,
+            diverged: vec![SlotId(1), SlotId(3)],
+            missing: Vec::new(),
+        }]
+    );
+}
+
 #[test]
 fn nobody_reporting_names_nobody() {
     let start = Instant::now();

@@ -24,6 +24,15 @@
 //! quiet and the leave machinery settles it. When nobody can be singled out (a 1v1 that disagrees,
 //! an even split, nobody reporting) the verdict names no one. A step with fewer than two slots
 //! taking part (the rest left) has nothing to compare, so it decides nothing about anyone.
+//!
+//! Steps are judged as they become decidable, not in order, so a later step can name a slot
+//! before an earlier step is judged. The slot takes no further part, but its report of the
+//! earlier step still backs the hash it matches there: where the slots still taking part split
+//! evenly, the backing can give one hash its majority, so judging the later step first never
+//! turns the earlier verdict that names a minority into one that names nobody. A named slot's
+//! report never counts against anyone, so it can't split a step that has a majority without it.
+//! Every relay learns the step a slot was named at from the eviction order, so a relay promoted
+//! later judges the earlier step the same way.
 
 use super::*;
 use crate::rate_limit::RateLimitedCounter;
@@ -100,8 +109,9 @@ pub(in crate::consensus) struct StateHashTracker {
     confirmable_until: u64,
     /// Every step before this one has been judged or dropped.
     retired_below: u64,
-    /// Slots a verdict named; they take no further part.
-    excluded: HashSet<SlotId>,
+    /// Slots a verdict named, each with the step it named them at. They take no further part,
+    /// but a report one made of an earlier step can still back a hash other slots reported there.
+    excluded: HashMap<SlotId, u64>,
     /// Set once a verdict named nobody: with no majority to trust, nothing later is comparable.
     pub(in crate::consensus) dormant: bool,
     invalid_warns: RateLimitedCounter,
@@ -121,7 +131,7 @@ impl StateHashTracker {
         hash: u64,
         now: Instant,
     ) {
-        if self.dormant || self.excluded.contains(&slot) {
+        if self.dormant || self.excluded.get(&slot).is_some_and(|&from| from <= step) {
             return;
         }
         let horizon = self
@@ -225,7 +235,7 @@ impl StateHashTracker {
             }
         }
         let until = required
-            .filter(|slot| !self.excluded.contains(slot))
+            .filter(|slot| !self.excluded.contains_key(slot))
             .map(|slot| self.forwarded.get(&slot).copied().unwrap_or(0))
             .min()
             .unwrap_or(0);
@@ -282,7 +292,7 @@ impl StateHashTracker {
                 };
                 let complete = required
                     .iter()
-                    .filter(|slot| !self.excluded.contains(slot))
+                    .filter(|slot| !self.excluded.contains_key(slot))
                     .all(|slot| pending.reports.iter().any(|x| x.0 == *slot));
                 complete || now.saturating_duration_since(confirmable_at) >= STATE_HASH_DEADLINE
             });
@@ -354,7 +364,7 @@ impl StateHashTracker {
     fn judge(
         &mut self,
         step: u64,
-        reports: &[(SlotId, u64)],
+        all_reports: &[(SlotId, u64)],
         required: &HashSet<SlotId>,
         settle: bool,
     ) -> Judgment {
@@ -362,22 +372,22 @@ impl StateHashTracker {
         // missing report hides nothing (a 1v1 whose opponent has left).
         if required
             .iter()
-            .filter(|x| !self.excluded.contains(x))
+            .filter(|x| !self.excluded.contains_key(x))
             .count()
             < 2
         {
             return Judgment::Decided(None);
         }
-        let reports: Vec<(SlotId, u64)> = reports
+        let reports: Vec<(SlotId, u64)> = all_reports
             .iter()
             .copied()
-            .filter(|(slot, _)| required.contains(slot) && !self.excluded.contains(slot))
+            .filter(|(slot, _)| required.contains(slot) && !self.excluded.contains_key(slot))
             .collect();
         // A slot that sent no report is at fault only if it kept sending turns well past the step.
         let mut missing: Vec<SlotId> = required
             .iter()
             .copied()
-            .filter(|slot| !self.excluded.contains(slot))
+            .filter(|slot| !self.excluded.contains_key(slot))
             .filter(|slot| !reports.iter().any(|x| x.0 == *slot))
             .filter(|slot| {
                 self.forwarded.get(slot).copied().unwrap_or(0)
@@ -402,7 +412,7 @@ impl StateHashTracker {
         // Every slot still taking part but those withholding their report can still report.
         let voters = required
             .iter()
-            .filter(|slot| !self.excluded.contains(slot))
+            .filter(|slot| !self.excluded.contains_key(slot))
             .count()
             .saturating_sub(missing.len());
         // No report at all agrees with nothing: the slots yet to report decide it.
@@ -414,7 +424,7 @@ impl StateHashTracker {
         } else if reports.len() < voters && !settle {
             return Judgment::Undecided;
         } else {
-            majority_of(reports.len())
+            majority_of(reports.len()).or_else(|| self.backed_majority(step, all_reports, &groups))
         };
         let Some(majority) = majority else {
             // Nobody to trust: a 1v1 that disagrees, an even split, or nobody reporting at all.
@@ -434,11 +444,11 @@ impl StateHashTracker {
             .collect();
         diverged.sort_unstable();
         for slot in diverged.iter().chain(&missing) {
-            self.excluded.insert(*slot);
+            self.exclude(*slot, step);
         }
         if required
             .iter()
-            .filter(|x| !self.excluded.contains(x))
+            .filter(|x| !self.excluded.contains_key(x))
             .count()
             < 2
         {
@@ -451,6 +461,45 @@ impl StateHashTracker {
             diverged,
             missing,
         }))
+    }
+
+    /// The slots of whichever hash in `groups` (the reports of the slots still taking part in
+    /// `step`, which have no majority among themselves) has a majority once the reports of slots
+    /// named at a later step are added where they back one of those hashes. Such a slot took part
+    /// in this step, and judging the later step first must not take its report back here; but
+    /// being named, it only ever backs a hash a slot still taking part reported, so it can settle a
+    /// split, never cause one, and is never named again.
+    fn backed_majority(
+        &self,
+        step: u64,
+        all_reports: &[(SlotId, u64)],
+        groups: &HashMap<u64, Vec<SlotId>>,
+    ) -> Option<Vec<SlotId>> {
+        let backing: Vec<u64> = all_reports
+            .iter()
+            .filter(|(slot, hash)| {
+                self.excluded.get(slot).is_some_and(|&from| from > step)
+                    && groups.contains_key(hash)
+            })
+            .map(|&(_, hash)| hash)
+            .collect();
+        if backing.is_empty() {
+            return None;
+        }
+        let count = groups.values().map(Vec::len).sum::<usize>() + backing.len();
+        groups
+            .iter()
+            .find(|(hash, slots)| {
+                (slots.len() + backing.iter().filter(|x| x == hash).count()) * 2 > count
+            })
+            .map(|(_, slots)| slots.clone())
+    }
+
+    /// Notes that a verdict on `step` named `slot`, whether this relay judged it or the authority
+    /// that did told it so.
+    pub(in crate::consensus) fn exclude(&mut self, slot: SlotId, step: u64) {
+        let from = self.excluded.entry(slot).or_insert(step);
+        *from = (*from).min(step);
     }
 
     /// Drops the oldest steps while more than [`STATE_HASH_WINDOW`] are in flight.

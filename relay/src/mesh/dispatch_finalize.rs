@@ -140,12 +140,13 @@ pub(super) fn dispatch_finalize_drop_result(
     }
 }
 
-/// The authority's order to evict a slot its rollback verdict named. Only the
-/// relay whose descriptor strictly homes the slot acts: it marks the slot
+/// The authority's order to evict a slot its rollback verdict named. Every
+/// relay notes which step named it, so its state hash comparator takes the slot
+/// out from that step on, as the authority's did. Only the relay whose
+/// descriptor strictly homes the slot acts on its link: it marks the slot
 /// evicted, which refuses every later dial for it, and only then closes its
 /// link, so a dial racing the close cannot reinstate it. The drop is finalized
-/// once the link is down (see `routing::end_desynced_slot_link`). Every other
-/// relay ignores the frame.
+/// once the link is down (see `routing::end_desynced_slot_link`).
 pub(super) fn dispatch_evict_slot(
     evict: EvictSlot,
     sessions: &routing::Sessions,
@@ -160,6 +161,9 @@ pub(super) fn dispatch_evict_slot(
         );
         return;
     };
+    mesh.session
+        .decision_makers
+        .exclude_from_state_hashes(key, slot, evict.sync_ordinal);
     if !mesh.session.decision_makers.mark_desync_evicted(key, slot) {
         return;
     }

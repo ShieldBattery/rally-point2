@@ -63,8 +63,9 @@ use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 ///   a non-authority ignores it (the authority is among the broadcast's
 ///   receivers). Not re-broadcast across the mesh — no echo, like the arms above.
 /// - **`EvictSlot`**: the authority's order that a slot its rollback verdict
-///   named leave the game. Acted on only by the relay that strictly homes the
-///   slot, which marks it evicted, closes its link and finalizes its drop; not
+///   named leave the game. Every relay notes the verdict's step for its state
+///   hash comparator; only the relay that strictly homes the slot acts on it,
+///   marking it evicted, closing its link and finalizing its drop. Not
 ///   re-broadcast.
 /// - **`MeshResumeCursors`**: the peer's per-origin-slot resume cursors.
 ///   Answered before this function ever runs — the reply is a replay of this

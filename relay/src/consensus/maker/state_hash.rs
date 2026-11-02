@@ -91,6 +91,16 @@ impl DecisionMaker {
         Arc::clone(&self.turns_complete)
     }
 
+    /// Notes that the authority's verdict on `step` named `slot`, as its eviction order tells every
+    /// relay serving the session. The slot takes no part from that step on but still does before
+    /// it, after its eviction too, so this relay compares the same slots in every step as the
+    /// authority did if it is promoted.
+    pub fn exclude_from_state_hashes(&mut self, slot: SlotId, step: u64) {
+        if self.rollback_enabled {
+            self.hashes.exclude(slot, step);
+        }
+    }
+
     /// Judges every step whose reports are all in or whose deadline has passed by `now`, if this
     /// relay is the session's authority. Every relay keeps the reports; only the authority judges.
     /// Every slot a verdict names, or every player for a verdict with no majority, is also queued

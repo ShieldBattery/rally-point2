@@ -58,6 +58,14 @@ impl DecisionMakers {
         claimed
     }
 
+    /// Notes that the authority's verdict on `step` named `slot` in `key`'s session (see
+    /// [`DecisionMaker::exclude_from_state_hashes`]). For a verdict another relay produced.
+    pub fn exclude_from_state_hashes(&self, key: &SessionKey, slot: SlotId, step: u64) {
+        if let Some(maker) = self.lock().get_mut(key) {
+            maker.exclude_from_state_hashes(slot, step);
+        }
+    }
+
     /// Marks `slot` evicted for desync in `key`'s session if this relay strictly homes it, and
     /// returns whether it does (see [`DecisionMaker::mark_desync_evicted`]). For a verdict another
     /// relay produced; `false` when no maker exists.

@@ -470,10 +470,11 @@ pub(crate) fn fan_out_finalize_drop_result(
 
 /// Broadcasts the authority's order that `slot` leave the game because the
 /// verdict on state hash step `sync_ordinal` named it. Sent to every peer
-/// serving `key`; the one relay whose descriptor strictly homes the slot
-/// self-selects, marks it evicted, closes its link and finalizes its drop, and
-/// the rest ignore it (as does a peer that predates the frame kind, which then
-/// leaves the slot playing and its drop to the survivors).
+/// serving `key`; every one notes the step for its state hash comparator, and
+/// the one relay whose descriptor strictly homes the slot self-selects, marks
+/// it evicted, closes its link and finalizes its drop (a peer that predates the
+/// frame kind ignores it, leaving the slot playing and its drop to the
+/// survivors).
 pub(crate) fn fan_out_evict_slot(
     links: &MeshLinks,
     key: &SessionKey,
