@@ -873,10 +873,13 @@ targets.
   arrived after the whole wait, so a player whose late turns stop the clock still reads every
   moment of it. Each stop is placed where the relay's copy has the clock standing still (from its
   step's deadline, for its pause), so this needs nothing recorded at arrival and reads the same
-  whenever the relay learned of the stop. A player homed off the authority can read up to one
-  mesh hop later than against the final deadline, never earlier: a turn reaching its relay less
-  than a hop after the turn that ends a stop (a burst) arrived while the authority's clock still
-  stood waiting for that turn.
+  whenever the relay learned of the stop. With one authority making the stops, a player homed off
+  it can read up to one mesh hop later than against the final deadline, never earlier: a turn
+  reaching its relay less than a hop after the turn that ends a stop (a burst) arrived while the
+  authority's clock still stood waiting for that turn. That bound does not survive an authority
+  change or overlap: stops decided by another authority, or by two at once, merge in by step and
+  can be placed before turns that were in flight when the clock really stood still, so such a
+  turn can read late by a whole stop (up to the length of an outage) rather than a hop.
 - **Copies, merged.** Relays share no timebase, and no relay's copy of the clock is the original.
   Every relay sends its copy's whole state over the mesh (`SessionClock`: the anchor step and age,
   the limit, and the stops, those older than any relay still measures folded into one base sum)
