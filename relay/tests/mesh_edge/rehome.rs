@@ -1,4 +1,4 @@
-//! Recovery from a failed home relay onto a replacement with no session history.
+//! Recovery from a failed home relay onto a replacement relay.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -174,5 +174,97 @@ async fn replay_survivor_history(replacement_first: bool, next: u64) -> Result<(
         }
     }
     assert_eq!(received, HashSet::from([missing, missing + 1, missing + 2]));
+    Ok(())
+}
+
+/// A relay can die after its client's turns reached one peer but before they
+/// reached another. The client re-homes onto the peer that has them and
+/// re-sends them, but that relay already holds them as mesh arrivals and drops
+/// the copies. As the slot's new home it must still carry them on to the peer
+/// the old home never reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_home_forwards_the_turns_it_held_only_as_mesh_arrivals() -> Result<(), AnyError> {
+    let tenant = make_default_tenant();
+    let session = SessionId(62);
+    let key = SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session,
+    };
+    let old_home = Relay::start(&tenant, 520);
+    let new_home = Relay::start(&tenant, 521);
+    let other = Relay::start(&tenant, 522);
+    for relay in [&old_home, &new_home, &other] {
+        seed_authority(&relay.mesh.session.decision_makers, &key)
+            .expecting([0, 1, 2])
+            .apply();
+        relay.mesh.session.decision_makers.mark_started(&key);
+    }
+    let link = |relay: &Relay, end, peer| {
+        spawn_mesh_link_to(
+            end,
+            Arc::clone(&relay.sessions),
+            relay.mesh.clone(),
+            mesh::IDLE_TIMEOUT,
+            RelayId(peer),
+        )
+        .0
+    };
+    let links_of = |relay: &Relay| relay.mesh.links.lock().get(&key).map_or(0, Vec::len);
+
+    // The old home reaches the new home, and its turns for slot 2 arrive there.
+    let (old_end, new_end, _old_ep, _new_ep) = mesh_link_pair().await;
+    let old_commands = link(&old_home, old_end, 521);
+    let new_commands = link(&new_home, new_end, 520);
+    old_commands.send(mesh::MeshCommand::Join(key.clone()))?;
+    new_commands.send(mesh::MeshCommand::Join(key.clone()))?;
+    wait_until("both ends of the first link joined", || {
+        links_of(&old_home) == 1 && links_of(&new_home) == 1
+    })
+    .await;
+    for seq in 0..3 {
+        mesh::forward_client_turn(
+            &old_home.sessions,
+            &old_home.mesh,
+            &key,
+            SlotId(2),
+            build_turn(2, seq, Some(seq as u32)),
+        );
+    }
+    wait_until("the new home received the old home's turns", || {
+        mesh::forwarded_count(&new_home.mesh.seen, &key, SlotId(2)) == Some(3)
+    })
+    .await;
+
+    // The old home never reached the third relay. A mesh arrival is never
+    // forwarded on, so linking the new home to it carries nothing yet.
+    let (new_end, other_end, _new_ep2, _other_ep) = mesh_link_pair().await;
+    let new_to_other = link(&new_home, new_end, 522);
+    let other_commands = link(&other, other_end, 521);
+    new_to_other.send(mesh::MeshCommand::Join(key.clone()))?;
+    other_commands.send(mesh::MeshCommand::Join(key.clone()))?;
+    wait_until("both ends of the second link joined", || {
+        links_of(&new_home) == 2 && links_of(&other) == 1
+    })
+    .await;
+    // A negative claim: on loopback the joined link would have carried a
+    // forwarded turn well inside this window.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        mesh::forwarded_count(&other.mesh.seen, &key, SlotId(2)),
+        None
+    );
+
+    // Slot 2 re-homes onto the new home, anchoring its own re-sent range at 0.
+    let endpoint = client_endpoint(&new_home.ca);
+    let client_key = keypair();
+    let token = mint_token(&tenant, session, SlotId(2), client_key.public);
+    let connection = endpoint.connect(new_home.addr, "localhost")?.await?;
+    handshake(&connection, &token, &client_key, &[(SlotId(2), 0)]).await?;
+    let _client = Link::new(connection);
+
+    wait_until("the new home never forwarded the turns it held", || {
+        mesh::forwarded_count(&other.mesh.seen, &key, SlotId(2)) == Some(3)
+    })
+    .await;
     Ok(())
 }

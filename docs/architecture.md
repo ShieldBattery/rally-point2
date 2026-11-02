@@ -252,7 +252,9 @@ a local client is fanned out both to its own local clients and to its peer relay
 forwards it on to *its* local clients. There is **one QUIC connection per relay-pair** (separate streams
 don't isolate datagram congestion). A mesh-received turn stops at that relay: it is delivered to local
 clients and is **never re-forwarded to another relay**. Thus every turn crosses at most one relay-to-relay
-link, and the peer it arrived from is its origin slot's home relay. A session-level `(slot, seq)` gate
+link, and the peer it arrived from is its origin slot's home relay. The one exception keeps that
+inference true: a relay a slot re-homes onto becomes that slot's home, and forwards once the slot's
+recent turns it had held only as mesh arrivals (see [Failover and reconnect](#failover-and-reconnect)). A session-level `(slot, seq)` gate
 still protects local delivery against connection replacement, resume replay, and slot re-home overlap;
 the per-link transport dedup independently handles redundant copies within one connection.
 
@@ -435,7 +437,12 @@ returning clients to replay. Recovery combines that client replay with surviving
   the unacked window but kept here. On a re-home dial (only), the client re-injects the retained turns as
   unacked into the fresh link, so the replacement relay's empty ring re-carries them to peers, which dedup by
   origin `(slot, seq)`. This closes the window where the dead relay acked a turn but died before fanning it
-  out. An oversize retained turn (one that rides the reliable control streams end to end, never datagrams) is staged for the fresh connection's reliable control
+  out. A replacement already serving the session can hold some of those turns as mesh arrivals: the dead
+  relay reached it but not every other peer, and a mesh arrival stops at the relay it reaches. Its forward
+  gate drops the re-injected copies, so when it admits the slot it forwards the turns of that slot at or
+  past the own-slot anchor that it holds only as mesh arrivals to its peers itself, once, and records them
+  as its own, so a resume ask from a peer whose link is down then is answered with them too. Peers that
+  already have them drop the copies; the replacement's own clients are not handed them again. An oversize retained turn (one that rides the reliable control streams end to end, never datagrams) is staged for the fresh connection's reliable control
   stream and kept staged until its send succeeds, so a mid-drain stream failure retries it on the next
   session rather than losing it. A successful write is not delivery either, so once written the turn
   stays **owed** until the relay's delivered-through beacon cursor covers it, and every new connection

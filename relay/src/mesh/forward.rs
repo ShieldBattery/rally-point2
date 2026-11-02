@@ -329,6 +329,33 @@ pub(super) fn deliver_turn_to_locals(
     Some(payload)
 }
 
+/// Forwards to the mesh, once, the turns of `slot` from `from_seq` on that this
+/// relay holds only as mesh arrivals, now that `slot` has made it its home.
+///
+/// A relay that dies or leaves can have delivered a turn to some peers and
+/// not yet to others. The slot's client re-sends its recent turns to its new
+/// home, but a new home already serving the session may hold some of them as
+/// mesh arrivals: its forward gate drops the re-sent copies, and a mesh
+/// arrival is never forwarded on, so peers the old home never reached would
+/// wait on those turns forever. `from_seq` is the client's own-slot resume
+/// anchor, the oldest seq it re-sends, so this covers exactly the re-sent
+/// range. Peers that already have a turn drop the copy at their forward gate;
+/// local clients are not handed it again. The turns are re-tagged as this
+/// relay's own in the replay ring, so a peer whose link is down now recovers
+/// them from its resume ask later.
+pub(crate) fn forward_adopted_turns(
+    mesh: &MeshState,
+    key: &SessionKey,
+    slot: SlotId,
+    from_seq: u64,
+) {
+    let _ = mesh.session.gates.with_ingress(key, || {
+        for payload in mesh.session.turn_ring.adopt_mesh_turns(key, slot, from_seq) {
+            fan_out_to_mesh(&mesh.links, key, payload);
+        }
+    });
+}
+
 /// The copy of `payload` this relay forwards to its clients: without the sender's state hash
 /// report. Reports stay on the mesh, where the authority relay compares them, but a client that saw
 /// another's hash before its own was due could copy it instead of computing its own.

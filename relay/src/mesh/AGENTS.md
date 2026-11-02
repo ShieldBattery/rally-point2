@@ -29,6 +29,12 @@
   runs inside `with_current`, awaits inside `await_while_current`.
 - Dedup is per session, not per link, and sits above validation — only fanned-out
   turns advance it. `forwarded_count` refuses a sparse-cap-collapsed prefix.
+- A mesh arrival never leaves this relay again, with one exception: when a slot
+  makes this relay its home (`forward_adopted_turns`, at the slot link's resume
+  anchor), its turns from the anchor that this relay holds only as mesh
+  arrivals are forwarded once and re-tagged local in the ring. The client
+  re-sends that range, but the forward gate already holds it and drops the
+  copies, so nothing else would carry them to peers its old home missed.
 - A Join anchors receive windows from the forward-gate cursors and asks the peer
   to replay from them. The ask is always `resuming` (a slot absent from the
   cursors asks for everything retained): no forward-gate history is not proof

@@ -157,7 +157,10 @@ const _: () = {
 /// must answer the second question, entry by entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnOrigin {
-    /// Delivered by this relay's own client edge — a local client produced it.
+    /// Delivered by this relay's own client edge — a local client produced it —
+    /// or adopted from the mesh when its slot made this relay its home (see
+    /// [`TurnRing::adopt_mesh_turns`]): either way, this relay is the one that
+    /// owes it to its peers.
     Local,
     /// Delivered by a peer relay over the mesh — forwarded, not originated
     /// here, regardless of which slot it is homed on.
@@ -342,6 +345,36 @@ impl TurnRing {
         resuming: bool,
     ) -> Vec<Payload> {
         self.matching(key, cursors, Some(TurnOrigin::Local), resuming, None)
+    }
+
+    /// Re-tags as [`TurnOrigin::Local`] every recorded turn of `slot` at or past
+    /// `from_seq` that arrived over the mesh, returning those turns oldest-first.
+    ///
+    /// Called when `slot` makes this relay its home. Its previous home may have
+    /// died or left with some of those turns delivered here but not yet to
+    /// every other peer, and this relay never forwards a mesh arrival. The
+    /// slot's client re-sends them on its re-home, but this relay's forward
+    /// gate already holds each one and drops the copy, so the caller forwards
+    /// the returned turns to the mesh itself; once re-tagged, a later resume
+    /// ask is answered with them too. Each turn is returned once: a second
+    /// call finds it already local.
+    pub fn adopt_mesh_turns(&self, key: &SessionKey, slot: SlotId, from_seq: u64) -> Vec<Payload> {
+        let mut state = self.state.lock();
+        let Some(ring) = state.sessions.get_mut(key) else {
+            return Vec::new();
+        };
+        ring.turns
+            .iter_mut()
+            .filter(|entry| {
+                entry.origin == TurnOrigin::Mesh
+                    && entry.payload.slot == u32::from(slot.0)
+                    && entry.payload.seq >= from_seq
+            })
+            .map(|entry| {
+                entry.origin = TurnOrigin::Local;
+                entry.payload.clone()
+            })
+            .collect()
     }
 
     /// Shared body for [`replay`](Self::replay) and

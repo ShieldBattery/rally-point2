@@ -48,9 +48,25 @@ pub fn spawn_mesh_link_timed(
     mpsc::UnboundedSender<mesh::MeshCommand>,
     tokio::task::JoinHandle<mesh::MeshLinkExit>,
 ) {
+    spawn_mesh_link_to(link, sessions, mesh, idle_timeout, RelayId(0))
+}
+
+/// Like [`spawn_mesh_link_timed`], naming the peer the link leads to. A relay
+/// holds one link per peer id, so a test giving one relay links to two peers
+/// must name them apart or the second claim supersedes the first.
+pub fn spawn_mesh_link_to(
+    link: MeshLink,
+    sessions: Sessions,
+    mesh: mesh::MeshState,
+    idle_timeout: Duration,
+    peer: RelayId,
+) -> (
+    mpsc::UnboundedSender<mesh::MeshCommand>,
+    tokio::task::JoinHandle<mesh::MeshLinkExit>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let attempt = mesh::new_mesh_link_attempt();
-    let lease = mesh::claim_mesh_link(&mesh, RelayId(0), &attempt)
+    let lease = mesh::claim_mesh_link(&mesh, peer, &attempt)
         .expect("raw test driver claims its peer lease");
     // These raw link pairs skip the hello exchange, so build the presence
     // streams the production edge would have set up: an outbound uni-stream
@@ -64,7 +80,7 @@ pub fn spawn_mesh_link_timed(
             link.connection().clone(),
         );
         let presence_io = rally_point_relay::session::presence::PresenceIo {
-            peer_id: RelayId(0),
+            peer_id: peer,
             tx: presence_tx,
             rx: presence_rx,
         };

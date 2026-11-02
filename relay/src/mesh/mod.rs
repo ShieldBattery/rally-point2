@@ -59,8 +59,8 @@ pub(crate) use fan_out::{
     fan_out_skin, fan_out_slot_connectivity, fan_out_slot_departed, fan_out_slot_present,
     fan_out_slot_started,
 };
-pub(crate) use forward::deliver_mesh_turn;
 pub use forward::forward_client_turn;
+pub(crate) use forward::{deliver_mesh_turn, forward_adopted_turns};
 pub(crate) use frames::{
     FINALIZE_OUTCOME_FINALIZED, FINALIZE_OUTCOME_REJECTED_LIVE, FINALIZE_OUTCOME_REJECTED_NO_CURSOR,
 };

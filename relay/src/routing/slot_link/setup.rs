@@ -317,6 +317,10 @@ pub(super) fn apply_resume_anchor(
         for seq in receipts.ahead {
             link.seed_delivered(ctx.slot, seq);
         }
+        // That seeding drops every re-sent turn this relay already holds, but
+        // on a re-home some of those it holds only as mesh arrivals, which it
+        // never forwarded on. Forward them now, as the slot's new home.
+        crate::mesh::forward_adopted_turns(&ctx.mesh_for_teardown, &ctx.key, ctx.slot, anchor);
     }
     ControlFlow::Continue(())
 }

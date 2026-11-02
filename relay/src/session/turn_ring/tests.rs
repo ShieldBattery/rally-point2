@@ -1,7 +1,8 @@
 //! Tests for the turn ring: cursor-based replay (named, unnamed, and
 //! empty-cursor slots), oldest-first ordering, the count and byte bounds'
-//! drop-oldest eviction and per-session slot-count scaling, and the
-//! `replay_local` origin filter mesh resume replies rely on.
+//! drop-oldest eviction and per-session slot-count scaling, the
+//! `replay_local` origin filter mesh resume replies rely on, and a new home
+//! adopting a slot's mesh arrivals.
 
 use super::*;
 use crate::test_support::session_key as key_of;
@@ -362,5 +363,33 @@ fn replay_local_answers_an_unlisted_slot_from_zero_only_when_resuming() {
             .collect::<Vec<_>>(),
         vec![0, 1, 2],
         "a resuming ask replays an unlisted slot's Local turns from the start",
+    );
+}
+
+#[test]
+fn adopting_returns_a_slots_mesh_arrivals_from_the_anchor_once_and_makes_them_local() {
+    let ring = TurnRing::new();
+    let k = key();
+    for seq in 0..4 {
+        ring.record(&k, &turn(2, seq, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
+    }
+    // Another slot's mesh arrival and the slot's own local turn stay as they are.
+    ring.record(&k, &turn(1, 0, 8), TurnOrigin::Mesh, MAX_GAME_SLOTS);
+    ring.record(&k, &turn(2, 4, 8), TurnOrigin::Local, MAX_GAME_SLOTS);
+
+    let seqs =
+        |payloads: Vec<Payload>| payloads.iter().map(|p| (p.slot, p.seq)).collect::<Vec<_>>();
+    assert_eq!(
+        seqs(ring.adopt_mesh_turns(&k, SlotId(2), 1)),
+        vec![(2, 1), (2, 2), (2, 3)],
+    );
+    assert!(
+        ring.adopt_mesh_turns(&k, SlotId(2), 1).is_empty(),
+        "an adopted turn is already local",
+    );
+    assert_eq!(
+        seqs(ring.replay_local(&k, &HashMap::new(), true)),
+        vec![(2, 1), (2, 2), (2, 3), (2, 4)],
+        "a resume ask is now answered with the adopted turns",
     );
 }
