@@ -427,9 +427,17 @@ impl PhaseController {
         let mut widest_gap = 0i64;
         let mut cluster_end = 0usize; // index of the cluster's latest phase
         for i in 0..count {
+            // The last phase's gap wraps to the first one a cycle later.
+            // Taken as a plain difference rather than reduced modulo the
+            // cycle: when every phase coincides that wrap gap is the whole
+            // cycle (span zero), where a modulo would fold it to zero and
+            // read a perfectly aligned population as a full turn apart.
             let this = phases[i].1;
-            let next = phases[(i + 1) % count].1;
-            let gap = (next - this).rem_euclid(self.turn_us);
+            let next = match phases.get(i + 1) {
+                Some(&(_, next)) => next,
+                None => phases[0].1 + self.turn_us,
+            };
+            let gap = next - this;
             if gap > widest_gap {
                 widest_gap = gap;
                 cluster_end = i;

@@ -353,3 +353,26 @@ fn seq_history_from_before_measurement_does_not_skew_the_phase() {
     let corrections = controller.evaluate(last + Duration::from_millis(1));
     assert!(corrections.is_empty(), "same phase, got {corrections:?}");
 }
+
+#[test]
+fn exactly_coincident_phases_read_as_aligned() {
+    // Every slot's phase estimate landing on the same microsecond is what a
+    // successful correction aims for. That population is perfectly aligned:
+    // its span is zero, and its evaluations must neither count toward the
+    // give-up latch nor report a full-turn span.
+    let mut controller = PhaseController::new(TURN_US);
+    let start = Instant::now();
+    let offsets = [(slot(0), 5_000i64), (slot(1), 5_000)];
+    let mut seq = 0u64;
+    for _ in 0..MAX_UNCONVERGED_ROUNDS {
+        let clock = feed_steady(&mut controller, start, &offsets, seq, ROUND_TURNS);
+        seq += ROUND_TURNS;
+        assert!(
+            controller
+                .evaluate(clock + Duration::from_millis(1))
+                .is_empty()
+        );
+        assert_eq!(controller.last_span_us(), Some(0));
+    }
+    assert!(!controller.is_disabled(), "an aligned session latched off");
+}
