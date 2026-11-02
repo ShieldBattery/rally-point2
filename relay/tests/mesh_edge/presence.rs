@@ -388,3 +388,131 @@ async fn first_peer_presence_repeats_a_resuming_joins_resume_ask() -> Result<(),
     drop(peer_control_tx);
     Ok(())
 }
+
+/// The leave state and session start a Join replays are re-sent on the peer's
+/// first presence too. A peer that has not joined the session yet drops every
+/// control frame for it, and on a redial the accept side usually reads the
+/// dialer's Join-time frames before its own Join lands. A synced leave or the
+/// session start lost with the old link would then never reach that peer: its
+/// survivors stall waiting for the leave, or its clients never start.
+#[tokio::test]
+async fn first_peer_presence_re_sends_leave_state_and_the_session_start() -> Result<(), AnyError> {
+    use rally_point_proto::ids::GameFrameCount;
+    use rally_point_proto::messages::MeshControlFrame;
+    use rally_point_proto::messages::mesh_control_frame::Kind;
+
+    /// Every frame the driver wrote up to and including `session`'s resume ask.
+    async fn frames_through_ask(
+        frames: &mut mpsc::Receiver<MeshControlFrame>,
+        session: u64,
+    ) -> Vec<MeshControlFrame> {
+        let mut seen = Vec::new();
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv())
+                .await
+                .expect("a mesh control frame arrived within 2s")
+                .expect("the driver's control stream stayed open");
+            let ask =
+                frame.session == session && matches!(frame.kind, Some(Kind::MeshResumeCursors(_)));
+            seen.push(frame);
+            if ask {
+                return seen;
+            }
+        }
+    }
+
+    let key = |session| SessionKey {
+        tenant: TenantId(TENANT.to_owned()),
+        session: SessionId(session),
+    };
+    let game = key(60);
+    let barrier = key(61);
+
+    let sessions: Sessions = Arc::default();
+    let mesh_state = mesh::MeshState::default();
+    let makers = mesh_state.session.decision_makers.clone();
+    // This relay is the authority, already decided slot 1's leave, and
+    // already started the session: the state a link redialing mid-game carries.
+    seed_authority(&makers, &game).apply();
+    makers.observe_frame(&game, SlotId(1), GameFrameCount(40));
+    let leave = makers
+        .decide_leave(
+            &game,
+            SlotId(1),
+            rally_point_relay::consensus::LEAVE_REASON_DROPPED,
+        )
+        .expect("the authority decides slot 1's leave");
+    makers.mark_started(&game);
+
+    let (local_link, peer_link, _local_endpoint, _peer_endpoint) = mesh_link_pair().await;
+    let local_connection = local_link.connection().clone();
+    let peer_connection = peer_link.connection().clone();
+    let presence_send = local_connection.open_uni().await?;
+    let (peer_presence_tx, peer_presence_rx) = mpsc::channel::<MeshPresence>(8);
+    let (mut control_send, _unused_control_recv) = local_connection.open_bi().await?;
+    rally_point_transport::mesh_control_stream::establish_mesh_control(&mut control_send).await?;
+    let mut outbound_control =
+        rally_point_transport::mesh_control_stream::spawn_mesh_control_reader_accepting(
+            peer_connection.clone(),
+        );
+    let (_peer_control_tx, peer_control_rx) = mpsc::channel::<MeshControlFrame>(8);
+    let attempt = mesh::new_mesh_link_attempt();
+    let lease = mesh::claim_mesh_link(&mesh_state, RelayId(9), &attempt)
+        .expect("the test driver claims its peer lease");
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    let driver = tokio::spawn(mesh::run_mesh_link(
+        local_link,
+        mesh::MeshLinkIo {
+            presence: rally_point_relay::session::presence::PresenceIo {
+                peer_id: RelayId(9),
+                tx: presence_send,
+                rx: peer_presence_rx,
+            },
+            control: mesh::MeshControlIo {
+                tx: control_send,
+                rx: peer_control_rx,
+            },
+            lease,
+        },
+        commands_rx,
+        Arc::clone(&sessions),
+        mesh_state,
+        mesh::IDLE_TIMEOUT,
+    ));
+
+    let carries_the_state = |frames: &[MeshControlFrame]| {
+        let leave_sent = frames.iter().any(|frame| {
+            frame.session == game.session.0
+                && matches!(frame.kind, Some(Kind::LeaveDirective(sent)) if sent == leave)
+        });
+        let start_sent = frames.iter().any(|frame| {
+            frame.session == game.session.0 && matches!(frame.kind, Some(Kind::SessionStart(_)))
+        });
+        (leave_sent, start_sent)
+    };
+
+    // The Join replays both — to a peer that, not having joined, drops them.
+    commands_tx.send(mesh::MeshCommand::Join(game.clone()))?;
+    let join_time = frames_through_ask(&mut outbound_control, game.session.0).await;
+    assert_eq!(carries_the_state(&join_time), (true, true));
+
+    // The peer's first presence proves its Join. The driver handles ready
+    // presence before commands, so everything it re-sends for `game` precedes
+    // the barrier Join's ask.
+    peer_presence_tx
+        .send(MeshPresence {
+            session: game.session,
+            live_players: 1,
+        })
+        .await?;
+    commands_tx.send(mesh::MeshCommand::Join(barrier.clone()))?;
+    let after_presence = frames_through_ask(&mut outbound_control, barrier.session.0).await;
+    assert_eq!(
+        carries_the_state(&after_presence),
+        (true, true),
+        "the leave and the session start reach the peer once it has joined",
+    );
+
+    driver.abort();
+    Ok(())
+}
