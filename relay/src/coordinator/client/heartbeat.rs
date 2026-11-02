@@ -127,6 +127,12 @@ const HEARTBEAT_EVIDENCE_BYTES: usize = 512 * 1024;
 /// A complete roster with a rotating bounded subset of paired observations.
 /// Candidate enumeration holds only identities; the callback clones only pairs
 /// that fit. A stale identity is skipped without stopping later candidates.
+///
+/// `cursor` is a position in the sorted candidate list, not a candidate
+/// identity: when candidates appear or disappear between beats it can land on a
+/// different candidate than it last pointed at, so a beat may skip or repeat one.
+/// The drift is bounded by how much the list changed between beats, and the
+/// cursor still advances past whatever each beat attached.
 pub(super) fn attach_heartbeat_evidence(
     roster: &mut [SessionPresence],
     cursor: &mut usize,
@@ -185,8 +191,9 @@ pub(super) fn attach_heartbeat_evidence(
             // lookup. It did not spend the budget and must not stop this beat.
             Ok(None) => {}
             Err(()) => {
-                // A pair that exhausted this beat's budget gets first chance next
-                // time. A pair too large even when first must not pin the rotation.
+                // A pair that exhausted this beat's budget is where the next beat
+                // starts (unless the candidate list shifts under the position). A
+                // pair too large even when first must not pin the rotation.
                 *cursor = if offset == 0 {
                     (index + 1) % candidates.len()
                 } else {

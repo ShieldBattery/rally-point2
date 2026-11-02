@@ -304,8 +304,9 @@ impl TurnRing {
     /// a session starts only once every expected slot is present, so the ring a first
     /// arrival reads is empty.
     ///
-    /// Oldest-first preserves each slot's seq order for the client's per-slot reorder
-    /// buffer. Every origin qualifies: a client wants everything it missed regardless
+    /// Turns replay in the order the ring recorded them (arrival order at this relay),
+    /// which is not guaranteed to be seq order within a slot: the client's per-slot
+    /// reorder buffer restores seq order. Every origin qualifies: a client wants everything it missed regardless
     /// of whether its home client edge or a direct peer link first delivered it here.
     /// Replayed turns carry no state hash report, like every turn a client is forwarded.
     pub fn replay(
