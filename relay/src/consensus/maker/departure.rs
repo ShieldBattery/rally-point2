@@ -96,6 +96,24 @@ pub(in crate::consensus) struct Departure {
     pub(in crate::consensus) connection_epoch: Option<u64>,
 }
 
+impl Departure {
+    /// This record as a Join-time reconcile re-announces it for `slot`.
+    fn recorded(&self, slot: SlotId) -> RecordedDeparture {
+        (
+            slot,
+            DepartureStamps {
+                last_frame: self.last_frame,
+                reachable_frame: self.reachable_frame,
+                result: self.result.clone(),
+                final_turn_count: self.final_turn_count,
+                finalized: self.finalized,
+            },
+            self.reason,
+            self.connection_epoch,
+        )
+    }
+}
+
 /// The home-side outcome of a drop finalization (see [`DecisionMakers::finalize_drop`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalizeOutcome {
@@ -498,23 +516,39 @@ impl DecisionMaker {
         let departures = self
             .departures
             .iter()
-            .map(|(slot, departure)| {
-                (
-                    *slot,
-                    DepartureStamps {
-                        last_frame: departure.last_frame,
-                        reachable_frame: departure.reachable_frame,
-                        result: departure.result.clone(),
-                        final_turn_count: departure.final_turn_count,
-                        finalized: departure.finalized,
-                    },
-                    departure.reason,
-                    departure.connection_epoch,
-                )
-            })
+            .map(|(&slot, departure)| departure.recorded(slot))
             .collect();
         let directives = self.decided_leaves.values().copied().collect();
         (departures, directives)
+    }
+
+    /// The departures a freshly (re)joined mesh link must see preceded by the
+    /// activation of the generation they ended: every undecided departure of a
+    /// slot this relay strictly homes that names its connection generation, in
+    /// slot order.
+    ///
+    /// Epochs are equality fences, so a peer that missed a generation while its
+    /// link was down refuses that generation's departure as stale. The home is
+    /// the only relay that authors a slot's generations, and it records the
+    /// newest one, so restating its activation first lets the peer walk the
+    /// same `Up(E)` then `Down(E)` path it would have walked live. A relay that
+    /// learned a departure second-hand may have missed a newer generation, and
+    /// restating the old one would retire the live generation on its peer, so
+    /// only the home's departures qualify. A decided leave needs no generation:
+    /// the cached directive is final on its own.
+    pub(in crate::consensus) fn departed_home_generations(&self) -> Vec<RecordedDeparture> {
+        let mut departures: Vec<RecordedDeparture> = self
+            .departures
+            .iter()
+            .filter(|&(slot, departure)| {
+                self.strictly_homes(*slot)
+                    && !self.decided_leaves.contains_key(slot)
+                    && departure.connection_epoch.is_some()
+            })
+            .map(|(&slot, departure)| departure.recorded(slot))
+            .collect();
+        departures.sort_by_key(|(slot, ..)| *slot);
+        departures
     }
 
     /// Records a departure and retires the slot's live state. The shared step

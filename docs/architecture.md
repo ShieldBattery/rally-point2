@@ -710,9 +710,17 @@ happened. The client's own copy of the epoch fence orders this snapshot against 
 
 A fresh mesh link reliably replays every active `connected=true` epoch. Registry mutation and replay enqueue
 are serialized, so the link receives either the old replay followed by the new transition or the new replay;
-this is not a claim that QUIC streams arrive before datagrams. An epoch-bearing conditions sidecar whose
-reliable true has not arrived is ignored and a later sample recovers it naturally. The optional fields
-provide only one-way compatibility: a slot that has remained entirely unfenced accepts legacy epoch-less
+this is not a claim that QUIC streams arrive before datagrams. A home slot whose newest generation departed,
+undecided, is replayed as that generation's whole history instead: `connected=true(E)`, `SlotDeparted(E)`,
+then (for a drop) `connected=false(E)`. A peer whose link was down for E would otherwise refuse the bare
+departure as stale, keep the older generation it last saw live, and hold neither the departure nor its drop
+hold, so no survivor's drop request could be honored there. Only the home restates a generation: it alone
+authors them and records the newest, while a relay that learned a departure second-hand may have missed a
+newer generation, and replaying the old activation would retire the live one on its peer. The replay runs
+under the same registry lock, which a reconnect passes through only after reinstating the departure, so a
+new generation's live announce can never precede the replay of the one it replaced. An epoch-bearing
+conditions sidecar whose reliable true has not arrived is ignored and a later sample recovers it naturally.
+The optional fields provide only one-way compatibility: a slot that has remained entirely unfenced accepts legacy epoch-less
 messages, but observing a present epoch permanently rejects later epoch-less messages. This is not a general
 live rolling-upgrade guarantee. Deployments must drain and promptly bounce the relay fleet so an
 epoch-enabled session can never rehome onto an older relay that emits no epoch.

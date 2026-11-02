@@ -464,7 +464,12 @@ impl LinkDriver {
                         // sent, and a synced leave or start lost with the old
                         // link has no other way back to it.
                         reconcile_leaves_on_join(decision_makers, control_forward_tx, &key);
-                        reconcile_local_slots_on_join(conditions, control_forward_tx, &key);
+                        reconcile_local_slots_on_join(
+                            conditions,
+                            decision_makers,
+                            control_forward_tx,
+                            &key,
+                        );
                         reconcile_started_slots_on_join(decision_makers, control_forward_tx, &key);
                         reconcile_session_clock_on_join(decision_makers, control_forward_tx, &key);
                         reconcile_lobby_on_join(

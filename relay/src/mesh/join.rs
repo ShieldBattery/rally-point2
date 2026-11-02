@@ -65,14 +65,29 @@ pub(super) fn reconcile_leaves_on_join(
 /// or after the replay, never departure-then-stale-present. A slot whose setup
 /// has not activated yet will announce normally after this link registration.
 /// Duplicate replays are harmless because peer slot presence is set-valued.
+///
+/// A home slot whose newest generation departed, undecided, is replayed as
+/// that generation's whole live history: connected, then the departure, then
+/// (for a drop) disconnected. Epochs are equality fences, so a peer whose link
+/// was down for that generation would refuse a bare departure naming it and
+/// keep the older generation it last saw live, holding no departure and no drop
+/// hold. Restating the activation first moves it onto the departed generation
+/// exactly as the live frames would have. The same lock orders this against a
+/// reconnect: the reconnect reinstates the departure before activating the slot
+/// here, so a departure read under this lock still precedes the new
+/// generation's live announce on this link. Without that order a peer could
+/// see the new generation and then the stale one's activation, which would
+/// retire the live generation there. The decision-maker lock is taken inside
+/// the conditions lock; nothing takes them the other way round.
 pub(super) fn reconcile_local_slots_on_join(
     conditions: &ConditionsRegistry,
+    decision_makers: &crate::consensus::DecisionMakers,
     control_tx: &MeshControlTx,
     key: &SessionKey,
 ) {
     let roster = conditions.lock();
-    let mut slots: Vec<(SlotId, Option<u64>)> = roster
-        .get(key)
+    let active = roster.get(key);
+    let mut slots: Vec<(SlotId, Option<u64>)> = active
         .into_iter()
         .flat_map(|slots| slots.iter())
         .map(|(&slot, conditions)| (slot, conditions.connection_epoch))
@@ -87,6 +102,22 @@ pub(super) fn reconcile_local_slots_on_join(
                 true,
                 Some(epoch),
             ));
+        }
+    }
+    for (slot, stamps, reason, epoch) in decision_makers.departed_home_generations(key) {
+        if active.is_some_and(|slots| slots.contains_key(&slot)) {
+            continue;
+        }
+        let _ = control_tx.send(slot_connectivity_frame(key.session, slot, true, epoch));
+        let _ = control_tx.send(slot_departed_frame(
+            key.session,
+            slot,
+            &stamps,
+            reason,
+            epoch,
+        ));
+        if reason == crate::consensus::LEAVE_REASON_DROPPED {
+            let _ = control_tx.send(slot_connectivity_frame(key.session, slot, false, epoch));
         }
     }
 }

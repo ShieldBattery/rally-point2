@@ -213,6 +213,17 @@ impl DecisionMakers {
             .unwrap_or_default()
     }
 
+    /// The undecided departures of slots this relay strictly homes, each with
+    /// the generation it ended, for a freshly (re)joined mesh link to replay
+    /// as that generation's activation and then its departure. Empty when no
+    /// maker exists. See `DecisionMaker`'s `departed_home_generations`.
+    pub fn departed_home_generations(&self, key: &SessionKey) -> Vec<RecordedDeparture> {
+        self.lock()
+            .get(key)
+            .map(|maker| maker.departed_home_generations())
+            .unwrap_or_default()
+    }
+
     /// Removes a session's decision-maker (the session has ended). Idempotent.
     /// Also forgets the session's correlation ids, so the refs map doesn't outlive
     /// the sessions it describes.

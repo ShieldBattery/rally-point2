@@ -42,6 +42,7 @@ mod evict_slot;
 mod fan_out_links;
 mod finalize_drop;
 mod gating;
+mod join_departures;
 mod join_reconcile;
 mod leases;
 mod leave_flow;

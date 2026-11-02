@@ -140,6 +140,7 @@ fn join_reconcile_re_sends_the_authoritys_session_clock() {
 #[test]
 fn join_reconcile_replays_each_active_slot_and_generation_every_time() {
     let conditions = new_conditions_registry();
+    let makers = crate::consensus::new_decision_makers();
     let key = control_key();
     for (slot, epoch) in [
         (SlotId(2), Some(22)),
@@ -161,8 +162,8 @@ fn join_reconcile_replays_each_active_slot_and_generation_every_time() {
     }
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    reconcile_local_slots_on_join(&conditions, &control_tx, &key);
-    reconcile_local_slots_on_join(&conditions, &control_tx, &key);
+    reconcile_local_slots_on_join(&conditions, &makers, &control_tx, &key);
+    reconcile_local_slots_on_join(&conditions, &makers, &control_tx, &key);
 
     let mut present = Vec::new();
     let mut connected = Vec::new();

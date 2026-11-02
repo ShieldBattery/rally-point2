@@ -200,7 +200,12 @@ impl LinkDriver {
                     // link registration. This closes the race where a
                     // client's original announcement ran before the Join.
                     // The same snapshot carries active connection epochs.
-                    reconcile_local_slots_on_join(conditions, control_forward_tx, &key);
+                    reconcile_local_slots_on_join(
+                        conditions,
+                        decision_makers,
+                        control_forward_tx,
+                        &key,
+                    );
                     // And the game-started reports its own home clients made,
                     // which reach no other relay on their own.
                     reconcile_started_slots_on_join(decision_makers, control_forward_tx, &key);
