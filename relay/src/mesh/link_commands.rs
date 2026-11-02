@@ -14,10 +14,10 @@ use crate::routing;
 use super::conditions::snapshot_conditions;
 use super::forward::send_turn_over_link;
 use super::join::{
-    local_presence, needs_resume_replay, presence_statement, presence_updates,
-    push_presence_updates, reconcile_leaves_on_join, reconcile_lobby_on_join,
-    reconcile_local_slots_on_join, reconcile_resume_cursors_on_join,
-    reconcile_session_clock_on_join, reconcile_started_slots_on_join,
+    local_presence, presence_statement, presence_updates, push_presence_updates,
+    reconcile_leaves_on_join, reconcile_lobby_on_join, reconcile_local_slots_on_join,
+    reconcile_resume_cursors_on_join, reconcile_session_clock_on_join,
+    reconcile_started_slots_on_join,
 };
 use super::link_arms::LinkDriver;
 use super::link_run::{MeshCommand, defer_flush_after_send};
@@ -229,15 +229,9 @@ impl LinkDriver {
                     // replay whatever this relay's forward-gate is still
                     // missing for the session — the resume-cursor mesh
                     // counterpart of the leave re-sync just above. The peer
-                    // may not have joined yet, so a resuming Join asks again
-                    // on the peer's first presence.
-                    let resumed = needs_resume_replay(seen_registries, decision_makers, &key);
-                    reconcile_resume_cursors_on_join(
-                        seen_registries,
-                        decision_makers,
-                        control_forward_tx,
-                        &key,
-                    );
+                    // may not have joined yet, so the ask is repeated on the
+                    // peer's first presence.
+                    reconcile_resume_cursors_on_join(seen_registries, control_forward_tx, &key);
                     let joined_at = tokio::time::Instant::now();
                     joined.insert(
                         session_id,
@@ -245,7 +239,6 @@ impl LinkDriver {
                             key,
                             flush_deadline: joined_at + routing::FLUSH_INTERVAL,
                             acks_owed: false,
-                            resumed,
                             _registration: registration,
                         },
                     );

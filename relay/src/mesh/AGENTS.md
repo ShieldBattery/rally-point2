@@ -30,11 +30,12 @@
 - Dedup is per session, not per link, and sits above validation — only fanned-out
   turns advance it. `forwarded_count` refuses a sparse-cap-collapsed prefix.
 - A Join anchors receive windows from the forward-gate cursors and asks the peer
-  to replay from them. `resuming` separates a first join (ask for nothing) from a
-  recovery whose slots are all gapped (ask for everything) — both send an empty
-  cursor list. A peer drops an ask for a session it has not joined, and the
-  accept side of a redial usually reads the dialer's ask before its own Join
-  lands, so a resuming Join asks again on the peer's first presence report.
+  to replay from them. The ask is always `resuming` (a slot absent from the
+  cursors asks for everything retained): no forward-gate history is not proof
+  of no gap — a link can die after the start before any turn reached this
+  relay. A peer drops an ask for a session it has not joined, and the accept
+  side of a redial usually reads the dialer's ask before its own Join lands, so
+  every Join asks again on the peer's first presence report.
   Anything replayed on a peer's Join-time arrival must also be re-sent there.
   The lobby log is one of these re-sends (`reconcile_lobby_on_join`): a lobby
   command crosses the mesh once, so the re-share is its only recovery from a

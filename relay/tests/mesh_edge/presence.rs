@@ -208,18 +208,19 @@ async fn first_peer_presence_forces_exactly_one_current_reply() -> Result<(), An
     Ok(())
 }
 
-/// A resuming Join's resume ask can reach a peer that has not joined the
-/// session yet, which drops it unanswered; the accept side of a redial usually
-/// reads the dialer's ask before its own Join lands. The peer's first presence
-/// report proves it has joined, so a resuming Join asks again then, once. A
-/// first Join's ask asks for nothing and is never repeated, even when local
-/// turns gave the session forward-gate history after the Join.
+/// A Join's resume ask can reach a peer that has not joined the session yet,
+/// which drops it unanswered; the accept side of a redial usually reads the
+/// dialer's ask before its own Join lands. The peer's first presence report
+/// proves it has joined, so every Join asks again then, once. That includes a
+/// Join with no forward-gate history: its clients can still be waiting on
+/// turns the peer's clients sent while the two were not joined, which no live
+/// path carries.
 ///
 /// The peer here is hand-driven: it never answers the first ask, exactly what
 /// an unjoined peer's drop amounts to, and its presence reports are fed
 /// straight into the driver so their order against the asks is deterministic.
 #[tokio::test]
-async fn first_peer_presence_repeats_a_resuming_joins_resume_ask() -> Result<(), AnyError> {
+async fn first_peer_presence_repeats_every_joins_resume_ask() -> Result<(), AnyError> {
     use rally_point_proto::messages::mesh_control_frame::Kind;
     use rally_point_proto::messages::{MeshControlFrame, MeshResumeCursors};
 
@@ -307,13 +308,17 @@ async fn first_peer_presence_repeats_a_resuming_joins_resume_ask() -> Result<(),
     commands_tx.send(mesh::MeshCommand::Join(fresh.clone()))?;
     let (session, ask) = next_resume_ask(&mut outbound_control).await;
     assert_eq!(session, fresh.session.0);
-    assert!(!ask.resuming, "a Join with no history is a first join");
-    // A local turn after the Join gives `fresh` history of its own, which must
-    // not turn its first join into a resuming one at the peer's presence.
+    assert!(
+        ask.resuming,
+        "a Join with no history still asks for everything retained",
+    );
+    assert!(ask.cursors.is_empty());
+    // A local turn after the Join gives `fresh` history of its own, which the
+    // repeated ask carries.
     mesh::mark_seen(&seen, &fresh, SlotId(0), 0);
 
-    // Neither ask is answered. `fresh`'s report goes first, so a re-ask for it
-    // would be written ahead of `resumed`'s.
+    // Neither ask is answered. Both Joins ask again on the peer's first
+    // presence, in report order.
     for session in [fresh.session, resumed.session] {
         peer_presence_tx
             .send(MeshPresence {
@@ -324,9 +329,13 @@ async fn first_peer_presence_repeats_a_resuming_joins_resume_ask() -> Result<(),
     }
     let (session, ask) = next_resume_ask(&mut outbound_control).await;
     assert_eq!(
-        session, resumed.session.0,
-        "only the resuming Join asks again on the peer's first presence",
+        session, fresh.session.0,
+        "a Join without history asks again on the peer's first presence",
     );
+    assert!(ask.resuming);
+    assert_eq!(cursors(&ask), vec![(0, 1)]);
+    let (session, ask) = next_resume_ask(&mut outbound_control).await;
+    assert_eq!(session, resumed.session.0);
     assert!(ask.resuming);
     assert_eq!(cursors(&ask), vec![(1, 1)]);
 
@@ -357,7 +366,7 @@ async fn first_peer_presence_repeats_a_resuming_joins_resume_ask() -> Result<(),
         commands_tx.send(mesh::MeshCommand::Join(replacement.clone()))?;
         let (session, ask) = next_resume_ask(&mut outbound_control).await;
         assert_eq!(session, id);
-        assert_eq!(ask.resuming, descriptor_before_join);
+        assert!(ask.resuming);
         assert!(ask.cursors.is_empty());
         assert!(!mesh::has_resumable_state(&seen, &replacement));
         if !descriptor_before_join {

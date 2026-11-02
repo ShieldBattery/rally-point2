@@ -450,12 +450,16 @@ returning clients to replay. Recovery combines that client replay with surviving
 with its routing entry. Forwarded turns below a destination's next-needed cursor are already
 received there, so recovery skips them before charging that destination's bounded queue.
 
-**A fresh replacement also recovers survivor turns across the mesh.** The replacement's Join asks
-surviving peers for their retained local-origin turns whenever the coordinator assigned a resumed
-session, even with no forwarding history of its own. Otherwise a survivor that stalled during the
-outage has no new turns to carry the missing tail to the replacement. The first peer presence
-repeats the ask because a peer may have discarded it before joining. An ordinary fresh session
-still asks for no history; a resumed assignment learned before that presence enables the retry.
+**Every mesh Join asks for whatever its forward gate doesn't cover.** A Join asks the peer to replay
+its retained local-origin turns past this relay's forward-gate cursors, and a slot with no cursor
+asks for all of them, even when this relay has no forwarding history at all. Missing history is
+not proof of a missing gap: a fresh replacement has none, a link can die after the start before any
+turn reached this relay, and a first ask can be dropped by a peer that had not joined yet while turns
+entered no link. In each case a survivor that stalled has no new turns to carry the missing tail, so
+the ask is the only recovery. Before the start the peer retains nothing, so a fresh session's ask
+costs nothing; the forward gate absorbs any overlap. The first peer presence repeats the ask because
+a peer may have discarded it before joining. (Relays that predate this ask a first Join for nothing;
+the wire's `resuming` flag tells the two apart, and every current relay sets it.)
 
 A resume request can opt into newest-first recovery. The receiver advertises this only when
 its mesh receive window preserves delayed turns behind advancing live traffic and its frame

@@ -245,7 +245,6 @@ pub(super) fn joined_state(
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
             acks_owed: false,
-            resumed: false,
             _registration: MeshLinkRegistration {
                 links: mesh_links.clone(),
                 key: key.clone(),

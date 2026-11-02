@@ -456,7 +456,6 @@ impl LinkDriver {
                     // unjoined session has no key to record under.
                     let state = joined.get(&report.session)?;
                     let key = state.key.clone();
-                    let resumed = state.resumed || decision_makers.is_resumed(&key);
                     let first_peer_presence = peer_presence_seen.insert(report.session);
                     if first_peer_presence {
                         // Leave state and the session start too: a peer that
@@ -486,14 +485,11 @@ impl LinkDriver {
                         // waiting on them stalls for good. Asking again here
                         // reaches a peer that has joined; a replay the peer
                         // already answered is dropped by the forward gate.
-                        if resumed {
-                            reconcile_resume_cursors_on_join(
-                                seen_registries,
-                                decision_makers,
-                                control_forward_tx,
-                                &key,
-                            );
-                        }
+                        // Asked whether or not the Join had history to resume:
+                        // a first Join's ask lost this way is the only request
+                        // for turns this relay's clients missed while it was
+                        // unjoined.
+                        reconcile_resume_cursors_on_join(seen_registries, control_forward_tx, &key);
                     }
                     if crate::session::presence::record_peer(
                         presence,

@@ -449,11 +449,6 @@ pub(super) struct JoinedSession {
     /// Payload-bearing datagrams need a packet ACK even without local traffic
     /// or a contiguous receive prefix. ACK-only datagrams never arm this.
     pub(super) acks_owed: bool,
-    /// Whether Join needed history from a prior forwarding record or a resumed
-    /// assignment. The first peer presence retries its ask because a peer that
-    /// had not joined yet discarded it. A resumed assignment learned after Join
-    /// also triggers that retry; ordinary newly-authored turns do not.
-    pub(super) resumed: bool,
     /// Deregisters this session's mesh forward channel when the `JoinedSession` is
     /// dropped — on a `Leave`, a normal wind-down, or the driver task being
     /// cancelled. Never read; its `Drop` is the point.

@@ -11,12 +11,12 @@ use rally_point_proto::messages::{
 
 /// Builds a `MeshResumeCursors` mesh control frame for `session`, from
 /// `cursors` — each entry an origin slot and the next seq this relay's
-/// forward-gate still needs from it — and `resuming`, which decides what an
-/// absent slot means to the receiver (see the wire frame's own doc).
+/// forward-gate still needs from it. Always resuming: a slot absent from
+/// `cursors` asks for everything the receiver retains for it (see the wire
+/// frame's own doc).
 pub(super) fn resume_cursors_frame(
     session: SessionId,
     cursors: Vec<(SlotId, u64)>,
-    resuming: bool,
 ) -> MeshControlFrame {
     MeshControlFrame {
         session: session.0,
@@ -31,7 +31,7 @@ pub(super) fn resume_cursors_frame(
                         },
                     )
                     .collect(),
-                resuming,
+                resuming: true,
                 prefer_recent: true,
             },
         )),

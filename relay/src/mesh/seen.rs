@@ -376,13 +376,8 @@ pub fn highest_forwarded_seq(
 /// A snapshot of `key`'s forward-gate cursors, as "next needed seq" per slot —
 /// the seq immediately past each slot's contiguous forwarded-to-locals prefix.
 /// A slot with no contiguous prefix (nothing forwarded yet, or a gap below
-/// what has) is omitted entirely, not given a `0`. What an absent slot then
-/// asks of the reply depends on [`has_resumable_state`] alongside this
-/// snapshot: nothing, for a session with no forward-gate history at all
-/// (a fresh join); that slot's turns from the very start, for a session that
-/// does (see the wire frame's own doc for the full two-mode story — this
-/// snapshot only ever answers "how far did I get", never "should an absent
-/// slot mean nothing or everything").
+/// what has) is omitted entirely, not given a `0`, and the resume ask built
+/// from it asks for such a slot's retained turns from the very start.
 ///
 /// Read from the same registry [`mark_forwarded`](MeshSeen::mark_forwarded)
 /// writes, so the snapshot reflects exactly what this session has actually
@@ -450,8 +445,6 @@ pub fn slot_receipts(registries: &SeenRegistries, key: &SessionKey, slot: SlotId
 }
 
 /// Whether `key` has any forward-gate history, even if every slot is gapped.
-/// Mesh recovery also considers the coordinator's resumed assignment: a fresh
-/// replacement can owe its clients history before this registry has any entry.
 pub fn has_resumable_state(registries: &SeenRegistries, key: &SessionKey) -> bool {
     registries.lock().contains_key(key)
 }

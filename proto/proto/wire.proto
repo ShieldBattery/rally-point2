@@ -1321,18 +1321,18 @@ message MeshControlFrame {
     // An origin slot absent from `cursors` means one of two things, told
     // apart by `resuming`:
     //
-    // - `resuming` false: an ordinary first Join with neither forward-gate
-    //   history nor a coordinator assignment to resume an already-running
-    //   session. An absent slot asks for no replay.
-    // - `resuming` true: the sender has forwarding history, or a resumed
-    //   assignment whose clients may need turns produced before this relay
-    //   joined. An absent slot asks for every retained local-origin turn;
-    //   the sender's dedup absorbs overlap. A fresh replacement must ask even
-    //   before its first client turn creates a forward-gate entry.
+    // - `resuming` true: an absent slot asks for every retained local-origin
+    //   turn; the sender's dedup absorbs overlap. Every ask a current relay
+    //   sends is resuming. A Join with no forward-gate history can still owe
+    //   its clients turns: the link may have died after the start but before
+    //   anything reached this relay, or its first ask may have been dropped
+    //   by a peer that had not joined yet while turns entered no link. Before
+    //   the start the peer has nothing retained, so the ask costs nothing.
+    // - `resuming` false: an absent slot asks for no replay. Only relays that
+    //   predate the always-resuming ask send it, for a first Join.
     //
-    // A resuming Join repeats its ask on the peer's first presence, because
-    // a peer that has not joined yet cannot answer. A resumed assignment
-    // learned between Join and that presence also triggers the repeat.
+    // Every Join repeats its ask on the peer's first presence, because a
+    // peer that has not joined yet cannot answer.
     MeshResumeCursors mesh_resume_cursors = 12;
 
     // The sending relay's per-slot delivered-through cursors for THIS mesh

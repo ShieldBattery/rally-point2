@@ -330,12 +330,11 @@ impl TurnRing {
     /// mesh. That is what keeps a resume reply from becoming an echo: a mesh
     /// peer's cursors are answered only with what genuinely originated here.
     ///
-    /// `resuming` decides what a slot absent from `cursors` means. A recovering
-    /// mesh link or a relay assigned an already-running session needs every
-    /// retained local-origin turn for that slot; the asker's dedup absorbs
-    /// overlap. An ordinary first Join asks for no old turns. The resumed
-    /// assignment matters even before the replacement's forward gate has history:
-    /// its client can already be waiting for turns held only by a surviving peer.
+    /// `resuming` decides what a slot absent from `cursors` means: every
+    /// retained local-origin turn for that slot, or none. Every current relay
+    /// asks as resuming, since an asker with no forward-gate history for a slot
+    /// can still have clients waiting on its turns; the asker's dedup absorbs
+    /// overlap. Only a relay that predates that asks a first Join for none.
     pub fn replay_local(
         &self,
         key: &SessionKey,

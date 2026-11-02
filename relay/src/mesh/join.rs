@@ -12,7 +12,7 @@ use crate::routing;
 use super::conditions::ConditionsRegistry;
 use super::frames::*;
 use super::links::MeshControlTx;
-use super::seen::{SeenRegistries, has_resumable_state, resume_cursor_snapshot};
+use super::seen::{SeenRegistries, resume_cursor_snapshot};
 
 /// Re-sends this relay's known leave state for `key` down a freshly registered
 /// link's control channel, so a link that died and redialed converges. Every
@@ -177,17 +177,6 @@ pub(super) fn reconcile_session_clock_on_join(
     }
 }
 
-/// A replacement assigned an already-running session needs history even before
-/// its first local turn creates a forward-gate entry. Ordinary first joins have
-/// neither resumed assignment nor forwarding history, and ask for no old turns.
-pub(super) fn needs_resume_replay(
-    seen: &SeenRegistries,
-    makers: &crate::consensus::DecisionMakers,
-    key: &SessionKey,
-) -> bool {
-    makers.is_resumed(key) || has_resumable_state(seen, key)
-}
-
 /// Sends this relay's resume cursors for `key` down a freshly registered
 /// link's control channel — the mesh counterpart of
 /// [`reconcile_leaves_on_join`], closing the gap a redialed link's fresh
@@ -195,18 +184,25 @@ pub(super) fn needs_resume_replay(
 /// the old link died are gone from that link's own state, but this session's
 /// forward-gate cursors survive it (see [`resume_cursor_snapshot`]), so the
 /// fresh link can still ask for exactly what's missing. Every Join sends one,
-/// and a Join that resumes history or an assigned running session sends another
-/// on the peer's first presence report: a peer that had not joined the session
-/// yet drops the first ask unanswered.
+/// and sends another on the peer's first presence report: a peer that had not
+/// joined the session yet drops the first ask unanswered.
+///
+/// The ask is always resuming: a slot absent from the cursors asks for every
+/// turn the peer's own clients produced that it still retains. Lacking
+/// forward-gate history does not mean lacking a gap. A link that died after
+/// the start but before any turn reached this relay leaves no cursors behind,
+/// and neither does a first ask dropped by a peer that had not joined while
+/// turns entered no link; either way this relay's clients wait on turns
+/// nothing else will carry. Before the start the peer has retained nothing,
+/// so asking for everything costs nothing, and the forward gate absorbs any
+/// overlap.
 pub(super) fn reconcile_resume_cursors_on_join(
     seen: &SeenRegistries,
-    makers: &crate::consensus::DecisionMakers,
     control_tx: &MeshControlTx,
     key: &SessionKey,
 ) {
     let cursors = resume_cursor_snapshot(seen, key);
-    let resuming = needs_resume_replay(seen, makers, key);
-    let _ = control_tx.send(resume_cursors_frame(key.session, cursors, resuming));
+    let _ = control_tx.send(resume_cursors_frame(key.session, cursors));
 }
 
 /// Reads one joined session's authoritative local-player count. Kept separate

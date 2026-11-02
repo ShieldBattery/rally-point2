@@ -239,21 +239,20 @@ fn resume_cursor_saturates_at_the_sequence_ceiling() {
 }
 
 #[test]
-fn reconcile_resume_cursors_on_join_sends_an_empty_frame_for_a_first_join() {
-    // A session this relay has never forwarded anything for -- a first
-    // Join, or a peer that predates this link entirely -- sends a frame
-    // with no cursors AND `resuming = false`, which the wire's own doc
-    // marks as "replay nothing", never as "replay from the very start".
+fn a_join_without_forward_gate_history_asks_for_everything_retained() {
+    // A started session this relay has never forwarded a turn for: its link
+    // to a peer died after the start, and the peer's client sent while it was
+    // down. Nothing reached this relay, so there are no cursors -- but its
+    // clients still wait on that turn, which only the peer's retained history
+    // can carry. The empty cursor list must ask for every retained turn.
     let seen = new_seen_registries();
     let key = control_key();
     let makers = crate::consensus::new_decision_makers();
     test_maker(&makers, &key, crate::consensus::Authority::SelfRelay);
     makers.mark_started(&key);
-    // Starting locally is not a resumed assignment; only the latter requires
-    // history even when this relay has no prior forwarding record.
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
 
-    reconcile_resume_cursors_on_join(&seen, &makers, &control_tx, &key);
+    reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
 
     let frame = control_rx.try_recv().expect("a frame was sent");
     assert_eq!(frame.session, key.session.0);
@@ -261,7 +260,10 @@ fn reconcile_resume_cursors_on_join_sends_an_empty_frame_for_a_first_join() {
         Some(mesh_control_frame::Kind::MeshResumeCursors(resume)) => {
             assert!(resume.cursors.is_empty());
             assert!(resume.prefer_recent);
-            assert!(!resume.resuming, "no forward-gate history to resume from");
+            assert!(
+                resume.resuming,
+                "an absent slot asks for its whole retained history",
+            );
         }
         other => panic!("expected MeshResumeCursors, got {other:?}"),
     }
@@ -275,12 +277,7 @@ fn reconcile_resume_cursors_on_join_sends_the_current_snapshot() {
     mark_seen(&seen, &key, SlotId(0), 1);
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    reconcile_resume_cursors_on_join(
-        &seen,
-        &crate::consensus::new_decision_makers(),
-        &control_tx,
-        &key,
-    );
+    reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
 
     let frame = control_rx.try_recv().expect("a frame was sent");
     match frame.kind {
@@ -308,12 +305,7 @@ fn a_wholly_gapped_session_still_sends_an_empty_but_resuming_frame() {
     mark_seen(&seen, &key, SlotId(0), 5); // arrived, but gapped below 5
 
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
-    reconcile_resume_cursors_on_join(
-        &seen,
-        &crate::consensus::new_decision_makers(),
-        &control_tx,
-        &key,
-    );
+    reconcile_resume_cursors_on_join(&seen, &control_tx, &key);
 
     let frame = control_rx.try_recv().expect("a frame was sent");
     match frame.kind {
@@ -376,7 +368,6 @@ fn resume_replay_answers_only_with_this_relays_own_locally_originated_turns() {
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
             acks_owed: false,
-            resumed: false,
             _registration: register_mesh_link(
                 &mesh.links,
                 key.clone(),
@@ -451,7 +442,6 @@ fn resume_replay_answers_an_unlisted_slot_from_zero_only_when_the_ask_is_resumin
             key: key.clone(),
             flush_deadline: tokio::time::Instant::now(),
             acks_owed: false,
-            resumed: false,
             _registration: register_mesh_link(
                 &mesh.links,
                 key.clone(),

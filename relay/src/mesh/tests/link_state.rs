@@ -201,7 +201,6 @@ fn bare_session_state(key: SessionKey) -> JoinedSession {
         key,
         flush_deadline: tokio::time::Instant::now(),
         acks_owed: false,
-        resumed: false,
         _registration: registration,
     }
 }
