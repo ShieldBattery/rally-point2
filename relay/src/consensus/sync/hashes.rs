@@ -259,10 +259,12 @@ impl StateHashTracker {
         self.evict_over_window(key);
     }
 
-    /// Judges again every judged step that gained a report or has been undecided long enough, then
-    /// every step whose reports are all in, or whose deadline has passed by `now`, oldest first,
-    /// and returns the verdicts that named anyone. `required` yields the slots whose reports a step
-    /// needs.
+    /// Judges again every judged step that gained a report or is still undecided, then every step
+    /// whose reports are all in, or whose deadline has passed by `now`, oldest first, and returns
+    /// the verdicts that named anyone. `required` yields the slots whose reports a step needs. An
+    /// undecided step is judged on every call, not just once its hold runs out: a slot leaving
+    /// can take away the report it was held for, and a relay promoted then would decide it at
+    /// once.
     pub(in crate::consensus) fn judge_ready(
         &mut self,
         now: Instant,
@@ -274,7 +276,7 @@ impl StateHashTracker {
         let due: Vec<u64> = self
             .judged
             .iter()
-            .filter(|(_, judged)| judged.dirty || (judged.held && judged.hold_is_over(now)))
+            .filter(|(_, judged)| judged.dirty || judged.held)
             .map(|(&step, _)| step)
             .collect();
         for step in due {

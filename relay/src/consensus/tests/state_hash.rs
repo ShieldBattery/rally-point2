@@ -515,6 +515,21 @@ fn a_promoted_relay_settles_a_held_step_when_the_authority_would_have() {
 }
 
 #[test]
+fn an_undecided_step_is_decided_once_the_slot_it_waits_on_leaves() {
+    let start = Instant::now();
+    let mut m = rollback_maker(&[0, 1, 2]);
+    forward(&mut m, &[0, 1, 2], STATE_HASH_INTERVAL, start);
+    m.observe_state_hash(SlotId(0), 8, A, start);
+    m.observe_state_hash(SlotId(1), 8, B, start);
+    assert!(m.judge_state_hashes(start + STATE_HASH_DEADLINE).is_empty());
+    // Slot 2's report would have decided it; with slot 2 gone, nothing still to come can.
+    m.note_departure(SlotId(2), framed(1), 0, None);
+    let verdicts = m.judge_state_hashes(start + STATE_HASH_DEADLINE);
+    assert_eq!(verdicts.len(), 1);
+    assert!(verdicts[0].no_majority);
+}
+
+#[test]
 fn a_late_report_that_leaves_the_step_undecided_holds_it_from_its_arrival() {
     let start = Instant::now();
     let mut m = rollback_maker(&[0, 1, 2, 3]);
