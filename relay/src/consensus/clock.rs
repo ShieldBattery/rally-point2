@@ -59,6 +59,11 @@ pub(in crate::consensus) const STALL_SLACK_STEPS: u64 = 6;
 /// sum, which moves every turn still measured by all of them.
 pub(in crate::consensus) const KEPT_STOP_STEPS: u64 = LEAD_SEEN_SEQS + STALL_SLACK_STEPS;
 
+/// The most stops a frame may carry. A copy keeps at most one stop per step, none more than
+/// [`KEPT_STOP_STEPS`] behind its limit (the limit's own step included), so no copy sends more. A
+/// frame past it is a malformed one, and merging costs time quadratic in its stops.
+const MAX_FRAME_STOPS: usize = KEPT_STOP_STEPS as usize + 1;
+
 /// When `steps` turns' worth of the clock has passed.
 fn steps_duration(steps: u64) -> Duration {
     Duration::from_micros(STEP_DURATION_US.saturating_mul(steps))
@@ -90,7 +95,13 @@ impl CopiedStops {
         let mut stops: Vec<Stop> = frame
             .stops
             .iter()
-            .filter(|stop| stop.step >= frame.base_step && stop.step <= frame.final_through)
+            .filter(|stop| {
+                // The clock only ever stops at its limit, which starts past the anchor, so a stop
+                // before the anchor was not made by any copy of this clock.
+                stop.step >= frame.base_step
+                    && stop.step >= frame.anchor_step
+                    && stop.step <= frame.final_through
+            })
             .map(|stop| Stop {
                 step: stop.step,
                 pause: Duration::from_micros(stop.pause_us),
@@ -364,14 +375,18 @@ impl SessionClock {
     /// by the jitter of their own trip: half a round trip before the frame arrived, by the least
     /// round trip the link has sampled. That is the estimate the authority moved the start back
     /// by, so a route slower one way than the other cancels out, and a round trip a queue has
-    /// inflated for now places the anchor no earlier. A frame anchored at another step is
-    /// ignored.
+    /// inflated for now places the anchor no earlier. A frame anchored at another step, or
+    /// carrying more stops than a copy ever keeps, is ignored, and a stop of a frame placed before
+    /// its anchor is left out.
     pub(in crate::consensus) fn merge(
         &mut self,
         frame: &SessionClockFrame,
         received_at: Instant,
         mesh_rtt_floor_us: u32,
     ) -> bool {
+        if frame.stops.len() > MAX_FRAME_STOPS {
+            return false;
+        }
         let theirs = CopiedStops::from_frame(frame);
         let Some((anchor_step, _)) = self.anchor else {
             let age = Duration::from_micros(frame.since_anchor_us)

@@ -520,3 +520,51 @@ fn a_copy_whose_limit_is_the_last_step_merges_without_overflowing() {
     assert_eq!(clock.pause_before(u64::MAX), Duration::ZERO);
     assert!(!clock.merge(&copy(u64::MAX, Vec::new()), start, 0));
 }
+
+/// A bare anchored clock and a frame from a copy with the same anchor, for merging directly.
+fn clock_and_frame() -> (SessionClock, SessionClockFrame, Instant) {
+    let now = Instant::now();
+    let mut clock = SessionClock::default();
+    assert!(clock.anchor(ANCHOR_STEP, now));
+    let frame = clock.to_frame(now).unwrap();
+    (clock, frame, now)
+}
+
+#[test]
+fn a_frame_with_more_stops_than_a_copy_keeps_is_ignored() {
+    let (mut clock, mut frame, now) = clock_and_frame();
+    let limit = frame.final_through;
+    // One stop per step, one past what any copy keeps.
+    frame.final_through = limit + KEPT_STOP_STEPS + 1;
+    frame.stops = (limit..=limit + KEPT_STOP_STEPS + 1)
+        .map(|step| ClockStop { step, pause_us: 1 })
+        .collect();
+    assert_eq!(frame.stops.len() as u64, KEPT_STOP_STEPS + 2);
+    assert!(!clock.merge(&frame, now, 0));
+    assert_eq!(clock.final_through(), Some(limit));
+    assert_eq!(clock.pause(), Duration::ZERO);
+
+    // The most a copy keeps is taken in.
+    frame.stops.pop();
+    frame.final_through -= 1;
+    assert!(clock.merge(&frame, now, 0));
+    assert_eq!(clock.pause(), Duration::from_micros(KEPT_STOP_STEPS + 1));
+}
+
+#[test]
+fn a_stop_placed_before_the_anchor_is_left_out_of_a_merge() {
+    let (mut clock, mut frame, now) = clock_and_frame();
+    let limit = frame.final_through;
+    frame.stops = vec![
+        ClockStop {
+            step: ANCHOR_STEP - 1,
+            pause_us: 5_000_000,
+        },
+        ClockStop {
+            step: limit,
+            pause_us: 7,
+        },
+    ];
+    assert!(clock.merge(&frame, now, 0));
+    assert_eq!(clock.pause(), Duration::from_micros(7));
+}
