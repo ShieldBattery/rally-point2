@@ -604,24 +604,22 @@ fn tracker_feed(
     )
 }
 
-/// Advances `slot`'s ordinal from 0 up to (but not including) `through`,
-/// reporting `value` at every step. Used to push the tracker's frontier
-/// past the evaluation margin without needing every compared slot to
-/// individually advance — the margin only cares about the single furthest
-/// member's progress, so racing one slot ahead is enough to make earlier
-/// ordinals eligible for evaluation. Returns the last divergence observed,
-/// if any (there is at most one, since the comparator fires exactly one
-/// notice per event).
+/// Advances every slot in `slots` through `ordinals` together, one ordinal
+/// at a time across all of them, reporting `value` at every step. The
+/// evaluation margin is measured from the second-furthest slot, so clearing
+/// it for earlier ordinals takes at least two slots moving. Returns the
+/// first divergence observed, if any.
 fn advance(
     maker: &mut DecisionMaker,
-    slot: u8,
+    slots: &[u8],
     value: SyncValue,
-    through: u8,
+    ordinals: std::ops::Range<u8>,
 ) -> Option<SyncDivergence> {
     let mut divergence = None;
-    for ordinal in 0..through {
-        if let Some(d) = feed_auto_seq(maker, slot, ordinal, value) {
-            divergence = Some(d);
+    for ordinal in ordinals {
+        for &slot in slots {
+            let fired = feed_auto_seq(maker, slot, ordinal, value);
+            divergence = divergence.or(fired);
         }
     }
     divergence

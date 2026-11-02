@@ -78,8 +78,8 @@ pub(in crate::consensus) const SYNC_KIND_HEADER: u8 = 2;
 pub(in crate::consensus) const SYNC_RING_MODULUS: u64 = 16;
 
 /// The floor for [`sync_eval_margin`]'s per-session margin: how far past an
-/// ordinal the frontier must move before the comparator trusts its report set
-/// as complete. It covers transport reordering even for shallow buffers.
+/// ordinal the second-furthest slot must move before the comparator trusts its
+/// report set as complete. It covers transport reordering even for shallow buffers.
 pub(in crate::consensus) const SYNC_EVAL_MARGIN_MIN: u64 = 8;
 
 /// A defensive backstop, not a live constraint under normal policy: buffer

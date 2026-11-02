@@ -14,7 +14,9 @@ fn first_huge_ordinal_anchors_the_reset_tracker_without_retiring_from_zero() {
 
     assert_eq!(tracker_feed(&mut tracker, 1, first, SYNC_A), None);
     for ordinal in first + 1..first + authority_margin() {
-        assert_eq!(tracker_feed(&mut tracker, 0, ordinal, SYNC_A), None);
+        for slot in [0, 1] {
+            assert_eq!(tracker_feed(&mut tracker, slot, ordinal, SYNC_A), None);
+        }
     }
     assert_eq!(
         tracker.base_ordinal,
@@ -47,7 +49,9 @@ fn a_late_older_report_is_dropped_without_corrupting_future_comparisons() {
     tracker_feed(&mut tracker, 2, base + 1, SYNC_B);
     let mut divergence = None;
     for ordinal in base + 2..=base + authority_margin() {
-        divergence = divergence.or_else(|| tracker_feed(&mut tracker, 0, ordinal, SYNC_A));
+        for slot in [0, 1] {
+            divergence = divergence.or_else(|| tracker_feed(&mut tracker, slot, ordinal, SYNC_A));
+        }
     }
     assert_eq!(
         divergence,
@@ -70,7 +74,9 @@ fn a_kind_parity_mismatch_is_excluded_from_an_otherwise_honest_interval() {
     tracker_feed(&mut tracker, 2, 0, SYNC_A);
 
     for ordinal in 1..authority_margin() {
-        assert_eq!(tracker_feed(&mut tracker, 0, ordinal, SYNC_A), None);
+        for slot in [0, 2] {
+            assert_eq!(tracker_feed(&mut tracker, slot, ordinal, SYNC_A), None);
+        }
     }
     assert_eq!(tracker.base_ordinal, 1);
     assert!(tracker.kind_parity_warns > 0);
@@ -97,15 +103,16 @@ fn departed_slot_is_no_longer_required_for_the_next_interval() {
     for slot in 0..3 {
         tracker_feed(&mut tracker, slot, 0, SYNC_A);
     }
-    for ordinal in 1..authority_margin() {
-        tracker_feed(&mut tracker, 0, ordinal, SYNC_A);
+    for ordinal in 1..=authority_margin() {
+        for slot in [0, 1] {
+            tracker_feed(&mut tracker, slot, ordinal, SYNC_A);
+        }
     }
-    assert_eq!(tracker.base_ordinal, 1);
+    assert_eq!(tracker.base_ordinal, 1, "slot 2 holds ordinal 1");
 
-    tracker_feed(&mut tracker, 1, 1, SYNC_A);
     tracker.remove_member(SlotId(2));
     assert_eq!(
-        tracker_feed(&mut tracker, 0, authority_margin(), SYNC_A),
+        tracker_feed(&mut tracker, 0, authority_margin() + 1, SYNC_A),
         None
     );
     assert_eq!(tracker.base_ordinal, 2);
@@ -118,10 +125,16 @@ fn the_in_flight_window_is_bounded_when_one_slot_stalls() {
     for ordinal in 0..SYNC_WINDOW as u64 + 6 {
         tracker_feed(&mut tracker, 0, ordinal, SYNC_A);
     }
-    // With nobody else to compare slot 0 against, its reports past the window count as
-    // progress without being held.
+    // Slot 1's progress anchors the window, so slot 0's reports more than the window past it
+    // count as progress without being held.
     assert!(tracker.ahead_warns > 0);
-    assert!(tracker.pending.len() <= SYNC_WINDOW);
+    let anchor = tracker.members[&SlotId(1)].next_expected;
+    assert!(
+        tracker
+            .pending
+            .keys()
+            .all(|&ordinal| ordinal < anchor + SYNC_WINDOW as u64)
+    );
 }
 
 #[test]
@@ -190,8 +203,10 @@ fn a_confirmed_minority_cannot_rejoin_from_a_later_ordered_report() {
             if slot == 2 { SYNC_B } else { SYNC_A },
         );
     }
-    let divergence =
-        (1..authority_margin()).find_map(|ordinal| tracker_feed(&mut tracker, 0, ordinal, SYNC_A));
+    let divergence = (1..authority_margin()).find_map(|ordinal| {
+        let first = tracker_feed(&mut tracker, 0, ordinal, SYNC_A);
+        first.or_else(|| tracker_feed(&mut tracker, 1, ordinal, SYNC_A))
+    });
     assert_eq!(divergence.unwrap().diverged, vec![SlotId(2)]);
 
     tracker_feed(&mut tracker, 2, authority_margin(), SYNC_B);

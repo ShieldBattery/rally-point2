@@ -131,11 +131,14 @@ impl SyncTracker {
                 .or_insert(SyncObservation::Skipped);
         }
     }
-    /// Evaluates every ordinal now ready: the frontier (the furthest any
-    /// member has reached) has moved at least `margin` past it (see
-    /// [`sync_eval_margin`]), and every member required for it (its `since` at
-    /// or before it) has moved past it, with a report or an omission (held, or
-    /// counted without being held when it was beyond the window). Returns the
+    /// Evaluates every ordinal now ready: the second-furthest member has moved
+    /// at least `margin` past it (see [`sync_eval_margin`]), and every member
+    /// required for it (its `since` at or before it) has moved past it, with a
+    /// report or an omission (held, or counted without being held when it was
+    /// beyond the window). The margin is what gives a slot whose first report
+    /// is late time to join before an early ordinal is judged without it, so
+    /// it is measured from the second-furthest member: one slot's claimed
+    /// progress, however far ahead, never satisfies it alone. Returns the
     /// first [`SyncDivergence`] fired, if any — the caller's next `record` call
     /// resumes draining from where this left off.
     pub(in crate::consensus) fn evaluate_ready(
@@ -144,9 +147,10 @@ impl SyncTracker {
         margin: u64,
     ) -> Option<SyncDivergence> {
         loop {
-            let Some(frontier) = self.members.values().map(|m| m.next_expected).max() else {
-                return None; // no members yet
-            };
+            if self.members.is_empty() {
+                return None;
+            }
+            let frontier = self.second_frontier();
             let base = self.base_ordinal;
             if frontier.saturating_sub(base) < margin {
                 return None; // not enough lead yet to trust completeness
@@ -354,7 +358,8 @@ impl SyncTracker {
 
     /// How far the second-furthest member has reached (the one member's
     /// progress, when there is only one): the furthest point no single slot's
-    /// claimed progress can move on its own.
+    /// claimed progress can move on its own. Both the evaluation margin and the
+    /// window are measured from it.
     fn second_frontier(&self) -> u64 {
         let (mut first, mut second) = (0, 0);
         for member in self.members.values() {

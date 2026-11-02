@@ -993,8 +993,10 @@ fires), so a desync would be **invisible to everyone** unless something that see
 compares the checksums. The **authority relay does**, off the same validated turn stream the buffer
 and leave consensus already read: it extracts each slot's `hash16` (the sim-state bytes of the
 `0x37`, not the per-sender fog/vision bytes that legitimately differ), assigns its native-generation
-ordinal, and once every required origin has coverage for that ordinal and the frontier has advanced
-past it, compares the actual checksum reports. A divergence is reported up the coordinator webhook
+ordinal, and once every required origin has coverage for that ordinal and the second-furthest origin
+has advanced a margin past it, compares the actual checksum reports. The margin is what lets an origin
+whose first report is late join before the early ordinals are judged without it; measuring it from the
+second-furthest origin means no single origin's claimed progress satisfies it alone. A divergence is reported up the coordinator webhook
 leg, keyed on the sync ordinal so a re-detection after an authority handoff isn't counted twice.
 Observers are excluded - they don't reliably emit sync commands, so requiring their checksums would
 stall the cross-check.

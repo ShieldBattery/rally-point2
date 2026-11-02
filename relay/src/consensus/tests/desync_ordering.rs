@@ -115,17 +115,19 @@ fn enhanced_incident_jump_retires_the_omission_and_compares_the_following_checks
 
     let mut divergence = None;
     for generation in 38..=44u64 {
-        divergence = maker.observe_sync_with_generation(
-            SlotId(0),
-            generation,
-            Some(generation as u32),
-            &sync_command(
-                (generation % 16) as u8,
-                expected_kind_for_ordinal(generation),
-                SYNC_A,
-            ),
-            Some(generation),
-        );
+        for slot in [0, 1] {
+            divergence = divergence.or(maker.observe_sync_with_generation(
+                SlotId(slot),
+                generation,
+                Some(generation as u32),
+                &sync_command(
+                    (generation % 16) as u8,
+                    expected_kind_for_ordinal(generation),
+                    SYNC_A,
+                ),
+                Some(generation),
+            ));
+        }
     }
     assert_eq!(
         divergence,

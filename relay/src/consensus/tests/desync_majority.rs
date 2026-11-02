@@ -5,11 +5,9 @@ use super::*;
 #[test]
 fn all_agree_retires_the_ordinal_silently() {
     let mut m = authority_maker();
-    feed_auto_seq(&mut m, 1, 0, SYNC_A);
-    // Slot 0 alone races ahead; ordinal 0 isn't evaluated until the
-    // frontier clears the margin, at which point it retires silently
-    // (matching values).
-    let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8);
+    // Ordinal 0 isn't evaluated until the slots clear the margin, at which
+    // point it retires silently (matching values).
+    let divergence = advance(&mut m, &[0, 1], SYNC_A, 0..authority_margin() as u8);
     assert_eq!(divergence, None, "matching values retire silently");
     assert_eq!(m.sync.base_ordinal, 1, "ordinal 0 retired");
     assert!(!m.sync.pending.contains_key(&0));
@@ -18,10 +16,9 @@ fn all_agree_retires_the_ordinal_silently() {
 #[test]
 fn three_slot_majority_identifies_the_diverged_minority() {
     let mut m = authority_maker();
-    feed_auto_seq(&mut m, 1, 0, SYNC_A);
     feed_auto_seq(&mut m, 2, 0, SYNC_B); // slot 2's sim diverged
-    // Slot 0 alone races ahead to clear the evaluation margin for ordinal 0.
-    let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
+    // Slots 0 and 1 move ahead to clear the evaluation margin for ordinal 0.
+    let divergence = advance(&mut m, &[0, 1], SYNC_A, 0..authority_margin() as u8)
         .expect("clearing the margin evaluates ordinal 0");
     assert_eq!(divergence.sync_ordinal, 0);
     assert!(!divergence.no_majority);
@@ -36,8 +33,9 @@ fn three_slot_majority_identifies_the_diverged_minority() {
 #[test]
 fn one_v_one_disagreement_is_no_majority_and_goes_dormant() {
     let mut m = authority_maker();
+    feed_auto_seq(&mut m, 0, 0, SYNC_A);
     feed_auto_seq(&mut m, 1, 0, SYNC_B);
-    let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
+    let divergence = advance(&mut m, &[0, 1], SYNC_A, 1..authority_margin() as u8)
         .expect("clearing the margin evaluates ordinal 0");
     assert_eq!(divergence.sync_ordinal, 0);
     assert!(divergence.no_majority, "1v1 has no majority");
@@ -47,7 +45,7 @@ fn one_v_one_disagreement_is_no_majority_and_goes_dormant() {
         "truth is unrecoverable — dormant for the session"
     );
     assert_eq!(
-        feed_auto_seq(&mut m, 1, 1, SYNC_B),
+        feed_auto_seq(&mut m, 1, authority_margin() as u8, SYNC_B),
         None,
         "a dormant comparator no-ops"
     );
@@ -56,10 +54,11 @@ fn one_v_one_disagreement_is_no_majority_and_goes_dormant() {
 #[test]
 fn even_split_is_no_majority() {
     let mut m = authority_maker();
+    feed_auto_seq(&mut m, 0, 0, SYNC_A);
     feed_auto_seq(&mut m, 1, 0, SYNC_A);
     feed_auto_seq(&mut m, 2, 0, SYNC_B);
     feed_auto_seq(&mut m, 3, 0, SYNC_B);
-    let divergence = advance(&mut m, 0, SYNC_A, authority_margin() as u8)
+    let divergence = advance(&mut m, &[0, 1], SYNC_A, 1..authority_margin() as u8)
         .expect("clearing the margin evaluates ordinal 0");
     assert!(divergence.no_majority, "2-2 has no strict majority");
     assert!(divergence.diverged.is_empty());
@@ -70,18 +69,18 @@ fn even_split_is_no_majority() {
 fn a_second_divergence_fires_again_at_its_own_ordinal() {
     let mut m = authority_maker();
     // Ordinal 0: slot 3 diverges from the 0/1/2 majority.
-    feed_auto_seq(&mut m, 1, 0, SYNC_A);
     feed_auto_seq(&mut m, 2, 0, SYNC_A);
     feed_auto_seq(&mut m, 3, 0, SYNC_B);
-    let first = advance(&mut m, 0, SYNC_A, 8).expect("slot 0 clearing the margin fires the first");
+    let first = advance(&mut m, &[0, 1], SYNC_A, 0..8)
+        .expect("slots 0 and 1 clearing the margin fire the first");
     assert_eq!(first.sync_ordinal, 0);
     assert_eq!(first.diverged, vec![SlotId(3)]);
 
-    // Survivors {0,1,2} continue. Ordinal 1: slot 2 now diverges. Slot 0's
-    // ordinal-1 report already landed during the `advance` above.
-    feed_auto_seq(&mut m, 1, 1, SYNC_A);
+    // Survivors {0,1,2} continue. Ordinal 1: slot 2 now diverges. Slots 0
+    // and 1's ordinal-1 reports already landed during the `advance` above.
     feed_auto_seq(&mut m, 2, 1, SYNC_C);
-    let second = feed_auto_seq(&mut m, 0, 8, SYNC_A).expect("a second divergence at ordinal 1");
+    assert_eq!(feed_auto_seq(&mut m, 0, 8, SYNC_A), None);
+    let second = feed_auto_seq(&mut m, 1, 8, SYNC_A).expect("a second divergence at ordinal 1");
     assert_eq!(second.sync_ordinal, 1, "a distinct, later ordinal");
     assert!(!second.no_majority);
     assert_eq!(second.diverged, vec![SlotId(2)]);
@@ -118,8 +117,8 @@ fn an_observer_slot_is_excluded_from_comparison_however_the_set_arrived() {
         "the observer set is seeded at creation, not on a later push",
     );
 
-    // Two players agree; the observer reports a different checksum. Racing a
-    // compared slot ahead clears the evaluation margin for ordinal 0.
+    // Two players agree; the observer reports a different checksum. The
+    // players moving ahead clears the evaluation margin for ordinal 0.
     feed_auto_seq(m, 0, 0, SYNC_A);
     feed_auto_seq(m, 1, 0, SYNC_A);
     assert_eq!(
@@ -127,7 +126,7 @@ fn an_observer_slot_is_excluded_from_comparison_however_the_set_arrived() {
         None,
         "the observer's disagreeing report is a no-op",
     );
-    let divergence = advance(m, 0, SYNC_A, authority_margin() as u8);
+    let divergence = advance(m, &[0, 1], SYNC_A, 1..authority_margin() as u8);
     assert!(
         divergence.is_none(),
         "the observer is never a required reporter, so no divergence fires",
@@ -149,7 +148,7 @@ fn an_observer_slot_is_excluded_from_comparison_however_the_set_arrived() {
         "the observer's disagreeing report is a no-op",
     );
     assert_eq!(
-        advance(&mut live, 0, SYNC_A, authority_margin() as u8),
+        advance(&mut live, &[0, 1], SYNC_A, 1..authority_margin() as u8),
         None,
         "the observer is never a required reporter, so no divergence fires",
     );
@@ -214,19 +213,21 @@ fn observe_sync_fires_a_desync_notice_with_stamped_refs() {
     );
     assert!(rx.try_recv().is_err(), "held until the margin clears");
 
-    // Slot 0 alone races ahead to clear the margin.
+    // Slots 0 and 1 move ahead to clear the margin.
     for ordinal in 1u8..(sync_eval_margin(6) as u8) {
-        registry.observe_sync(
-            &k,
-            SlotId(0),
-            u64::from(ordinal),
-            Some(500 + u32::from(ordinal)),
-            &sync_command(
-                ordinal,
-                expected_kind_for_ordinal(u64::from(ordinal)),
-                SYNC_A,
-            ),
-        );
+        for slot in [0, 1] {
+            registry.observe_sync(
+                &k,
+                SlotId(slot),
+                u64::from(ordinal),
+                Some(500 + u32::from(ordinal)),
+                &sync_command(
+                    ordinal,
+                    expected_kind_for_ordinal(u64::from(ordinal)),
+                    SYNC_A,
+                ),
+            );
+        }
     }
 
     let RelayNotice::Desync(notice) = rx.try_recv().expect("a desync notice fires") else {

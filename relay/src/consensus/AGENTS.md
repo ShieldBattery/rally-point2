@@ -41,7 +41,7 @@
   wall clock. Tests that "lose" loss are exercising this.
 - **Desync needs ordered history**: checksum metadata follows each origin's complete
   sequence prefix and retains absolute sync ordinals across promotion. An ordinal
-  waits until the frontier clears a bounds-scaled margin; uncertain history excludes
+  waits until the second-furthest origin clears a bounds-scaled margin; uncertain history excludes
   only that origin, and checksum bookkeeping never gates gameplay forwarding.
 - **Synced leaves** schedule from the *departing* slot's last frame, clamped to a
   reachable ceiling so an inflated claim cannot stall survivors. A promoted relay

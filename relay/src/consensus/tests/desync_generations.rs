@@ -14,10 +14,12 @@ fn one_players_omission_does_not_hide_a_disagreement_among_other_players() {
     }
     assert!(feed_generation(&mut maker, 3, 1, 2, SYNC_A).is_none());
     let mut verdict = None;
-    for generation in 2..=1 + authority_margin() {
-        if let Some(found) = feed_generation(&mut maker, 0, generation, generation, SYNC_A) {
-            verdict = Some(found);
-            break;
+    'feed: for generation in 2..=1 + authority_margin() {
+        for slot in [0, 1] {
+            if let Some(found) = feed_generation(&mut maker, slot, generation, generation, SYNC_A) {
+                verdict = Some(found);
+                break 'feed;
+            }
         }
     }
     let verdict = verdict.expect("three actual reports must still be compared");
@@ -149,11 +151,16 @@ fn enhanced_history_retains_its_ring_epoch_across_promotion_and_reordering() {
     let _ = maker.set_authority(Authority::SelfRelay, &HashSet::new());
     assert!(feed_generation(&mut maker, 1, 41, 36, SYNC_A).is_none());
     assert!(feed_generation(&mut maker, 0, 41, 36, SYNC_B).is_none());
+    assert!(feed_generation(&mut maker, 1, 42, 37, SYNC_A).is_none());
     let mut verdict = None;
-    for generation in 38..=36 + authority_margin() {
-        if let Some(found) = feed_generation(&mut maker, 0, generation + 5, generation, SYNC_A) {
-            verdict = Some(found);
-            break;
+    'feed: for generation in 38..=36 + authority_margin() {
+        for slot in [0, 1] {
+            if let Some(found) =
+                feed_generation(&mut maker, slot, generation + 5, generation, SYNC_A)
+            {
+                verdict = Some(found);
+                break 'feed;
+            }
         }
     }
     let verdict = verdict.expect("the first checksum after the shared omission must be compared");
@@ -228,14 +235,29 @@ fn a_whole_ring_of_unreported_generations_is_rejected_instead_of_compared_at_the
     let delta = (actual_generation % 16 + 16 - last_generation % 16) % 16;
     assert_eq!(delta, 2);
     let guessed_generation = last_generation + delta;
-    let false_verdict = feed_generation(
-        &mut inferred,
-        0,
-        52,
-        guessed_generation,
-        52_u16.to_le_bytes(),
-    )
-    .expect("assuming the advance bound compares snapshots from different epochs");
+    assert!(
+        feed_generation(
+            &mut inferred,
+            0,
+            52,
+            guessed_generation,
+            52_u16.to_le_bytes(),
+        )
+        .is_none()
+    );
+    // The guessed epoch holds from there on, until slot 0 is the margin past it.
+    let false_verdict = (1..=authority_margin())
+        .find_map(|step| {
+            let generation = guessed_generation + step;
+            feed_generation(
+                &mut inferred,
+                0,
+                52 + step,
+                generation,
+                (generation as u16).to_le_bytes(),
+            )
+        })
+        .expect("assuming the advance bound compares snapshots from different epochs");
     assert_eq!(false_verdict.sync_ordinal, 36);
     assert!(false_verdict.no_majority);
     assert_eq!(tagged.sync.evict_warns, 0);
@@ -305,6 +327,36 @@ fn a_slot_whose_generations_run_far_ahead_leaves_the_others_compared() {
             .first()
             .map(|v| (v.sync_ordinal, v.diverged.clone())),
         Some((150, vec![SlotId(1)])),
+        "{verdicts:?}"
+    );
+}
+
+#[test]
+fn a_slot_whose_first_turn_is_late_is_compared_from_the_start() {
+    let mut maker = authority_maker();
+    maker.set_expected_slots([SlotId(0), SlotId(1), SlotId(2)].into());
+    let honest = |generation: u64| (generation as u16).to_le_bytes();
+    let mut verdicts = Vec::new();
+    for seq in 0..60 {
+        verdicts.extend(feed_generation(&mut maker, 0, seq, seq, honest(seq)));
+        // Slot 2's checksum differs at generation 0, then its generations run far ahead.
+        let generation = seq * LARGEST_ADVANCE;
+        let value = if seq == 0 {
+            [0xde, 0xad]
+        } else {
+            honest(generation)
+        };
+        verdicts.extend(feed_generation(&mut maker, 2, seq, generation, value));
+        // Slot 1's turns arrive four turns late, so it joins after slot 2 is far ahead.
+        if let Some(late) = seq.checked_sub(4) {
+            verdicts.extend(feed_generation(&mut maker, 1, late, late, honest(late)));
+        }
+    }
+    assert_eq!(
+        verdicts
+            .first()
+            .map(|v| (v.sync_ordinal, v.no_majority, v.diverged.clone())),
+        Some((0, false, vec![SlotId(2)])),
         "{verdicts:?}"
     );
 }

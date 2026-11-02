@@ -608,7 +608,7 @@ fn a_report_off_the_interval_is_ignored() {
 fn a_rollback_session_ignores_native_sync_commands() {
     let mut m = rollback_maker(&[0, 1]);
     feed_auto_seq(&mut m, 1, 0, SYNC_B);
-    assert_eq!(advance(&mut m, 0, SYNC_A, 20), None);
+    assert_eq!(advance(&mut m, &[0], SYNC_A, 0..20), None);
     assert!(
         m.sync.members.is_empty(),
         "the native comparator never saw them"
