@@ -52,6 +52,11 @@ impl EvidenceOutbox {
                 && entry.report.slot == report.slot
                 && entry.report.history.sample.assignment_revision
                     == report.history.sample.assignment_revision
+                // The first failure is immutable within a maker and its sequence is unique
+                // process-wide, so it names the maker incarnation: a maker re-created for the
+                // same session restarts its failure count and must not be read as a regression
+                // of its predecessor's retained summary.
+                && entry.report.history.sample.sequence == report.history.sample.sequence
         }) {
             let previous = &inner.entries[index];
             if report.history.failures < previous.report.history.failures

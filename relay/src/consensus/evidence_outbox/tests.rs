@@ -207,3 +207,43 @@ fn saturated_count_still_advances_latest_and_fences_old_receipts() {
     outbox.acknowledge(&first.receipt());
     assert_eq!(outbox.reports(now, 16), vec![next]);
 }
+
+#[test]
+fn a_re_created_makers_first_failures_are_kept_beside_its_predecessors_summary() {
+    let outbox = EvidenceOutbox::default();
+    let now = Instant::now();
+    // The retired maker's summary: three failures, first at sequence 10, latest at 30.
+    let mut retired = report(10);
+    retired.history.failures = 3;
+    let mut latest = retired.history.clone();
+    latest.sample.sequence = 30;
+    retired.history.latest = Some(Box::new(rally_point_proto::control::EvidenceFailure {
+        admission: latest.admission,
+        sample: latest.sample,
+        observed_at_ms: 60,
+    }));
+    outbox.insert(retired.clone(), now);
+
+    // The same session, slot, and revision again from a new maker: one failure, a later first.
+    let mut reserved = report(40);
+    reserved.session = retired.session;
+    outbox.insert(reserved.clone(), now);
+    assert!(outbox.contains(&reserved.receipt(), now));
+    assert!(outbox.contains(&retired.receipt(), now));
+
+    // Within one maker, a newer summary still replaces the older in place.
+    let mut grown = reserved.clone();
+    grown.history.failures = 2;
+    grown.history.latest = Some(Box::new(rally_point_proto::control::EvidenceFailure {
+        admission: grown.history.admission.clone(),
+        sample: EvidenceObservation {
+            sequence: 50,
+            ..grown.history.sample.clone()
+        },
+        observed_at_ms: 70,
+    }));
+    outbox.insert(grown.clone(), now);
+    assert!(!outbox.contains(&reserved.receipt(), now));
+    assert!(outbox.contains(&grown.receipt(), now));
+    assert_eq!(outbox.inner.lock().entries.len(), 2);
+}
