@@ -241,3 +241,70 @@ fn a_whole_ring_of_unreported_generations_is_rejected_instead_of_compared_at_the
     assert_eq!(tagged.sync.evict_warns, 0);
     assert_eq!(inferred.sync.evict_warns, 0);
 }
+
+/// The per-turn generation step a slot runs ahead by in these tests.
+const LARGEST_ADVANCE: u64 = rally_point_proto::control::GAME_SYNC_SAFE_BUFFER_MAX as u64;
+
+#[test]
+fn a_slot_whose_generations_run_far_ahead_is_still_compared() {
+    let mut maker = authority_maker();
+    maker.set_expected_slots([SlotId(0), SlotId(1), SlotId(2)].into());
+    let mut verdicts = Vec::new();
+    for seq in 0..200 {
+        for slot in [0, 1] {
+            verdicts.extend(feed_generation(
+                &mut maker,
+                slot,
+                seq,
+                seq,
+                (seq as u16).to_le_bytes(),
+            ));
+        }
+        // Slot 2 agrees at generation 0, then reports a different checksum at every generation
+        // it claims.
+        let generation = seq * LARGEST_ADVANCE;
+        let value = if seq == 0 { [0, 0] } else { [0xde, 0xad] };
+        verdicts.extend(feed_generation(&mut maker, 2, seq, generation, value));
+    }
+    assert_eq!(
+        verdicts
+            .first()
+            .map(|v| (v.sync_ordinal, v.diverged.clone())),
+        Some((LARGEST_ADVANCE, vec![SlotId(2)])),
+        "{verdicts:?}"
+    );
+}
+
+#[test]
+fn a_slot_whose_generations_run_far_ahead_leaves_the_others_compared() {
+    let mut maker = authority_maker();
+    maker.set_expected_slots([SlotId(0), SlotId(1), SlotId(2), SlotId(3)].into());
+    let honest = |generation: u64| (generation as u16).to_le_bytes();
+    let mut verdicts = Vec::new();
+    for seq in 0..200 {
+        for slot in [0, 1, 2] {
+            // Slot 1's simulation diverges from generation 150 on.
+            let value = if slot == 1 && seq >= 150 {
+                [0xde, 0xad]
+            } else {
+                honest(seq)
+            };
+            verdicts.extend(feed_generation(&mut maker, slot, seq, seq, value));
+        }
+        let generation = seq * LARGEST_ADVANCE;
+        verdicts.extend(feed_generation(
+            &mut maker,
+            3,
+            seq,
+            generation,
+            honest(generation),
+        ));
+    }
+    assert_eq!(
+        verdicts
+            .first()
+            .map(|v| (v.sync_ordinal, v.diverged.clone())),
+        Some((150, vec![SlotId(1)])),
+        "{verdicts:?}"
+    );
+}

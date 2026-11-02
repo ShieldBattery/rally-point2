@@ -1039,7 +1039,12 @@ establish that an excluded player's simulation agreed with them. A skipped entry
 this origin supplies no vote for the interval. It satisfies retirement bookkeeping, not a successful
 checksum comparison, and does not trigger a missing-report eviction warning. Ordered/comparable slot
 counts do not measure the number of intervals actually compared. Repeated claimed omissions can
-therefore reduce detection coverage without producing an ordering failure.
+therefore reduce detection coverage without producing an ordering failure, but only that origin's
+own: the comparator holds checksum ordinals within a fixed span on either side of the
+second-furthest origin's progress. Ordinals behind that span retire unevaluated (a stalled origin
+holds back no one else), and an origin's coverage ahead of it counts as progress without being
+stored. No single origin's claimed advance, however far, moves the span, so it cannot retire the
+intervals the other origins are still reporting.
 
 A relay missing an origin's sequence-zero history cannot establish checksum ordering in either mode.
 A later ring index or generation tag cannot replace that missing prefix. This can occur during initial

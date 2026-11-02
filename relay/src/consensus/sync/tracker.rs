@@ -51,14 +51,34 @@ impl SyncTracker {
         });
         member.next_expected = member.next_expected.max(next_expected);
         let since = member.since;
+        let frontier = self.second_frontier();
+        self.retire_behind_window(key, frontier);
         if ordinal < self.base_ordinal {
             // The ordered source can retain a report whose comparison interval
             // already retired before this relay became authority. Keep the
             // member's forward progress, but never resurrect that interval.
             return None;
         }
+        let limit = frontier.saturating_add(SYNC_WINDOW as u64);
         if let Some(skipped) = skipped {
-            self.record_skipped(slot, since, skipped);
+            self.record_skipped(slot, since, skipped, limit);
+        }
+        if ordinal >= limit {
+            // Its progress above already counts it as covering this ordinal,
+            // so it holds back no comparison; it just casts no vote there.
+            if self.ahead_warns.observe() {
+                tracing::warn!(
+                    tenant = key.tenant.as_ref(),
+                    session = key.session.0,
+                    slot = slot.0,
+                    ordinal,
+                    frontier,
+                    count = self.ahead_warns.count(),
+                    "sync report is further ahead of the other slots than the window holds; \
+                     counting it as coverage without a vote",
+                );
+            }
+            return self.evaluate_ready(key, margin);
         }
         match self.pending.entry(ordinal).or_default().entry(slot) {
             std::collections::hash_map::Entry::Occupied(existing) => match existing.get() {
@@ -96,15 +116,11 @@ impl SyncTracker {
                 vacant.insert(SyncObservation::Report(report));
             }
         }
-        if let Some(divergence) = self.evaluate_ready(key, margin) {
-            return Some(divergence);
-        }
-        self.evict_over_window(key);
-        None
+        self.evaluate_ready(key, margin)
     }
 
-    fn record_skipped(&mut self, slot: SlotId, since: u64, skipped: SyncGap) {
-        for ordinal in skipped.first.max(self.base_ordinal)..skipped.end {
+    fn record_skipped(&mut self, slot: SlotId, since: u64, skipped: SyncGap, limit: u64) {
+        for ordinal in skipped.first.max(self.base_ordinal)..skipped.end.min(limit) {
             if ordinal < since {
                 continue;
             }
@@ -118,9 +134,10 @@ impl SyncTracker {
     /// Evaluates every ordinal now ready: the frontier (the furthest any
     /// member has reached) has moved at least `margin` past it (see
     /// [`sync_eval_margin`]), and every member required for it (its `since` at
-    /// or before it) has reported it. Returns the first [`SyncDivergence`]
-    /// fired, if any — the caller's next `record` call resumes draining from
-    /// where this left off.
+    /// or before it) has moved past it, with a report or an omission (held, or
+    /// counted without being held when it was beyond the window). Returns the
+    /// first [`SyncDivergence`] fired, if any — the caller's next `record` call
+    /// resumes draining from where this left off.
     pub(in crate::consensus) fn evaluate_ready(
         &mut self,
         key: &SessionKey,
@@ -136,16 +153,15 @@ impl SyncTracker {
             }
 
             // Which members are required (their `since` at or before `base`)
-            // and whether every one of them has reported `base`, computed in
-            // one pass with no allocation — both are cheap membership checks
-            // against `self.pending`, never stored past this iteration.
-            let reports_at_base = self.pending.get(&base);
+            // and whether every one of them has moved past `base`, computed in
+            // one pass with no allocation. A member's stream is ordered, so
+            // moving past an ordinal means it reported or omitted it.
             let mut any_required = false;
             let mut complete = true;
-            for (slot, member) in &self.members {
+            for member in self.members.values() {
                 if member.since <= base {
                     any_required = true;
-                    if !reports_at_base.is_some_and(|reports| reports.contains_key(slot)) {
+                    if member.next_expected <= base {
                         complete = false;
                     }
                 }
@@ -165,7 +181,7 @@ impl SyncTracker {
                 return None;
             }
 
-            let observations = self.pending.remove(&base).expect("just matched complete");
+            let observations = self.pending.remove(&base).unwrap_or_default();
             self.base_ordinal = self.base_ordinal.saturating_add(1);
             if let Some(divergence) = self.evaluate(base, &observations, key) {
                 return Some(divergence);
@@ -336,18 +352,44 @@ impl SyncTracker {
         }
     }
 
-    /// Evicts the oldest in-flight ordinal(s) while over [`SYNC_WINDOW`]. A slot
-    /// that stalled leaves its ordinals forever-incomplete; the eviction bounds
-    /// memory and is the missing-sync signal too — the evicted ordinal's report
-    /// set names who *did* report, so the rest are the stalled slots.
-    pub(in crate::consensus) fn evict_over_window(&mut self, key: &SessionKey) {
-        while self.pending.len() > SYNC_WINDOW {
-            let ordinal = *self
-                .pending
-                .keys()
-                .next()
-                .expect("over-window is non-empty");
-            let reports = self.pending.remove(&ordinal).expect("just matched");
+    /// How far the second-furthest member has reached (the one member's
+    /// progress, when there is only one): the furthest point no single slot's
+    /// claimed progress can move on its own.
+    fn second_frontier(&self) -> u64 {
+        let (mut first, mut second) = (0, 0);
+        for member in self.members.values() {
+            if member.next_expected > first {
+                second = first;
+                first = member.next_expected;
+            } else if member.next_expected > second {
+                second = member.next_expected;
+            }
+        }
+        if self.members.len() < 2 {
+            first
+        } else {
+            second
+        }
+    }
+
+    /// Retires the oldest ordinals, unevaluated, once `frontier` (the
+    /// second-furthest member's progress) is more than [`SYNC_WINDOW`] past
+    /// them. A slot that stalled leaves its ordinals forever-incomplete; this
+    /// lets the others go on being compared, and is the missing-sync signal
+    /// too: a retired ordinal's report set names who *did* report, so the
+    /// rest are the stalled slots. Measuring from the second-furthest member,
+    /// not the furthest, means no single slot's claimed progress can retire
+    /// the ordinals every other slot is still reporting.
+    fn retire_behind_window(&mut self, key: &SessionKey, frontier: u64) {
+        let floor = frontier.saturating_sub(SYNC_WINDOW as u64);
+        if floor <= self.base_ordinal {
+            return;
+        }
+        while let Some(entry) = self.pending.first_entry() {
+            if *entry.key() >= floor {
+                break;
+            }
+            let (ordinal, reports) = entry.remove_entry();
             let mut missing: Vec<u8> = self
                 .members
                 .keys()
@@ -366,10 +408,8 @@ impl SyncTracker {
                      a slot's sync stream is lagging or stopped",
                 );
             }
-            if ordinal >= self.base_ordinal {
-                self.base_ordinal = ordinal.saturating_add(1);
-            }
         }
+        self.base_ordinal = floor;
     }
 
     /// Excludes a confirmed divergent minority for this tracker instance. A

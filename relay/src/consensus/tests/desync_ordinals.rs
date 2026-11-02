@@ -118,8 +118,28 @@ fn the_in_flight_window_is_bounded_when_one_slot_stalls() {
     for ordinal in 0..SYNC_WINDOW as u64 + 6 {
         tracker_feed(&mut tracker, 0, ordinal, SYNC_A);
     }
+    // With nobody else to compare slot 0 against, its reports past the window count as
+    // progress without being held.
+    assert!(tracker.ahead_warns > 0);
+    assert!(tracker.pending.len() <= SYNC_WINDOW);
+}
+
+#[test]
+fn a_stalled_slot_does_not_hold_back_the_slots_still_reporting() {
+    let mut tracker = SyncTracker::default();
+    tracker_feed(&mut tracker, 2, 0, SYNC_A);
+    let end = SYNC_WINDOW as u64 + 6;
+    for ordinal in 0..end {
+        tracker_feed(&mut tracker, 0, ordinal, SYNC_A);
+        tracker_feed(&mut tracker, 1, ordinal, SYNC_A);
+    }
     assert!(tracker.evict_warns > 0, "a stalled slot triggered eviction");
     assert!(tracker.pending.len() <= SYNC_WINDOW);
+    assert_eq!(tracker.base_ordinal, end - SYNC_WINDOW as u64);
+    assert_eq!(
+        tracker.ahead_warns, 0,
+        "the two still reporting keep every report"
+    );
 }
 
 #[test]

@@ -92,12 +92,17 @@ pub(in crate::consensus) const SYNC_EVAL_MARGIN_MIN: u64 = 8;
 /// longer threatens the comparator's correctness the way it used to.
 pub(in crate::consensus) const SYNC_ABSURD_BUFFER_MAX: u32 = (SYNC_WINDOW / 2) as u32;
 
-/// The most sync ordinals the comparator keeps in flight per session before
-/// evicting the oldest incomplete one. Sized comfortably above what
-/// [`sync_eval_margin`] can return under any buffer policy this session would
-/// actually run with (see [`SYNC_ABSURD_BUFFER_MAX`]); it is a memory-safety
-/// backstop for a slot whose sync stream stalls or stops (its ordinals then
-/// never complete and would otherwise accumulate without bound).
+/// How far, in sync ordinals, the comparator holds coverage on either side of
+/// the second-furthest slot's progress: the oldest ordinals retire unevaluated
+/// once that slot is more than this past them, and a report more than this
+/// ahead of it counts as its slot's progress but isn't stored. Measuring from
+/// the second-furthest slot keeps any one slot's claimed progress from
+/// retiring ordinals the others are still reporting. Sized
+/// comfortably above what [`sync_eval_margin`] can return under any buffer
+/// policy this session would actually run with (see
+/// [`SYNC_ABSURD_BUFFER_MAX`]); it is a memory-safety backstop for a slot
+/// whose sync stream stalls or stops (its ordinals then never complete and
+/// would otherwise accumulate without bound) or runs far ahead of the rest.
 pub(in crate::consensus) const SYNC_WINDOW: usize = 64;
 
 /// The evaluation margin for a session whose buffer policy allows up to
@@ -235,6 +240,8 @@ pub(in crate::consensus) struct SyncTracker {
     pub(in crate::consensus) kind_parity_warns: RateLimitedCounter,
     /// Rate-limit counter for the window-eviction (stalled-slot) warn.
     pub(in crate::consensus) evict_warns: RateLimitedCounter,
+    /// Rate-limit counter for reports too far ahead of the window to store.
+    pub(in crate::consensus) ahead_warns: RateLimitedCounter,
     /// Rate-limit counter for extra sync commands packed into one turn.
     pub(in crate::consensus) multi_sync_warns: RateLimitedCounter,
 }
