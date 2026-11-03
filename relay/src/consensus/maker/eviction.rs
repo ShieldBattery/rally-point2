@@ -69,6 +69,10 @@ impl DecisionMaker {
     /// agree and nothing can reconcile them, so it queues every slot in
     /// `required` (the players it compared): the game ends for all of them, and
     /// the tenant voids it rather than having the relay pick a side.
+    ///
+    /// Each queued slot is noted in the comparator at the verdict's step, just as every relay
+    /// receiving the eviction order notes it, so the orders a Join restates include every one this
+    /// relay sent: a verdict with no majority names nobody, yet orders every player out.
     pub(in crate::consensus) fn queue_desync_evictions(
         &mut self,
         verdicts: &[SyncDivergence],
@@ -81,6 +85,7 @@ impl DecisionMaker {
                 .chain(&verdict.diverged)
                 .chain(&verdict.missing)
             {
+                self.hashes.exclude(slot, verdict.sync_ordinal);
                 if !self
                     .pending_desync_evictions
                     .iter()

@@ -86,6 +86,16 @@ fn a_verdict_with_no_majority_queues_every_player() {
         assert_eq!(m.eviction(SlotId(slot)), Some(EvictionCause::Desync));
     }
     assert_eq!(m.eviction(SlotId(4)), None, "the observer watches on");
+    assert_eq!(
+        m.state_hash_exclusions(),
+        [
+            (SlotId(0), 8),
+            (SlotId(1), 8),
+            (SlotId(2), 8),
+            (SlotId(3), 8)
+        ],
+        "every order sent is kept for a Join to restate",
+    );
 }
 
 #[test]

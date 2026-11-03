@@ -350,3 +350,50 @@ fn a_join_restates_the_step_that_named_each_evicted_slot() {
     );
     assert_eq!(makers.eviction(key, SlotId(1)), None, "homed elsewhere");
 }
+
+/// A verdict with no majority names nobody but orders every player out. With
+/// the link down when the authority sent those orders, the Join restates them,
+/// and the peer evicts the player it homes.
+#[test]
+fn a_join_restates_the_orders_a_verdict_with_no_majority_sent() {
+    let peer = Peer::new();
+    let key = &peer.key;
+    rollback(&peer.mesh.session.decision_makers, key);
+
+    let authority = crate::consensus::new_decision_makers();
+    let _ = crate::test_support::seed_maker(
+        &authority,
+        key,
+        crate::consensus::Authority::SelfRelay,
+        &[0, 1],
+        &[1],
+    );
+    rollback(&authority, key);
+    {
+        let mut makers = authority.lock();
+        let maker = makers.get_mut(key).expect("a seeded maker");
+        let now = std::time::Instant::now();
+        for slot in [0, 1] {
+            maker.note_forwarded_turns(SlotId(slot), 8, now);
+        }
+        maker.observe_state_hash(SlotId(0), 8, 0xaaaa, now);
+        let verdicts = maker.observe_state_hash(SlotId(1), 8, 0xbbbb, now);
+        assert!(verdicts.len() == 1 && verdicts[0].no_majority);
+        // Claimed while the link to the peer is down: the orders reach no one.
+        assert_eq!(maker.claim_desync_evictions().len(), 2);
+    }
+    for frame in join_frames(&new_conditions_registry(), &authority, key) {
+        peer.dispatch(frame);
+    }
+
+    let makers = &peer.mesh.session.decision_makers;
+    assert_eq!(
+        makers.eviction(key, SlotId(0)),
+        Some(crate::consensus::EvictionCause::Desync),
+        "slot 0's home evicts it",
+    );
+    assert_eq!(
+        makers.state_hash_exclusions(key),
+        [(SlotId(0), 8), (SlotId(1), 8)]
+    );
+}
