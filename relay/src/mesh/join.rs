@@ -123,12 +123,12 @@ pub(super) fn reconcile_local_slots_on_join(
 }
 
 /// Re-sends every state hash eviction order this relay knows for `key` down a freshly registered
-/// link's control channel. An order is broadcast once, when the authority's verdict names a slot,
-/// so a peer whose link was down then never learns which step named it: promoted, it would compare
-/// that slot's reports in steps before it differently from the authority that named it, and the
-/// slot's home would leave it playing. Every relay re-sends what it knows, its own verdicts and the
-/// orders it received alike, so the step survives the authority. Idempotent on receipt: a slot's
-/// earliest named step stands, and its home evicts it once.
+/// link's control channel. An order travels when the authority's verdict names a slot, and on from
+/// each relay that hears it first, so a peer whose links were down then never learns which step
+/// named it: promoted, it would compare that slot's reports in steps before it differently from the
+/// authority that named it, and the slot's home would leave it playing. Every relay re-sends what it
+/// knows, its own orders and the ones it received alike, so the step survives the authority.
+/// Idempotent on receipt: a slot's earliest named step stands, and its home evicts it once.
 pub(super) fn reconcile_evictions_on_join(
     decision_makers: &crate::consensus::DecisionMakers,
     control_tx: &MeshControlTx,

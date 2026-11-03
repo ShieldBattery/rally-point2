@@ -22,16 +22,16 @@ fn depart(makers: &crate::consensus::DecisionMakers, key: &SessionKey, slot: u8,
 }
 
 /// Everything a Join's reconciles put on the link, in the order a Join sends
-/// them: the local slots first, the leave state last.
+/// them: the eviction orders first, then the local slots, the leave state last.
 fn join_frames(
     conditions: &ConditionsRegistry,
     makers: &crate::consensus::DecisionMakers,
     key: &SessionKey,
 ) -> Vec<MeshControlFrame> {
     let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+    reconcile_evictions_on_join(makers, &control_tx, key);
     reconcile_local_slots_on_join(conditions, makers, &control_tx, key);
     reconcile_leaves_on_join(makers, &control_tx, key);
-    reconcile_evictions_on_join(makers, &control_tx, key);
     std::iter::from_fn(|| control_rx.try_recv().ok()).collect()
 }
 

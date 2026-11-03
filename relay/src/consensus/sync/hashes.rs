@@ -31,8 +31,9 @@
 //! evenly, the backing can give one hash its majority, so judging the later step first never
 //! turns the earlier verdict that names a minority into one that names nobody. A named slot's
 //! report never counts against anyone, so it can't split a step that has a majority without it.
-//! Every relay learns the step a slot was named at from the eviction order, so a relay promoted
-//! later judges the earlier step the same way.
+//! Every relay learns the step a slot was named at from the eviction order, which relays pass on,
+//! and from the slot's departure, which carries it, so a relay promoted later judges the earlier
+//! step the same way.
 
 use super::*;
 use crate::rate_limit::RateLimitedCounter;
@@ -550,11 +551,18 @@ impl StateHashTracker {
         exclusions
     }
 
-    /// Notes that a verdict on `step` named `slot`, whether this relay judged it or the authority
-    /// that did told it so.
-    pub(in crate::consensus) fn exclude(&mut self, slot: SlotId, step: u64) {
-        let from = self.excluded.entry(slot).or_insert(step);
+    /// The step a verdict named `slot` at, if one did.
+    pub(in crate::consensus) fn exclusion(&self, slot: SlotId) -> Option<u64> {
+        self.excluded.get(&slot).copied()
+    }
+
+    /// Notes that a verdict on `step` named `slot`, whether this relay judged it or another relay
+    /// told it so, and returns whether that is news: the slot wasn't named yet, or only later.
+    pub(in crate::consensus) fn exclude(&mut self, slot: SlotId, step: u64) -> bool {
+        let from = self.excluded.entry(slot).or_insert(u64::MAX);
+        let news = step < *from;
         *from = (*from).min(step);
+        news
     }
 
     /// Drops steps while more than [`STATE_HASH_WINDOW`] are in flight: the newest one that isn't

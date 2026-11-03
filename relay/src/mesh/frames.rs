@@ -230,6 +230,7 @@ pub(super) fn slot_departed_frame(
             result_slot_frame,
             connection_epoch,
             final_turn_count: stamps.final_turn_count,
+            evict_sync_ordinal: stamps.evict_sync_ordinal,
         })),
     }
 }

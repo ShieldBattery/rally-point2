@@ -65,8 +65,9 @@ use super::{MeshState, deliver_mesh_turn, fan_out_session_start};
 /// - **`EvictSlot`**: the authority's order that a slot its rollback verdict
 ///   named leave the game. Every relay notes the verdict's step for its state
 ///   hash comparator; only the relay that strictly homes the slot acts on it,
-///   marking it evicted, closing its link and finalizing its drop. Not
-///   re-broadcast.
+///   marking it evicted, closing its link and finalizing its drop. Passed on
+///   to every peer when it is news here, so it doesn't rest on the authority's
+///   own link to each relay; old news stops, so the relaying ends.
 /// - **`MeshResumeCursors`**: the peer's per-origin-slot resume cursors.
 ///   Answered before this function ever runs — the reply is a replay of this
 ///   relay's own turns, sent directly over the link that received the ask, not
@@ -185,6 +186,7 @@ fn dispatch_mesh_control_frame(
                     .then_some(departed.final_turn_count)
                     .flatten(),
                 finalized: finalized_accepted,
+                evict_sync_ordinal: departed.evict_sync_ordinal,
             };
             let outcome = if departed.reason == crate::consensus::LEAVE_REASON_DROPPED {
                 mesh.session

@@ -142,7 +142,8 @@ pub(super) fn dispatch_finalize_drop_result(
 
 /// The authority's order to evict a slot its rollback verdict named. Every
 /// relay notes which step named it, so its state hash comparator takes the slot
-/// out from that step on, as the authority's did. Only the relay whose
+/// out from that step on, as the authority's did, and passes an order that is
+/// news to it on to its peers. Only the relay whose
 /// descriptor strictly homes the slot acts on its link: it marks the slot
 /// evicted, which refuses every later dial for it, and only then closes its
 /// link, so a dial racing the close cannot reinstate it. The drop is finalized
@@ -161,9 +162,17 @@ pub(super) fn dispatch_evict_slot(
         );
         return;
     };
-    mesh.session
+    // An order this relay didn't know yet goes on to every other peer, before the home closes the
+    // link, so it doesn't depend on the authority's own link to each relay: one that missed it
+    // hears it from the rest, ahead of the departure that follows the eviction. Old news stops
+    // here, so the relaying ends.
+    if mesh
+        .session
         .decision_makers
-        .exclude_from_state_hashes(key, slot, evict.sync_ordinal);
+        .exclude_from_state_hashes(key, slot, evict.sync_ordinal)
+    {
+        crate::mesh::fan_out_evict_slot(&mesh.links, key, slot, evict.sync_ordinal);
+    }
     // A Join restates every order a peer knows, so the home sees one it already acted on again.
     if mesh.session.decision_makers.eviction(key, slot)
         == Some(crate::consensus::EvictionCause::Desync)

@@ -296,6 +296,7 @@ fn final_leave_blocks_true_fanout_and_live_conditions_in_both_peer_orderings() {
                 result_slot_frame: None,
                 connection_epoch: Some(11),
                 final_turn_count: None,
+                evict_sync_ordinal: None,
             })),
         };
 

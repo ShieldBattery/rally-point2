@@ -59,11 +59,19 @@ impl DecisionMakers {
     }
 
     /// Notes that the authority's verdict on `step` named `slot` in `key`'s session (see
-    /// [`DecisionMaker::exclude_from_state_hashes`]). For a verdict another relay produced.
-    pub fn exclude_from_state_hashes(&self, key: &SessionKey, slot: SlotId, step: u64) {
-        if let Some(maker) = self.lock().get_mut(key) {
-            maker.exclude_from_state_hashes(slot, step);
-        }
+    /// [`DecisionMaker::exclude_from_state_hashes`]), returning whether that is news to this
+    /// relay. For a verdict another relay produced.
+    pub fn exclude_from_state_hashes(&self, key: &SessionKey, slot: SlotId, step: u64) -> bool {
+        self.lock()
+            .get_mut(key)
+            .is_some_and(|maker| maker.exclude_from_state_hashes(slot, step))
+    }
+
+    /// The step a state hash verdict named `slot` at in `key`'s session, as this relay knows it.
+    pub fn state_hash_exclusion(&self, key: &SessionKey, slot: SlotId) -> Option<u64> {
+        self.lock()
+            .get(key)
+            .and_then(|maker| maker.state_hash_exclusion(slot))
     }
 
     /// Every slot a state hash verdict named in `key`'s session, with the step that named it (see

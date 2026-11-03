@@ -196,6 +196,10 @@ impl LinkDriver {
                         control_forward_tx.clone(),
                         Arc::clone(shutdown),
                     );
+                    // First, which step named each slot a state hash verdict
+                    // evicted, ahead of the departures and leaves below that
+                    // retire those slots: the order crosses the mesh once.
+                    reconcile_evictions_on_join(decision_makers, control_forward_tx, &key);
                     // Replay every currently-active local slot after the
                     // link registration. This closes the race where a
                     // client's original announcement ran before the Join.
@@ -225,9 +229,6 @@ impl LinkDriver {
                     // redialed (its `joined` empty again) reconverges. All of
                     // these are idempotent (dedup by slot everywhere).
                     reconcile_leaves_on_join(decision_makers, control_forward_tx, &key);
-                    // And which step named each slot a state hash verdict
-                    // evicted, which crosses the mesh once.
-                    reconcile_evictions_on_join(decision_makers, control_forward_tx, &key);
                     // Ask the peer, over the same fresh registration, to
                     // replay whatever this relay's forward-gate is still
                     // missing for the session — the resume-cursor mesh

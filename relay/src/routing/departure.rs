@@ -152,7 +152,9 @@ pub(crate) fn announce_departure_recorded(
     // ceiling and the result are home-authored here (only this relay, the slot's
     // home, holds the retained report and computes the ceiling), so every relay
     // clamps to the identical apply frame and folds the identical result — see
-    // `DecisionMakers::reachable_frame` / `DecisionMakers::result_for`.
+    // `DecisionMakers::reachable_frame` / `DecisionMakers::result_for`. So does
+    // the step a state hash verdict named the slot at: a desync eviction notes it
+    // before closing the link, so a peer that missed the order still learns it.
     let stamps = consensus::DepartureStamps {
         last_frame: decision_makers.slot_frame(key, slot),
         reachable_frame: decision_makers.reachable_frame(key, slot),
@@ -161,6 +163,7 @@ pub(crate) fn announce_departure_recorded(
         // A link-death departure is never born finalized; the proof only ever
         // enters the record through `finalize_drop`'s stamp.
         finalized: false,
+        evict_sync_ordinal: decision_makers.state_hash_exclusion(key, slot),
     };
     let outcome = if reason == LEAVE_REASON_DROPPED {
         // A dropped departure and its reconnect hold are one transition. The

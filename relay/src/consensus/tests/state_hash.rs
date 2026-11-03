@@ -482,6 +482,47 @@ fn a_split_waits_for_every_report_of_the_slots_named_later() {
     );
 }
 
+/// The step-16 split above, judged by a relay promoted after slots 4 and 5 left. Only slot 4's
+/// eviction order reached it, but each departure carries the step its slot was named at, so it
+/// counts slot 5's report where the authority did and finds the same even split.
+#[test]
+fn a_departure_tells_a_relay_that_missed_the_order_which_step_named_the_slot() {
+    let start = Instant::now();
+    let mut m = peer_maker();
+    m.latch_rollback(true);
+    m.set_expected_slots((0..6).map(SlotId).collect());
+    forward(&mut m, &[0, 1, 2, 3, 4, 5], 3 * STATE_HASH_INTERVAL, start);
+    for (slot, hash) in [(0, A), (1, A), (2, B), (3, B), (4, A), (5, B)] {
+        m.observe_state_hash(SlotId(slot), 16, hash, start);
+    }
+    for (slot, hash) in [(0, A), (1, A), (2, A), (3, A), (4, 0xcccc), (5, 0xdddd)] {
+        m.observe_state_hash(SlotId(slot), 24, hash, start);
+    }
+    m.exclude_from_state_hashes(SlotId(4), 24);
+    for slot in [4, 5] {
+        m.note_departure(
+            SlotId(slot),
+            DepartureStamps {
+                evict_sync_ordinal: Some(24),
+                ..framed(1)
+            },
+            0,
+            None,
+        );
+    }
+    m.authority = Authority::SelfRelay;
+    assert_eq!(
+        m.judge_state_hashes(start),
+        vec![SyncDivergence {
+            sync_ordinal: 16,
+            game_frame: None,
+            no_majority: true,
+            diverged: Vec::new(),
+            missing: Vec::new(),
+        }]
+    );
+}
+
 /// The same split with slot 5's report never arriving is decided on the reports present once the
 /// step's hold runs out.
 #[test]

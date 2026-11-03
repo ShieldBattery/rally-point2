@@ -140,3 +140,94 @@ async fn a_relay_that_does_not_home_the_slot_ignores_the_order() {
     );
     assert!(ctl_rx.try_recv().is_err(), "the order is not re-broadcast");
 }
+
+/// Latches the fixture's maker into a rollback session, where state hash
+/// verdicts evict.
+fn rollback(fixture: &FinalizeFixture) {
+    fixture
+        .mesh
+        .session
+        .decision_makers
+        .lock()
+        .get_mut(&fixture.key)
+        .expect("a seeded maker")
+        .latch_rollback(true);
+}
+
+/// The order `frame` carries, if it is one.
+fn order(frame: &MeshControlFrame) -> Option<(u32, u64)> {
+    match &frame.kind {
+        Some(mesh_control_frame::Kind::EvictSlot(evict)) => Some((evict.slot, evict.sync_ordinal)),
+        _ => None,
+    }
+}
+
+/// An order a relay didn't know yet goes on to its peers, so a relay whose own
+/// link to the authority was down still hears it; one it already knew stops
+/// there.
+#[test]
+fn an_order_new_to_a_relay_goes_on_to_its_peers_once() {
+    let fixture = finalize_fixture(crate::consensus::Authority::Peer, &[0], PeerDrop::Untouched);
+    rollback(&fixture);
+    let (_echo_fwd_rx, mut ctl_rx) = register_link_channels(&fixture.mesh.links, &fixture.key);
+
+    fixture.dispatch(evict_frame(&fixture));
+    let relayed = ctl_rx.try_recv().expect("the order goes on");
+    assert_eq!(order(&relayed), Some((u32::from(FINALIZE_SUBJECT_SLOT), 8)));
+
+    fixture.dispatch(evict_frame(&fixture));
+    assert!(
+        ctl_rx.try_recv().is_err(),
+        "an order already known stops here"
+    );
+}
+
+/// The home's departure of a slot it evicted carries the step that named it,
+/// and a relay that missed the order learns the step from the departure.
+#[tokio::test(start_paused = true)]
+async fn the_departure_of_an_evicted_slot_carries_the_step_that_named_it() {
+    let fixture = finalize_fixture(
+        crate::consensus::Authority::Peer,
+        &[FINALIZE_SUBJECT_SLOT],
+        PeerDrop::Untouched,
+    );
+    rollback(&fixture);
+    let (_registration, _inbox) =
+        routing::register(&fixture.sessions, &fixture.key, SUBJECT, 1).expect("subject registers");
+    let (_echo_fwd_rx, mut ctl_rx) = register_link_channels(&fixture.mesh.links, &fixture.key);
+
+    fixture.dispatch(evict_frame(&fixture));
+    assert!(routing::announce_departure_recorded(
+        &fixture.sessions,
+        &fixture.mesh,
+        &fixture.key,
+        SUBJECT,
+        crate::consensus::LEAVE_REASON_LEFT,
+        None,
+        Some(1),
+    ));
+
+    let frames: Vec<MeshControlFrame> = std::iter::from_fn(|| ctl_rx.try_recv().ok()).collect();
+    let departed = frames
+        .iter()
+        .find_map(|frame| match &frame.kind {
+            Some(mesh_control_frame::Kind::SlotDeparted(departed)) => Some(departed.clone()),
+            _ => None,
+        })
+        .expect("the home announces the departure");
+    assert_eq!(departed.evict_sync_ordinal, Some(8));
+
+    let peer = finalize_fixture(crate::consensus::Authority::Peer, &[0], PeerDrop::Untouched);
+    rollback(&peer);
+    peer.dispatch(MeshControlFrame {
+        session: peer.key.session.0,
+        kind: Some(mesh_control_frame::Kind::SlotDeparted(departed)),
+    });
+    assert_eq!(
+        peer.mesh
+            .session
+            .decision_makers
+            .state_hash_exclusions(&peer.key),
+        [(SUBJECT, 8)],
+    );
+}

@@ -94,11 +94,15 @@ impl DecisionMaker {
     /// Notes that the authority's verdict on `step` named `slot`, as its eviction order tells every
     /// relay serving the session. The slot takes no part from that step on but still does before
     /// it, after its eviction too, so this relay compares the same slots in every step as the
-    /// authority did if it is promoted.
-    pub fn exclude_from_state_hashes(&mut self, slot: SlotId, step: u64) {
-        if self.rollback_enabled {
-            self.hashes.exclude(slot, step);
-        }
+    /// authority did if it is promoted. Returns whether that is news to this relay (see
+    /// [`StateHashTracker::exclude`]); never outside a rollback session.
+    pub fn exclude_from_state_hashes(&mut self, slot: SlotId, step: u64) -> bool {
+        self.rollback_enabled && self.hashes.exclude(slot, step)
+    }
+
+    /// The step a state hash verdict named `slot` at, as this relay knows it.
+    pub fn state_hash_exclusion(&self, slot: SlotId) -> Option<u64> {
+        self.hashes.exclusion(slot)
     }
 
     /// Every slot a state hash verdict named, with the step that named it, as this relay knows

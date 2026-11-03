@@ -88,6 +88,7 @@ fn a_slot_departed_after_retirement_recreates_no_drop_hold() {
             result_slot_frame: None,
             connection_epoch: Some(1),
             final_turn_count: None,
+            evict_sync_ordinal: None,
         })),
     };
 
@@ -239,6 +240,7 @@ fn a_pre_start_reconnect_of_a_peer_homed_slot_still_completes_coverage() {
             result_slot_frame: None,
             connection_epoch: Some(1),
             final_turn_count: None,
+            evict_sync_ordinal: None,
         },
     )));
     assert!(mesh_state.session.drop_holds.is_pending(&key, SlotId(1)));

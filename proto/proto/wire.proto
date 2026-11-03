@@ -1400,9 +1400,10 @@ message MeshControlFrame {
     // only then closes its link, and once that link is down finalizes the drop and answers with
     // an unprompted `FinalizeDropResult`, so the authority decides a leave carrying the exact
     // count. Every relay notes the step, so it compares the slot only in the steps before it, as
-    // the authority does; a relay that predates this kind ignores it. Not re-broadcast, but every
-    // relay restates the orders it knows on a mesh Join, so one whose link was down still learns
-    // them. See `EvictSlot`.
+    // the authority does; a relay that predates this kind ignores it. A relay passes an order it
+    // didn't know yet on to every other peer, restates the orders it knows on a mesh Join, and
+    // the slot's departure carries the step too, so one whose link to the authority was down
+    // still learns it. See `EvictSlot`.
     EvictSlot evict_slot = 18;
 
     // A relay's copy of a rollback session's clock, so every relay measures its
@@ -1602,6 +1603,14 @@ message SlotDeparted {
   // Default false, so every legacy sender reads as unproven and receivers
   // strip the dropped count.
   bool finalized = 11;
+
+  // The state hash step whose verdict named the slot, as its home knew it when
+  // the slot departed (see `EvictSlot.sync_ordinal`). Every relay notes it as it
+  // would the eviction order itself, so a relay that learns the departure also
+  // learns which steps the slot still took part in, even if the order never
+  // reached it. Absent when no verdict named the slot, outside a rollback
+  // session, and from a sender that predates the field.
+  optional uint64 evict_sync_ordinal = 12;
 }
 
 // A relay's directive that a session may begin: every slot the coordinator

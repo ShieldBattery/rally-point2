@@ -251,6 +251,7 @@ fn stale_mesh_teardown_cannot_regress_a_reconnected_slot() {
             result_slot_frame: None,
             connection_epoch: Some(11),
             final_turn_count: None,
+            evict_sync_ordinal: None,
         })),
     };
     dispatch_mesh_control(

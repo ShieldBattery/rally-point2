@@ -134,6 +134,7 @@ fn a_slot_departed_carries_an_embedded_result_through_the_frame() {
             result_slot_frame: Some(4242),
             connection_epoch: None,
             final_turn_count: Some(4243),
+            evict_sync_ordinal: Some(24),
         })),
     };
     let encoded = encode_frame(&departed).unwrap();
@@ -158,6 +159,7 @@ fn a_slot_departed_carries_an_embedded_result_through_the_frame() {
             result_slot_frame: None,
             connection_epoch: None,
             final_turn_count: None,
+            evict_sync_ordinal: None,
         })),
     };
     let encoded = encode_frame(&never_framed).unwrap();

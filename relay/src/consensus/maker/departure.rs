@@ -35,6 +35,9 @@ pub struct DepartureStamps {
     /// home-side finalization (see [`DecisionMakers::finalize_drop`]) — the proof every count
     /// ingress requires before accepting a dropped count.
     pub finalized: bool,
+    /// The state hash step whose verdict named the slot, as its home knew it at the departure
+    /// (see `Departure::evict_sync_ordinal`).
+    pub evict_sync_ordinal: Option<u64>,
 }
 
 /// One observed slot departure, kept for authority-handoff re-derivation. Holds
@@ -94,6 +97,11 @@ pub(in crate::consensus) struct Departure {
     /// the record itself so Join-time reconciliation cannot accidentally stamp
     /// it with a newer generation from mutable live-link state.
     pub(in crate::consensus) connection_epoch: Option<u64>,
+    /// The state hash step whose verdict named the slot, as its home knew it when the slot
+    /// departed. Home-authored and folded first-non-`None`-wins like `reachable_frame`; noted in
+    /// the comparator exactly like the eviction order, so a relay that learns the departure learns
+    /// which steps the slot's reports still count in, even if the order itself never reached it.
+    pub(in crate::consensus) evict_sync_ordinal: Option<u64>,
 }
 
 impl Departure {
@@ -107,6 +115,7 @@ impl Departure {
                 result: self.result.clone(),
                 final_turn_count: self.final_turn_count,
                 finalized: self.finalized,
+                evict_sync_ordinal: self.evict_sync_ordinal,
             },
             self.reason,
             self.connection_epoch,
@@ -610,6 +619,7 @@ impl DecisionMaker {
             result,
             final_turn_count,
             finalized,
+            evict_sync_ordinal,
         } = stamps;
         use std::collections::hash_map::Entry;
         let result = result.filter(|echo| {
@@ -661,6 +671,7 @@ impl DecisionMaker {
                 record.final_turn_count = record.final_turn_count.or(final_turn_count);
                 record.finalized |= finalized;
                 record.connection_epoch = record.connection_epoch.or(connection_epoch);
+                record.evict_sync_ordinal = record.evict_sync_ordinal.or(evict_sync_ordinal);
             }
             Entry::Vacant(vacant) => {
                 vacant.insert(Departure {
@@ -672,8 +683,15 @@ impl DecisionMaker {
                     final_turn_count,
                     finalized,
                     connection_epoch,
+                    evict_sync_ordinal,
                 });
             }
+        }
+        // The step a verdict named the slot at counts here as the eviction order does: the
+        // departure removes the slot from every step's comparison, and without the step its
+        // reports of the steps before it would stop backing the hashes they match.
+        if let Some(step) = evict_sync_ordinal {
+            self.exclude_from_state_hashes(slot, step);
         }
         // A departed slot stops being required by the desync comparator: drop it
         // from the compare set so ordinals it would never report can still
