@@ -44,6 +44,7 @@ mod session_start;
 mod shrink;
 mod silence;
 mod state_hash;
+mod state_hash_evictions;
 mod target;
 mod turns_complete;
 
