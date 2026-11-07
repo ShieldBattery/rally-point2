@@ -103,6 +103,14 @@ async fn restart_with(
 ) {
     let ledger = in_memory_ledger();
     let minted = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
+    ledger
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/adopted",
+            &[],
+            &["127.0.0.1:14900".parse().unwrap()],
+        )
+        .expect("record the task's advertise set");
     let (cert_der, key) = self_signed();
     let builder = || {
         let builder = CoordinatorBuilder::new()

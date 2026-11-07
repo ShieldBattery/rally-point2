@@ -53,13 +53,14 @@ pub(super) const MAX_PENDING_CONTROL_HELLOS: usize = 512;
 
 /// The standard WebSocket "try again later" close code (RFC 6455 / the IANA
 /// close-code registry), used to refuse a connection when the pending-Hello
-/// gate ([`MAX_PENDING_CONTROL_HELLOS`]) is saturated. Distinct from the
+/// gate ([`MAX_PENDING_CONTROL_HELLOS`]) is saturated, and to defer a relay whose
+/// advertise addresses the provisioner has not recorded yet. Distinct from the
 /// `CONTROL_CLOSE_*` codes in [`rally_point_proto::version`]: those name a
 /// specific enroll refusal a relay recognizes and reacts to individually
 /// (`classify_control_close` on the relay side); this one carries no such
 /// meaning; an unrecognized code already falls back to the relay's ordinary
-/// short-delay reconnect, which is exactly the right reaction to a transient
-/// capacity refusal.
+/// short-delay reconnect, which is exactly the right reaction to either
+/// transient refusal.
 pub(super) const CONTROL_CLOSE_TRY_AGAIN_LATER: u16 = 1013;
 
 /// The close frame a refused connection is sent before it is dropped. The
@@ -358,8 +359,12 @@ impl<'a> EnrollHandshake<'a> {
         // this proof-of-possession-verified certificate) or re-presenting the bound
         // certificate (a reconnect). A refusal closes with a single generic reason so a
         // caller cannot probe which ids exist or whether a token was near-valid; the
-        // specific class rides only the server-side log. A coordinator with no ledger
-        // skips this entirely — the id claim is accepted as presented (dev / loopback).
+        // specific class rides only the server-side log. The one exception is a
+        // relay that proved it holds the id but whose addresses the provisioner has
+        // not recorded yet: it gets a retry-later close, which a relay of any
+        // version answers with its short reconnect. A coordinator with no ledger
+        // skips this entirely — the id claim and the hello's addresses are accepted
+        // as presented (dev / loopback).
         // A first enroll carries the relay's cold-start duration (launch to enroll),
         // observed into the histogram once the enroll fully succeeds. A reconnect and a
         // no-ledger enroll carry none.
@@ -375,30 +380,26 @@ impl<'a> EnrollHandshake<'a> {
                 Ok(authorized) => {
                     if let crate::ledger::Authorized::FirstEnroll {
                         cold_start_secs: cold_start,
-                    } = authorized
+                    } = authorized.kind
                     {
                         cold_start_secs = cold_start;
                     }
-                    // Coordinator-sourced addresses win; the hello's self-report is the
-                    // fallback. When the ledger recorded an advertise set for this id,
-                    // override the hello's addresses with it (first entry is the
-                    // primary) before enrolling, so the registry advertises what the
-                    // coordinator resolved rather than what the relay claimed. An id
-                    // with no recorded set enrolls with its self-reported addresses.
-                    match ledger.advertised_addrs(relay_id) {
-                        Ok(Some(addrs)) if !addrs.is_empty() => {
-                            hello.relay_addr = addrs[0];
-                            hello.relay_addrs = addrs;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            tracing::warn!(
-                                relay_id = relay_id.0,
-                                %error,
-                                "reading the ledger advertise set failed; enrolling with the hello's addresses",
-                            );
-                        }
-                    }
+                    // A provisioned relay is advertised only at the addresses the
+                    // coordinator resolved for its task. Its hello's self-report is
+                    // task-local (loopback on Fargate), so it is never used here;
+                    // the ledger refuses the enroll until the resolved set exists.
+                    hello.relay_addr = authorized.addrs[0];
+                    hello.relay_addrs = authorized.addrs;
+                }
+                Err(crate::ledger::EnrollRefusal::AddrsPending) => {
+                    tracing::info!(
+                        relay_id = relay_id.0,
+                        "deferring relay enroll: its advertise addresses are not recorded yet",
+                    );
+                    return EnrollStep::Refuse(Some(ControlClose {
+                        code: CONTROL_CLOSE_TRY_AGAIN_LATER,
+                        reason: "relay addresses not resolved yet; retry shortly".to_owned(),
+                    }));
                 }
                 Err(refusal) => {
                     tracing::warn!(

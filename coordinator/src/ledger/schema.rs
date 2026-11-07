@@ -4,7 +4,7 @@
 //! Grouped here because none of it is enrollment *policy* — `mod.rs` decides
 //! what an enroll means; this file is just how a row gets in and out of SQLite.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
@@ -170,7 +170,19 @@ pub(super) struct LedgerRow {
     pub(super) token_hash: Vec<u8>,
     pub(super) token_expires_at: i64,
     pub(super) expected_ips: Option<String>,
+    pub(super) addrs: Option<String>,
     pub(super) launched_at: i64,
+}
+
+/// Parses a stored advertise-address set — a JSON array of `"ip:port"` strings
+/// in preference order — into socket addresses.
+pub(super) fn parse_addrs(json: &str) -> Result<Vec<SocketAddr>, LedgerError> {
+    let strings: Vec<String> = serde_json::from_str(json)?;
+    let addrs = strings
+        .iter()
+        .map(|s| s.parse::<SocketAddr>())
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(addrs)
 }
 
 /// Parses the stored expected-peer-IP set — a JSON array of canonical IP strings,

@@ -296,6 +296,90 @@ fn a_ledger_refusal_lands_after_the_permit_drops_and_before_the_registry() {
     );
 }
 
+/// A public address the provisioner resolved for a relay's task, distinct from
+/// the loopback self-report in [`RelayIdentity::hello`].
+fn resolved_addr() -> SocketAddr {
+    "[2001:db8::7]:14900".parse().unwrap()
+}
+
+/// Runs one handshake for `relay` presenting `hello`, returning the final step.
+fn handshake_once(
+    context: &EnrollContext<'_>,
+    relay: &RelayIdentity,
+    hello: RelayHello,
+) -> EnrollStep {
+    let gate = Arc::new(Semaphore::new(1));
+    let mut handshake = EnrollHandshake::start(context, &gate).unwrap();
+    let nonce = challenge_nonce(handshake.offer(Some(RelayToCoordinator::Hello(hello))));
+    handshake.offer(Some(relay.proof(&nonce)))
+}
+
+#[test]
+fn a_relay_whose_addresses_are_not_recorded_is_deferred_without_spending_its_token() {
+    let setup = relayless_setup();
+    let lifecycle = Lifecycle::new(setup.clone());
+    let regions = RegionsConfig::default();
+    let ledger = RelayLedger::open(Path::new(":memory:")).expect("an in-memory ledger opens");
+    // Launched and recorded, but its task has not reported an address yet: the
+    // window in which a fast-starting relay used to enroll on its loopback
+    // self-report and be handed to clients at 127.0.0.1.
+    let minted = ledger.mint(None, Duration::from_secs(300)).unwrap();
+    let context = EnrollContext::new(&setup, &lifecycle, &regions, Some(&ledger), None);
+    let relay = RelayIdentity::generate();
+    let mut hello = relay.hello(minted.relay_id.0);
+    hello.enroll_token = Some(minted.token.clone());
+
+    let close = refusal(handshake_once(&context, &relay, hello.clone()));
+    assert_eq!(
+        close.code, CONTROL_CLOSE_TRY_AGAIN_LATER,
+        "a retry-later close, which every relay version answers with its short redial",
+    );
+    assert_eq!(enrolled_count(&setup), 0);
+
+    // The token was not consumed, so the id is still a launch in flight (scale-up
+    // must not launch a second relay for it) and the same token binds once the
+    // address lands.
+    let now = rally_point_proto::time::unix_secs_fail_closed();
+    assert_eq!(ledger.count_launching(None, now).unwrap(), 1);
+    ledger
+        .record_task(minted.relay_id, "task/late", &[], &[resolved_addr()])
+        .unwrap();
+    assert!(matches!(
+        handshake_once(&context, &relay, hello),
+        EnrollStep::Enrolled(_)
+    ));
+}
+
+#[test]
+fn a_provisioned_relay_enrolls_at_its_recorded_addresses_never_its_self_report() {
+    let setup = relayless_setup();
+    let lifecycle = Lifecycle::new(setup.clone());
+    let regions = RegionsConfig::default();
+    let ledger = RelayLedger::open(Path::new(":memory:")).expect("an in-memory ledger opens");
+    let minted = ledger.mint(None, Duration::from_secs(300)).unwrap();
+    let secondary: SocketAddr = "198.51.100.7:14900".parse().unwrap();
+    ledger
+        .record_task(
+            minted.relay_id,
+            "task/a",
+            &[],
+            &[resolved_addr(), secondary],
+        )
+        .unwrap();
+    let context = EnrollContext::new(&setup, &lifecycle, &regions, Some(&ledger), None);
+    let relay = RelayIdentity::generate();
+    let mut hello = relay.hello(minted.relay_id.0);
+    hello.enroll_token = Some(minted.token);
+
+    assert!(matches!(
+        handshake_once(&context, &relay, hello),
+        EnrollStep::Enrolled(_)
+    ));
+    let entry = registry::entry(setup.registry(), minted.relay_id).unwrap();
+    assert_eq!(entry.relay_addr, resolved_addr());
+    assert_eq!(entry.relay_addrs, vec![resolved_addr(), secondary]);
+}
+
 #[test]
 fn an_id_retired_after_authorization_is_refused_at_the_registry_insert() {
     let setup = relayless_setup();
@@ -304,6 +388,9 @@ fn an_id_retired_after_authorization_is_refused_at_the_registry_insert() {
     let ledger = RelayLedger::open(Path::new(":memory:")).expect("an in-memory ledger opens");
     let minted = ledger.mint(None, Duration::from_secs(300)).unwrap();
     let relay_id = minted.relay_id;
+    ledger
+        .record_task(relay_id, "task/retired", &[], &[resolved_addr()])
+        .unwrap();
     // The ledger authorizes this enroll, then a drain tombstones the id before the
     // registry insert, the way the reconcile loop can between its own steps.
     let context = EnrollContext::new(&setup, &lifecycle, &regions, Some(&ledger), None)

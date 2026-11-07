@@ -91,6 +91,11 @@ task status reaches RUNNING, so `state` reports `Running` off the ENI alone;
 a v6-only set stays `Starting` until a v4 attaches or `PUBLIC_IPV4_WAIT_SECS`
 elapses (the launch-deadline sweep is the real backstop).
 
+Enrollment waits on `resolve_pending`: a relay that starts before its
+addresses are recorded is told to retry until `record_task` lands. So how soon
+a launch's addresses get recorded is part of the relay's cold start, and an id
+whose addresses are never recorded never serves.
+
 ## Testing
 `reconcile` shares a `FakeProvisioner` + `Harness` (`reconcile/tests/mod.rs`)
 over an in-memory registry/ledger/session; every clock read takes an

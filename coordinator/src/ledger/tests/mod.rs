@@ -24,5 +24,26 @@ fn ledger() -> RelayLedger {
 /// A day, the token TTL most tests mint with.
 const DAY: Duration = Duration::from_secs(86_400);
 
+/// The advertise address tests record for an id so that it may enroll.
+fn advertise_addr() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 14_900))
+}
+
+/// Mints an untagged id at `now` and records a task for it advertised at
+/// [`advertise_addr`], as the provisioner does once the task reports its
+/// addresses, so the id may enroll.
+fn mint_recorded(ledger: &RelayLedger, now: u64, token_ttl: Duration) -> Minted {
+    let minted = ledger.mint_at(now, None, token_ttl).unwrap();
+    ledger
+        .record_task(
+            minted.relay_id,
+            &format!("task/{}", minted.relay_id.0),
+            &[],
+            &[advertise_addr()],
+        )
+        .unwrap();
+    minted
+}
+
 mod bookkeeping;
 mod enrollment;

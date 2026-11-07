@@ -7,7 +7,7 @@ use super::*;
 #[test]
 fn mint_then_authorize_binds_consumes_and_records_enrolled() {
     let ledger = ledger();
-    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+    let minted = mint_recorded(&ledger, 1_000, DAY);
 
     let outcome = ledger
         .authorize_enroll_at(
@@ -20,7 +20,7 @@ fn mint_then_authorize_binds_consumes_and_records_enrolled() {
         .unwrap();
     // Minted at 1_000, first enroll at 1_100 -> a 100-second cold start.
     assert_eq!(
-        outcome,
+        outcome.kind,
         Authorized::FirstEnroll {
             cold_start_secs: Some(100),
         },
@@ -47,7 +47,7 @@ fn the_same_token_binds_at_most_one_fingerprint() {
     // different certificates leave exactly one bound. The first wins; the
     // second finds the id already bound and is refused.
     let ledger = ledger();
-    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+    let minted = mint_recorded(&ledger, 1_000, DAY);
 
     let first = ledger
         .authorize_enroll_at(
@@ -58,7 +58,7 @@ fn the_same_token_binds_at_most_one_fingerprint() {
             None,
         )
         .unwrap();
-    assert!(matches!(first, Authorized::FirstEnroll { .. }));
+    assert!(matches!(first.kind, Authorized::FirstEnroll { .. }));
 
     // Once bound, the token is ignored on a reconnect — only the certificate
     // matters, so a different fingerprint is refused even though it still
@@ -77,7 +77,7 @@ fn the_same_token_binds_at_most_one_fingerprint() {
     let reconnect = ledger
         .authorize_enroll_at(1_030, minted.relay_id, fingerprint(0xAA), None, None)
         .unwrap();
-    assert_eq!(reconnect, Authorized::Reenroll);
+    assert_eq!(reconnect.kind, Authorized::Reenroll);
 }
 
 #[test]
@@ -86,7 +86,7 @@ fn a_consumed_token_cannot_be_reused_to_bind() {
     // was consumed but (contrived here) left unbound refuses a second use of
     // that token with TokenInvalid, never a second bind.
     let ledger = ledger();
-    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+    let minted = mint_recorded(&ledger, 1_000, DAY);
     {
         let conn = ledger.conn.lock();
         conn.execute(
@@ -204,7 +204,12 @@ fn expected_ip_gates_first_and_reenroll() {
     let expected: IpAddr = Ipv4Addr::new(203, 0, 113, 7).into();
     let other: IpAddr = Ipv4Addr::new(198, 51, 100, 9).into();
     ledger
-        .record_task(minted.relay_id, "arn:aws:ecs:task/abc", &[expected], &[])
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/abc",
+            &[expected],
+            &[advertise_addr()],
+        )
         .unwrap();
 
     // A mismatched peer is refused before the token is even consulted.
@@ -236,7 +241,7 @@ fn expected_ip_gates_first_and_reenroll() {
             Some(expected),
         )
         .unwrap();
-    assert!(matches!(ok, Authorized::FirstEnroll { .. }));
+    assert!(matches!(ok.kind, Authorized::FirstEnroll { .. }));
 
     // The gate still applies on reconnect: a mismatched peer with the bound
     // certificate is refused.
@@ -252,7 +257,7 @@ fn expected_ip_gates_first_and_reenroll() {
             Some(expected),
         )
         .unwrap();
-    assert_eq!(reconnect_ok, Authorized::Reenroll);
+    assert_eq!(reconnect_ok.kind, Authorized::Reenroll);
 }
 
 #[test]
@@ -265,7 +270,12 @@ fn enroll_matches_any_ip_in_the_expected_set() {
     let v6: IpAddr = "2001:db8::7".parse().unwrap();
     let other: IpAddr = Ipv4Addr::new(198, 51, 100, 9).into();
     ledger
-        .record_task(minted.relay_id, "arn:aws:ecs:task/dual", &[v4, v6], &[])
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/dual",
+            &[v4, v6],
+            &[advertise_addr()],
+        )
         .unwrap();
 
     // Enroll over IPv6 (binds the cert).
@@ -278,13 +288,13 @@ fn enroll_matches_any_ip_in_the_expected_set() {
             Some(v6),
         )
         .unwrap();
-    assert!(matches!(over_v6, Authorized::FirstEnroll { .. }));
+    assert!(matches!(over_v6.kind, Authorized::FirstEnroll { .. }));
 
     // Reconnect over the other family in the set is accepted too.
     let over_v4 = ledger
         .authorize_enroll_at(1_020, minted.relay_id, fingerprint(0x20), None, Some(v4))
         .unwrap();
-    assert_eq!(over_v4, Authorized::Reenroll);
+    assert_eq!(over_v4.kind, Authorized::Reenroll);
 
     // An address outside the set is refused.
     let outside =
@@ -299,7 +309,12 @@ fn an_empty_expected_set_gates_nothing() {
     let ledger = ledger();
     let minted = ledger.mint_at(1_000, None, DAY).unwrap();
     ledger
-        .record_task(minted.relay_id, "arn:aws:ecs:task/none", &[], &[])
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/none",
+            &[],
+            &[advertise_addr()],
+        )
         .unwrap();
     let any_peer: IpAddr = Ipv4Addr::new(198, 51, 100, 3).into();
     let ok = ledger
@@ -311,7 +326,7 @@ fn an_empty_expected_set_gates_nothing() {
             Some(any_peer),
         )
         .unwrap();
-    assert!(matches!(ok, Authorized::FirstEnroll { .. }));
+    assert!(matches!(ok.kind, Authorized::FirstEnroll { .. }));
 }
 
 #[test]
@@ -345,6 +360,122 @@ fn record_task_and_advertised_addrs_roundtrip() {
         Some(vec![v4, v6]),
         "the advertise set round-trips in stored order",
     );
+}
+
+#[test]
+fn a_first_enroll_waits_for_the_advertise_set_and_keeps_its_token() {
+    let ledger = ledger();
+    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+    // The task is launched but its addresses are not resolved yet.
+    ledger
+        .record_launch(minted.relay_id, "arn:aws:ecs:task/early")
+        .unwrap();
+
+    let early = ledger.authorize_enroll_at(
+        1_010,
+        minted.relay_id,
+        fingerprint(0xC1),
+        Some(&minted.token),
+        None,
+    );
+    assert!(matches!(early, Err(EnrollRefusal::AddrsPending)));
+    assert_eq!(
+        ledger.count_launching(None, 1_010).unwrap(),
+        1,
+        "the token is unspent, so the id still counts as a launch in flight",
+    );
+
+    ledger
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/early",
+            &[],
+            &[advertise_addr()],
+        )
+        .unwrap();
+    let ready = ledger
+        .authorize_enroll_at(
+            1_020,
+            minted.relay_id,
+            fingerprint(0xC1),
+            Some(&minted.token),
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        ready,
+        AuthorizedEnroll {
+            kind: Authorized::FirstEnroll {
+                cold_start_secs: Some(20),
+            },
+            addrs: vec![advertise_addr()],
+        },
+    );
+}
+
+#[test]
+fn a_reconnect_without_an_advertise_set_waits_for_one() {
+    // A bound id whose row carries no advertise set (written before enrollment
+    // required one) is held off until the provisioner records it.
+    let ledger = ledger();
+    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+    {
+        let conn = ledger.conn.lock();
+        conn.execute(
+            "UPDATE provisioned_relays SET cert_fingerprint = ?1, token_consumed_at = 1000
+              WHERE relay_id = ?2",
+            params![fingerprint(0xD1).as_slice(), as_i64(minted.relay_id.0)],
+        )
+        .unwrap();
+    }
+    let early = ledger.authorize_enroll_at(1_010, minted.relay_id, fingerprint(0xD1), None, None);
+    assert!(matches!(early, Err(EnrollRefusal::AddrsPending)));
+
+    ledger
+        .record_task(minted.relay_id, "task/d", &[], &[advertise_addr()])
+        .unwrap();
+    let ready = ledger
+        .authorize_enroll_at(1_020, minted.relay_id, fingerprint(0xD1), None, None)
+        .unwrap();
+    assert_eq!(ready.kind, Authorized::Reenroll);
+    assert_eq!(ready.addrs, vec![advertise_addr()]);
+}
+
+#[test]
+fn only_a_caller_that_proves_the_id_learns_its_addresses_are_pending() {
+    // `AddrsPending` is a distinct answer, so it must not reach a caller that
+    // has not proven it holds the id: a wrong token or a foreign certificate
+    // still gets the generic refusal classes.
+    let ledger = ledger();
+    let unbound = ledger.mint_at(1_000, None, DAY).unwrap();
+    let wrong_token = ledger.authorize_enroll_at(
+        1_010,
+        unbound.relay_id,
+        fingerprint(0xE1),
+        Some("not-the-token"),
+        None,
+    );
+    assert!(matches!(wrong_token, Err(EnrollRefusal::TokenInvalid)));
+    let no_token =
+        ledger.authorize_enroll_at(1_010, unbound.relay_id, fingerprint(0xE1), None, None);
+    assert!(matches!(no_token, Err(EnrollRefusal::TokenRequired)));
+
+    let bound = ledger.mint_at(1_000, None, DAY).unwrap();
+    {
+        let conn = ledger.conn.lock();
+        conn.execute(
+            "UPDATE provisioned_relays SET cert_fingerprint = ?1, token_consumed_at = 1000
+              WHERE relay_id = ?2",
+            params![fingerprint(0xE2).as_slice(), as_i64(bound.relay_id.0)],
+        )
+        .unwrap();
+    }
+    let foreign_cert =
+        ledger.authorize_enroll_at(1_010, bound.relay_id, fingerprint(0xEE), None, None);
+    assert!(matches!(
+        foreign_cert,
+        Err(EnrollRefusal::FingerprintMismatch)
+    ));
 }
 
 #[test]

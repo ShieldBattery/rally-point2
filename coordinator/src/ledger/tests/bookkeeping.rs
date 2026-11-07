@@ -39,6 +39,9 @@ fn count_launching_counts_only_unretired_unbound_unexpired_in_region() {
 
     // Binding `a` (a first enroll) drops it from the launching count.
     ledger
+        .record_task(a.relay_id, "task/a", &[], &[advertise_addr()])
+        .unwrap();
+    ledger
         .authorize_enroll_at(1_050, a.relay_id, fingerprint(0x01), Some(&a.token), None)
         .unwrap();
     assert_eq!(
@@ -67,7 +70,9 @@ fn expired_launching_returns_only_past_deadline_unbound_ids_with_tasks() {
         .mint_at(1_000, None, Duration::from_secs(10))
         .unwrap();
     let _c = ledger.mint_at(1_000, None, DAY).unwrap();
-    ledger.record_task(a.relay_id, "task/a", &[], &[]).unwrap();
+    ledger
+        .record_task(a.relay_id, "task/a", &[], &[advertise_addr()])
+        .unwrap();
 
     // At t=2000 both short tokens have expired; the long one has not.
     let mut expired = ledger.expired_launching(2_000).unwrap();
@@ -100,11 +105,16 @@ fn bound_unretired_lists_bound_ids_and_omits_retired_and_launching() {
     let b = ledger.mint_at(1_000, None, DAY).unwrap();
     let _launching = ledger.mint_at(1_000, None, DAY).unwrap();
 
-    // Bind both a and b; record a task for a; retire b.
+    // Record tasks for a and b; bind both; retire b.
+    ledger
+        .record_task(a.relay_id, "task/a", &[], &[advertise_addr()])
+        .unwrap();
+    ledger
+        .record_task(b.relay_id, "task/b", &[], &[advertise_addr()])
+        .unwrap();
     ledger
         .authorize_enroll_at(1_010, a.relay_id, fingerprint(0xA1), Some(&a.token), None)
         .unwrap();
-    ledger.record_task(a.relay_id, "task/a", &[], &[]).unwrap();
     ledger
         .authorize_enroll_at(1_010, b.relay_id, fingerprint(0xB1), Some(&b.token), None)
         .unwrap();

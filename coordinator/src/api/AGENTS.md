@@ -39,6 +39,12 @@ webhook). This layer decodes and calls once; it decides none of it.
   `control.rs` only sends what it returns. It names no axum/tungstenite type and
   never awaits, so `tests/control_enroll.rs` walks the whole sequence, and each
   refusal point, without a socket; assert where the permit is still held.
+- In ledger mode a relay enrolls only at the advertise set `record_task`
+  stored for its id, never the `Hello`'s self-reported addresses (task-local,
+  loopback on Fargate). An id with no stored set gets a retry-later close
+  (1013), and only after it proved it holds the id, so the distinct answer
+  leaks nothing. A first enroll's token stays unspent until then, which keeps
+  the id counted as a launch in flight.
 - `peer_ip` arrives only when the server was built with
   `into_make_service_with_connect_info`. In-process TLS keeps the real peer
   visible; behind an L7 proxy a ledger's expected-address check would compare

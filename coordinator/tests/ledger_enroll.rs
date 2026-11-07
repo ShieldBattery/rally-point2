@@ -3,10 +3,11 @@
 //! with a one-time token, admits the relay that presents that token (binding its
 //! certificate), refuses a token-less or wrong-token enroll with a single generic
 //! close code, admits the bound relay's reconnect on its certificate alone, and
-//! refuses a different certificate claiming the bound id. It also proves the
-//! coordinator-recorded advertise set overrides the hello's self-reported
-//! addresses at enroll, and that the recorded expected-address gate is measured
-//! against the connection's real transport peer.
+//! refuses a different certificate claiming the bound id. It also proves a relay
+//! is enrolled only at the coordinator-recorded advertise set, never its
+//! self-reported addresses, and is told to retry until that set exists; and
+//! that the recorded expected-address gate is measured against the connection's
+//! real transport peer.
 //!
 //! The tokenless dev / loopback path is proven unchanged by the sibling
 //! `enroll_identity` suite, which runs against a coordinator with no ledger.
@@ -27,6 +28,15 @@ use common::{
 /// The token lifetime tests mint with — comfortably longer than any test runs.
 const TOKEN_TTL: Duration = Duration::from_secs(3600);
 
+/// The WebSocket "try again later" close code, which a relay of any version
+/// answers with its short ordinary redial.
+const CLOSE_TRY_AGAIN_LATER: u16 = 1013;
+
+/// An advertise address to record for an id so that it may enroll.
+fn resolved_addr() -> SocketAddr {
+    "[2001:db8::9]:14900".parse().unwrap()
+}
+
 /// Reads down-frames until the descriptor re-sync every accepted enroll includes —
 /// proof the connection enrolled rather than being closed. The enrolled path leads
 /// with the tenant-key push before the first descriptor, so this reads past it.
@@ -35,46 +45,35 @@ async fn expect_enrolled(socket: &mut ControlSocket) {
 }
 
 #[tokio::test]
-async fn a_recorded_advertise_set_overrides_the_hello_addresses() {
-    // A relay behind NAT self-reports a useless address, so the addresses the
-    // coordinator resolved for the task must win at enroll. With nothing
-    // recorded there is nothing to override and the hello's own address stands.
+async fn a_relay_enrolls_only_once_its_advertise_set_is_recorded_and_only_at_it() {
+    // A relay only knows task-local addresses (loopback on Fargate), so it may
+    // only enroll at the addresses the coordinator resolved for its task. A relay
+    // that comes up before the provisioner has recorded them is told to retry,
+    // not enrolled on its self-report, which clients could never reach.
     let ledger = in_memory_ledger();
     let served = CoordinatorBuilder::new()
         .with_ledger(ledger.clone())
         .serve()
         .await;
 
-    // Nothing recorded: the hello's self-reported address is what enrolls.
-    let self_reported = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
-    let (cert_der, key) = self_signed();
-    let hello = hello_at_current(self_reported.relay_id.0, 14900, cert_der)
-        .with_enroll_token(self_reported.token.clone());
-    let mut socket = connect_and_send_hello(&served.base_url, hello).await;
-    prove_identity(&mut socket, &key).await;
-
-    assert!(
-        wait_for_enrollment(served.registry(), self_reported.relay_id).await,
-        "a minted relay presenting its token enrolls",
-    );
-    let entry = registry::entry(served.registry(), self_reported.relay_id).unwrap();
-    assert_eq!(
-        entry.relay_addr,
-        SocketAddr::from((Ipv4Addr::LOCALHOST, 14900)),
-        "with no recorded advertise set, the hello's own address is used",
-    );
-
-    // A recorded advertise set: it replaces the hello's addresses entirely.
     let recorded = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
+    let (cert_der, key) = self_signed();
+    let hello = hello_at_current(recorded.relay_id.0, 14901, cert_der)
+        .with_enroll_token(recorded.token.clone());
+
+    // Nothing recorded yet: deferred, and the registry never sees it.
+    let mut socket = connect_and_send_hello(&served.base_url, hello.clone()).await;
+    prove_identity(&mut socket, &key).await;
+    expect_close(&mut socket, CLOSE_TRY_AGAIN_LATER).await;
+    assert!(registry::peer(served.registry(), recorded.relay_id).is_none());
+
+    // The provisioner records the task's addresses; the same relay's redial,
+    // with the same still-unspent token, enrolls at them.
     let v4: SocketAddr = "203.0.113.5:15000".parse().unwrap();
     let v6: SocketAddr = "[2001:db8::5]:15000".parse().unwrap();
     ledger
         .record_task(recorded.relay_id, "arn:aws:ecs:task/abc", &[], &[v4, v6])
         .expect("record the task's advertise set");
-
-    let (cert_der, key) = self_signed();
-    let hello = hello_at_current(recorded.relay_id.0, 14901, cert_der)
-        .with_enroll_token(recorded.token.clone());
     let mut socket = connect_and_send_hello(&served.base_url, hello).await;
     prove_identity(&mut socket, &key).await;
 
@@ -128,6 +127,14 @@ async fn the_bound_cert_reconnects_tokenless_and_a_new_cert_is_refused() {
         .serve()
         .await;
     let minted = ledger.mint(None, TOKEN_TTL).expect("mint an id + token");
+    ledger
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/bound",
+            &[],
+            &[resolved_addr()],
+        )
+        .expect("record the task's advertise set");
     let (cert_der, key) = self_signed();
 
     // First enroll with the token binds this certificate to the id.
@@ -204,7 +211,7 @@ async fn the_expected_address_gate_is_measured_against_the_real_connection_peer(
             expected_here.relay_id,
             "arn:aws:ecs:task/here",
             &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            &[],
+            &[resolved_addr()],
         )
         .expect("record the expected address");
     let (cert_der, key) = self_signed();
@@ -225,7 +232,7 @@ async fn the_expected_address_gate_is_measured_against_the_real_connection_peer(
             expected_elsewhere.relay_id,
             "arn:aws:ecs:task/elsewhere",
             &["203.0.113.7".parse().unwrap()],
-            &[],
+            &[resolved_addr()],
         )
         .expect("record the expected address");
     let (cert_der, key) = self_signed();
@@ -258,7 +265,7 @@ async fn a_recorded_expected_address_refuses_a_server_that_cannot_see_its_peer()
             minted.relay_id,
             "arn:aws:ecs:task/here",
             &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
-            &[],
+            &[resolved_addr()],
         )
         .expect("record the expected address");
 

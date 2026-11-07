@@ -273,7 +273,7 @@ impl Harness {
         }
     }
 
-    /// Mints, binds, records a task for, and enrolls a live relay in `region`
+    /// Mints, records a task for, binds, and enrolls a live relay in `region`
     /// at `now`, as if it had come up and enrolled. Returns its id and enroll
     /// generation.
     fn seed_live_relay(&self, region: &RegionId, now: u64) -> (RelayId, u64) {
@@ -281,20 +281,21 @@ impl Harness {
             .ledger
             .mint_at(now, Some(region), Duration::from_secs(3_600))
             .unwrap();
-        self.ledger
-            .authorize_enroll_at(now, minted.relay_id, [0x11; 32], Some(&minted.token), None)
-            .unwrap();
+        let port = 14_900 + minted.relay_id.0 as u16;
         self.ledger
             .record_task(
                 minted.relay_id,
                 &format!("task-live-{}", minted.relay_id.0),
                 &[],
-                &[],
+                &[SocketAddr::from(([127, 0, 0, 1], port))],
             )
+            .unwrap();
+        self.ledger
+            .authorize_enroll_at(now, minted.relay_id, [0x11; 32], Some(&minted.token), None)
             .unwrap();
         let generation = registry::enroll(
             &self.reg,
-            hello(minted.relay_id.0, 14_900 + minted.relay_id.0 as u16).with_region(region.clone()),
+            hello(minted.relay_id.0, port).with_region(region.clone()),
         );
         (minted.relay_id, generation)
     }

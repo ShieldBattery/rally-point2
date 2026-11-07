@@ -64,6 +64,14 @@ async fn the_vanished_task_sweep_retires_a_bound_relay_whose_task_stopped() {
         .mint_at(1_000, Some(&east), Duration::from_secs(3_600))
         .unwrap();
     h.ledger
+        .record_task(
+            minted.relay_id,
+            "task-vanished",
+            &[],
+            &[SocketAddr::from((Ipv4Addr::LOCALHOST, 14_900))],
+        )
+        .unwrap();
+    h.ledger
         .authorize_enroll_at(
             1_000,
             minted.relay_id,
@@ -71,9 +79,6 @@ async fn the_vanished_task_sweep_retires_a_bound_relay_whose_task_stopped() {
             Some(&minted.token),
             None,
         )
-        .unwrap();
-    h.ledger
-        .record_task(minted.relay_id, "task-vanished", &[], &[])
         .unwrap();
     h.fake.set_task_state("task-vanished", TaskState::Stopped);
 

@@ -1534,9 +1534,13 @@ exist or whether a token was near-valid; the specific class rides only the coord
 enroll consumes the token and **binds** the id to the certificate the `Hello` presented, in one atomic
 `UPDATE` so two enrolls racing on a token bind at most one cert; every reconnect thereafter must re-present
 that bound certificate (no token), and a retired id is refused forever. An id is therefore only ever
-*launching* (token-guarded), *live* (cert-bound), or *retired* — never offline-but-claimable. Where the
-coordinator recorded a resolved advertise set for a launched id, that set overrides the hello's self-reported
-addresses at enroll (coordinator-sourced addresses win; the hello is the fallback). A coordinator with **no**
+*launching* (token-guarded), *live* (cert-bound), or *retired* — never offline-but-claimable. A relay is
+enrolled only at the advertise set the coordinator resolved for its task, never at the hello's self-reported
+addresses, which are task-local (loopback on Fargate) and unreachable. A relay can start before its ENI
+reports a public address, so an id whose set is not recorded yet is answered with a retry-later close (`1013`,
+which every relay version redials on its short delay) instead of being enrolled; that answer is given only
+after the token or bound certificate checks out, and a first enroll's token stays unspent until it binds. A
+coordinator with **no**
 ledger keeps the dev / loopback posture: the id claim in a `Hello` is accepted as presented, and this whole
 authorization step is skipped.
 

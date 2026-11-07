@@ -8,7 +8,9 @@
 //! - **launching** — [`mint`](RelayLedger::mint) records a fresh id with a
 //!   one-time token (only the token's SHA-256 is stored; the token itself is
 //!   handed to the launched relay and never written down) and no bound
-//!   certificate.
+//!   certificate. Once its task reports an address,
+//!   [`record_task`](RelayLedger::record_task) stores the coordinator-resolved
+//!   advertise set, and no enroll is authorized before that.
 //! - **live** — the relay's first enroll presents the token; the token is
 //!   consumed and the id is bound to the certificate the enroll `Hello` carried,
 //!   in one atomic step ([`authorize_enroll`](RelayLedger::authorize_enroll)).
@@ -64,7 +66,10 @@ mod sessions;
 
 pub(crate) use sessions::{SessionStateWrite, StoredSession};
 
-use schema::{LedgerRow, TOKEN_BYTES, as_i64, as_u64, parse_expected_ips, row_to_provisioned_task};
+use schema::{
+    LedgerRow, TOKEN_BYTES, as_i64, as_u64, parse_addrs, parse_expected_ips,
+    row_to_provisioned_task,
+};
 // Test-only: not needed by this file's own code, only by `tests`' `use
 // super::*;` picking them up the same way it would if this were still one
 // file.
@@ -116,10 +121,23 @@ pub(crate) struct ProvisionedTask {
     /// The relay id the row minted.
     pub relay_id: RelayId,
     /// The provisioner task recorded for the id, or `None` if no task was ever
-    /// recorded (an id that enrolled on its self-reported addresses).
+    /// recorded (a mint whose launch failed before the task was written down).
     pub task_arn: Option<String>,
     /// The region the id was minted for, or `None` for an untagged id.
     pub region: Option<RegionId>,
+}
+
+/// An enroll the ledger authorized: how it did so, and the addresses the relay
+/// is to be advertised at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedEnroll {
+    /// Whether this bound the id or re-presented its bound certificate.
+    pub kind: Authorized,
+    /// The coordinator-resolved advertise-address set recorded for the id, in
+    /// preference order (first is the primary); never empty. A relay only
+    /// knows its task-local addresses, so the set its `Hello` reports is never
+    /// the one it is reached at.
+    pub addrs: Vec<SocketAddr>,
 }
 
 /// The ledger authorized an enroll — how it did so.
@@ -168,6 +186,15 @@ pub enum EnrollRefusal {
     /// been consumed, or had expired.
     #[error("enroll token is invalid, already consumed, or expired")]
     TokenInvalid,
+    /// The relay proved it holds the id (a valid token, or the bound
+    /// certificate), but the provisioner has not recorded the addresses it is
+    /// reached at yet. Its task can be up before its ENI reports a public
+    /// address. Enrolling now would advertise the relay's self-report, which is
+    /// task-local and unreachable for clients, so the relay retries until
+    /// `record_task` lands. A first enroll's token stays unconsumed, so the id
+    /// keeps counting as a launch in flight.
+    #[error("relay id has no recorded advertise addresses yet")]
+    AddrsPending,
     /// The ledger's storage failed while deciding — treated as a refusal so a
     /// storage fault fails closed rather than admitting an enroll.
     #[error("relay ledger storage error during enroll authorization: {0}")]
@@ -250,14 +277,16 @@ impl RelayLedger {
     ///
     /// A first enroll consumes the id's one-time token and binds the fingerprint
     /// in one atomic step; a reconnect re-presents the bound fingerprint and needs
-    /// no token. See [`EnrollRefusal`] for the refusal classes.
+    /// no token. Either way the id must already have its advertise set recorded,
+    /// which the authorization hands back. See [`EnrollRefusal`] for the refusal
+    /// classes.
     pub fn authorize_enroll(
         &self,
         relay_id: RelayId,
         cert_fingerprint: [u8; 32],
         token: Option<&str>,
         peer_ip: Option<IpAddr>,
-    ) -> Result<Authorized, EnrollRefusal> {
+    ) -> Result<AuthorizedEnroll, EnrollRefusal> {
         self.authorize_enroll_at(
             unix_secs_fail_closed(),
             relay_id,
@@ -277,12 +306,12 @@ impl RelayLedger {
         cert_fingerprint: [u8; 32],
         token: Option<&str>,
         peer_ip: Option<IpAddr>,
-    ) -> Result<Authorized, EnrollRefusal> {
+    ) -> Result<AuthorizedEnroll, EnrollRefusal> {
         let conn = self.conn.lock();
         let row = conn
             .query_row(
                 "SELECT retired_at, cert_fingerprint, token_hash, token_expires_at,
-                        token_consumed_at, expected_ips, launched_at
+                        expected_ips, addrs, launched_at
                  FROM provisioned_relays WHERE relay_id = ?1",
                 params![as_i64(relay_id.0)],
                 |row| {
@@ -291,7 +320,8 @@ impl RelayLedger {
                         cert_fingerprint: row.get(1)?,
                         token_hash: row.get(2)?,
                         token_expires_at: row.get(3)?,
-                        expected_ips: row.get(5)?,
+                        expected_ips: row.get(4)?,
+                        addrs: row.get(5)?,
                         launched_at: row.get(6)?,
                     })
                 },
@@ -319,15 +349,29 @@ impl RelayLedger {
             }
         }
 
+        // The advertise set is checked only once the caller has proven it holds
+        // the id (the bound certificate, or a valid token), so the distinct
+        // `AddrsPending` answer tells nothing to anyone else. A first enroll
+        // checks it before the token is consumed.
+        let addrs = match row.addrs.as_deref() {
+            Some(json) => parse_addrs(json)?,
+            None => Vec::new(),
+        };
+
         match row.cert_fingerprint {
             // Bound already: this is a reconnect. The token (if any) is ignored;
             // only the certificate matters, and it must be the bound one.
             Some(bound) => {
-                if constant_time_eq(&bound, &cert_fingerprint) {
-                    Ok(Authorized::Reenroll)
-                } else {
-                    Err(EnrollRefusal::FingerprintMismatch)
+                if !constant_time_eq(&bound, &cert_fingerprint) {
+                    return Err(EnrollRefusal::FingerprintMismatch);
                 }
+                if addrs.is_empty() {
+                    return Err(EnrollRefusal::AddrsPending);
+                }
+                Ok(AuthorizedEnroll {
+                    kind: Authorized::Reenroll,
+                    addrs,
+                })
             }
             // Unbound: a first enroll, which the one-time token authorizes.
             None => {
@@ -347,6 +391,11 @@ impl RelayLedger {
                 // the lock; this is the cheap constant-time gate in front of it.
                 if !constant_time_eq(&presented, &row.token_hash) {
                     return Err(EnrollRefusal::TokenInvalid);
+                }
+                // Refused before the UPDATE, so the token is still unspent when
+                // the relay redials once its addresses are recorded.
+                if addrs.is_empty() {
+                    return Err(EnrollRefusal::AddrsPending);
                 }
                 // Consume the token and bind the fingerprint in one statement,
                 // gated on the token still being unconsumed. Two enrolls racing on
@@ -369,7 +418,10 @@ impl RelayLedger {
                     // measurement rather than a nonsense delta.
                     let cold_start_secs =
                         (now != u64::MAX).then(|| now.saturating_sub(as_u64(row.launched_at)));
-                    Ok(Authorized::FirstEnroll { cold_start_secs })
+                    Ok(AuthorizedEnroll {
+                        kind: Authorized::FirstEnroll { cold_start_secs },
+                        addrs,
+                    })
                 } else {
                     Err(EnrollRefusal::TokenInvalid)
                 }
@@ -414,9 +466,9 @@ impl RelayLedger {
     /// enrolling from (any one of which matches), and the coordinator-resolved
     /// advertise-address set clients and peers reach it at. Both sets are stored
     /// as a JSON array of strings — canonical IPs for the expected set, `"ip:port"`
-    /// for the advertise set. The advertise set later overrides a hello's
-    /// self-reported addresses at enroll ([`advertised_addrs`](Self::advertised_addrs)),
-    /// and the expected set gates every enroll ([`authorize_enroll`](Self::authorize_enroll)).
+    /// for the advertise set. Until this runs, [`authorize_enroll`](Self::authorize_enroll)
+    /// refuses the id; from then on it enrolls advertised at `addrs` and only from
+    /// an address in `expected_ips`.
     pub fn record_task(
         &self,
         relay_id: RelayId,
@@ -480,10 +532,8 @@ impl RelayLedger {
     }
 
     /// The coordinator-resolved advertise-address set recorded for `relay_id`, in
-    /// stored order (first is the primary), or `None` when none was recorded — a
-    /// relay whose addresses were never set through
-    /// [`record_task`](Self::record_task), which then enrolls with its
-    /// self-reported hello addresses.
+    /// stored order (first is the primary), or `None` while
+    /// [`record_task`](Self::record_task) has not set one.
     pub fn advertised_addrs(
         &self,
         relay_id: RelayId,
@@ -497,15 +547,7 @@ impl RelayLedger {
             )
             .optional()?
             .flatten();
-        let Some(json) = stored else {
-            return Ok(None);
-        };
-        let strings: Vec<String> = serde_json::from_str(&json)?;
-        let addrs = strings
-            .iter()
-            .map(|s| s.parse::<SocketAddr>())
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(addrs))
+        stored.as_deref().map(parse_addrs).transpose()
     }
 
     /// The number of ids in `region` that are still launching at `now`: minted,
