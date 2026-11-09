@@ -85,6 +85,9 @@ Full rationale in `docs/architecture.md`. The ones easy to break by accident:
 - `unsafe` is denied workspace-wide; the hot-path FFI and the BW-thread ⇄
   Tokio-thread handoff live in `shieldbattery/game/`, not here.
 - CI enforces `cargo clippy --workspace --all-targets -- -D warnings`; keep it clean.
+- CI also runs `cargo doc --workspace --no-deps` with `RUSTDOCFLAGS=-D warnings`,
+  which clippy doesn't cover. Docs on a public item can't intra-link a
+  `pub(crate)` / `pub(in …)` item — describe it in words instead.
 - `Cargo.lock` is committed and CI builds `--locked` — commit it when deps change.
 - The datagram wire format is **protobuf**, generated from `proto/proto/wire.proto`
   by `protox` (pure-Rust, no `protoc` needed) in `proto/build.rs`. Edit the
