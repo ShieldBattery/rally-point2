@@ -52,6 +52,7 @@ mod leave;
 mod leave_announcer;
 mod phase;
 mod sync_generation;
+mod unpinned_source;
 
 pub use dial::{ClientEndpoint, DialError, EndpointError};
 pub use directive::DirectiveTracker;
