@@ -303,6 +303,104 @@ fn enroll_matches_any_ip_in_the_expected_set() {
 }
 
 #[test]
+fn an_ipv4_peer_seen_through_a_dual_stack_listener_matches_its_ipv4_entry() {
+    // A listener bound to the IPv6 wildcard also accepts IPv4 connections, and
+    // reports their peers as IPv4-mapped IPv6 addresses. That is the same host as
+    // the plain IPv4 address the task recorded, on a first enroll and a reconnect.
+    let ledger = ledger();
+    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+    let v4 = Ipv4Addr::new(203, 0, 113, 7);
+    let v6: IpAddr = "2001:db8::7".parse().unwrap();
+    let mapped: IpAddr = v4.to_ipv6_mapped().into();
+    let other_mapped: IpAddr = Ipv4Addr::new(198, 51, 100, 9).to_ipv6_mapped().into();
+    ledger
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/dual",
+            &[v6, v4.into()],
+            &[advertise_addr()],
+        )
+        .unwrap();
+
+    let first = ledger
+        .authorize_enroll_at(
+            1_010,
+            minted.relay_id,
+            fingerprint(0x21),
+            Some(&minted.token),
+            Some(mapped),
+        )
+        .unwrap();
+    assert!(matches!(first.kind, Authorized::FirstEnroll { .. }));
+
+    let reconnect = ledger
+        .authorize_enroll_at(
+            1_020,
+            minted.relay_id,
+            fingerprint(0x21),
+            None,
+            Some(mapped),
+        )
+        .unwrap();
+    assert_eq!(reconnect.kind, Authorized::Reenroll);
+
+    // The mapped form of an address outside the set is still refused.
+    let outside = ledger.authorize_enroll_at(
+        1_030,
+        minted.relay_id,
+        fingerprint(0x21),
+        None,
+        Some(other_mapped),
+    );
+    assert!(matches!(outside, Err(EnrollRefusal::IpMismatch)));
+}
+
+#[test]
+fn an_ipv4_mapped_expected_entry_matches_either_form_of_the_peer() {
+    // A recorded set may itself hold the IPv4-mapped form. It names the same host
+    // as the plain IPv4 address, so a peer reported in either form matches it.
+    let ledger = ledger();
+    let minted = ledger.mint_at(1_000, None, DAY).unwrap();
+    let v4 = Ipv4Addr::new(203, 0, 113, 7);
+    let mapped: IpAddr = v4.to_ipv6_mapped().into();
+    let other: IpAddr = Ipv4Addr::new(198, 51, 100, 9).into();
+    ledger
+        .record_task(
+            minted.relay_id,
+            "arn:aws:ecs:task/mapped",
+            &[mapped],
+            &[advertise_addr()],
+        )
+        .unwrap();
+
+    let first = ledger
+        .authorize_enroll_at(
+            1_010,
+            minted.relay_id,
+            fingerprint(0x22),
+            Some(&minted.token),
+            Some(mapped),
+        )
+        .unwrap();
+    assert!(matches!(first.kind, Authorized::FirstEnroll { .. }));
+
+    let plain = ledger
+        .authorize_enroll_at(
+            1_020,
+            minted.relay_id,
+            fingerprint(0x22),
+            None,
+            Some(v4.into()),
+        )
+        .unwrap();
+    assert_eq!(plain.kind, Authorized::Reenroll);
+
+    let outside =
+        ledger.authorize_enroll_at(1_030, minted.relay_id, fingerprint(0x22), None, Some(other));
+    assert!(matches!(outside, Err(EnrollRefusal::IpMismatch)));
+}
+
+#[test]
 fn an_empty_expected_set_gates_nothing() {
     // Recording an empty expected set leaves the gate open: any peer, or none,
     // enrolls — the posture for a substrate that resolves no address.

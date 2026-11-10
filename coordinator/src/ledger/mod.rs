@@ -344,9 +344,17 @@ impl RelayLedger {
         // address the server could not record. It presumes the coordinator is
         // directly exposed (the connection's transport-level peer address is the
         // relay's real one, not a reverse proxy's).
+        //
+        // Both sides are compared in canonical form: a listener bound to the IPv6
+        // wildcard reports an IPv4 peer as an IPv4-mapped IPv6 address, which is
+        // the same host as its plain IPv4 address, whichever form the recorded
+        // set holds.
         let expected = parse_expected_ips(row.expected_ips.as_deref())?;
         if !expected.is_empty() {
-            let matches = peer_ip.is_some_and(|ip| expected.contains(&ip));
+            let matches = peer_ip.is_some_and(|ip| {
+                let peer = ip.to_canonical();
+                expected.iter().any(|entry| entry.to_canonical() == peer)
+            });
             if !matches {
                 return Err(EnrollRefusal::IpMismatch);
             }
