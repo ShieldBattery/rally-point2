@@ -40,7 +40,8 @@ replayed push. `CoordinatorSink` zstd-compresses the blob, refuses one over
 the control connection, which gets a presigned URL and calls
 `flight_upload::spawn_put` to PUT straight to storage (3 attempts, 20s
 each) — never over the control socket. The `sent` oneshot fires only once
-stored; a dropped sender means lost.
+stored and its completion frame is sent; a dropped sender means incomplete
+delivery, even if an earlier upload stored the object.
 
 ## task_stats and tests
 No-op unless `ECS_CONTAINER_METADATA_URI_V4` is set (Fargate only).

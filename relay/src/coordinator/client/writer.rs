@@ -74,7 +74,8 @@ pub(super) enum FlightGrant {
 ///
 /// **The shipment is the durable part.** It lives in the caller-owned
 /// [`OutboundQueues::pending_flights`] from the moment it is pulled until it is
-/// stored (its `sent` ack fires) or dropped (refused/failed/timeout), so a
+/// stored and its completion frame is sent (its `sent` ack fires), or delivery is
+/// abandoned (refused/failed/timeout), so a
 /// connection death leaves it parked for the next connection to re-request.
 /// `request` and `stage` are current-connection scratch: request ids are minted per
 /// connection, so the next connection re-arms every parked shipment with a fresh id
@@ -82,7 +83,7 @@ pub(super) enum FlightGrant {
 /// entry.
 pub(super) struct PendingFlight {
     /// The parked shipment: its compressed bytes, and the `sent` ack fired only once
-    /// the recording is stored.
+    /// the recording is stored and its completion frame has been sent.
     pub(super) shipment: FlightShipment,
     /// The correlation id of the upload request outstanding for this shipment on the
     /// CURRENT connection. Re-minted on every (re)request.
@@ -118,9 +119,10 @@ pub(super) enum FlightStage {
 /// grant or refusal for that id, and on a grant this half spawns a detached PUT of the
 /// compressed bytes straight to the object store (see [`crate::observability::flight_upload`]), which
 /// reports its outcome over one shared per-connection completion channel. Only after a
-/// PUT stores the object does this half fire that shipment's `sent` ack (delivery
-/// means *stored*) and send a
-/// [`FlightUploadDone`](RelayToCoordinator::FlightUploadDone). A refusal, an upload
+/// PUT stores the object does this half send
+/// [`FlightUploadDone`](RelayToCoordinator::FlightUploadDone), then fire that
+/// shipment's `sent` ack. Until the completion send succeeds, the shipment stays
+/// parked for a fresh request and upload on reconnect. A refusal, an upload
 /// failure, or no grant within the connection's grant timeout
 /// ([`FLIGHT_GRANT_TIMEOUT`](super::FLIGHT_GRANT_TIMEOUT), which also covers an
 /// older coordinator that drops the request as unknown) drops that one recording with a log
@@ -133,11 +135,13 @@ pub(super) enum FlightStage {
 /// relay-wide bounded outbox and clears only on an exact memory receipt or expiry.
 /// A notice is parked *before* its send await
 /// and cleared only *after* it returns; a shipment is pushed onto `pending_flights`
-/// *before* its request send and removed only on ack (stored) or drop (lost) — so if
+/// *before* its request send and removed only after storage and completion-send
+/// success, or after abandoning delivery — so if
 /// this future is dropped (the read half ended the connection) or a send errors
 /// mid-frame, every undelivered item stays parked and the next connection re-delivers
 /// it (a shipment re-*requests* an upload URL with a fresh id), while a
-/// delivered/stored item is already cleared and never re-run.
+/// completed item is already cleared and never re-run. An abandoned retry may
+/// leave an already-stored blob whose completion was not reported.
 pub(super) async fn write_control_frames(
     mut sink: impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     outbound: &mut OutboundQueues,
@@ -338,7 +342,7 @@ pub(super) async fn write_control_frames(
                     None => flight_grant_open = false,
                     // A grant for a shipment still awaiting one: spawn the detached PUT
                     // of its compressed bytes and mark it uploading. The shipment stays
-                    // parked (its `sent` ack fires only on a stored PUT), so a
+                    // parked until the PUT and completion send succeed, so a
                     // connection death mid-upload re-requests it on the next connection.
                     Some(FlightGrant::Granted { request, url }) => {
                         if let Some(flight) = pending_flights.iter_mut().find(|f| {
@@ -372,8 +376,8 @@ pub(super) async fn write_control_frames(
             }
 
             // A detached PUT reported its outcome over the shared completion channel.
-            // On stored, fire the ack (delivery means stored) and tell the coordinator
-            // so it runs its post-store bookkeeping; on failure, drop the recording.
+            // On stored, send the completion before firing the ack so cancellation
+            // retains the shipment for retry; on failure, abandon this delivery.
             done = put_done_rx.recv() => {
                 let flight_upload::FlightPutDone { request, outcome } = done
                     .expect("the write half holds a completion sender for the connection's life");
@@ -383,9 +387,9 @@ pub(super) async fn write_control_frames(
                 {
                     match outcome {
                         PutOutcome::Stored => {
+                            send_flight_done(&mut sink, request).await?;
                             let flight = pending_flights.swap_remove(index);
                             let _ = flight.shipment.sent.send(());
-                            send_flight_done(&mut sink, request).await?;
                         }
                         PutOutcome::Failed => {
                             let flight = pending_flights.swap_remove(index);
@@ -596,10 +600,10 @@ pub(super) async fn write_control_frames(
     }
 }
 
-/// Drops an in-flight flight shipment that will not be stored (refused, upload
-/// failed, or no grant in time), logging the loss. Dropping the entry drops its
-/// shipment's `sent` ack, which resolves the sink's await as not-stored — flight data
-/// is observability, never backpressure on a session teardown.
+/// Abandons a shipment after a refusal, upload failure, or grant timeout, logging
+/// incomplete delivery. Dropping the entry drops its `sent` ack; an earlier PUT
+/// may already have stored the object. Flight data is observability, never
+/// backpressure on a session teardown.
 fn drop_flight(flight: PendingFlight, relay_id: RelayId, reason: &str) {
     let shipment = flight.shipment;
     tracing::warn!(
@@ -608,10 +612,10 @@ fn drop_flight(flight: PendingFlight, relay_id: RelayId, reason: &str) {
         session = shipment.session.0,
         bytes = shipment.payload.len(),
         reason,
-        "dropping a flight recording; flight data is never backpressure",
+        "abandoning flight recording delivery; a prior upload may already be stored",
     );
     // `shipment` drops here, dropping its `sent` ack so the sink await resolves as
-    // not-stored.
+    // incomplete delivery, without claiming that no object was stored.
 }
 
 /// Sends a [`RelayToCoordinator::Draining`] up the control connection, asking the

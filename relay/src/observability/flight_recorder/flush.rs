@@ -114,7 +114,7 @@ impl FlightRecorder {
                     %error,
                     tenant = key.tenant.as_ref(),
                     session = key.session.0,
-                    "flight recording store failed; the blob is lost",
+                    "flight recording delivery failed; storage or completion is unconfirmed",
                 );
                 FlushOutcome::Failed
             }

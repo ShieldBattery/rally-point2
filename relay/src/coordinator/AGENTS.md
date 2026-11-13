@@ -23,7 +23,8 @@ coordinator outage must leave running games untouched.
   locks the relay out permanently.
 - **Undelivered work is caller-owned.** `OutboundQueues` outlives each connection:
   a notice is parked *before* its send await and cleared only after; a shipment
-  stays in `pending_flights` until stored or dropped. Don't move it into the loop.
+  stays in `pending_flights` until stored and its completion frame is sent, or
+  delivery is abandoned. Don't move it into the loop.
 - Descriptor sets are declarative — a full set replaces (absences are leaves), a
   delta mutates what the connect-time full set established. One ordered connection
   orders full-set before delta. Requested installation barrier ids only correlate

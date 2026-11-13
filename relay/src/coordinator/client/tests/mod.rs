@@ -42,6 +42,7 @@ mod enroll;
 mod evidence_compat;
 mod fence;
 mod flight;
+mod flight_completion;
 mod notices;
 mod periodic_reporting;
 mod presence;

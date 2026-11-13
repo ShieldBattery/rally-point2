@@ -120,14 +120,14 @@ pub const DRAIN_FLUSH_CONCURRENCY: usize = 16;
 
 /// One flushed recording handed to the coordinator control connection: the metadata
 /// the relay's upload request carries, the compressed bytes it PUTs to storage, and a
-/// one-shot the connection fires once the recording is **stored**.
+/// one-shot the connection fires once the recording is stored and its completion
+/// frame has been sent to the coordinator.
 ///
 /// The sink awaits that `sent` ack, so the drain path's
 /// [`DRAIN_FLUSH_TIMEOUT`](super::DRAIN_FLUSH_TIMEOUT)-bounded [`FlightRecorder::flush_all`](super::FlightRecorder::flush_all) waits for real
-/// storage rather than mere enqueueing. The ack fires only after a successful upload
-/// PUT; a dropped sender (the coordinator refused the upload, the PUT failed or timed
-/// out, or the connection tore down) resolves the sink's await as an error, so the
-/// recording is reported lost rather than stored.
+/// storage and completion notification rather than mere enqueueing. A dropped
+/// sender resolves the sink's await as an error. An earlier upload may already
+/// have stored the object even when a completion retry is abandoned.
 pub struct FlightShipment {
     /// The tenant the recording's session belongs to.
     pub tenant: TenantId,
@@ -140,10 +140,8 @@ pub struct FlightShipment {
     /// relay PUTs to the presigned URL. Cheaply cloneable so an in-progress upload can
     /// own a copy while the shipment stays parked for a re-request across a reconnect.
     pub payload: Bytes,
-    /// Fired by the connection once the recording is stored (a successful upload PUT).
-    /// A dropped sender (an upload refusal, PUT failure/timeout, or connection
-    /// teardown) resolves the sink's await as an error, so an unstored recording is
-    /// reported lost rather than stored.
+    /// Fired after a successful upload PUT and completion-frame send. A dropped
+    /// sender reports incomplete delivery; it does not prove the object is absent.
     pub sent: oneshot::Sender<()>,
 }
 
@@ -242,12 +240,11 @@ impl FlightSink for CoordinatorSink {
                 .map_err(|error| {
                     std::io::Error::other(format!("flight shipment queue unavailable: {error}"))
                 })?;
-            // Resolve only once the connection reports the recording stored (a
-            // successful upload PUT); a dropped ack sender (a refusal, PUT failure, or
-            // teardown) means it was not stored.
+            // Resolve only after the upload and completion send succeed. A dropped
+            // sender leaves delivery incomplete, even if an earlier PUT succeeded.
             sent_rx
                 .await
-                .map_err(|_| std::io::Error::other("flight shipment dropped before it was stored"))
+                .map_err(|_| std::io::Error::other("flight shipment delivery was not completed"))
         })
     }
 }
