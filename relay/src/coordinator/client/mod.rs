@@ -59,7 +59,9 @@ use crate::observability::flight_recorder::FlightShipment;
 use crate::routing::Sessions;
 
 mod connect;
+mod dial;
 mod heartbeat;
+mod liveness;
 mod reader;
 mod writer;
 
@@ -576,6 +578,12 @@ pub enum ControlError {
     /// because `tungstenite::Error` is large and would bloat every `Result`.
     #[error("coordinator control connection failed: {0}")]
     WebSocket(Box<tokio_tungstenite::tungstenite::Error>),
+    /// A control connection operation exceeded its deadline.
+    #[error("coordinator control {0} timed out")]
+    Timeout(&'static str),
+    /// DNS or TCP connection failed.
+    #[error("coordinator control network failure: {0}")]
+    Network(#[from] std::io::Error),
     /// A pushed control message did not decode.
     #[error("decoding a coordinator control message failed: {0}")]
     Decode(#[from] serde_json::Error),

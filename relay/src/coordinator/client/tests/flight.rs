@@ -357,6 +357,8 @@ impl WriterHarness {
             identity_key: throwaway_identity_key(),
             grants,
             routes: Some(WriterRoutes {
+                probe_rx: tokio::sync::mpsc::unbounded_channel().1,
+                timing: ControlTiming::default(),
                 challenge_rx,
                 flight_grant_rx,
                 load_state_rx,

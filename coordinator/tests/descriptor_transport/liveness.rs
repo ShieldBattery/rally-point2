@@ -14,10 +14,59 @@ use tokio::time::timeout;
 use crate::common::{prove_identity, relay_key};
 use crate::helpers::*;
 
-/// The shortened liveness deadline both tests run against — short enough that a
+/// The shortened liveness deadline these tests run against — short enough that a
 /// silent relay is dropped promptly, still several times the heartbeat interval
 /// the heartbeating test uses.
 const LIVENESS_DEADLINE: Duration = Duration::from_millis(300);
+
+#[tokio::test]
+async fn an_idle_coordinator_echoes_websocket_probes_without_application_pushes() {
+    use futures_util::{SinkExt, StreamExt};
+    use rally_point_proto::control::RelayToCoordinator;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let (base_url, reg) = serve_bare_coordinator(api::HELLO_TIMEOUT, LIVENESS_DEADLINE).await;
+    let ws_url = format!("{}/relay/control", base_url.replace("http://", "ws://"));
+    let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+    let hello = serde_json::to_string(&RelayToCoordinator::Hello(relay_hello(7, 15007))).unwrap();
+    socket.send(Message::Text(hello.into())).await.unwrap();
+    prove_identity(&mut socket, &relay_key(7)).await;
+    assert!(wait_for_enrollment(&reg, RelayId(7)).await);
+
+    // No roster changes or application replies are needed for either endpoint to
+    // prove liveness. The socket reader must flush its automatic Pong even while
+    // the coordinator's application writer has nothing to send.
+    let until = tokio::time::Instant::now() + LIVENESS_DEADLINE * 2;
+    let mut sequence = 0u64;
+    while tokio::time::Instant::now() < until {
+        let payload = sequence.to_be_bytes().to_vec();
+        timeout(Duration::from_secs(2), async {
+            socket
+                .send(Message::Ping(payload.clone().into()))
+                .await
+                .unwrap();
+            loop {
+                match socket.next().await.expect("connection stays open").unwrap() {
+                    Message::Pong(reply) => {
+                        assert_eq!(reply.as_ref(), payload.as_slice());
+                        break;
+                    }
+                    Message::Text(_) => {}
+                    other => panic!("unexpected frame while awaiting Pong: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("the coordinator answers the probe promptly");
+        assert!(registry::peer(&reg, RelayId(7)).is_some());
+        sequence += 1;
+        tokio::time::sleep(LIVENESS_DEADLINE / 6).await;
+    }
+    assert!(
+        sequence >= 2,
+        "distinct probes are answered on the same connection"
+    );
+}
 
 #[tokio::test]
 async fn a_silent_relay_is_deregistered_after_the_liveness_deadline() {

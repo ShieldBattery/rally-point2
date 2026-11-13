@@ -26,6 +26,7 @@ use super::heartbeat::{
     LoadStateAnswer, LoadStateAsk, heartbeat_presence_with_evidence, heartbeat_region_rtts,
     start_load_state_answer, unsent_periodic_candidates,
 };
+use super::liveness::ControlTiming;
 use super::{
     ControlError, HeartbeatConfig, LOAD_STATE_ASK_CAPACITY, MAX_INFLIGHT_FLIGHT_UPLOADS,
     OutboundQueues,
@@ -46,6 +47,10 @@ pub(super) struct WriterRoutes {
     pub(super) load_state_rx: Receiver<LoadStateAsk>,
     /// Latest requested descriptor barrier completed on this connection.
     pub(super) descriptor_ack_rx: watch::Receiver<Option<u64>>,
+    /// Connection-local probes, prioritized over ordinary outbound work.
+    pub(super) probe_rx: UnboundedReceiver<Vec<u8>>,
+    /// Per-connection deadlines used by every outbound send.
+    pub(super) timing: ControlTiming,
 }
 
 /// A coordinator's answer to a [`FlightUploadRequest`](RelayToCoordinator::FlightUploadRequest),
@@ -105,7 +110,7 @@ pub(super) enum FlightStage {
 }
 
 /// The write half of an enrolled control connection: owns every send and drives a
-/// `biased` priority order so bulk can never delay control. Highest first: a drain
+/// `biased` priority order so bulk can never delay control. Highest first: a probe, then a drain
 /// re-assert, then queued notices, then a routed identity-proof answer, then a
 /// descriptor installation acknowledgement, then the flight-upload arms (a routed grant/refusal, a completed upload, an expired grant
 /// wait), then the periodic heartbeat, and last a fresh flight shipment — so a
@@ -156,6 +161,8 @@ pub(super) async fn write_control_frames(
         mut flight_grant_rx,
         mut load_state_rx,
         mut descriptor_ack_rx,
+        mut probe_rx,
+        timing,
     } = routes;
     // Split the caller-owned queues into their fields. The park/clear discipline
     // below mutates these in place, so whatever stays parked here is exactly what the
@@ -240,7 +247,7 @@ pub(super) async fn write_control_frames(
         };
         // A send error ends the connection (via `?`) with the shipment still parked,
         // so the next connection re-requests it.
-        send_flight_request(&mut sink, flight.request, &flight.shipment).await?;
+        send_flight_request(&mut sink, flight.request, &flight.shipment, timing.write).await?;
     }
 
     loop {
@@ -271,6 +278,10 @@ pub(super) async fn write_control_frames(
         tokio::select! {
             biased;
 
+            Some(probe) = probe_rx.recv() => {
+                super::liveness::send(&mut sink, Message::Ping(probe.into()), timing.write).await?;
+            }
+
             // The drain sequence flipped the flag: ask the coordinator to stop
             // assigning us new sessions. A send error ends the connection; the next
             // reconnect re-asserts the drain right after its Hello.
@@ -278,7 +289,7 @@ pub(super) async fn write_control_frames(
                 match changed {
                     Ok(()) => {
                         if *drain.borrow_and_update() {
-                            send_draining(&mut sink).await?;
+                            send_draining(&mut sink, timing.write).await?;
                         }
                     }
                     // The drain sender was dropped: no drain will ever come.
@@ -298,7 +309,7 @@ pub(super) async fn write_control_frames(
                         *pending = Some(notice);
                         // A send error ends the connection (via `?`) with the notice
                         // still pending, so the next connection flushes it.
-                        send_notice(&mut sink, pending.as_ref().expect("just set")).await?;
+                        send_notice(&mut sink, pending.as_ref().expect("just set"), timing.write).await?;
                         *pending = None;
                     }
                     None => notifier_open = false,
@@ -311,7 +322,7 @@ pub(super) async fn write_control_frames(
             nonce = challenge_rx.recv(), if challenge_open => {
                 match nonce {
                     Some(nonce) => {
-                        answer_identity_challenge(&mut sink, identity_key, &nonce, relay_id).await?;
+                        answer_identity_challenge(&mut sink, identity_key, &nonce, relay_id, timing.write).await?;
                     }
                     None => challenge_open = false,
                 }
@@ -327,7 +338,7 @@ pub(super) async fn write_control_frames(
                             let frame = serde_json::to_string(
                                 &RelayToCoordinator::DescriptorsApplied { ack_id },
                             ).expect("a descriptor acknowledgement serializes");
-                            sink.send(Message::Text(frame.into())).await?;
+                            super::liveness::send(&mut sink, Message::Text(frame.into()), timing.write).await?;
                         }
                     }
                     Err(_) => descriptor_ack_open = false,
@@ -387,7 +398,7 @@ pub(super) async fn write_control_frames(
                 {
                     match outcome {
                         PutOutcome::Stored => {
-                            send_flight_done(&mut sink, request).await?;
+                            send_flight_done(&mut sink, request, timing.write).await?;
                             let flight = pending_flights.swap_remove(index);
                             let _ = flight.shipment.sent.send(());
                         }
@@ -454,7 +465,7 @@ pub(super) async fn write_control_frames(
                 let frame = serde_json::to_string(&RelayToCoordinator::Heartbeat {
                     roster_complete: true, sessions, region_rtts,
                 }).expect("a heartbeat always serializes");
-                sink.send(Message::Text(frame.into())).await?;
+                super::liveness::send(&mut sink, Message::Text(frame.into()), timing.write).await?;
                 heartbeat_sent.extend(attached);
 
             }
@@ -482,7 +493,7 @@ pub(super) async fn write_control_frames(
                     reports_turns: true,
                 })
                 .expect("a load-state snapshot always serializes");
-                sink.send(Message::Text(frame.into())).await?;
+                super::liveness::send(&mut sink, Message::Text(frame.into()), timing.write).await?;
             }
 
             // A load-state request the read half routed here. Ranked BELOW the
@@ -528,7 +539,7 @@ pub(super) async fn write_control_frames(
                 }
                 let frame = serde_json::to_string(&RelayToCoordinator::EvidenceReport(Box::new(report)))
                     .expect("a retained evidence report serializes");
-                sink.send(Message::Text(frame.into())).await?;
+                super::liveness::send(&mut sink, Message::Text(frame.into()), timing.write).await?;
             }
 
             // A watch coalesces collector changes instead of queueing sample
@@ -562,7 +573,7 @@ pub(super) async fn write_control_frames(
                 {
                     let frame = serde_json::to_string(&RelayToCoordinator::SlotEvidence(notice))
                         .expect("a periodic evidence notice serializes");
-                    sink.send(Message::Text(frame.into())).await?;
+                    super::liveness::send(&mut sink, Message::Text(frame.into()), timing.write).await?;
                     periodic_sent.insert((key, slot, sequence));
                 }
             }
@@ -590,6 +601,7 @@ pub(super) async fn write_control_frames(
                             &mut sink,
                             request,
                             &pending_flights.last().expect("just pushed").shipment,
+                            timing.write,
                         )
                         .await?;
                     }
@@ -622,10 +634,11 @@ fn drop_flight(flight: PendingFlight, relay_id: RelayId, reason: &str) {
 /// coordinator to stop assigning this relay new sessions.
 pub(super) async fn send_draining(
     socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
+    write_timeout: std::time::Duration,
 ) -> Result<(), ControlError> {
     let frame =
         serde_json::to_string(&RelayToCoordinator::Draining).expect("a draining frame serializes");
-    socket.send(Message::Text(frame.into())).await?;
+    super::liveness::send(socket, Message::Text(frame.into()), write_timeout).await?;
     Ok(())
 }
 
@@ -634,6 +647,7 @@ pub(super) async fn send_draining(
 pub(super) async fn send_notice(
     socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     notice: &RelayNotice,
+    write_timeout: std::time::Duration,
 ) -> Result<(), ControlError> {
     let frame = match notice {
         RelayNotice::Departure(notice) => RelayToCoordinator::Departure(notice.clone()),
@@ -649,7 +663,7 @@ pub(super) async fn send_notice(
         },
     };
     let text = serde_json::to_string(&frame).expect("a relay notice always serializes");
-    socket.send(Message::Text(text.into())).await?;
+    super::liveness::send(socket, Message::Text(text.into()), write_timeout).await?;
     Ok(())
 }
 
@@ -661,6 +675,7 @@ async fn send_flight_request(
     socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     request: u64,
     shipment: &FlightShipment,
+    write_timeout: std::time::Duration,
 ) -> Result<(), ControlError> {
     let frame = serde_json::to_string(&RelayToCoordinator::FlightUploadRequest {
         request,
@@ -670,7 +685,7 @@ async fn send_flight_request(
         bytes: shipment.payload.len() as u64,
     })
     .expect("a flight upload request always serializes");
-    socket.send(Message::Text(frame.into())).await?;
+    super::liveness::send(socket, Message::Text(frame.into()), write_timeout).await?;
     Ok(())
 }
 
@@ -680,9 +695,10 @@ async fn send_flight_request(
 async fn send_flight_done(
     socket: &mut (impl SinkExt<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin),
     request: u64,
+    write_timeout: std::time::Duration,
 ) -> Result<(), ControlError> {
     let frame = serde_json::to_string(&RelayToCoordinator::FlightUploadDone { request })
         .expect("a flight upload done always serializes");
-    socket.send(Message::Text(frame.into())).await?;
+    super::liveness::send(socket, Message::Text(frame.into()), write_timeout).await?;
     Ok(())
 }

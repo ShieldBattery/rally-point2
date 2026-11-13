@@ -163,6 +163,8 @@ fn targets() -> ControlApplyTargets {
 
 fn routes(descriptor_ack_tx: watch::Sender<Option<u64>>) -> ReaderRoutes {
     ReaderRoutes {
+        pong_tx: tokio::sync::mpsc::channel(16).0,
+        accepted_tx: watch::channel(false).0,
         challenge_tx: mpsc::unbounded_channel().0,
         flight_grant_tx: mpsc::unbounded_channel().0,
         load_state_tx: mpsc::channel(LOAD_STATE_ASK_CAPACITY).0,

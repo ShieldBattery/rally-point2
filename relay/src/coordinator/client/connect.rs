@@ -21,6 +21,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
+use super::liveness::ControlTiming;
 use super::reader::{ReaderRoutes, read_control_frames};
 use super::writer::{WriterRoutes, send_draining, send_notice, write_control_frames};
 use super::{
@@ -125,6 +126,37 @@ pub async fn run_descriptor_subscriber(
 pub async fn run_descriptor_subscriber_with(
     enroll: EnrollConfig,
     apply_targets: ControlApplyTargets,
+    outbound: OutboundQueues,
+    heartbeat: HeartbeatConfig,
+    drain: watch::Receiver<bool>,
+    control_connected: watch::Sender<bool>,
+    backoff: ReconnectBackoff,
+) {
+    run_descriptor_subscriber_timed(
+        enroll,
+        apply_targets,
+        outbound,
+        heartbeat,
+        drain,
+        control_connected,
+        ControlConfig {
+            backoff,
+            timing: ControlTiming::default(),
+        },
+    )
+    .await
+}
+
+/// Reconnect policy and deadlines for one subscriber.
+pub(super) struct ControlConfig {
+    pub(super) backoff: ReconnectBackoff,
+    pub(super) timing: ControlTiming,
+}
+
+/// Internal entry point for exercising control deadlines without changing the public API.
+pub(super) async fn run_descriptor_subscriber_timed(
+    enroll: EnrollConfig,
+    apply_targets: ControlApplyTargets,
     // Caller-owned across reconnects: this loop owns the outbound queues and lends
     // `&mut` per connection, so a notice or shipment parked when a connection dies
     // rides the next connection's flush rather than being lost.
@@ -132,8 +164,9 @@ pub async fn run_descriptor_subscriber_with(
     heartbeat: HeartbeatConfig,
     mut drain: watch::Receiver<bool>,
     control_connected: watch::Sender<bool>,
-    backoff: ReconnectBackoff,
+    config: ControlConfig,
 ) {
+    let ControlConfig { backoff, timing } = config;
     let relay_id = enroll.relay_hello.relay_id;
 
     loop {
@@ -144,6 +177,7 @@ pub async fn run_descriptor_subscriber_with(
             &heartbeat,
             &mut drain,
             &control_connected,
+            timing,
         )
         .await
         {
@@ -215,9 +249,8 @@ pub async fn run_descriptor_subscriber_with(
 /// `pending` slot and `pending_flights` table the single source of undelivered
 /// state across a reconnect.
 ///
-/// A heartbeat send that fails ends the connection so the caller redials: on a
-/// half-open socket (a silently dead coordinator) the periodic send is what
-/// eventually surfaces the failure, since no inbound frame arrives to reveal it.
+/// A matching WebSocket Pong proves bidirectional control connectivity. Missing
+/// replies and stalled writes end the connection so the caller redials.
 async fn connect_and_stream(
     enroll: &EnrollConfig,
     apply_targets: &ControlApplyTargets,
@@ -225,16 +258,17 @@ async fn connect_and_stream(
     heartbeat: &HeartbeatConfig,
     drain: &mut watch::Receiver<bool>,
     control_connected: &watch::Sender<bool>,
+    timing: ControlTiming,
 ) -> Result<ControlDisconnect, ControlError> {
     let relay_id = enroll.relay_hello.relay_id;
     let request = build_request(&enroll.coordinator_url, enroll.bootstrap_secret.as_deref())?;
-    let (mut socket, _response) = tokio_tungstenite::connect_async(request).await?;
+    let (mut socket, _) = super::dial::connect(request, timing).await?;
 
     // Enroll: the first frame is this relay's Hello, registering it on the same
     // authenticated connection that then carries descriptor pushes back.
     let hello = serde_json::to_string(&RelayToCoordinator::Hello(enroll.relay_hello.clone()))
         .expect("a relay hello always serializes");
-    socket.send(Message::Text(hello.into())).await?;
+    super::liveness::send(&mut socket, Message::Text(hello.into()), timing.write).await?;
     tracing::info!(
         relay_id = relay_id.0,
         "coordinator control connection established",
@@ -247,8 +281,15 @@ async fn connect_and_stream(
     // first, the coordinator would read that instead and refuse the enroll — and
     // a pending notice persists across reconnects, locking the relay out of
     // re-enrolling indefinitely. Read frames until the challenge is answered.
+    let challenge_deadline = tokio::time::Instant::now() + timing.challenge;
     loop {
-        match socket.next().await {
+        if tokio::time::Instant::now() >= challenge_deadline {
+            return Err(ControlError::Timeout("enrollment challenge"));
+        }
+        match tokio::time::timeout_at(challenge_deadline, socket.next())
+            .await
+            .map_err(|_| ControlError::Timeout("enrollment challenge"))?
+        {
             Some(Ok(Message::Text(text))) => {
                 match serde_json::from_str::<CoordinatorToRelay>(text.as_str())? {
                     CoordinatorToRelay::IdentityChallenge { nonce } => {
@@ -257,6 +298,7 @@ async fn connect_and_stream(
                             &enroll.identity_key,
                             &nonce,
                             relay_id,
+                            timing.write,
                         )
                         .await?;
                         break;
@@ -295,20 +337,27 @@ async fn connect_and_stream(
     // the coordinator was down (or one a failed send left pending) must go out on
     // this fresh connection before anything else, so it is not lost to the
     // reconnect. On send failure it stays pending and rides the next reconnect.
-    if let Some(notice) = outbound.pending.as_ref() {
-        send_notice(&mut socket, notice).await?;
-        outbound.pending = None;
-    }
+    let acceptance_deadline = tokio::time::Instant::now() + timing.acceptance;
+    tokio::time::timeout_at(acceptance_deadline, async {
+        if let Some(notice) = outbound.pending.as_ref() {
+            send_notice(&mut socket, notice, timing.write).await?;
+            outbound.pending = None;
+        }
 
-    // Re-assert a drain that is already in progress. A re-enroll clears the
-    // coordinator-side draining flag, so if we are mid-drain this fresh connection
-    // must re-send `Draining` (right after enrolling, ahead of the steady-state
-    // loop) or the coordinator would treat us as available again.
-    // `borrow_and_update` also marks the current value seen, so the loop's
-    // `drain.changed()` below fires only on a *new* transition.
-    if *drain.borrow_and_update() {
-        send_draining(&mut socket).await?;
-    }
+        // Re-assert a drain that is already in progress. A re-enroll clears the
+        // coordinator-side draining flag, so if we are mid-drain this fresh connection
+        // must re-send `Draining` (right after enrolling, ahead of the steady-state
+        // loop) or the coordinator would treat us as available again.
+        // `borrow_and_update` also marks the current value seen, so the loop's
+        // `drain.changed()` below fires only on a *new* transition.
+        if *drain.borrow_and_update() {
+            send_draining(&mut socket, timing.write).await?;
+        }
+
+        Ok::<(), ControlError>(())
+    })
+    .await
+    .map_err(|_| ControlError::Timeout("enrollment acceptance"))??;
 
     // Shipments held over from a prior connection are NOT flushed here: their bytes
     // never ride the socket. They stay parked in `pending_flights`, and the write half
@@ -355,7 +404,11 @@ async fn connect_and_stream(
     // spawned task to leak, and the caller-owned `outbound` slots — mutated in place
     // by the writer through `&mut` — carry whatever stayed undelivered straight back
     // to the caller no matter which half ended the connection.
+    let (probe_tx, probe_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (pong_tx, pong_rx) = tokio::sync::mpsc::channel(16);
+    let (accepted_tx, accepted_rx) = watch::channel(false);
     tokio::select! {
+        result = super::liveness::monitor(probe_tx, pong_rx, accepted_rx, timing, acceptance_deadline) => result,
         result = read_control_frames(
             stream,
             apply_targets,
@@ -365,6 +418,8 @@ async fn connect_and_stream(
                 flight_grant_tx,
                 load_state_tx,
                 descriptor_ack_tx,
+                pong_tx,
+                accepted_tx,
             },
             read_stats,
             control_connected,
@@ -381,6 +436,8 @@ async fn connect_and_stream(
                 flight_grant_rx,
                 load_state_rx,
                 descriptor_ack_rx,
+                probe_rx,
+                timing,
             },
         ) => result,
     }
@@ -402,12 +459,13 @@ pub(super) async fn answer_identity_challenge(
     identity_key: &PrivateKeyDer<'static>,
     nonce: &[u8; 32],
     relay_id: RelayId,
+    write_timeout: std::time::Duration,
 ) -> Result<(), ControlError> {
     match sign_enroll_proof(identity_key, nonce) {
         Some(signature) => {
             let frame = serde_json::to_string(&RelayToCoordinator::IdentityProof { signature })
                 .expect("an identity-proof frame always serializes");
-            socket.send(Message::Text(frame.into())).await?;
+            super::liveness::send(socket, Message::Text(frame.into()), write_timeout).await?;
             Ok(())
         }
         None => {

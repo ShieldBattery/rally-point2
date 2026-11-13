@@ -1536,10 +1536,12 @@ That buys three things: the coordinator pushes a change the instant it happens (
 staleness); the connection carries liveness directly — a clean drop is an immediate "this relay is gone"
 signal, and a connection that dies *without* a close (a crashed relay, a half-open TCP, or a peer that
 stopped reading and stalls the coordinator's sends under backpressure) is caught within a bounded window
-by the relay's periodic heartbeat plus a coordinator-side liveness deadline that also bounds the
-descriptor sends — exactly what presence tracking and failover want, instead of inferring death from
-missed polls; and the two directions share one connection instead of two periodic round-trips. It is a
-WebSocket rather than QUIC because the coordinator is deliberately an HTTP service and a low-frequency
+by the coordinator's inbound liveness deadline and the relay's WebSocket ping/pong deadline. Both sides
+also bound their writes, so a socket stuck under backpressure cannot hold either connection loop open.
+The relay requires the matching Pong for its outstanding probe: successful buffered writes, unrelated
+descriptor traffic, and stale Pongs do not prove that the coordinator received that probe. Standard
+WebSocket probes work with the coordinator's automatic Pong handling without a control-protocol change.
+It is a WebSocket rather than QUIC because the coordinator is deliberately an HTTP service and a low-frequency
 control channel gains nothing from QUIC's congestion control or stream multiplexing — a held TCP
 connection is plenty, and rides the server that already exists.
 
@@ -1575,8 +1577,18 @@ enrolling under a `relay_id` another live connection already holds, closing the 
 check-then-insert would leave for two concurrent enrolls to both pass. Together with the fleet-membership
 secret, this is what a relay's enrolled identity now rests on — the same enrolled `(relay_id, cert
 fingerprint)` pairing the mesh acceptor pins against (see [Mesh trust](#the-mesh-relay--relay)). The
-relay→coordinator heartbeat rides this same channel — it doubles as the keepalive that surfaces a
-connection that died without a close.
+relay→coordinator heartbeat rides this same channel and refreshes the coordinator's view of the relay's
+sessions. Round-trip WebSocket probes independently detect a connection that died without a close.
+
+**Bounded recovery.** DNS resolution, connection establishment, the enrollment challenge, acceptance, and individual
+writes have ten-second deadlines. An enrolled relay sends a probe after ten seconds and allows fifteen
+seconds for its matching Pong, leaving reply time after a preceding write nearly consumes its budget.
+Resolved addresses are raced with a 250 ms stagger through TCP, TLS, and the WebSocket
+upgrade, retaining the original hostname for certificate validation and the HTTP request. A blackholed
+address or a peer that accepts TCP but never completes its handshake cannot prevent another address
+from connecting. Every reconnect considers the full resolved address set, including after a transient
+enrollment refusal. A timeout ends only the control connection; the game data plane keeps running, and
+caller-owned pending notices and recordings remain available to the next connection.
 
 **A provisioned-identity ledger (optional) removes the offline-but-claimable state.** Proof of possession
 still lets *any* id be claimed with *any* freshly generated certificate, so a bootstrap-secret holder could

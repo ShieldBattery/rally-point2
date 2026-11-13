@@ -37,6 +37,8 @@ fn routes() -> (WriterRoutes, mpsc::UnboundedSender<FlightGrant>) {
             flight_grant_rx,
             load_state_rx: mpsc::channel(1).1,
             descriptor_ack_rx: watch::channel(None).1,
+            probe_rx: mpsc::unbounded_channel().1,
+            timing: ControlTiming::default(),
         },
         grants,
     )

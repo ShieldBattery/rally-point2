@@ -220,3 +220,88 @@ async fn a_retired_close_stops_redialing_and_flips_the_retired_signal() {
         "a retired relay's id is tombstoned, so it must never redial",
     );
 }
+
+#[tokio::test]
+async fn missing_pong_redials_even_while_application_frames_arrive() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        accept_enroll(&mut ws).await;
+        let keys = serde_json::to_string(&CoordinatorToRelay::TenantKeys { keys: vec![] }).unwrap();
+        ws.send(Message::Text(keys.clone().into())).await.unwrap();
+        let (mut reader, mut writer) = ws.into_inner().into_split();
+        // Read complete frames on a dedicated task: cancelling read_exact midway
+        // through a frame would lose the framing position.
+        let ping = tokio::spawn(async move {
+            async fn read_opcode(
+                reader: &mut (impl tokio::io::AsyncRead + Unpin),
+            ) -> std::io::Result<u8> {
+                let mut header = [0u8; 2];
+                reader.read_exact(&mut header).await?;
+                let length = match header[1] & 0x7f {
+                    126 => {
+                        let mut bytes = [0; 2];
+                        reader.read_exact(&mut bytes).await?;
+                        u64::from(u16::from_be_bytes(bytes))
+                    }
+                    127 => {
+                        let mut bytes = [0; 8];
+                        reader.read_exact(&mut bytes).await?;
+                        u64::from_be_bytes(bytes)
+                    }
+                    length => u64::from(length),
+                };
+                if header[1] & 0x80 != 0 {
+                    let mut mask = [0; 4];
+                    reader.read_exact(&mut mask).await?;
+                }
+                let mut remaining = length;
+                let mut buffer = [0; 1024];
+                while remaining > 0 {
+                    let size = remaining.min(buffer.len() as u64) as usize;
+                    reader.read_exact(&mut buffer[..size]).await?;
+                    remaining -= size as u64;
+                }
+                Ok(header[0] & 0x0f)
+            }
+            while let Ok(opcode) = read_opcode(&mut reader).await {
+                if opcode == 9 {
+                    return true;
+                }
+            }
+            false
+        });
+        let spam = tokio::spawn(async move {
+            let mut frame = vec![0x81, keys.len() as u8];
+            frame.extend_from_slice(keys.as_bytes());
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                if writer.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let (second, _) = listener.accept().await.unwrap();
+        drop(second);
+        assert!(ping.await.unwrap(), "the first connection received a Ping");
+        spam.abort();
+    });
+    SubscriberFixture {
+        timing: ControlTiming {
+            probe_interval: Duration::from_millis(500),
+            pong: Duration::from_millis(500),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .spawn(addr);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("a missing Pong must trigger a redial")
+        .unwrap();
+}

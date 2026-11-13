@@ -38,6 +38,10 @@ pub(super) struct ReaderRoutes {
     pub(super) load_state_tx: Sender<LoadStateAsk>,
     /// Latest completed installation barrier; coalesces without blocking applies.
     pub(super) descriptor_ack_tx: watch::Sender<Option<u64>>,
+    /// Routes bounded Pong payloads to the connection liveness monitor.
+    pub(super) pong_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// Signals the first recognized application frame after enrollment.
+    pub(super) accepted_tx: watch::Sender<bool>,
 }
 
 /// The read half of an enrolled control connection: receives coordinator frames
@@ -74,6 +78,8 @@ pub(super) async fn read_control_frames(
         flight_grant_tx,
         load_state_tx,
         descriptor_ack_tx,
+        pong_tx,
+        accepted_tx,
     } = routes;
     // Set once, on the first recognized application frame: it is the accepted-enroll
     // signal (see this function's doc). The reconnect loop clears it uniformly on
@@ -100,6 +106,7 @@ pub(super) async fn read_control_frames(
                 if !connected_reported {
                     let _ = control_connected.send(true);
                     connected_reported = true;
+                    accepted_tx.send_replace(true);
                 }
                 match message {
                     CoordinatorToRelay::DrainAck => {
@@ -207,9 +214,11 @@ pub(super) async fn read_control_frames(
                 // wherever it arrives.
                 return Ok(classify_control_close(frame, relay_id));
             }
-            // The coordinator sends no pings today and the relay reads only
-            // descriptor text frames; any other frame is ignored.
-            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+            // Only matching Pong payloads satisfy the liveness monitor.
+            Message::Pong(payload) => {
+                let _ = pong_tx.try_send(payload.to_vec());
+            }
+            Message::Ping(_) | Message::Binary(_) | Message::Frame(_) => {}
         }
     }
 }

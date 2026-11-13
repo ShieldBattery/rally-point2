@@ -8,6 +8,8 @@ coordinator outage must leave running games untouched.
 - `client/` — the held WebSocket. `mod.rs`: public handles + the caller-owned
   queues. `connect.rs`: dial, enroll, next-dial delay. `reader.rs`: apply inbound
   pushes. `writer.rs`: *every* send. `heartbeat.rs`: what goes up about sessions.
+  `dial.rs`: bounded address races through TCP, TLS, and WebSocket upgrade.
+  `liveness.rs`: control timing configuration, write deadlines, and Ping/Pong probes.
 - `region_ping/` — UDP echo measurement of the pushed beacon set.
 - `load_fence.rs` — the probe/ack broker a load-state answer fences against.
 - `idle_exit.rs` — the self-reap countdown.
@@ -49,8 +51,11 @@ coordinator outage must leave running games untouched.
 
 ## Testing
 
-`cargo test -p rally-point-relay --lib coordinator::` (60 tests). A stand-in
+`cargo test -p rally-point-relay --lib coordinator::`. A stand-in
 coordinator must run the `accept_enroll` fixture before reading any application
-frame, or the relay blocks awaiting its challenge; inject short delays via
-`run_descriptor_subscriber_with` instead of waiting production intervals.
+frame, then push a recognized application frame within the acceptance deadline
+(10 seconds in production). It must also read the socket to flush automatic Pong
+replies. Unit fixtures can inject `ControlTiming` through the internal subscriber
+entry point; public `run_descriptor_subscriber_with` injects heartbeat and backoff
+intervals. Use real time for socket tests and paused time for channel-only tests.
 End-to-end against the real coordinator: `coordinator/tests/descriptor_transport/`.

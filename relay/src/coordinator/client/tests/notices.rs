@@ -26,7 +26,9 @@ async fn capture_sent(notice: &RelayNotice) -> Vec<Message> {
             }
         },
     ));
-    send_notice(&mut sink, notice).await.unwrap();
+    send_notice(&mut sink, notice, ControlTiming::default().write)
+        .await
+        .unwrap();
     let frames = captured.lock().unwrap();
     frames.clone()
 }
@@ -243,13 +245,10 @@ impl futures_util::Sink<Message> for StalledSink {
     }
 }
 
-#[tokio::test]
-async fn a_notice_parked_mid_send_survives_the_write_half_being_dropped() {
-    // The split's new exit path: the read half ends the connection while the
-    // write half holds a notice parked mid-send. The notice must stay in the
-    // caller-owned slot so the next connection's flush delivers it. Drive the
-    // write half against a sink that never completes a send, so it parks the
-    // notice and blocks, then drop it — the caller's slot must still hold it.
+#[tokio::test(start_paused = true)]
+async fn a_notice_parked_mid_send_survives_the_write_deadline() {
+    // A stalled send must time out with its notice still in the caller-owned
+    // slot, ready for the next connection's flush.
     let (notices_tx, notices_rx) = mpsc::unbounded_channel();
     notices_tx
         .send(RelayNotice::Departure(dropped_notice()))
@@ -266,8 +265,7 @@ async fn a_notice_parked_mid_send_survives_the_write_half_being_dropped() {
     let heartbeat = heartbeat(Duration::from_secs(3600));
     let identity_key = throwaway_identity_key();
 
-    // The write half never completes (the sink stalls), so a short timeout drops
-    // it exactly as the read half ending the connection would.
+    // The sink never completes a send; the production write deadline ends it.
     let writer = write_control_frames(
         StalledSink,
         &mut outbound,
@@ -276,25 +274,22 @@ async fn a_notice_parked_mid_send_survives_the_write_half_being_dropped() {
         &identity_key,
         RelayId(1),
         WriterRoutes {
+            probe_rx: tokio::sync::mpsc::unbounded_channel().1,
+            timing: ControlTiming::default(),
             challenge_rx,
             flight_grant_rx,
             load_state_rx,
             descriptor_ack_rx: watch::channel(None).1,
         },
     );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), writer)
-            .await
-            .is_err(),
-        "the write half stays parked on the stalled send",
-    );
+    assert!(matches!(writer.await, Err(ControlError::Timeout("write"))));
 
     // The notice is back in the caller-owned slot — parked before the send await
     // and never cleared — ready for the next connection's flush.
     assert_eq!(
         outbound.pending,
         Some(RelayNotice::Departure(dropped_notice())),
-        "a notice parked mid-send survives the write half being dropped",
+        "a notice parked mid-send survives the write deadline",
     );
     assert_eq!(
         outbound.stats.snapshot().notices,

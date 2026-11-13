@@ -184,3 +184,47 @@ async fn a_post_proof_application_frame_reports_control_connected() {
     .expect("the relay reports the control connection connected on the first push")
     .unwrap();
 }
+
+#[tokio::test]
+async fn unrelated_frames_cannot_keep_a_missing_challenge_alive() {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let _hello = ws.next().await.unwrap().unwrap();
+        let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+        let spam = tokio::spawn(async move {
+            let mut sent_tx = Some(sent_tx);
+            loop {
+                if ws.send(Message::Pong(vec![9].into())).await.is_err() {
+                    break;
+                }
+                if let Some(tx) = sent_tx.take() {
+                    let _ = tx.send(());
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let (second, _) = listener.accept().await.unwrap();
+        drop(second);
+        sent_rx
+            .await
+            .expect("an unrelated frame reached the connection");
+        spam.abort();
+    });
+    SubscriberFixture {
+        timing: ControlTiming {
+            challenge: Duration::from_millis(500),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+    .spawn(addr);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the relay must redial after the challenge deadline")
+        .unwrap();
+}

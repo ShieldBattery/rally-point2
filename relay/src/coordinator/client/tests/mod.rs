@@ -7,12 +7,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 use bytes::Bytes;
 
-use super::connect::{build_request, to_ws_scheme};
+use super::connect::{ControlConfig, build_request, run_descriptor_subscriber_timed, to_ws_scheme};
 use super::heartbeat::{
     FencedLoadState, LoadStateAnswer, LoadStateAsk, fenced_load_state_snapshot,
     fenced_load_state_snapshot_with, heartbeat_presence, heartbeat_region_rtts,
     session_load_snapshot, start_load_state_answer,
 };
+use super::liveness::ControlTiming;
 use super::reader::{apply_message, reconcile};
 use super::writer::{FlightGrant, WriterRoutes, send_notice, write_control_frames};
 use super::*;
@@ -123,6 +124,7 @@ struct SubscriberFixture {
     drain: watch::Receiver<bool>,
     connected: watch::Sender<bool>,
     backoff: ReconnectBackoff,
+    timing: ControlTiming,
 }
 
 impl Default for SubscriberFixture {
@@ -143,6 +145,7 @@ impl Default for SubscriberFixture {
             drain: watch::channel(false).1,
             connected: no_connected(),
             backoff: backoff(Duration::from_millis(20), Duration::from_secs(60)),
+            timing: ControlTiming::default(),
         }
     }
 }
@@ -150,7 +153,7 @@ impl Default for SubscriberFixture {
 impl SubscriberFixture {
     /// Spawns the subscriber against the stand-in coordinator listening at `addr`.
     fn spawn(self, addr: SocketAddr) {
-        tokio::spawn(run_descriptor_subscriber_with(
+        tokio::spawn(run_descriptor_subscriber_timed(
             enroll(addr, drain_hello()),
             ControlApplyTargets {
                 control: self.control,
@@ -165,7 +168,10 @@ impl SubscriberFixture {
             self.heartbeat,
             self.drain,
             self.connected,
-            self.backoff,
+            ControlConfig {
+                backoff: self.backoff,
+                timing: self.timing,
+            },
         ));
     }
 }

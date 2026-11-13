@@ -108,6 +108,8 @@ async fn reader_coalesces_requested_ids_and_ignores_legacy_frames() {
             &targets,
             RelayId(1),
             ReaderRoutes {
+                pong_tx: tokio::sync::mpsc::channel(16).0,
+                accepted_tx: watch::channel(false).0,
                 challenge_tx: mpsc::unbounded_channel().0,
                 flight_grant_tx: mpsc::unbounded_channel().0,
                 load_state_tx: mpsc::channel(LOAD_STATE_ASK_CAPACITY).0,
@@ -149,6 +151,8 @@ async fn writer_emits_only_the_latest_requested_acknowledgement() {
         &identity_key,
         RelayId(1),
         WriterRoutes {
+            probe_rx: tokio::sync::mpsc::unbounded_channel().1,
+            timing: ControlTiming::default(),
             challenge_rx,
             flight_grant_rx: mpsc::unbounded_channel().1,
             load_state_rx: mpsc::channel(LOAD_STATE_ASK_CAPACITY).1,

@@ -389,6 +389,8 @@ async fn periodic_notices_yield_to_load_state_asks_and_ready_answers() {
         &identity,
         RelayId(1),
         WriterRoutes {
+            probe_rx: tokio::sync::mpsc::unbounded_channel().1,
+            timing: ControlTiming::default(),
             challenge_rx: mpsc::unbounded_channel().1,
             flight_grant_rx: mpsc::unbounded_channel().1,
             load_state_rx,
@@ -595,16 +597,23 @@ async fn historical_report_survives_revocation_and_control_reconnect_until_reade
         let (stream, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
         accept_enroll(&mut ws).await;
+        let keys = serde_json::to_string(&CoordinatorToRelay::TenantKeys { keys: vec![] }).unwrap();
+        ws.send(Message::Text(keys.into())).await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(200), ws.next())
                 .await
                 .is_err(),
             "a control reconnect cannot bypass the report retry interval"
         );
-        let RelayToCoordinator::EvidenceReport(repeated) =
-            decode(ws.next().await.unwrap().unwrap())
-        else {
-            panic!("the unacknowledged report is retried");
+        let repeated = loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Text(text) => match decode(Message::Text(text)) {
+                    RelayToCoordinator::EvidenceReport(report) => break report,
+                    _ => panic!("the unacknowledged report is retried"),
+                },
+                Message::Ping(_) | Message::Pong(_) => continue,
+                frame => panic!("unexpected frame: {frame:?}"),
+            }
         };
         assert_eq!(repeated, first);
         for frame in [
@@ -619,8 +628,15 @@ async fn historical_report_survives_revocation_and_control_reconnect_until_reade
                 .await
                 .unwrap();
         }
+        let acknowledgement = loop {
+            match ws.next().await.unwrap().unwrap() {
+                Message::Text(text) => break decode(Message::Text(text)),
+                Message::Ping(_) | Message::Pong(_) => continue,
+                frame => panic!("unexpected frame: {frame:?}"),
+            }
+        };
         assert_eq!(
-            decode(ws.next().await.unwrap().unwrap()),
+            acknowledgement,
             RelayToCoordinator::DescriptorsApplied { ack_id: 77 }
         );
         // The ordered descriptor acknowledgement fences the preceding receipt's
@@ -720,6 +736,8 @@ async fn historical_report_batch_yields_to_load_state_asks_and_ready_answers() {
         &identity,
         RelayId(1),
         WriterRoutes {
+            probe_rx: tokio::sync::mpsc::unbounded_channel().1,
+            timing: ControlTiming::default(),
             challenge_rx: mpsc::unbounded_channel().1,
             flight_grant_rx: mpsc::unbounded_channel().1,
             load_state_rx,
