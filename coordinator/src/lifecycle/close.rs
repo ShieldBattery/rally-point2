@@ -84,7 +84,9 @@ impl Lifecycle {
             return;
         }
         state.session_closed_enqueued = true;
-        let state = sessions.remove(&key).expect("just held it");
+        let state = self
+            .remove_for_retirement(&mut sessions, &key)
+            .expect("just held it");
         drop(sessions);
         self.close_and_retire(tenant.clone(), session, state);
         crate::metrics::session_closed(&tenant);

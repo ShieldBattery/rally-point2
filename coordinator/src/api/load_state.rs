@@ -55,11 +55,22 @@ struct SessionLoadStateRequest {
 /// `known: false` is "no information about who is missing" — never "nobody
 /// arrived". A relay that did not answer in time, a relay with no live control
 /// connection, a relay that could not fence one of its slots, a coordinator that
-/// restarted, a reaped session, and a session whose serving relays changed under it
-/// (a re-home, or a relay that restarted its process — either destroys memory
-/// nothing later can reconstruct) all read that way. The answer is cheap to repeat,
-/// so a caller with time left may simply read again; one whose deadline has passed
-/// decides on the positive facts alone.
+/// restarted, a closed or reaped session, and a session whose serving relays
+/// changed under it (a re-home, or a relay that restarted its process — either
+/// destroys memory nothing later can reconstruct) all read that way. The answer is
+/// cheap to repeat, so a caller with time left may simply read again; one whose
+/// deadline has passed decides on the positive facts alone.
+///
+/// A session that has closed or been reaped keeps answering with the start instant
+/// and the four ever-sets it had accumulated, for a retention window measured from
+/// its retirement (five minutes in production). Such an answer asks no relay,
+/// carries no `evidence`, and every flag (`known`, `turnsKnown`, `closedKnown`,
+/// `setupFinal`) is false, with `closedSlots` and `liveSlots` empty: there is no
+/// longer a serving relay that could vouch for anything. A read whose session is
+/// retired while its own exchange is in flight is the one exception on
+/// `evidence`: it answers with the observations it read before the exchange. Once
+/// the window lapses, or across a coordinator restart, the answer is every set
+/// empty.
 ///
 /// `startedSlots` is a relay-recorded *client claim*: the client says its game loop
 /// is running, and nothing the relay sees backs that up. `forwardedSlots` is the
@@ -232,8 +243,9 @@ pub(super) async fn session_load_state(
     let session = SessionId(request.session);
 
     // The coordinator holds nothing at all for the session: never created here and
-    // no notice or beat has arrived for it, or it has been reaped. Nobody to ask,
-    // and nothing to answer with.
+    // no notice or beat has arrived for it, or it was retired holding no positive
+    // fact, or its retired facts' retention has lapsed. Nobody to ask, and nothing
+    // to answer with.
     let Some(before) = state.lifecycle.load_state(&request.tenant, session) else {
         return Ok(Json(SessionLoadStateResponse {
             known: false,
@@ -261,9 +273,13 @@ pub(super) async fn session_load_state(
     )
     .await;
     // Re-read after the exchange so the answer carries whatever the snapshots added.
-    // A session retired while the relays were answering leaves nothing to re-read,
-    // and the snapshots that landed went into a record that no longer exists — so
-    // the pre-exchange facts are answered with, and no claim is made over them.
+    // A session retired while the relays were answering re-reads as its retired
+    // facts, which include every snapshot merged before the retirement and claim
+    // nothing (not created here, not attestable). Only a retirement that kept
+    // nothing (its state held no positive fact, or the retention already lapsed)
+    // leaves nothing to re-read; the pre-exchange facts are then answered with, and
+    // no claim is made over them. Retired facts keep no connection observations, so
+    // a session retired during the exchange answers with the ones read before it.
     let Some(after) = state.lifecycle.load_state(&request.tenant, session) else {
         return Ok(Json(SessionLoadStateResponse {
             known: false,
@@ -333,12 +349,19 @@ pub(super) async fn session_load_state(
                             && current.serving_relays == before.serving_relays
                     })
             });
+    let retired_during_exchange =
+        !before.serving_relays.is_empty() && after.serving_relays.is_empty();
+    let evidence = if retired_during_exchange {
+        before.evidence
+    } else {
+        after.evidence
+    };
     Ok(Json(SessionLoadStateResponse {
         known: after.created_here && after.attestable && every_relay_fenced,
         setup_final,
         started_at_ms: after.started_at_ms,
         connected_slots: after.connected_slots.iter().map(|s| s.0).collect(),
-        evidence: after.evidence.into_iter().map(Into::into).collect(),
+        evidence: evidence.into_iter().map(Into::into).collect(),
         started_slots: after.started_slots.iter().map(|s| s.0).collect(),
         forwarded_slots: after.forwarded_slots.iter().map(|s| s.0).collect(),
         turns_known,

@@ -7,6 +7,7 @@ use super::*;
 
 mod closed;
 mod evidence;
+mod retired;
 
 /// How a stand-in relay answers the questions addressed to it.
 struct AttestOptions {

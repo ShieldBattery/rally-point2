@@ -142,6 +142,7 @@ fn heartbeat_load(
 }
 
 mod close;
+mod closed_facts;
 mod empty_reap;
 mod evidence;
 mod heartbeat;

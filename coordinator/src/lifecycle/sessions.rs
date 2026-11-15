@@ -316,30 +316,40 @@ impl Lifecycle {
     ///
     /// `Some` for every session the coordinator holds any state for, whatever built
     /// that state: the facts it has accumulated are positive evidence and worth
-    /// answering with regardless. `None` only when it holds nothing at all — the
-    /// session was never created here and no notice or beat has arrived for it, or
-    /// it has already been reaped.
+    /// answering with regardless. A session whose state was retired (closed or
+    /// reaped) keeps answering for [`LifecycleTunables::closed_load_facts_retention`]
+    /// with the start instant and slot sets its state held when it was retired,
+    /// with no connection observations, no serving relays, and neither
+    /// `created_here` nor `attestable`, so the answer supports no completeness
+    /// claim. If a state exists for the session again after it was retired, the
+    /// answer is that state's, with the retired facts unioned into its sets and the
+    /// retired start instant preferred. `None` only when the coordinator holds
+    /// nothing at all — the session was never created here and no notice or beat
+    /// has arrived for it, its retired state held no positive fact, or the
+    /// retention has lapsed.
     ///
     /// Nothing here decides whether a slot's *absence* may be read as proof it
     /// never arrived. That also requires the serving relays to have just answered
     /// for themselves, which only the caller that asked them can know.
     pub fn load_state(&self, tenant: &TenantId, session: SessionId) -> Option<SessionLoadState> {
         let assignments = self.inner.setup.evidence_assignments(tenant, session);
-        self.inner
-            .sessions
-            .lock()
-            .get(&(tenant.clone(), session))
-            .map(|state| SessionLoadState {
-                evidence: evidence::current_evidence(state, &assignments),
-                created_here: state.created_here,
-                attestable: state.attestable,
-                serving_relays: state.serving_relays.clone(),
-                started_at_ms: state.started_at_ms,
-                connected_slots: sorted_slots(&state.connected_slots),
-                started_slots: sorted_slots(&state.started_slots),
-                forwarded_slots: sorted_slots(&state.forwarded_slots),
-                lobby_violation_slots: sorted_slots(&state.lobby_violation_slots),
-            })
+        let key = (tenant.clone(), session);
+        let sessions = self.inner.sessions.lock();
+        let live = sessions.get(&key).map(|state| SessionLoadState {
+            evidence: evidence::current_evidence(state, &assignments),
+            created_here: state.created_here,
+            attestable: state.attestable,
+            serving_relays: state.serving_relays.clone(),
+            started_at_ms: state.started_at_ms,
+            connected_slots: sorted_slots(&state.connected_slots),
+            started_slots: sorted_slots(&state.started_slots),
+            forwarded_slots: sorted_slots(&state.forwarded_slots),
+            lobby_violation_slots: sorted_slots(&state.lobby_violation_slots),
+        });
+        // Still under the `sessions` hold: a retirement removes a state and records
+        // its facts inside one such hold, so this sees either the state or its
+        // record, never neither.
+        self.with_closed_load_facts(&key, live, Instant::now())
     }
 
     /// Folds the load state a relay reported for each named session into the

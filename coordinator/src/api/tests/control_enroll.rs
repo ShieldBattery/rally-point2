@@ -503,6 +503,7 @@ async fn check_evidence_downgrade(replacement: bool, restarted: bool) {
             Default::default(),
         );
     }
+    lifecycle.on_slot_connected(tenant_id(), required, SlotId(0));
     let (url, mut webhooks) = WebhookReceiver::default().spawn().await;
     crate::tenant::set_notify(
         setup.tenants(),
@@ -554,7 +555,14 @@ async fn check_evidence_downgrade(replacement: bool, restarted: bool) {
     } else {
         assert!(setup.serving_relays(&tenant_id(), required).is_empty());
         assert!(session::session_refs(&setup, &tenant_id(), required).is_none());
-        assert!(lifecycle.load_state(&tenant_id(), required).is_none());
+        // The retirement keeps the session's load facts, answered with no
+        // completeness input left to stand on.
+        let retired = lifecycle
+            .load_state(&tenant_id(), required)
+            .expect("the retired session's load facts are kept");
+        assert!(!retired.created_here && !retired.attestable);
+        assert!(retired.serving_relays.is_empty());
+        assert_eq!(retired.connected_slots, vec![SlotId(0)]);
         let webhook = tokio::time::timeout(Duration::from_secs(2), webhooks.recv())
             .await
             .unwrap()

@@ -111,6 +111,15 @@ pub const EMPTY_SESSION_REAP_GRACE: Duration = Duration::from_secs(15 * 60);
 /// unknown, never proof that a session is empty.
 pub const EMPTY_ROSTER_FRESHNESS: Duration = Duration::from_secs(35);
 
+/// How long a retired session's load facts stay answerable by the load-state
+/// read, measured from its retirement. A tenant reads load state when its own load
+/// deadline expires, on the order of a minute and a half after it created the
+/// session, and may read again while it resolves the outcome; a session that
+/// closed right after its creation must still answer then. Five minutes outlasts
+/// that deadline plus the resolution window with wide margin, while bounding the
+/// records kept to the sessions that closed in the last few minutes.
+pub const CLOSED_LOAD_FACTS_RETENTION: Duration = Duration::from_secs(5 * 60);
+
 /// One session's ordered dispatch queue's capacity. A session's genuine
 /// notice volume is small and bounded by its slot count: at most one
 /// departure and one result per slot (12 slots, BW's cap), a handful of
@@ -161,7 +170,8 @@ pub struct SessionLoadState {
     pub evidence: Vec<rally_point_proto::control::SlotEvidence>,
     /// Whether `register_session` created this state: the session was set up
     /// against *this* coordinator process, so the sets start at the session's
-    /// beginning rather than wherever a restarted process came up.
+    /// beginning rather than wherever a restarted process came up. Always `false`
+    /// for an answer built only from a retired session's kept facts.
     pub created_here: bool,
     /// Whether an unbroken chain of relay memory still covers the session's whole
     /// life, so a snapshot the serving relays produce today can still speak for
@@ -170,8 +180,9 @@ pub struct SessionLoadState {
     /// not restated is then unrecoverable.
     pub attestable: bool,
     /// The relays currently assigned to serve the session; empty for a state no
-    /// registration ever gave a serving set. Every one of them must produce a
-    /// snapshot for a completeness claim to stand.
+    /// registration ever gave a serving set, and for a retired session. Every one
+    /// of them must produce a snapshot for a completeness claim to stand, so an
+    /// empty set never supports one.
     pub serving_relays: Vec<RelayId>,
     /// Relay wall-clock (unix epoch ms) of the session's start — the earliest
     /// instant any relay reported for it. `None` when no relay has reported the
@@ -416,6 +427,10 @@ pub struct Lifecycle {
 struct Inner {
     setup: SessionSetup,
     sessions: Mutex<HashMap<SessionRef, SessionState>>,
+    /// The load facts of sessions whose state was retired from `sessions`, kept
+    /// for the retention window (see `closed_facts.rs`). Locked only while
+    /// `sessions` is already held, never the other way round.
+    closed_load_facts: Mutex<HashMap<SessionRef, closed_facts::ClosedSessionLoadFacts>>,
     /// Also serves as the connection-epoch linearization gate. Every production
     /// registry enrollment/removal is committed while this lock is held.
     relay_epochs: Mutex<HashMap<RelayId, RelayEpoch>>,
@@ -485,6 +500,9 @@ pub struct LifecycleTunables {
     /// The longest gap between the complete heartbeat rosters proving that
     /// emptiness that may still count as continuous ([`EMPTY_ROSTER_FRESHNESS`]).
     pub empty_roster_freshness: Duration,
+    /// How long a retired session's load facts stay answerable by the load-state
+    /// read ([`CLOSED_LOAD_FACTS_RETENTION`]).
+    pub closed_load_facts_retention: Duration,
     /// Each new session's ordered dispatch queue capacity —
     /// `NOTICE_QUEUE_CAPACITY` in production. Shrinking it lets a
     /// queue-overflow test observe the drop policy without pushing the full
@@ -501,6 +519,7 @@ impl Default for LifecycleTunables {
             never_started_grace: NEVER_STARTED_REAP_GRACE,
             empty_session_grace: EMPTY_SESSION_REAP_GRACE,
             empty_roster_freshness: EMPTY_ROSTER_FRESHNESS,
+            closed_load_facts_retention: CLOSED_LOAD_FACTS_RETENTION,
             queue_capacity: NOTICE_QUEUE_CAPACITY,
         }
     }
@@ -519,6 +538,7 @@ impl Lifecycle {
             inner: Arc::new(Inner {
                 setup,
                 sessions: Mutex::new(HashMap::new()),
+                closed_load_facts: Mutex::new(HashMap::new()),
                 relay_epochs: Mutex::new(HashMap::new()),
                 next_empty_timer_token: AtomicU64::new(1),
                 tunables,
@@ -573,6 +593,7 @@ async fn drain_queue(
 }
 
 mod close;
+mod closed_facts;
 mod evidence;
 mod evidence_history;
 mod heartbeat;

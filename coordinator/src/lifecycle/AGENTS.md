@@ -15,6 +15,10 @@ spread across these files, so grep by method name, not by file.
   evidence / load state / backbone RTTs), plus the `RegionRttIngest` view the
   RTT half folds through.
 - `close.rs` — `SessionClosed` handling, retirement, both queue pushes.
+- `closed_facts.rs` — the load facts a retired session leaves behind
+  (`ClosedSessionLoadFacts`), kept in memory for the retention window so the
+  load-state read still answers them, and `remove_for_retirement`, the one way
+  a state leaves the map.
 - `notices.rs` — `SessionNotice` + `ingest_notice`: the single owner of "a relay
   reported X" (authorize the reporter, record the fact, enqueue the webhook),
   and the notice dedup sets the lifecycle holds.
@@ -54,6 +58,12 @@ spread across these files, so grep by method name, not by file.
   so a stale task can't consume a re-armed timer's evidence), **webhook-only**
   (idle orphan state, re-armed by each webhook enqueued). A fired timer re-checks
   its condition under the lock; the abort alone is not trusted to win the race.
+- Every retirement removes its state through `remove_for_retirement`, which
+  records the state's load facts inside the same `sessions` hold as the
+  removal; a bare `sessions.remove` would let a load-state read find neither
+  the state nor its facts. Lock order is `sessions`, then the closed-facts map,
+  never the reverse. The records are in-memory only and stay out of
+  `LifecycleFacts`: a restart forgetting them is deliberate.
 - A restart restores only what `LifecycleFacts` carries. A new *accumulated*
   fact on `SessionState` (something a relay will not restate on its next beat)
   must join it, with a `serde(default)` reading for records written before it;

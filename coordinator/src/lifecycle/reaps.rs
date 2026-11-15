@@ -49,7 +49,9 @@ impl Lifecycle {
         if !state.serving_relays.is_empty() {
             return; // it gained a serving set: the normal close path owns it now
         }
-        let state = sessions.remove(&key).expect("just held it");
+        let state = self
+            .remove_for_retirement(&mut sessions, &key)
+            .expect("just held it");
         drop(sessions);
         abort_timers(&state);
         // Dropping `state` drops the queue sender; the drain task finishes any
@@ -285,7 +287,9 @@ impl Lifecycle {
         if state.started {
             return; // started (or was marked so) during the grace
         }
-        let state = sessions.remove(&key).expect("just held it");
+        let state = self
+            .remove_for_retirement(&mut sessions, &key)
+            .expect("just held it");
         drop(sessions);
         self.close_and_retire(tenant.clone(), session, state);
         crate::metrics::session_reaped(&tenant, "never_started");
@@ -346,7 +350,9 @@ impl Lifecycle {
         {
             return;
         }
-        let state = sessions.remove(&key).expect("just held it");
+        let state = self
+            .remove_for_retirement(&mut sessions, &key)
+            .expect("just held it");
         drop(sessions);
         self.close_and_retire(tenant.clone(), session, state);
         crate::metrics::session_reaped(&tenant, "heartbeat_empty");

@@ -1773,6 +1773,16 @@ The sets are **positive evidence and always safe to merge**, so the pull answers
 coordinator holds whatever their provenance. What takes qualifying is reading a slot's *absence* as proof it
 never arrived, and `known` gates exactly that.
 
+That includes a session that has already **closed or been reaped**. The tenant's load deadline can fall after a
+short game started, ended, and closed, and the slot that started is exactly the fact the read exists to
+recover. So when the coordinator retires a session's state it keeps that state's start instant and four
+ever-sets (not its connection observations) in memory for a retention window measured from the retirement,
+five minutes by default, which outlasts a tenant's load deadline plus its resolution window. A read in that
+window asks no relay — none serves the session any more — and answers those facts with every completeness flag
+false. A state recreated for the session after it closed (a late notice) answers with the kept facts unioned in.
+A coordinator restart forgets the kept facts; that is a deliberate limit, since persistence restores only live
+sessions.
+
 **Turn evidence.** `startedSlots` is a client's *claim*: a relay records the `GameStarted` frame, but nothing
 it observes backs the frame up, and a client whose link was black-holed can run its loop locally, re-assert
 started on reconnect, and never deliver a turn — so blaming its opponents by their absence from that set lets

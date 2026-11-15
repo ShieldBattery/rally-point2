@@ -86,12 +86,9 @@ impl Lifecycle {
         {
             return;
         }
-        let state = self
-            .inner
-            .sessions
-            .lock()
-            .remove(&(tenant.clone(), session))
-            .unwrap_or_else(|| self.new_state(Vec::new()));
+        let retired =
+            self.remove_for_retirement(&mut self.inner.sessions.lock(), &(tenant.clone(), session));
+        let state = retired.unwrap_or_else(|| self.new_state(Vec::new()));
         self.close_and_retire(tenant.clone(), session, state);
         crate::metrics::session_closed(tenant);
         tracing::warn!(
