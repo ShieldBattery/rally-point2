@@ -224,6 +224,7 @@ struct EmptyTimer {
 /// One webhook ready to sign and POST — enqueued onto a session's ordered queue.
 struct WebhookJob {
     tenant: TenantId,
+    session: SessionId,
     config: NotifyConfig,
     body: Bytes,
     kind: &'static str,
@@ -558,7 +559,15 @@ async fn drain_queue(
     pending: Arc<AtomicUsize>,
 ) {
     while let Some(job) = rx.recv().await {
-        notify::dispatch(tenants.clone(), job.tenant, job.config, job.body, job.kind).await;
+        notify::dispatch(
+            tenants.clone(),
+            job.tenant,
+            job.session,
+            job.config,
+            job.body,
+            job.kind,
+        )
+        .await;
         pending.fetch_sub(1, Ordering::AcqRel);
     }
 }

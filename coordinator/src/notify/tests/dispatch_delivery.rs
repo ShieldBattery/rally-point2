@@ -125,11 +125,122 @@ async fn the_response_body_cap_fails_an_attempt_only_past_it() {
         // can be what trips here.
         let outcome = send_attempt(request, Duration::from_secs(5)).await;
         match (expected, &outcome) {
-            (Ok(status), Ok(got)) => assert_eq!(*got, status, "{label} delivers"),
+            (Ok(status), Ok(got)) => assert_eq!(got.status, status, "{label} delivers"),
             (Err(AttemptError::BodyTooLarge), Err(AttemptError::BodyTooLarge)) => {}
             _ => panic!("{label}: unexpected outcome {outcome:?}"),
         }
     }
+}
+
+// -- Retry-After --
+
+fn headers_with_retry_after(value: &[u8]) -> hyper::HeaderMap {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert(
+        hyper::header::RETRY_AFTER,
+        hyper::header::HeaderValue::from_bytes(value).unwrap(),
+    );
+    headers
+}
+
+#[test]
+fn retry_after_parses_only_the_delta_seconds_form() {
+    assert_eq!(
+        parse_retry_after(&headers_with_retry_after(b"17")),
+        Some(Duration::from_secs(17)),
+    );
+    assert_eq!(
+        parse_retry_after(&headers_with_retry_after(b" 0 ")),
+        Some(Duration::ZERO),
+    );
+    assert_eq!(parse_retry_after(&hyper::HeaderMap::new()), None, "missing");
+    assert_eq!(
+        parse_retry_after(&headers_with_retry_after(b"Wed, 21 Oct 2015 07:28:00 GMT")),
+        None,
+        "the HTTP-date form is not honored",
+    );
+    assert_eq!(parse_retry_after(&headers_with_retry_after(b"soon")), None);
+    assert_eq!(parse_retry_after(&headers_with_retry_after(b"")), None);
+    assert_eq!(parse_retry_after(&headers_with_retry_after(b"-5")), None);
+    assert_eq!(parse_retry_after(&headers_with_retry_after(b"1.5")), None);
+}
+
+#[tokio::test]
+async fn send_attempt_reports_the_retry_after_of_a_real_response() {
+    for (header, expected) in [
+        (Some("7"), Some(Duration::from_secs(7))),
+        (Some("Wed, 21 Oct 2015 07:28:00 GMT"), None),
+        (None, None),
+    ] {
+        let app = Router::new().route(
+            "/hook",
+            post(move || async move {
+                let mut response =
+                    axum::response::IntoResponse::into_response(StatusCode::TOO_MANY_REQUESTS);
+                if let Some(value) = header {
+                    response
+                        .headers_mut()
+                        .insert(hyper::header::RETRY_AFTER, value.parse().unwrap());
+                }
+                response
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(format!("http://{addr}/hook"))
+            .body(Full::new(Bytes::new()))
+            .unwrap();
+        let response = send_attempt(request, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(response.status, 429);
+        assert_eq!(response.retry_after, expected, "header {header:?}");
+    }
+}
+
+#[test]
+fn the_retry_wait_is_the_larger_of_backoff_and_a_capped_retry_after() {
+    let backoff = Duration::from_secs(4);
+    assert_eq!(retry_wait(backoff, None), backoff, "no Retry-After");
+    assert_eq!(
+        retry_wait(backoff, Some(Duration::from_secs(1))),
+        backoff,
+        "a shorter Retry-After never shortens the backoff",
+    );
+    assert_eq!(
+        retry_wait(backoff, Some(Duration::from_secs(10))),
+        Duration::from_secs(10),
+        "a longer Retry-After extends the wait",
+    );
+    assert_eq!(
+        retry_wait(backoff, Some(Duration::from_secs(3600))),
+        BACKOFF_CAP,
+        "Retry-After is capped so an endpoint cannot park the queue",
+    );
+    assert_eq!(
+        retry_wait(BACKOFF_CAP, Some(Duration::from_secs(3600))),
+        BACKOFF_CAP,
+    );
+}
+
+#[test]
+fn attempt_failures_describe_themselves_for_the_give_up_log() {
+    assert_eq!(AttemptFailure::Status(429).to_string(), "HTTP status 429");
+    assert_eq!(AttemptFailure::TimedOut.to_string(), "attempt timed out");
+    assert_eq!(
+        AttemptFailure::BodyTooLarge.to_string(),
+        "response body over the size cap",
+    );
+    assert_eq!(
+        AttemptFailure::Transport("connection refused".to_owned()).to_string(),
+        "transport error: connection refused",
+    );
 }
 
 // -- Dispatch concurrency --
@@ -201,6 +312,7 @@ async fn the_dispatch_semaphore_bounds_concurrent_in_flight_attempts() {
         handles.push(tokio::spawn(dispatch(
             tenants,
             TenantId("t".to_owned()),
+            SessionId(1),
             config,
             Bytes::from_static(b"{}"),
             "test",

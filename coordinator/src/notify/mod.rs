@@ -101,7 +101,9 @@ use payloads::{
 // file — see `dispatch` for why each is `pub(super)` rather than private
 // there.
 #[cfg(test)]
-use dispatch::{AttemptError, WEBHOOK_SIG_DOMAIN, send_attempt};
+use dispatch::{
+    AttemptError, AttemptFailure, WEBHOOK_SIG_DOMAIN, parse_retry_after, retry_wait, send_attempt,
+};
 
 /// Departures already handled, keyed by `(tenant, session, slot)`. Shared across
 /// every relay control connection so the redundant reports of one leave collapse
@@ -260,7 +262,9 @@ impl NoticeDedup {
 }
 
 /// How many webhook attempts before giving up. With [`BACKOFF_START`] doubling to
-/// [`BACKOFF_CAP`], six attempts span roughly a minute of retries.
+/// [`BACKOFF_CAP`], six attempts span roughly a minute of retries, or up to
+/// five waits of [`BACKOFF_CAP`] each when the endpoint asks for the longest
+/// `Retry-After` delay it is allowed every time.
 const MAX_ATTEMPTS: u32 = 6;
 /// The first retry backoff; doubles each attempt up to [`BACKOFF_CAP`].
 const BACKOFF_START: Duration = Duration::from_secs(2);

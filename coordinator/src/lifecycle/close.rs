@@ -126,6 +126,7 @@ impl Lifecycle {
                 state.queue.clone(),
                 WebhookJob {
                     tenant: tenant.clone(),
+                    session,
                     config,
                     body,
                     kind: "sessionClosed",
@@ -168,6 +169,7 @@ impl Lifecycle {
             state,
             WebhookJob {
                 tenant: tenant.clone(),
+                session,
                 config,
                 body,
                 kind,

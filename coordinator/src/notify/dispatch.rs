@@ -35,6 +35,11 @@ pub(super) const SIGNATURE_HEADER: &str = "x-rp2-signature";
 /// labels the delivery in logs (departure vs. desync); `body` is the already
 /// serialized JSON.
 ///
+/// When a non-2xx response carries a `Retry-After` delay, the wait before the
+/// next attempt is the larger of the exponential backoff and that delay, with
+/// the delay capped at the backoff cap (see `retry_wait`). `session` is only
+/// for log correlation.
+///
 /// `tenants` + `tenant` are what let a detached task sign the request itself —
 /// the caller resolves them before spawning, since the private key stays behind
 /// `tenant::sign_webhook`'s narrow interface rather than being handed out as an
@@ -42,11 +47,13 @@ pub(super) const SIGNATURE_HEADER: &str = "x-rp2-signature";
 pub(crate) async fn dispatch(
     tenants: TenantStore,
     tenant: TenantId,
+    session: SessionId,
     config: NotifyConfig,
     body: Bytes,
     kind: &'static str,
 ) {
     let mut backoff = BACKOFF_START;
+    let mut last_failure = None;
     for attempt in 1..=MAX_ATTEMPTS {
         let request = match build_request(&tenants, &tenant, &config, body.clone()) {
             Ok(Some(request)) => request,
@@ -56,6 +63,7 @@ pub(crate) async fn dispatch(
                 crate::metrics::webhook_delivered(&tenant, "gave_up");
                 tracing::warn!(
                     tenant = tenant.as_ref(),
+                    session = session.0,
                     url = %config.url,
                     kind,
                     "tenant has no signing key; giving up on the webhook",
@@ -66,7 +74,14 @@ pub(crate) async fn dispatch(
                 // A malformed URL/header is deterministic — retrying can't fix
                 // it, so give up now rather than burning the whole budget.
                 crate::metrics::webhook_delivered(&tenant, "gave_up");
-                tracing::warn!(url = %config.url, %error, kind, "webhook request is unbuildable; dropping");
+                tracing::warn!(
+                    tenant = tenant.as_ref(),
+                    session = session.0,
+                    url = %config.url,
+                    %error,
+                    kind,
+                    "webhook request is unbuildable; dropping",
+                );
                 return;
             }
         };
@@ -87,14 +102,27 @@ pub(crate) async fn dispatch(
                 .expect("DISPATCH_PERMITS is never closed");
             send_attempt(request, ATTEMPT_TIMEOUT).await
         };
+        let mut retry_after = None;
         match outcome {
-            Ok(status) => {
+            Ok(AttemptResponse {
+                status,
+                retry_after: server_delay,
+            }) => {
                 if (200..300).contains(&status) {
                     crate::metrics::webhook_delivered(&tenant, "ok");
                     tracing::debug!(url = %config.url, status, kind, "webhook delivered");
                     return;
                 }
-                tracing::debug!(url = %config.url, status, attempt, kind, "webhook non-2xx; retrying");
+                tracing::debug!(
+                    url = %config.url,
+                    status,
+                    retry_after = ?server_delay,
+                    attempt,
+                    kind,
+                    "webhook non-2xx; retrying",
+                );
+                retry_after = server_delay;
+                last_failure = Some(AttemptFailure::Status(status));
             }
             Err(AttemptError::TimedOut) => {
                 tracing::debug!(
@@ -104,6 +132,7 @@ pub(crate) async fn dispatch(
                     timeout = ?ATTEMPT_TIMEOUT,
                     "webhook attempt timed out; retrying",
                 );
+                last_failure = Some(AttemptFailure::TimedOut);
             }
             Err(AttemptError::BodyTooLarge) => {
                 tracing::debug!(
@@ -113,9 +142,11 @@ pub(crate) async fn dispatch(
                     cap = MAX_RESPONSE_BODY_BYTES,
                     "webhook response body exceeded the cap; retrying",
                 );
+                last_failure = Some(AttemptFailure::BodyTooLarge);
             }
             Err(AttemptError::Transport(error)) => {
                 tracing::debug!(url = %config.url, %error, attempt, kind, "webhook attempt failed; retrying");
+                last_failure = Some(AttemptFailure::Transport(error.to_string()));
             }
         }
 
@@ -125,18 +156,81 @@ pub(crate) async fn dispatch(
         crate::metrics::webhook_attempt_failed(&tenant);
 
         if attempt < MAX_ATTEMPTS {
-            tokio::time::sleep(backoff).await;
+            tokio::time::sleep(retry_wait(backoff, retry_after)).await;
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }
     }
 
     crate::metrics::webhook_delivered(&tenant, "gave_up");
     tracing::warn!(
+        tenant = tenant.as_ref(),
+        session = session.0,
         url = %config.url,
         attempts = MAX_ATTEMPTS,
+        last_failure = %last_failure
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), ToString::to_string),
         kind,
         "gave up delivering a webhook; the consumer's result-based fallback covers it",
     );
+}
+
+/// How long to wait before the next attempt: the larger of the current
+/// exponential `backoff` and the server's `Retry-After` delay (if any), with the
+/// server's delay capped at [`BACKOFF_CAP`]. The cap matters because the
+/// session's ordered queue is blocked while this notice waits, so an endpoint
+/// must not be able to park it for an arbitrary time.
+pub(super) fn retry_wait(backoff: Duration, retry_after: Option<Duration>) -> Duration {
+    backoff.max(retry_after.map_or(Duration::ZERO, |delay| delay.min(BACKOFF_CAP)))
+}
+
+/// Parses a `Retry-After` response header in its delta-seconds form (a
+/// non-negative decimal integer number of seconds). The HTTP-date form, a
+/// missing header, and anything else unparseable (including negative numbers)
+/// yield `None`. Values too large for a `u64` saturate.
+pub(super) fn parse_retry_after(headers: &hyper::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(hyper::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)))
+}
+
+/// A usable response to one webhook attempt.
+#[derive(Debug)]
+pub(super) struct AttemptResponse {
+    /// The HTTP status code.
+    pub(super) status: u16,
+    /// The server's `Retry-After` delay, when it sent one in delta-seconds form.
+    pub(super) retry_after: Option<Duration>,
+}
+
+/// Why the most recent attempt did not deliver, for the give-up log line.
+#[derive(Debug)]
+pub(super) enum AttemptFailure {
+    /// The endpoint answered with a non-2xx status.
+    Status(u16),
+    /// The attempt exceeded [`ATTEMPT_TIMEOUT`].
+    TimedOut,
+    /// The response body exceeded [`MAX_RESPONSE_BODY_BYTES`].
+    BodyTooLarge,
+    /// A transport-level error, as its display text.
+    Transport(String),
+}
+
+impl std::fmt::Display for AttemptFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Status(status) => write!(f, "HTTP status {status}"),
+            Self::TimedOut => write!(f, "attempt timed out"),
+            Self::BodyTooLarge => write!(f, "response body over the size cap"),
+            Self::Transport(error) => write!(f, "transport error: {error}"),
+        }
+    }
 }
 
 /// Why one webhook attempt produced no usable response. Both variants are
@@ -156,8 +250,9 @@ pub(super) enum AttemptError {
 }
 
 /// Sends one webhook request on the shared [`WEBHOOK_CLIENT`] and returns its
-/// status, bounding the *whole* attempt — connect through the full body read
-/// — by one [`tokio::time::timeout`] and the body by [`MAX_RESPONSE_BODY_BYTES`].
+/// status and `Retry-After` delay, bounding the *whole* attempt — connect
+/// through the full body read — by one [`tokio::time::timeout`] and the body
+/// by [`MAX_RESPONSE_BODY_BYTES`].
 /// Both bounds exist for the same reason: the coordinator never reads the
 /// response body's content (only the status matters), so an endpoint that is
 /// slow or unbounded on either axis must not be able to hang this session's
@@ -167,13 +262,14 @@ pub(super) enum AttemptError {
 pub(super) async fn send_attempt(
     request: hyper::Request<Full<Bytes>>,
     attempt_timeout: Duration,
-) -> Result<u16, AttemptError> {
+) -> Result<AttemptResponse, AttemptError> {
     let attempt = async {
         let response = WEBHOOK_CLIENT
             .request(request)
             .await
             .map_err(AttemptError::Transport)?;
         let status = response.status().as_u16();
+        let retry_after = parse_retry_after(response.headers());
         // The body is never read for its content, only drained so the
         // connection returns to the client's pool cleanly — capped so an
         // endpoint streaming (or just sending) an oversized body can't grow
@@ -182,7 +278,10 @@ pub(super) async fn send_attempt(
             .collect()
             .await
             .map_err(|_| AttemptError::BodyTooLarge)?;
-        Ok(status)
+        Ok(AttemptResponse {
+            status,
+            retry_after,
+        })
     };
     match tokio::time::timeout(attempt_timeout, attempt).await {
         Ok(result) => result,

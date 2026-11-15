@@ -10,7 +10,7 @@ use rally_point_proto::control::TenantId;
 use serde::Serialize;
 
 use super::ATTEMPT_TIMEOUT;
-use super::dispatch::{build_request, send_attempt};
+use super::dispatch::{AttemptResponse, build_request, send_attempt};
 use crate::tenant::{NotifyConfig, TenantStore};
 
 const MAX_CONCURRENT_PERIODIC: usize = 4;
@@ -118,7 +118,13 @@ pub(super) fn try_dispatch_with(
                 return;
             }
         };
-        let delivered = matches!(send_attempt(request, ATTEMPT_TIMEOUT).await, Ok(200..300));
+        let delivered = matches!(
+            send_attempt(request, ATTEMPT_TIMEOUT).await,
+            Ok(AttemptResponse {
+                status: 200..300,
+                ..
+            })
+        );
         crate::metrics::periodic_webhook_outcome(&tenant, if delivered { "ok" } else { "failed" });
         tracing::debug!(
             tenant = tenant.as_ref(),
