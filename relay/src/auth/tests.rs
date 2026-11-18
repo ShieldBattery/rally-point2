@@ -1,10 +1,14 @@
 //! Tests for token/challenge verification and the coordinator-pushed
 //! `SharedRegistry`: signature/tenant/expiry rejection paths, wholesale
-//! registry replacement with stable in-flight snapshots, and the
-//! connection-binding challenge's replay and channel-substitution rejections.
+//! registry replacement with stable in-flight snapshots, the
+//! connection-binding challenge's replay and channel-substitution rejections,
+//! and what an abandoned handshake's progress record reports.
+
+use std::time::Duration;
 
 use super::*;
 use rally_point_proto::token::{ExpiresAt, Signature, TokenClaims};
+use rally_point_transport::test_util::{Edge, loopback};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 const NOW: u64 = 1_700_000_000;
@@ -360,4 +364,112 @@ fn rejects_a_challenge_response_perturbed_in_any_of_its_three_parts() {
             "accepted a response {perturbation}",
         );
     }
+}
+
+/// Runs [`authenticate`] on `relay_side` while `client` drives the other end,
+/// and abandons the handshake the moment `client` finishes, the way the
+/// authorization deadline drops it. Returns what the progress record held at
+/// that point, plus `client`'s output so the caller keeps its streams open.
+async fn progress_when_abandoned<T>(
+    relay_side: &noq::Connection,
+    registry: &Registry,
+    client: impl Future<Output = T>,
+) -> (AuthProgress, T) {
+    let mut progress = AuthProgress::new();
+    let output = tokio::select! {
+        result = authenticate(relay_side, registry, NOW, &mut progress) => {
+            panic!("the handshake finished on its own: {:?}", result.err())
+        }
+        output = client => output,
+    };
+    (progress, output)
+}
+
+#[tokio::test]
+async fn an_abandoned_handshake_reports_a_client_that_never_opened_the_stream() {
+    let f = fixture();
+    let (_client, relay_side, _client_endpoint, _relay_endpoint) = loopback(Edge::Client).await;
+
+    // The client sends nothing, so no window could let the handshake advance;
+    // this one only has to be long enough for the handshake to start waiting.
+    let (progress, ()) = progress_when_abandoned(
+        &relay_side,
+        &f.registry,
+        tokio::time::sleep(Duration::from_millis(50)),
+    )
+    .await;
+
+    assert_eq!(progress.stage(), AuthStage::AwaitingStream);
+    assert!(progress.identity().is_none());
+    assert_eq!(
+        progress.to_string(),
+        "waiting for the client to open the handshake stream"
+    );
+}
+
+#[tokio::test]
+async fn an_abandoned_handshake_after_a_valid_token_names_the_tokens_slot() {
+    let f = fixture();
+    let token = f.mint(SlotId(3));
+    let (client, relay_side, _client_endpoint, _relay_endpoint) = loopback(Edge::Client).await;
+
+    // Reading the challenge proves the relay verified the token and issued it;
+    // the client then stalls instead of answering.
+    let client_side = async {
+        let (mut send, mut recv) = client.open_bi().await.unwrap();
+        let frame = handshake::encode_token_frame(&token).unwrap();
+        send.write_all(&frame).await.unwrap();
+        let mut challenge = [0u8; CHALLENGE_LEN];
+        recv.read_exact(&mut challenge).await.unwrap();
+        (send, recv)
+    };
+    let (progress, _streams) = progress_when_abandoned(&relay_side, &f.registry, client_side).await;
+
+    assert_eq!(progress.stage(), AuthStage::AwaitingChallengeResponse);
+    assert_eq!(
+        progress.identity(),
+        Some(&TokenIdentity {
+            tenant: TenantId(TENANT.to_owned()),
+            session: SessionId(7),
+            slot: SlotId(3),
+        })
+    );
+    assert_eq!(
+        progress.to_string(),
+        "waiting for the challenge response \
+         (token for tenant TenantId(\"sb-staging\") session SessionId(7) slot SlotId(3))"
+    );
+}
+
+#[tokio::test]
+async fn a_handshake_the_client_breaks_off_keeps_its_progress() {
+    let f = fixture();
+    let token = f.mint(SlotId(3));
+    let (client, relay_side, _client_endpoint, _relay_endpoint) = loopback(Edge::Client).await;
+
+    // The client takes the challenge and then gives up on its own dial, closing
+    // the connection the way a dial that ran out of time does.
+    let client_side = async {
+        let (mut send, mut recv) = client.open_bi().await.unwrap();
+        let frame = handshake::encode_token_frame(&token).unwrap();
+        send.write_all(&frame).await.unwrap();
+        let mut challenge = [0u8; CHALLENGE_LEN];
+        recv.read_exact(&mut challenge).await.unwrap();
+        client.close(
+            noq::VarInt::from_u32(rally_point_proto::close_codes::CLIENT_CONNECT_TIMEOUT),
+            b"authorization timed out",
+        );
+    };
+    let mut progress = AuthProgress::new();
+    let (result, ()) = tokio::join!(
+        authenticate(&relay_side, &f.registry, NOW, &mut progress),
+        client_side,
+    );
+
+    assert!(result.is_err(), "the broken-off handshake authenticated");
+    assert_eq!(progress.stage(), AuthStage::AwaitingChallengeResponse);
+    assert_eq!(
+        progress.identity().map(|identity| identity.slot),
+        Some(SlotId(3))
+    );
 }

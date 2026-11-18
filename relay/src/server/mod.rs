@@ -42,10 +42,18 @@ use admission::{
 const MAX_PENDING_HANDSHAKES: usize = 4096;
 
 /// How long a client has to complete the authorization handshake once its QUIC
-/// connection is accepted. The exchange is sub-second in practice; this bounds a
-/// client that connects and then stalls — opening no stream, or sending only part
-/// of the handshake — so unauthenticated connections cannot pin a relay task open.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// connection is accepted, including a managed relay's wait for the session
+/// descriptor.
+///
+/// Bounds a client that connects and then stalls — opening no stream, or sending
+/// only part of the handshake — so unauthenticated connections cannot pin a
+/// relay task and a handshake permit open. It is generous because a slow client
+/// (evidence collection alone may take up to a second) or a lossy path can
+/// stretch an otherwise sub-second exchange to several seconds. It stays under
+/// the client's whole-dial budget (10 s by default, the QUIC handshake plus this
+/// exchange), so in the normal case the relay's close, which names the reason,
+/// reaches the client before the client gives up on its own.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Why one connection ended. Logged per connection; never tears down the relay.
 #[derive(Debug, thiserror::Error)]
@@ -59,9 +67,21 @@ enum ConnError {
     #[error(transparent)]
     DatagramBudgetTooSmall(#[from] rally_point_transport::quic::DatagramBudgetTooSmall),
     /// The client did not finish the authorization handshake within the deadline.
-    #[error("authorization handshake timed out")]
-    AuthTimeout,
-    /// The client did not authorize.
+    /// Carries the step the handshake was waiting on and, once the token had
+    /// verified, the tenant, session and slot it names.
+    #[error("authorization handshake timed out {0}")]
+    AuthTimeout(auth::AuthProgress),
+    /// The authorization handshake failed before the deadline: the client broke
+    /// it off (a client that gives up on its own dial closes the connection
+    /// first), or sent something that did not verify. Carries the step the
+    /// handshake was waiting on and, once the token had verified, the tenant,
+    /// session and slot it names.
+    #[error("authorization failed while {progress}: {error}")]
+    AuthFailed {
+        error: AuthError,
+        progress: auth::AuthProgress,
+    },
+    /// The client authorized, but the relay could not tell it so.
     #[error("authorization failed: {0}")]
     Auth(#[from] AuthError),
     /// The authorized slot was already taken by another live connection.
@@ -455,7 +475,13 @@ async fn serve_connection(
     // GATE: the authorization handshake, and the deadline on it. Nothing below
     // has a session to refuse against until this has named one.
     let auth_deadline = tokio::time::Instant::now() + AUTH_TIMEOUT;
-    let handshake = auth::authenticate(&connection, registry, time::unix_secs_fail_closed());
+    let mut progress = auth::AuthProgress::new();
+    let handshake = auth::authenticate(
+        &connection,
+        registry,
+        time::unix_secs_fail_closed(),
+        &mut progress,
+    );
     let auth::Authenticated {
         authorized,
         resume_cursors,
@@ -465,13 +491,14 @@ async fn serve_connection(
         evidence,
         evidence_request,
     } = match tokio::time::timeout_at(auth_deadline, handshake).await {
-        Ok(result) => result?,
+        Ok(Ok(authenticated)) => authenticated,
+        Ok(Err(error)) => return Err(ConnError::AuthFailed { error, progress }),
         Err(_elapsed) => {
             connection.close(
                 VarInt::from_u32(close_codes::AUTH_TIMEOUT),
                 b"authorization timed out",
             );
-            return Err(ConnError::AuthTimeout);
+            return Err(ConnError::AuthTimeout(progress));
         }
     };
 
@@ -484,8 +511,22 @@ async fn serve_connection(
     // protocol versions within the authorization deadline and admission cap until
     // the descriptor is installed; no roster or routing state exists while waiting.
     let config = if mesh.session.decision_makers.descriptors_required() {
+        progress.advance(auth::AuthStage::AwaitingSessionDescriptor);
         let wait = mesh.session.wait_evidence_config(&key);
-        match tokio::time::timeout_at(auth_deadline, wait).await {
+        // Nothing reads from the client while this waits, so a client that
+        // gives up and closes would go unnoticed until the deadline, holding its
+        // handshake permit the whole time. Watching for the close ends the wait
+        // as soon as the connection is gone.
+        let waited = tokio::select! {
+            waited = tokio::time::timeout_at(auth_deadline, wait) => waited,
+            error = connection.closed() => {
+                return Err(ConnError::AuthFailed {
+                    error: error.into(),
+                    progress,
+                });
+            }
+        };
+        match waited {
             Ok(Some(config)) => config,
             Ok(None) => {
                 connection.close(
@@ -503,7 +544,7 @@ async fn serve_connection(
                     VarInt::from_u32(close_codes::AUTH_TIMEOUT),
                     b"authorization timed out",
                 );
-                return Err(ConnError::AuthTimeout);
+                return Err(ConnError::AuthTimeout(progress));
             }
         }
     } else {

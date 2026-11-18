@@ -68,7 +68,9 @@ use ring::signature::{ED25519, UnparsedPublicKey};
 use tokio::sync::watch;
 
 mod evidence;
+mod progress;
 pub use evidence::{Authenticated, CheckedEvidence, verify_evidence};
+pub use progress::{AuthProgress, AuthStage, TokenIdentity};
 
 /// The byte the relay writes to acknowledge an authorized, routable connection.
 /// Re-exported from the shared handshake codec so callers reading the relay's
@@ -399,13 +401,20 @@ pub fn verify_challenge(
 /// map. They are read after — and only after — the challenge-response proof
 /// succeeds, so only an authenticated client's cursors are ever parsed; the count
 /// is bounded, so a hostile client cannot make the relay read an unbounded frame.
+///
+/// `progress` (start it from [`AuthProgress::new`]) records which step the
+/// exchange is waiting on and, once the token verifies, the slot it names. It
+/// lives outside this future so a caller that abandons the handshake at a
+/// deadline can still report where it stalled.
 pub async fn authenticate(
     connection: &noq::Connection,
     registry: &Registry,
     now_unix_secs: u64,
+    progress: &mut AuthProgress,
 ) -> Result<Authenticated, AuthError> {
     let (mut send, mut recv) = connection.accept_bi().await?;
 
+    progress.advance(AuthStage::AwaitingToken);
     let mut len_buf = [0u8; handshake::TOKEN_LEN_PREFIX_LEN];
     recv.read_exact(&mut len_buf).await?;
     let token_len = handshake::decode_token_len(len_buf)?;
@@ -414,6 +423,12 @@ pub async fn authenticate(
     let token = SignedToken::decode(&token_bytes)?;
 
     let authorized = verify_token(registry, &token, now_unix_secs)?;
+    progress.record_identity(TokenIdentity {
+        tenant: authorized.tenant.clone(),
+        session: authorized.session,
+        slot: authorized.slot,
+    });
+    progress.advance(AuthStage::SendingChallenge);
 
     let mut nonce = [0u8; CHALLENGE_LEN];
     SystemRandom::new()
@@ -431,6 +446,7 @@ pub async fn authenticate(
             .expect("a challenge nonce contains eight epoch bytes"),
     );
     send.write_all(challenge.as_bytes()).await?;
+    progress.advance(AuthStage::AwaitingChallengeResponse);
 
     let mut response = [0u8; SIGNATURE_LEN];
     recv.read_exact(&mut response).await?;
@@ -449,9 +465,11 @@ pub async fn authenticate(
         &ChallengeResponse(response),
     )?;
 
+    progress.advance(AuthStage::AwaitingResumeCursors);
     let resume_cursors = read_resume_cursors(&mut recv).await?;
 
     let evidence = if rally_point_transport::quic::supports_evidence(connection) {
+        progress.advance(AuthStage::AwaitingEvidence);
         let mut len = [0; handshake::EVIDENCE_LEN_PREFIX_LEN];
         recv.read_exact(&mut len).await?;
         let len = handshake::decode_evidence_len(len)?;

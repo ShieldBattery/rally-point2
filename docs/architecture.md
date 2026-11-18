@@ -365,7 +365,7 @@ unchanged sessions ready through unrelated updates, and refreshes response topol
 lock after waiting. Capability-only reenrollment wakes waiters even when mesh identities did not change.
 
 Relay admission still handles an older coordinator or a relay restart after acknowledgement: its
-handshake waits for installation within the existing five-second authorization deadline and shared
+handshake waits for installation within the existing eight-second authorization deadline and shared
 handshake cap. An already-installed descriptor is read immediately, including on ordinary same-relay
 reconnects, and a retired session is refused immediately. The relay does not register or activate the
 client while waiting: the descriptor supplies admission policy for all its traffic, whereas journaling

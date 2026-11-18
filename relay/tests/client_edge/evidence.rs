@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,6 +13,8 @@ use rally_point_proto::token::{
 use rally_point_relay::consensus::RelayNotice;
 use rally_point_relay::key::SessionKey;
 use rally_point_relay::mesh::{MeshState, control::MeshControl};
+use rally_point_relay::server;
+use rally_point_transport::quic::server_config;
 use rally_point_transport::{noq, rustls};
 
 fn managed_relay(tenant: &Tenant) -> TestRelay {
@@ -338,8 +340,10 @@ async fn missing_descriptor_times_out_without_claiming_a_slot() {
         handshake::encode_evidence_frame(None).unwrap()
     })
     .await;
+    // Outlasts the relay's 8 s authorization deadline, which covers the
+    // descriptor wait, with room for a slow test host.
     tokio::time::timeout(
-        Duration::from_secs(6),
+        Duration::from_secs(10),
         refused(&connection, &mut recv, close_codes::AUTH_TIMEOUT),
     )
     .await
@@ -347,6 +351,60 @@ async fn missing_descriptor_times_out_without_claiming_a_slot() {
     assert!(relay.sessions.lock().get(&key(session)).is_none());
     install(&relay, session, &keypair(), vec![]);
     let _link = connect_slot(&endpoint, relay.addr, &tenant, session, SlotId(0)).await;
+}
+
+#[tokio::test]
+async fn a_client_closing_during_the_descriptor_wait_frees_its_handshake_permit() {
+    let tenant = make_default_tenant();
+
+    // A managed relay that allows only one authorization handshake in flight.
+    let mesh = MeshState::default();
+    mesh.session.decision_makers.require_descriptors();
+    let (chain, relay_key, ca) = self_signed();
+    let server_cfg = server_config(chain, relay_key).unwrap();
+    let bind: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let relay = noq::Endpoint::server(server_cfg, bind).unwrap();
+    let addr = relay.local_addr().unwrap();
+    tokio::spawn(server::serve_with_max_pending(
+        relay,
+        Arc::new(registry_for_one(&tenant)),
+        Arc::default(),
+        mesh,
+        None,
+        1,
+    ));
+    let endpoint = client_endpoint(&ca);
+
+    // The first client finishes its side of the handshake for a session with no
+    // descriptor, so the relay parks in the descriptor wait holding the only
+    // permit. The pause lets the relay read the last frame and reach that wait.
+    let first = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let _streams = present(&first, &tenant, SessionId(707), SlotId(0), |_| {
+        handshake::encode_evidence_frame(None).unwrap()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        endpoint.connect(addr, "localhost").unwrap().await.is_err(),
+        "the waiting handshake should hold the only permit"
+    );
+
+    // The client gives up the way a dial that ran out of time does. The relay
+    // has to notice well before its own 8 s deadline would release the permit.
+    first.close(
+        noq::VarInt::from_u32(close_codes::CLIENT_CONNECT_TIMEOUT),
+        b"authorization timed out",
+    );
+    let admitted = tokio::time::timeout(Duration::from_secs(3), async {
+        while endpoint.connect(addr, "localhost").unwrap().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        admitted.is_ok(),
+        "the permit stayed held after the client closed"
+    );
 }
 
 #[tokio::test]
